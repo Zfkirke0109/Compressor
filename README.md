@@ -174,9 +174,9 @@ You can download them [here](https://l.joshattic.us/mDAc6J)
 
 *Why are the new benchmarks worse than the old ones?* Glad you asked! The old "benchmark" video was already quite low bitrate. It was simply a video of me violently shaking my phone around for 25 seconds. The new baseline videos are much more complex and contain more detail, creating a much more accurate benchmark for real world use.
 
-*Why have some devices been removed?* I removed the Galaxy S8+ because it was running a custom ROM which may have unfairly affected its score. The Galaxy S25 was removed as I do not have access to it anymore (I got a friend to do the testing for me, and I don't want to bother them to retest).
+*Why have some devices been removed?* I removed the Galaxy S8+ because it was running a custom ROM which may have unfairly affected its score. The Galaxy S25 was removed as I do not have access to it anymore (I got a friend to do the testing for me, and I don't want to bother them to retest). **The Galaxy S21+ will not be included in future tests as it is now broken and I can no longer test on it.**
 
-*Why are there new devices added?* I added the Galaxy S9 and S21+ to get a more complete picture of how Compressor performs on older flagships. The Galaxy A71, A32 and A05s were added to see how Compressor performs on older midrange devices and newer budget devices. All three of these categories make up a significant amount of my Play Store users, so I wanted to make sure Compressor performs well on them.
+*Why are there new devices added?* I added the Galaxy S9 and ~~S21+~~ to get a more complete picture of how Compressor performs on older flagships. The Galaxy A71, A32 and A05s were added to see how Compressor performs on older midrange devices and newer budget devices. All three of these categories make up a significant amount of my Play Store users, so I wanted to make sure Compressor performs well on them.
 
 ## Credits
 Compressor wouldn't be possible without these amazing people
