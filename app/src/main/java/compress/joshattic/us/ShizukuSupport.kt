@@ -62,7 +62,7 @@ object ShizukuSupport {
 
     fun copyFileWithShizuku(sourcePath: String, targetPath: String): Boolean {
         if (!hasPermission()) return false
-        val command = "cp ${shellQuote(sourcePath)} ${shellQuote(targetPath)} && sync"
+        val command = "cp ${shellQuote(sourcePath)} ${shellQuote(targetPath)} && sync && test -s ${shellQuote(targetPath)}"
         return runCatching {
             val process = startShellProcess(command) ?: return@runCatching false
             val stdout = BufferedReader(InputStreamReader(process.inputStream)).readText()
