@@ -64,13 +64,35 @@ object ShizukuSupport {
         if (!hasPermission()) return false
         val command = "cp ${shellQuote(sourcePath)} ${shellQuote(targetPath)} && sync"
         return runCatching {
-            @Suppress("DEPRECATION")
-            val process = Shizuku.newProcess(arrayOf("sh", "-c", command), null, null)
+            val process = startShellProcess(command) ?: return@runCatching false
             val stdout = BufferedReader(InputStreamReader(process.inputStream)).readText()
             val stderr = BufferedReader(InputStreamReader(process.errorStream)).readText()
             val exit = process.waitFor()
             exit == 0 && stderr.isBlank() && stdout.length >= 0
         }.getOrDefault(false)
+    }
+
+    /**
+     * Shizuku 13.1.5 keeps process creation private, so direct calls fail Kotlin
+     * compilation. Keep the app build-safe by looking it up reflectively and
+     * falling back to normal Android storage behavior if it is unavailable.
+     */
+    private fun startShellProcess(command: String): Process? {
+        return runCatching {
+            val method = Shizuku::class.java.getDeclaredMethod(
+                "newProcess",
+                Array<String>::class.java,
+                Array<String>::class.java,
+                String::class.java
+            )
+            method.isAccessible = true
+            method.invoke(
+                null,
+                arrayOf("sh", "-c", command),
+                null as Array<String>?,
+                null as String?
+            ) as? Process
+        }.getOrNull()
     }
 
     private fun shellQuote(value: String): String {
