@@ -74,7 +74,8 @@ enum class BatchItemStatus {
     Done,
     Failed,
     Replaced,
-    SavedCopy
+    SavedCopy,
+    Skipped
 }
 
 data class BatchVideoItem(
@@ -87,6 +88,7 @@ data class BatchVideoItem(
     val originalAudioBitrate: Int,
     val originalFps: Float,
     val durationMs: Long,
+    val isAlreadyCompressed: Boolean = false,
     val status: BatchItemStatus = BatchItemStatus.Pending,
     val progress: Float = 0f,
     val currentOutputSize: Long = 0L,
@@ -119,6 +121,8 @@ data class BatchCompressorUiState(
 ) {
     val doneCount: Int get() = items.count { it.status == BatchItemStatus.Done || it.status == BatchItemStatus.Replaced || it.status == BatchItemStatus.SavedCopy }
     val failedCount: Int get() = items.count { it.status == BatchItemStatus.Failed }
+    val skippedCount: Int get() = items.count { it.status == BatchItemStatus.Skipped || it.isAlreadyCompressed }
+    val compressibleCount: Int get() = items.count { !it.isAlreadyCompressed && it.status != BatchItemStatus.Skipped }
     val activeIndex: Int get() = items.indexOfFirst { it.status == BatchItemStatus.Compressing }
     val activeItem: BatchVideoItem? get() = items.getOrNull(activeIndex)
     val hasOutputs: Boolean get() = items.any { it.outputPath != null }
@@ -167,7 +171,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val quality = qualityFromLabel(label)
             state.copy(
                 qualityPreset = label,
-                items = state.items.map { it.copy(targetOutputSize = estimateOutputSize(it, quality)) }
+                items = state.items.map { item ->
+                    if (item.isAlreadyCompressed) item else item.copy(targetOutputSize = estimateOutputSize(item, quality))
+                }
             )
         }
     }
@@ -211,19 +217,34 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val quality = qualityFromLabel(_uiState.value.qualityPreset)
             val items = distinct.mapNotNull { uri ->
                 try {
-                    readMetadata(context, uri).let { item ->
+                    val item = readMetadata(context, uri)
+                    val alreadyCompressed = isLikelyCompressorOutput(item.originalName)
+                    if (alreadyCompressed) {
+                        item.copy(
+                            isAlreadyCompressed = true,
+                            status = BatchItemStatus.Skipped,
+                            progress = 1f,
+                            targetOutputSize = 0L,
+                            message = "Already compressed by Compressor — skipped."
+                        )
+                    } else {
                         item.copy(targetOutputSize = estimateOutputSize(item, quality))
                     }
                 } catch (e: Exception) {
                     null
                 }
             }
+            val skipped = items.count { it.isAlreadyCompressed }
             _uiState.update {
                 it.copy(
                     items = items,
                     isLoading = false,
                     deviceProfile = DeviceCapabilityProfiles.current().name,
-                    statusMessage = if (items.isEmpty()) "No readable videos found." else "Ready: ${items.size} video${if (items.size == 1) "" else "s"} selected.",
+                    statusMessage = when {
+                        items.isEmpty() -> "No readable videos found."
+                        skipped > 0 -> "Ready: ${items.size} selected. $skipped already compressed item${if (skipped == 1) "" else "s"} will be skipped."
+                        else -> "Ready: ${items.size} video${if (items.size == 1) "" else "s"} selected."
+                    },
                     errorMessage = null
                 )
             }
@@ -240,6 +261,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         viewModelScope.launch(Dispatchers.IO) {
             refreshShizukuStatus(context)
             val reports = items.take(5).map { item ->
+                if (item.isAlreadyCompressed) {
+                    return@map "${item.originalName}: already compressed — skipped"
+                }
                 val writable = runCatching {
                     context.contentResolver.openFileDescriptor(item.sourceUri, "rw")?.use { true } ?: false
                 }.getOrDefault(false)
@@ -260,6 +284,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     fun startCompression(context: Context) {
         val current = _uiState.value
         if (current.items.isEmpty() || current.isCompressing) return
+        if (current.compressibleCount == 0) {
+            _uiState.update { it.copy(statusMessage = "All selected videos already look compressed by Compressor, so nothing was recompressed.") }
+            return
+        }
 
         compressionJob = viewModelScope.launch(Dispatchers.Main) {
             _uiState.update {
@@ -278,22 +306,37 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
             _uiState.update { state ->
                 state.copy(
-                    items = state.items.map {
-                        it.copy(
-                            status = BatchItemStatus.Pending,
-                            progress = 0f,
-                            currentOutputSize = 0L,
-                            targetOutputSize = estimateOutputSize(it, quality),
-                            outputUri = null,
-                            outputPath = null,
-                            outputSize = 0L,
-                            message = null
-                        )
+                    items = state.items.map { item ->
+                        if (item.isAlreadyCompressed) {
+                            item.copy(
+                                status = BatchItemStatus.Skipped,
+                                progress = 1f,
+                                currentOutputSize = 0L,
+                                targetOutputSize = 0L,
+                                outputUri = null,
+                                outputPath = null,
+                                outputSize = 0L,
+                                message = "Already compressed by Compressor — skipped."
+                            )
+                        } else {
+                            item.copy(
+                                status = BatchItemStatus.Pending,
+                                progress = 0f,
+                                currentOutputSize = 0L,
+                                targetOutputSize = estimateOutputSize(item, quality),
+                                outputUri = null,
+                                outputPath = null,
+                                outputSize = 0L,
+                                message = null
+                            )
+                        }
                     }
                 )
             }
 
             _uiState.value.items.forEachIndexed { index, item ->
+                if (item.isAlreadyCompressed) return@forEachIndexed
+
                 val plannedFps = outputFpsFor(item, frameRate)
                 val codecLabel = if (preferredMime == MimeTypes.VIDEO_H265) "HEVC" else "H.264"
                 updateItem(index) {
@@ -347,7 +390,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             _uiState.update {
                 it.copy(
                     isCompressing = false,
-                    statusMessage = "Finished ${it.doneCount}/${it.items.size}. Saved ${it.formattedTotalSaved} total.",
+                    statusMessage = "Finished ${it.doneCount}/${it.items.size}. Skipped ${it.skippedCount}. Saved ${it.formattedTotalSaved} total.",
                     errorMessage = if (it.failedCount > 0) "${it.failedCount} item${if (it.failedCount == 1) "" else "s"} failed. Tap each item for details." else null
                 )
             }
@@ -828,6 +871,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         } catch (_: Exception) {
             null
         }
+    }
+
+    private fun isLikelyCompressorOutput(name: String): Boolean {
+        val base = name.substringBeforeLast('.').lowercase()
+        return base.endsWith("_compressed") ||
+            base.endsWith("-compressed") ||
+            base.contains("_compressed_") ||
+            base.startsWith("compressed_")
     }
 
     private fun BatchVideoItem.compressedName(): String {
