@@ -7,13 +7,13 @@ plugins {
 android {
     namespace = "compress.joshattic.us"
     compileSdk {
-        version = release(36)
+        version = release(35)
     }
 
     defaultConfig {
         applicationId = "compress.joshattic.us"
         minSdk = 24
-        targetSdk = 36
+        targetSdk = 35
         versionCode = 22
         versionName = "1.5.7"
 
