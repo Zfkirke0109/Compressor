@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import rikka.shizuku.Shizuku
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 
 /**
@@ -62,9 +63,21 @@ object ShizukuSupport {
 
     fun copyFileWithShizuku(sourcePath: String, targetPath: String): Boolean {
         if (!hasPermission()) return false
-        val command = "cp ${shellQuote(sourcePath)} ${shellQuote(targetPath)} && sync && test -s ${shellQuote(targetPath)}"
+        val sourceFile = File(sourcePath)
+        if (!sourceFile.exists() || sourceFile.length() <= 0L) return false
+
+        val target = shellQuote(targetPath)
+        val command = "old_ts=\$(toybox stat -c %Y $target 2>/dev/null || stat -c %Y $target 2>/dev/null); " +
+            "cat > $target && " +
+            "test -s $target && " +
+            "if [ -n \"\$old_ts\" ]; then toybox touch -m -d @\$old_ts $target 2>/dev/null || touch -m -d @\$old_ts $target 2>/dev/null || true; fi; " +
+            "sync"
+
         return runCatching {
             val process = startShellProcess(command) ?: return@runCatching false
+            sourceFile.inputStream().use { input ->
+                process.outputStream.use { output -> input.copyTo(output) }
+            }
             val stdout = BufferedReader(InputStreamReader(process.inputStream)).readText()
             val stderr = BufferedReader(InputStreamReader(process.errorStream)).readText()
             val exit = process.waitFor()
@@ -72,11 +85,6 @@ object ShizukuSupport {
         }.getOrDefault(false)
     }
 
-    /**
-     * Shizuku 13.1.5 keeps process creation private, so direct calls fail Kotlin
-     * compilation. Keep the app build-safe by looking it up reflectively and
-     * falling back to normal Android storage behavior if it is unavailable.
-     */
     private fun startShellProcess(command: String): Process? {
         return runCatching {
             val method = Shizuku::class.java.getDeclaredMethod(
