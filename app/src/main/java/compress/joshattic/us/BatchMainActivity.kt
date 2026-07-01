@@ -193,7 +193,7 @@ private fun BatchSettingsCard(state: BatchCompressorUiState, viewModel: BatchCom
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Batch settings", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Text("Quality preset", style = MaterialTheme.typography.labelLarge)
+            Text("Video quality", style = MaterialTheme.typography.labelLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf("High", "Medium", "Low").forEach { label ->
                     FilterChip(
@@ -204,6 +204,27 @@ private fun BatchSettingsCard(state: BatchCompressorUiState, viewModel: BatchCom
                     )
                 }
             }
+            Text(
+                "High keeps original resolution, Medium targets 1080p, Low targets 720p when the source is larger.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text("Frame rate", style = MaterialTheme.typography.labelLarge)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("Original", "60 fps", "30 fps", "24 fps").forEach { label ->
+                    FilterChip(
+                        selected = state.frameRateOption == label,
+                        onClick = { viewModel.setFrameRate(label) },
+                        label = { Text(label) },
+                        enabled = !state.isCompressing
+                    )
+                }
+            }
+            Text(
+                "60 fps caps high-frame-rate sources to 60. 30/24 lower higher-frame-rate clips. Lower-FPS clips stay at their real source rate.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             SettingSwitchRow("Prefer HEVC/H.265", "Best default for S23 Ultra storage savings.", state.preferHevc, !state.isCompressing) { viewModel.togglePreferHevc() }
             HorizontalDivider()
             SettingSwitchRow("Replace originals after compression", "Off by default. Falls back to a compressed copy when needed.", state.replaceOriginals, !state.isCompressing) { viewModel.toggleReplaceOriginals() }
