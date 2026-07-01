@@ -54,6 +54,13 @@ private enum class BatchQualityPreset(val label: String, val targetRatio: Float)
     LOW("Low", 0.22f)
 }
 
+private enum class BatchFrameRateOption(val label: String, val targetFps: Int?) {
+    ORIGINAL("Original", null),
+    FPS60("60 fps", 60),
+    FPS30("30 fps", 30),
+    FPS24("24 fps", 24)
+}
+
 enum class BatchItemStatus {
     Pending,
     Compressing,
@@ -94,6 +101,7 @@ data class BatchCompressorUiState(
     val isLoading: Boolean = false,
     val isCompressing: Boolean = false,
     val qualityPreset: String = BatchQualityPreset.MEDIUM.label,
+    val frameRateOption: String = BatchFrameRateOption.ORIGINAL.label,
     val preferHevc: Boolean = true,
     val replaceOriginals: Boolean = false,
     val useShizukuFallback: Boolean = false,
@@ -135,7 +143,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val label = when {
             granted -> "Authorized (${ShizukuSupport.backendLabel()})"
             binder -> "Running, permission needed"
-            installed -> "Installed, not running"
+            installed -> "Installed, bridge disabled in this build"
             else -> "Not installed"
         }
         _uiState.update { it.copy(shizukuStatus = label) }
@@ -155,6 +163,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 items = state.items.map { it.copy(targetOutputSize = estimateOutputSize(it, quality)) }
             )
         }
+    }
+
+    fun setFrameRate(label: String) {
+        _uiState.update { it.copy(frameRateOption = label) }
     }
 
     fun togglePreferHevc() {
@@ -228,6 +240,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
 
             val quality = qualityFromLabel(_uiState.value.qualityPreset)
+            val frameRate = frameRateFromLabel(_uiState.value.frameRateOption)
             val preferredMime = chooseOutputMime(_uiState.value.preferHevc)
             clearBatchCache()
 
@@ -249,17 +262,18 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
 
             _uiState.value.items.forEachIndexed { index, item ->
+                val plannedFps = outputFpsFor(item, frameRate)
                 updateItem(index) {
                     it.copy(
                         status = BatchItemStatus.Compressing,
                         progress = 0f,
                         currentOutputSize = 0L,
                         targetOutputSize = estimateOutputSize(it, quality),
-                        message = "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality))}"
+                        message = "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality))}${plannedFps?.let { fps -> " • ${fps}fps" } ?: ""}"
                     )
                 }
                 try {
-                    val outputFile = compressOne(context, item, index, quality, preferredMime)
+                    val outputFile = compressOne(context, item, index, quality, frameRate, preferredMime)
                     val outputUri = Uri.fromFile(outputFile)
                     val outputSize = outputFile.length()
 
@@ -464,6 +478,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         item: BatchVideoItem,
         index: Int,
         quality: BatchQualityPreset,
+        frameRate: BatchFrameRateOption,
         videoMimeType: String
     ): File = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
@@ -474,6 +489,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val targetBitrate = calculateVideoBitrate(item, quality)
             val audioBitrate = if (item.originalAudioBitrate > 0) item.originalAudioBitrate.coerceAtMost(192_000) else 128_000
             val estimatedOutputSize = estimateOutputSize(item, quality)
+            val plannedFps = outputFpsFor(item, frameRate)
 
             val decoderFactory = DefaultDecoderFactory.Builder(context)
                 .setEnableDecoderFallback(true)
@@ -539,8 +555,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 effectsList.add(Presentation.createForWidthAndHeight(outputWidth, outputHeight, Presentation.LAYOUT_SCALE_TO_FIT))
             }
 
-            if (quality != BatchQualityPreset.HIGH && item.originalFps > 30f) {
-                effectsList.add(FrameDropEffect.createSimpleFrameDropEffect(item.originalFps, 30f))
+            if (plannedFps != null && item.originalFps > plannedFps + 0.5f) {
+                effectsList.add(FrameDropEffect.createSimpleFrameDropEffect(item.originalFps, plannedFps.toFloat()))
             }
 
             val editedMediaItem = EditedMediaItem.Builder(MediaItem.fromUri(item.sourceUri))
@@ -568,7 +584,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             progress = progress,
                             currentOutputSize = currentSize,
                             targetOutputSize = estimatedOutputSize,
-                            message = "Compressing: ${formatFileSize(currentSize)} / est ${formatFileSize(estimatedOutputSize)} • ${(progress * 100f).toInt()}%"
+                            message = "Compressing: ${formatFileSize(currentSize)} / est ${formatFileSize(estimatedOutputSize)} • ${(progress * 100f).toInt()}%${plannedFps?.let { fps -> " • ${fps}fps" } ?: ""}"
                         )
                     }
                     delay(200)
@@ -579,6 +595,20 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     private fun qualityFromLabel(label: String): BatchQualityPreset {
         return BatchQualityPreset.entries.firstOrNull { it.label == label } ?: BatchQualityPreset.MEDIUM
+    }
+
+    private fun frameRateFromLabel(label: String): BatchFrameRateOption {
+        return BatchFrameRateOption.entries.firstOrNull { it.label == label } ?: BatchFrameRateOption.ORIGINAL
+    }
+
+    private fun outputFpsFor(item: BatchVideoItem, option: BatchFrameRateOption): Int? {
+        val target = option.targetFps ?: return null
+        return when (target) {
+            60 -> if (item.originalFps >= 50f) 60 else null
+            30 -> if (item.originalFps > 30.5f) 30 else null
+            24 -> if (item.originalFps > 24.5f) 24 else null
+            else -> null
+        }
     }
 
     private fun estimateOutputSize(item: BatchVideoItem, quality: BatchQualityPreset): Long {
