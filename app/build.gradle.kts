@@ -13,7 +13,7 @@ android {
     defaultConfig {
         applicationId = "compress.joshattic.us"
         minSdk = 24
-        targetSdk = 37
+        targetSdk = 36
         versionCode = 22
         versionName = "1.5.7"
 
