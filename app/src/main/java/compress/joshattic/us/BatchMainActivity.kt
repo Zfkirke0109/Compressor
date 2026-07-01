@@ -9,7 +9,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
@@ -90,8 +89,13 @@ private fun BatchCompressorScreen(
     val context = LocalContext.current
     val scrollState = rememberScrollState()
     val pickVideos = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickMultipleVisualMedia(50),
-        onResult = { uris -> if (uris.isNotEmpty()) viewModel.loadUris(context, uris) }
+        contract = ActivityResultContracts.OpenMultipleDocuments(),
+        onResult = { uris ->
+            if (uris.isNotEmpty()) {
+                persistVideoPermissions(context, uris)
+                viewModel.loadUris(context, uris)
+            }
+        }
     )
 
     LaunchedEffect(Unit) { viewModel.refreshShizukuStatus(context) }
@@ -119,21 +123,21 @@ private fun BatchCompressorScreen(
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("Samsung Galaxy S23 Ultra optimized", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "Device profile: ${state.deviceProfile}. Batch jobs run one at a time to protect the hardware encoder from heat and codec init failures.",
+                        "Default is Original: keep 4K as 4K, keep source FPS/audio, and use perceptually lossless compression for storage savings.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Button(
-                        onClick = { pickVideos.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)) },
+                        onClick = { pickVideos.launch(arrayOf("video/*")) },
                         modifier = Modifier.fillMaxWidth(),
                         enabled = !state.isCompressing && !state.isLoading
                     ) {
-                        Text(if (state.items.isEmpty()) "Select videos" else "Select different videos")
+                        Text(if (state.items.isEmpty()) "Select videos with write access" else "Select different videos")
                     }
                 }
             }
 
-            BatchSettingsCard(state, viewModel)
+            BatchSettingsCard(state, viewModel, context)
             if (state.items.isNotEmpty()) BatchSummaryCard(state)
 
             state.statusMessage?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary) }
@@ -179,7 +183,7 @@ private fun BatchCompressorScreen(
                 }
             } else if (!state.isLoading) {
                 Text(
-                    "Pick several videos here, or share multiple videos from Gallery into Compressor.",
+                    "For true replace-original mode, pick videos inside Compressor with the file picker. Videos shared from Gallery may be read-only and may need a safe copy fallback.",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -189,26 +193,60 @@ private fun BatchCompressorScreen(
 }
 
 @Composable
-private fun BatchSettingsCard(state: BatchCompressorUiState, viewModel: BatchCompressorViewModel) {
+private fun BatchSettingsCard(
+    state: BatchCompressorUiState,
+    viewModel: BatchCompressorViewModel,
+    context: Context
+) {
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Batch settings", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Text("Video quality", style = MaterialTheme.typography.labelLarge)
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("Original", "High").forEach { label ->
+                        FilterChip(
+                            selected = state.qualityPreset == label,
+                            onClick = { viewModel.setQuality(label) },
+                            label = { Text(label, maxLines = 1) },
+                            enabled = !state.isCompressing
+                        )
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("Medium", "Low").forEach { label ->
+                        FilterChip(
+                            selected = state.qualityPreset == label,
+                            onClick = { viewModel.setQuality(label) },
+                            label = { Text(label, maxLines = 1) },
+                            enabled = !state.isCompressing
+                        )
+                    }
+                }
+            }
+            Text(
+                "Original is the default perceptually lossless mode: keeps source resolution, source FPS, HDR mode, and audio bitrate. Medium/Low are explicit downgrade choices.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Text("Codec", style = MaterialTheme.typography.labelLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("High", "Medium", "Low").forEach { label ->
+                listOf("Auto", "HEVC", "H.264").forEach { label ->
                     FilterChip(
-                        selected = state.qualityPreset == label,
-                        onClick = { viewModel.setQuality(label) },
-                        label = { Text(label) },
+                        selected = state.codecOption == label,
+                        onClick = { viewModel.setCodec(label) },
+                        label = { Text(label, maxLines = 1) },
                         enabled = !state.isCompressing
                     )
                 }
             }
             Text(
-                "High keeps original resolution, Medium targets 1080p, Low targets 720p when the source is larger.",
+                "Auto chooses the best S23 Ultra hardware encoder. HEVC usually saves more storage; H.264 is best for compatibility.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+
             Text("Frame rate", style = MaterialTheme.typography.labelLarge)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -231,14 +269,23 @@ private fun BatchSettingsCard(state: BatchCompressorUiState, viewModel: BatchCom
                 }
             }
             Text(
-                "60 fps caps high-frame-rate sources to 60. 30/24 lower higher-frame-rate clips. Lower-FPS clips stay at their real source rate.",
+                "Original keeps source FPS. 60 caps high-frame-rate clips to 60. 30/24 lower higher-frame-rate clips only when selected.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            SettingSwitchRow("Prefer HEVC/H.265", "Best default for S23 Ultra storage savings.", state.preferHevc, !state.isCompressing) { viewModel.togglePreferHevc() }
+
             HorizontalDivider()
-            SettingSwitchRow("Replace originals after compression", "Off by default. Falls back to a compressed copy when needed.", state.replaceOriginals, !state.isCompressing) { viewModel.toggleReplaceOriginals() }
+            SettingSwitchRow("Replace originals after compression", "Off by default. Best results require selecting videos inside Compressor with write access.", state.replaceOriginals, !state.isCompressing) { viewModel.toggleReplaceOriginals() }
+            SettingSwitchRow("Use Shizuku fallback", "Uses Shizuku only after normal Android replacement fails.", state.useShizukuFallback, state.replaceOriginals && !state.isCompressing) { viewModel.toggleShizukuFallback() }
             Text("Shizuku: ${state.shizukuStatus}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { viewModel.requestShizukuPermission(context) }, enabled = !state.isCompressing) {
+                    Text("Authorize")
+                }
+                OutlinedButton(onClick = { viewModel.testReplacementAccess(context) }, enabled = !state.isCompressing) {
+                    Text("Test access")
+                }
+            }
         }
     }
 }
@@ -272,6 +319,7 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
             Text("Batch summary", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Text("Videos: ${state.items.size} • Done: ${state.doneCount} • Failed: ${state.failedCount}")
             Text("Original: ${state.formattedTotalOriginal}")
+            Text("Mode: ${state.qualityPreset} • Codec: ${state.codecOption} • FPS: ${state.frameRateOption}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (state.isCompressing) {
                 state.activeItem?.let { active ->
                     Text(
@@ -306,7 +354,7 @@ private fun BatchItemCard(index: Int, item: BatchVideoItem) {
                 overflow = TextOverflow.Ellipsis
             )
             Text(
-                "${item.originalWidth}x${item.originalHeight} • ${item.originalFps.toInt()}fps • ${item.displaySize}",
+                "Original: ${item.originalWidth}x${item.originalHeight} • ${item.originalFps.toInt()}fps • ${item.displaySize}",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -322,6 +370,15 @@ private fun BatchItemCard(index: Int, item: BatchVideoItem) {
             Text("Status: ${item.status.name}${item.message?.let { " — $it" } ?: ""}", style = MaterialTheme.typography.bodySmall)
             if (item.outputSize > 0L) Text("Output: ${item.outputDisplaySize}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
         }
+    }
+}
+
+private fun persistVideoPermissions(context: Context, uris: List<Uri>) {
+    val resolver = context.contentResolver
+    val readWriteFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+    uris.forEach { uri ->
+        runCatching { resolver.takePersistableUriPermission(uri, readWriteFlags) }
+            .recoverCatching { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
     }
 }
 

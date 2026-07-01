@@ -1,15 +1,18 @@
 package compress.joshattic.us
 
 import android.content.Context
+import android.content.pm.PackageManager
+import rikka.shizuku.Shizuku
+import java.io.BufferedReader
+import java.io.File
+import java.io.InputStreamReader
 
 /**
  * Optional Shizuku/Sui integration guardrails.
  *
- * The app must keep building and keep normal Android storage behavior even when
- * Shizuku artifacts are not bundled. This no-op adapter preserves the UI and
- * replace-original fallback call sites while avoiding a hard build dependency
- * on Shizuku AAR metadata. A future PR can re-enable the real bridge once the
- * project's AGP/SDK matrix is confirmed compatible.
+ * Normal Android storage behavior stays the default. This bridge is used only
+ * when the user enables Shizuku fallback and Shizuku/Sui is running with app
+ * permission granted.
  */
 object ShizukuSupport {
     const val REQUEST_CODE = 23023
@@ -23,15 +26,84 @@ object ShizukuSupport {
         }
     }
 
-    fun isBinderAvailable(): Boolean = false
+    fun isBinderAvailable(): Boolean {
+        return runCatching { Shizuku.pingBinder() }.getOrDefault(false)
+    }
 
-    fun hasPermission(): Boolean = false
+    fun hasPermission(): Boolean {
+        return runCatching {
+            isBinderAvailable() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        }.getOrDefault(false)
+    }
 
-    fun canRequestPermission(): Boolean = false
+    fun canRequestPermission(): Boolean {
+        return runCatching {
+            isBinderAvailable() && !Shizuku.shouldShowRequestPermissionRationale()
+        }.getOrDefault(false)
+    }
 
-    fun requestPermission() = Unit
+    fun requestPermission() {
+        runCatching {
+            if (isBinderAvailable() && !hasPermission()) {
+                Shizuku.requestPermission(REQUEST_CODE)
+            }
+        }
+    }
 
-    fun backendLabel(): String = "Disabled in this build"
+    fun backendLabel(): String {
+        return runCatching {
+            val uid = Shizuku.getUid()
+            when (uid) {
+                0 -> "Shizuku root"
+                2000 -> "Shizuku shell"
+                else -> "Shizuku uid $uid"
+            }
+        }.getOrDefault("Shizuku")
+    }
 
-    fun copyFileWithShizuku(sourcePath: String, targetPath: String): Boolean = false
+    fun copyFileWithShizuku(sourcePath: String, targetPath: String): Boolean {
+        if (!hasPermission()) return false
+        val sourceFile = File(sourcePath)
+        if (!sourceFile.exists() || sourceFile.length() <= 0L) return false
+
+        val target = shellQuote(targetPath)
+        val command = "old_ts=\$(toybox stat -c %Y $target 2>/dev/null || stat -c %Y $target 2>/dev/null); " +
+            "cat > $target && " +
+            "test -s $target && " +
+            "if [ -n \"\$old_ts\" ]; then toybox touch -m -d @\$old_ts $target 2>/dev/null || touch -m -d @\$old_ts $target 2>/dev/null || true; fi; " +
+            "sync"
+
+        return runCatching {
+            val process = startShellProcess(command) ?: return@runCatching false
+            sourceFile.inputStream().use { input ->
+                process.outputStream.use { output -> input.copyTo(output) }
+            }
+            val stdout = BufferedReader(InputStreamReader(process.inputStream)).readText()
+            val stderr = BufferedReader(InputStreamReader(process.errorStream)).readText()
+            val exit = process.waitFor()
+            exit == 0 && stderr.isBlank() && stdout.length >= 0
+        }.getOrDefault(false)
+    }
+
+    private fun startShellProcess(command: String): Process? {
+        return runCatching {
+            val method = Shizuku::class.java.getDeclaredMethod(
+                "newProcess",
+                Array<String>::class.java,
+                Array<String>::class.java,
+                String::class.java
+            )
+            method.isAccessible = true
+            method.invoke(
+                null,
+                arrayOf("sh", "-c", command),
+                null as Array<String>?,
+                null as String?
+            ) as? Process
+        }.getOrNull()
+    }
+
+    private fun shellQuote(value: String): String {
+        return "'" + value.replace("'", "'\\''") + "'"
+    }
 }
