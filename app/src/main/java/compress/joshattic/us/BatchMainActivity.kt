@@ -12,36 +12,11 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CenterAlignedTopAppBar
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
-import androidx.compose.material3.HorizontalDivider
-import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedCard
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Switch
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBarDefaults
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -78,9 +53,7 @@ class BatchMainActivity : ComponentActivity() {
 
     private fun consumeIncomingVideos(intent: Intent?) {
         val uris = extractIncomingVideoUris(intent)
-        if (uris.isNotEmpty()) {
-            viewModel.loadUris(this, uris)
-        }
+        if (uris.isNotEmpty()) viewModel.loadUris(this, uris)
     }
 
     @Suppress("DEPRECATION")
@@ -116,25 +89,18 @@ private fun BatchCompressorScreen(
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
     val scrollState = rememberScrollState()
-
     val pickVideos = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickMultipleVisualMedia(50),
-        onResult = { uris ->
-            if (uris.isNotEmpty()) viewModel.loadUris(context, uris)
-        }
+        onResult = { uris -> if (uris.isNotEmpty()) viewModel.loadUris(context, uris) }
     )
 
-    LaunchedEffect(Unit) {
-        viewModel.refreshShizukuStatus(context)
-    }
+    LaunchedEffect(Unit) { viewModel.refreshShizukuStatus(context) }
 
     Scaffold(
         topBar = {
             CenterAlignedTopAppBar(
                 title = { Text("Compressor Batch", fontWeight = FontWeight.Bold) },
-                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background
-                )
+                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(containerColor = MaterialTheme.colorScheme.background)
             )
         }
     ) { innerPadding ->
@@ -167,18 +133,11 @@ private fun BatchCompressorScreen(
                 }
             }
 
-            BatchSettingsCard(state, viewModel, context)
+            BatchSettingsCard(state, viewModel)
+            if (state.items.isNotEmpty()) BatchSummaryCard(state)
 
-            if (state.items.isNotEmpty()) {
-                BatchSummaryCard(state)
-            }
-
-            state.statusMessage?.let {
-                Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
-            }
-            state.errorMessage?.let {
-                Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
-            }
+            state.statusMessage?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary) }
+            state.errorMessage?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error) }
 
             if (state.items.isNotEmpty()) {
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -186,16 +145,12 @@ private fun BatchCompressorScreen(
                         onClick = { viewModel.startCompression(context) },
                         modifier = Modifier.weight(1f),
                         enabled = !state.isCompressing && !state.isLoading
-                    ) {
-                        Text("Compress ${state.items.size}")
-                    }
+                    ) { Text("Compress ${state.items.size}") }
                     OutlinedButton(
                         onClick = { viewModel.cancelCompression() },
                         modifier = Modifier.weight(1f),
                         enabled = state.isCompressing
-                    ) {
-                        Text("Cancel")
-                    }
+                    ) { Text("Cancel") }
                 }
 
                 if (state.hasOutputs) {
@@ -204,16 +159,12 @@ private fun BatchCompressorScreen(
                             onClick = { viewModel.saveAllCopiesToGallery(context) },
                             modifier = Modifier.weight(1f),
                             enabled = !state.isCompressing
-                        ) {
-                            Text("Save copies")
-                        }
+                        ) { Text("Save copies") }
                         OutlinedButton(
                             onClick = onShareOutputs,
                             modifier = Modifier.weight(1f),
                             enabled = !state.isCompressing
-                        ) {
-                            Text("Share")
-                        }
+                        ) { Text("Share") }
                     }
                 }
 
@@ -221,14 +172,10 @@ private fun BatchCompressorScreen(
                     onClick = { viewModel.clear() },
                     modifier = Modifier.align(Alignment.CenterHorizontally),
                     enabled = !state.isCompressing
-                ) {
-                    Text("Clear batch")
-                }
+                ) { Text("Clear batch") }
 
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    state.items.forEachIndexed { index, item ->
-                        BatchItemCard(index + 1, item)
-                    }
+                    state.items.forEachIndexed { index, item -> BatchItemCard(index + 1, item) }
                 }
             } else if (!state.isLoading) {
                 Text(
@@ -242,15 +189,10 @@ private fun BatchCompressorScreen(
 }
 
 @Composable
-private fun BatchSettingsCard(
-    state: BatchCompressorUiState,
-    viewModel: BatchCompressorViewModel,
-    context: Context
-) {
+private fun BatchSettingsCard(state: BatchCompressorUiState, viewModel: BatchCompressorViewModel) {
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("Batch settings", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-
             Text("Quality preset", style = MaterialTheme.typography.labelLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf("High", "Medium", "Low").forEach { label ->
@@ -262,41 +204,10 @@ private fun BatchSettingsCard(
                     )
                 }
             }
-
-            SettingSwitchRow(
-                title = "Prefer HEVC/H.265",
-                subtitle = "Best default for S23 Ultra storage savings when the hardware encoder supports it.",
-                checked = state.preferHevc,
-                enabled = !state.isCompressing,
-                onCheckedChange = { viewModel.togglePreferHevc() }
-            )
-
+            SettingSwitchRow("Prefer HEVC/H.265", "Best default for S23 Ultra storage savings.", state.preferHevc, !state.isCompressing) { viewModel.togglePreferHevc() }
             HorizontalDivider()
-
-            SettingSwitchRow(
-                title = "Replace originals after compression",
-                subtitle = "Off by default. Compressor writes only after the compressed output exists and verifies. Protected originals fall back to a safe copy.",
-                checked = state.replaceOriginals,
-                enabled = !state.isCompressing,
-                onCheckedChange = { viewModel.toggleReplaceOriginals() }
-            )
-
-            SettingSwitchRow(
-                title = "Use Shizuku fallback",
-                subtitle = "Optional advanced path for file-path originals when Android blocks normal writes. Status: ${state.shizukuStatus}",
-                checked = state.useShizukuFallback,
-                enabled = state.replaceOriginals && !state.isCompressing,
-                onCheckedChange = { viewModel.toggleShizukuFallback() }
-            )
-
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { viewModel.refreshShizukuStatus(context) }, enabled = !state.isCompressing) {
-                    Text("Refresh Shizuku")
-                }
-                OutlinedButton(onClick = { viewModel.requestShizukuPermission(context) }, enabled = !state.isCompressing) {
-                    Text("Authorize")
-                }
-            }
+            SettingSwitchRow("Replace originals after compression", "Off by default. Falls back to a compressed copy when needed.", state.replaceOriginals, !state.isCompressing) { viewModel.toggleReplaceOriginals() }
+            Text("Shizuku: ${state.shizukuStatus}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -330,9 +241,24 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
             Text("Batch summary", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Text("Videos: ${state.items.size} • Done: ${state.doneCount} • Failed: ${state.failedCount}")
             Text("Original: ${state.formattedTotalOriginal}")
-            if (state.totalOutputBytes > 0) {
-                Text("Compressed: ${state.formattedTotalOutput} • Saved: ${state.formattedTotalSaved}")
+            if (state.isCompressing) {
+                state.activeItem?.let { active ->
+                    Text(
+                        "Active: ${active.currentOutputDisplaySize} / est ${active.targetOutputDisplaySize} • ${active.progressPercent}%",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                if (state.totalTargetOutputBytes > 0L) {
+                    Text(
+                        "Batch written: ${state.formattedTotalCurrentOutput} / est ${state.formattedTotalTargetOutput}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
+            if (state.totalOutputBytes > 0) Text("Compressed: ${state.formattedTotalOutput} • Saved: ${state.formattedTotalSaved}")
         }
     }
 }
@@ -353,13 +279,17 @@ private fun BatchItemCard(index: Int, item: BatchVideoItem) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Text("Status: ${item.status.name}${item.message?.let { " — $it" } ?: ""}", style = MaterialTheme.typography.bodySmall)
             if (item.status == BatchItemStatus.Compressing) {
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                Text(
+                    "Output: ${item.currentOutputDisplaySize} / est ${item.targetOutputDisplaySize} • ${item.progressPercent}%",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold
+                )
+                LinearProgressIndicator(progress = { item.progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
             }
-            if (item.outputSize > 0L) {
-                Text("Output: ${item.outputDisplaySize}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
-            }
+            Text("Status: ${item.status.name}${item.message?.let { " — $it" } ?: ""}", style = MaterialTheme.typography.bodySmall)
+            if (item.outputSize > 0L) Text("Output: ${item.outputDisplaySize}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
         }
     }
 }

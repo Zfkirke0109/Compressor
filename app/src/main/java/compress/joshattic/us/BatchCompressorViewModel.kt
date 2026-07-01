@@ -32,10 +32,12 @@ import androidx.media3.transformer.EditedMediaItemSequence
 import androidx.media3.transformer.Effects
 import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.VideoEncoderSettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -73,6 +75,8 @@ data class BatchVideoItem(
     val durationMs: Long,
     val status: BatchItemStatus = BatchItemStatus.Pending,
     val progress: Float = 0f,
+    val currentOutputSize: Long = 0L,
+    val targetOutputSize: Long = 0L,
     val outputUri: Uri? = null,
     val outputPath: String? = null,
     val outputSize: Long = 0L,
@@ -80,6 +84,9 @@ data class BatchVideoItem(
 ) {
     val displaySize: String get() = formatFileSize(originalSize)
     val outputDisplaySize: String get() = formatFileSize(outputSize)
+    val currentOutputDisplaySize: String get() = formatFileSize(currentOutputSize)
+    val targetOutputDisplaySize: String get() = formatFileSize(targetOutputSize)
+    val progressPercent: Int get() = (progress.coerceIn(0f, 1f) * 100f).toInt()
 }
 
 data class BatchCompressorUiState(
@@ -97,12 +104,19 @@ data class BatchCompressorUiState(
 ) {
     val doneCount: Int get() = items.count { it.status == BatchItemStatus.Done || it.status == BatchItemStatus.Replaced || it.status == BatchItemStatus.SavedCopy }
     val failedCount: Int get() = items.count { it.status == BatchItemStatus.Failed }
+    val activeIndex: Int get() = items.indexOfFirst { it.status == BatchItemStatus.Compressing }
+    val activeItem: BatchVideoItem? get() = items.getOrNull(activeIndex)
     val hasOutputs: Boolean get() = items.any { it.outputPath != null }
     val totalOriginalBytes: Long get() = items.sumOf { it.originalSize }
     val totalOutputBytes: Long get() = items.sumOf { it.outputSize }
+    val totalCurrentOutputBytes: Long get() = items.sumOf { if (it.outputSize > 0L) it.outputSize else it.currentOutputSize }
+    val totalTargetOutputBytes: Long get() = items.sumOf { it.targetOutputSize }
     val totalSavedBytes: Long get() = (totalOriginalBytes - totalOutputBytes).coerceAtLeast(0L)
+    val currentBatchProgress: Float get() = if (items.isEmpty()) 0f else items.sumOf { it.progress.toDouble() }.toFloat() / items.size
     val formattedTotalOriginal: String get() = formatFileSize(totalOriginalBytes)
     val formattedTotalOutput: String get() = formatFileSize(totalOutputBytes)
+    val formattedTotalCurrentOutput: String get() = formatFileSize(totalCurrentOutputBytes)
+    val formattedTotalTargetOutput: String get() = formatFileSize(totalTargetOutputBytes)
     val formattedTotalSaved: String get() = formatFileSize(totalSavedBytes)
 }
 
@@ -134,7 +148,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     }
 
     fun setQuality(label: String) {
-        _uiState.update { it.copy(qualityPreset = label) }
+        _uiState.update { state ->
+            val quality = qualityFromLabel(label)
+            state.copy(
+                qualityPreset = label,
+                items = state.items.map { it.copy(targetOutputSize = estimateOutputSize(it, quality)) }
+            )
+        }
     }
 
     fun togglePreferHevc() {
@@ -169,9 +189,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
         viewModelScope.launch(Dispatchers.IO) {
             _uiState.update { it.copy(isLoading = true, errorMessage = null, statusMessage = "Reading ${distinct.size} video${if (distinct.size == 1) "" else "s"}…") }
+            val quality = qualityFromLabel(_uiState.value.qualityPreset)
             val items = distinct.mapNotNull { uri ->
                 try {
-                    readMetadata(context, uri)
+                    readMetadata(context, uri).let { item ->
+                        item.copy(targetOutputSize = estimateOutputSize(item, quality))
+                    }
                 } catch (e: Exception) {
                     null
                 }
@@ -204,14 +227,39 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 )
             }
 
-            val quality = BatchQualityPreset.entries.firstOrNull { it.label == _uiState.value.qualityPreset } ?: BatchQualityPreset.MEDIUM
+            val quality = qualityFromLabel(_uiState.value.qualityPreset)
             val preferredMime = chooseOutputMime(_uiState.value.preferHevc)
             clearBatchCache()
 
+            _uiState.update { state ->
+                state.copy(
+                    items = state.items.map {
+                        it.copy(
+                            status = BatchItemStatus.Pending,
+                            progress = 0f,
+                            currentOutputSize = 0L,
+                            targetOutputSize = estimateOutputSize(it, quality),
+                            outputUri = null,
+                            outputPath = null,
+                            outputSize = 0L,
+                            message = null
+                        )
+                    }
+                )
+            }
+
             _uiState.value.items.forEachIndexed { index, item ->
-                updateItem(index) { it.copy(status = BatchItemStatus.Compressing, progress = 0f, message = "Compressing…") }
+                updateItem(index) {
+                    it.copy(
+                        status = BatchItemStatus.Compressing,
+                        progress = 0f,
+                        currentOutputSize = 0L,
+                        targetOutputSize = estimateOutputSize(it, quality),
+                        message = "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality))}"
+                    )
+                }
                 try {
-                    val outputFile = compressOne(context, item, quality, preferredMime)
+                    val outputFile = compressOne(context, item, index, quality, preferredMime)
                     val outputUri = Uri.fromFile(outputFile)
                     val outputSize = outputFile.length()
 
@@ -219,6 +267,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         it.copy(
                             status = BatchItemStatus.Done,
                             progress = 1f,
+                            currentOutputSize = outputSize,
                             outputUri = outputUri,
                             outputPath = outputFile.absolutePath,
                             outputSize = outputSize,
@@ -413,6 +462,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     private suspend fun compressOne(
         context: Context,
         item: BatchVideoItem,
+        index: Int,
         quality: BatchQualityPreset,
         videoMimeType: String
     ): File = withContext(Dispatchers.Main) {
@@ -423,6 +473,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
             val targetBitrate = calculateVideoBitrate(item, quality)
             val audioBitrate = if (item.originalAudioBitrate > 0) item.originalAudioBitrate.coerceAtMost(192_000) else 128_000
+            val estimatedOutputSize = estimateOutputSize(item, quality)
 
             val decoderFactory = DefaultDecoderFactory.Builder(context)
                 .setEnableDecoderFallback(true)
@@ -443,6 +494,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 )
                 .build()
 
+            var progressJob: Job? = null
             val transformer = Transformer.Builder(context)
                 .setVideoMimeType(videoMimeType)
                 .setAudioMimeType(MimeTypes.AUDIO_AAC)
@@ -450,17 +502,31 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 .setEncoderFactory(encoderFactory)
                 .addListener(object : Transformer.Listener {
                     override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                        progressJob?.cancel()
+                        val finalSize = outputFile.length()
+                        updateItem(index) {
+                            it.copy(
+                                progress = 1f,
+                                currentOutputSize = finalSize,
+                                targetOutputSize = estimatedOutputSize,
+                                message = "Compressing: ${formatFileSize(finalSize)} / est ${formatFileSize(estimatedOutputSize)} • 100%"
+                            )
+                        }
                         if (continuation.isActive) continuation.resume(outputFile)
                     }
 
                     override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {
+                        progressJob?.cancel()
                         if (continuation.isActive) continuation.resumeWithException(exportException)
                     }
                 })
                 .build()
 
             activeTransformer = transformer
-            continuation.invokeOnCancellation { transformer.cancel() }
+            continuation.invokeOnCancellation {
+                progressJob?.cancel()
+                transformer.cancel()
+            }
 
             val effectsList = mutableListOf<Effect>()
             val targetHeight = targetHeightFor(item, quality)
@@ -486,7 +552,38 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 .build()
 
             transformer.start(composition, outputFile.absolutePath)
+
+            progressJob = viewModelScope.launch(Dispatchers.Main) {
+                while (continuation.isActive) {
+                    val progressHolder = ProgressHolder()
+                    val progressState = transformer.getProgress(progressHolder)
+                    val currentSize = if (outputFile.exists()) outputFile.length() else 0L
+                    val progress = if (progressState == Transformer.PROGRESS_STATE_AVAILABLE) {
+                        (progressHolder.progress / 100f).coerceIn(0f, 0.99f)
+                    } else {
+                        0f
+                    }
+                    updateItem(index) {
+                        it.copy(
+                            progress = progress,
+                            currentOutputSize = currentSize,
+                            targetOutputSize = estimatedOutputSize,
+                            message = "Compressing: ${formatFileSize(currentSize)} / est ${formatFileSize(estimatedOutputSize)} • ${(progress * 100f).toInt()}%"
+                        )
+                    }
+                    delay(200)
+                }
+            }
         }
+    }
+
+    private fun qualityFromLabel(label: String): BatchQualityPreset {
+        return BatchQualityPreset.entries.firstOrNull { it.label == label } ?: BatchQualityPreset.MEDIUM
+    }
+
+    private fun estimateOutputSize(item: BatchVideoItem, quality: BatchQualityPreset): Long {
+        if (item.originalSize <= 0L) return 0L
+        return (item.originalSize * quality.targetRatio).toLong().coerceAtLeast(1L)
     }
 
     private fun calculateVideoBitrate(item: BatchVideoItem, quality: BatchQualityPreset): Int {
