@@ -4,6 +4,8 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val stableDebugKeystore = rootProject.file("ci-debug.keystore")
+
 android {
     namespace = "compress.joshattic.us"
     compileSdk = 36
@@ -12,13 +14,27 @@ android {
         applicationId = "compress.joshattic.us"
         minSdk = 24
         targetSdk = 36
-        versionCode = 22
-        versionName = "1.5.7"
+        versionCode = 23
+        versionName = "1.5.8"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        getByName("debug") {
+            if (stableDebugKeystore.isFile) {
+                storeFile = stableDebugKeystore
+                storePassword = System.getenv("COMPRESSOR_DEBUG_KEYSTORE_PASSWORD") ?: "compressor-debug"
+                keyAlias = System.getenv("COMPRESSOR_DEBUG_KEY_ALIAS") ?: "compressor-debug"
+                keyPassword = System.getenv("COMPRESSOR_DEBUG_KEY_PASSWORD") ?: storePassword
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("debug")
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
