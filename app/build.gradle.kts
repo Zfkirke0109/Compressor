@@ -7,7 +7,7 @@ plugins {
 android {
     namespace = "compress.joshattic.us"
     compileSdk {
-        version = release(36)
+        version = release(37)
     }
 
     defaultConfig {
