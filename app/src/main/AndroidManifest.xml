@@ -14,30 +14,36 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.Compressor">
         <activity
-            android:name=".MainActivity"
+            android:name=".BatchMainActivity"
             android:exported="true"
             android:label="@string/app_name"
             android:theme="@style/Theme.Compressor">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-            
-            <!-- Handle shared videos -->
+
+            <!-- Handle one shared video. -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="video/*" />
             </intent-filter>
 
-            <!-- Handle shared batches of videos. MainActivity still needs batch-state plumbing. -->
+            <!-- Handle shared batches of videos. -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND_MULTIPLE" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="video/*" />
             </intent-filter>
         </activity>
+
+        <!-- Keep the original single-video UI available internally without making it the launcher/share target. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:label="@string/app_name"
+            android:theme="@style/Theme.Compressor" />
 
         <provider
             android:name="androidx.core.content.FileProvider"
