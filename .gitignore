@@ -23,5 +23,6 @@ output-metadata.json
 *.dm
 *.apk
 *.log
+ci-debug.keystore
 app/release/baselineProfiles/0/app-release.dm
 app/release/baselineProfiles/0/app-release.dm
