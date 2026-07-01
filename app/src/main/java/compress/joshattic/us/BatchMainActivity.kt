@@ -9,7 +9,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
@@ -90,8 +89,13 @@ private fun BatchCompressorScreen(
     val context = LocalContext.current
     val scrollState = rememberScrollState()
     val pickVideos = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickMultipleVisualMedia(50),
-        onResult = { uris -> if (uris.isNotEmpty()) viewModel.loadUris(context, uris) }
+        contract = ActivityResultContracts.OpenMultipleDocuments(),
+        onResult = { uris ->
+            if (uris.isNotEmpty()) {
+                persistVideoPermissions(context, uris)
+                viewModel.loadUris(context, uris)
+            }
+        }
     )
 
     LaunchedEffect(Unit) { viewModel.refreshShizukuStatus(context) }
@@ -124,11 +128,11 @@ private fun BatchCompressorScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Button(
-                        onClick = { pickVideos.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.VideoOnly)) },
+                        onClick = { pickVideos.launch(arrayOf("video/*")) },
                         modifier = Modifier.fillMaxWidth(),
                         enabled = !state.isCompressing && !state.isLoading
                     ) {
-                        Text(if (state.items.isEmpty()) "Select videos" else "Select different videos")
+                        Text(if (state.items.isEmpty()) "Select videos with write access" else "Select different videos")
                     }
                 }
             }
@@ -179,7 +183,7 @@ private fun BatchCompressorScreen(
                 }
             } else if (!state.isLoading) {
                 Text(
-                    "Pick several videos here, or share multiple videos from Gallery into Compressor.",
+                    "Pick videos here using Android's file picker so Compressor can request writable originals, or share multiple videos from Gallery into Compressor.",
                     style = MaterialTheme.typography.bodyLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -210,12 +214,22 @@ private fun BatchSettingsCard(state: BatchCompressorUiState, viewModel: BatchCom
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text("Frame rate", style = MaterialTheme.typography.labelLarge)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("Original", "60 fps", "30 fps", "24 fps").forEach { label ->
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf("Original", "60 fps", "30 fps").forEach { label ->
+                        FilterChip(
+                            selected = state.frameRateOption == label,
+                            onClick = { viewModel.setFrameRate(label) },
+                            label = { Text(label, maxLines = 1) },
+                            enabled = !state.isCompressing
+                        )
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     FilterChip(
-                        selected = state.frameRateOption == label,
-                        onClick = { viewModel.setFrameRate(label) },
-                        label = { Text(label) },
+                        selected = state.frameRateOption == "24 fps",
+                        onClick = { viewModel.setFrameRate("24 fps") },
+                        label = { Text("24 fps", maxLines = 1) },
                         enabled = !state.isCompressing
                     )
                 }
@@ -312,6 +326,15 @@ private fun BatchItemCard(index: Int, item: BatchVideoItem) {
             Text("Status: ${item.status.name}${item.message?.let { " — $it" } ?: ""}", style = MaterialTheme.typography.bodySmall)
             if (item.outputSize > 0L) Text("Output: ${item.outputDisplaySize}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
         }
+    }
+}
+
+private fun persistVideoPermissions(context: Context, uris: List<Uri>) {
+    val resolver = context.contentResolver
+    val readWriteFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+    uris.forEach { uri ->
+        runCatching { resolver.takePersistableUriPermission(uri, readWriteFlags) }
+            .recoverCatching { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
     }
 }
 
