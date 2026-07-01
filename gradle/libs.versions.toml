@@ -12,6 +12,7 @@ media3 = "1.5.0"
 animation = "1.10.1"
 ui = "1.10.1"
 shizuku = "13.1.5"
+desugarJdkLibs = "2.1.5"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -36,6 +37,7 @@ androidx-compose-animation = { group = "androidx.compose.animation", name = "ani
 androidx-ui = { group = "androidx.compose.ui", name = "ui", version.ref = "ui" }
 shizuku-api = { group = "dev.rikka.shizuku", name = "api", version.ref = "shizuku" }
 shizuku-provider = { group = "dev.rikka.shizuku", name = "provider", version.ref = "shizuku" }
+desugar-jdk-libs = { group = "com.android.tools", name = "desugar_jdk_libs", version.ref = "desugarJdkLibs" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
