@@ -1,15 +1,17 @@
 package compress.joshattic.us
 
 import android.content.Context
+import android.content.pm.PackageManager
+import rikka.shizuku.Shizuku
+import java.io.BufferedReader
+import java.io.InputStreamReader
 
 /**
  * Optional Shizuku/Sui integration guardrails.
  *
- * The app must keep building and keep normal Android storage behavior even when
- * Shizuku artifacts are not bundled. This no-op adapter preserves the UI and
- * replace-original fallback call sites while avoiding a hard build dependency
- * on Shizuku AAR metadata. A future PR can re-enable the real bridge once the
- * project's AGP/SDK matrix is confirmed compatible.
+ * Normal Android storage behavior stays the default. This bridge is used only
+ * when the user enables Shizuku fallback and Shizuku/Sui is running with app
+ * permission granted.
  */
 object ShizukuSupport {
     const val REQUEST_CODE = 23023
@@ -23,15 +25,55 @@ object ShizukuSupport {
         }
     }
 
-    fun isBinderAvailable(): Boolean = false
+    fun isBinderAvailable(): Boolean {
+        return runCatching { Shizuku.pingBinder() }.getOrDefault(false)
+    }
 
-    fun hasPermission(): Boolean = false
+    fun hasPermission(): Boolean {
+        return runCatching {
+            isBinderAvailable() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        }.getOrDefault(false)
+    }
 
-    fun canRequestPermission(): Boolean = false
+    fun canRequestPermission(): Boolean {
+        return runCatching {
+            isBinderAvailable() && !Shizuku.shouldShowRequestPermissionRationale()
+        }.getOrDefault(false)
+    }
 
-    fun requestPermission() = Unit
+    fun requestPermission() {
+        runCatching {
+            if (isBinderAvailable() && !hasPermission()) {
+                Shizuku.requestPermission(REQUEST_CODE)
+            }
+        }
+    }
 
-    fun backendLabel(): String = "Disabled in this build"
+    fun backendLabel(): String {
+        return runCatching {
+            val uid = Shizuku.getUid()
+            when (uid) {
+                0 -> "Shizuku root"
+                2000 -> "Shizuku shell"
+                else -> "Shizuku uid $uid"
+            }
+        }.getOrDefault("Shizuku")
+    }
 
-    fun copyFileWithShizuku(sourcePath: String, targetPath: String): Boolean = false
+    fun copyFileWithShizuku(sourcePath: String, targetPath: String): Boolean {
+        if (!hasPermission()) return false
+        val command = "cp ${shellQuote(sourcePath)} ${shellQuote(targetPath)} && sync"
+        return runCatching {
+            @Suppress("DEPRECATION")
+            val process = Shizuku.newProcess(arrayOf("sh", "-c", command), null, null)
+            val stdout = BufferedReader(InputStreamReader(process.inputStream)).readText()
+            val stderr = BufferedReader(InputStreamReader(process.errorStream)).readText()
+            val exit = process.waitFor()
+            exit == 0 && stderr.isBlank() && stdout.length >= 0
+        }.getOrDefault(false)
+    }
+
+    private fun shellQuote(value: String): String {
+        return "'" + value.replace("'", "'\\''") + "'"
+    }
 }
