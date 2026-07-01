@@ -1,15 +1,15 @@
 package compress.joshattic.us
 
 import android.content.Context
-import android.content.pm.PackageManager
-import rikka.shizuku.Shizuku
 
 /**
  * Optional Shizuku/Sui integration guardrails.
  *
- * Compressor must continue to work normally without Shizuku. Use this helper
- * before any privileged file operation, and keep the regular Android Storage
- * Access Framework / MediaStore path as the default path.
+ * The app must keep building and keep normal Android storage behavior even when
+ * Shizuku artifacts are not bundled. This no-op adapter preserves the UI and
+ * replace-original fallback call sites while avoiding a hard build dependency
+ * on Shizuku AAR metadata. A future PR can re-enable the real bridge once the
+ * project's AGP/SDK matrix is confirmed compatible.
  */
 object ShizukuSupport {
     const val REQUEST_CODE = 23023
@@ -23,61 +23,15 @@ object ShizukuSupport {
         }
     }
 
-    fun isBinderAvailable(): Boolean {
-        return try {
-            Shizuku.pingBinder()
-        } catch (_: Exception) {
-            false
-        }
-    }
+    fun isBinderAvailable(): Boolean = false
 
-    fun hasPermission(): Boolean {
-        return try {
-            !Shizuku.isPreV11() &&
-                Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
-        } catch (_: Exception) {
-            false
-        }
-    }
+    fun hasPermission(): Boolean = false
 
-    fun canRequestPermission(): Boolean {
-        return try {
-            isBinderAvailable() && !Shizuku.isPreV11() && !Shizuku.shouldShowRequestPermissionRationale()
-        } catch (_: Exception) {
-            false
-        }
-    }
+    fun canRequestPermission(): Boolean = false
 
-    fun requestPermission() {
-        if (canRequestPermission()) {
-            Shizuku.requestPermission(REQUEST_CODE)
-        }
-    }
+    fun requestPermission() = Unit
 
-    fun backendLabel(): String {
-        return try {
-            when (Shizuku.getUid()) {
-                0 -> "Sui/root"
-                2000 -> "Shizuku/ADB shell"
-                else -> "Shizuku UID ${Shizuku.getUid()}"
-            }
-        } catch (_: Exception) {
-            "Unavailable"
-        }
-    }
+    fun backendLabel(): String = "Disabled in this build"
 
-    fun copyFileWithShizuku(sourcePath: String, targetPath: String): Boolean {
-        if (!hasPermission()) return false
-        return try {
-            val command = "cp ${shellQuote(sourcePath)} ${shellQuote(targetPath)} && chmod 0644 ${shellQuote(targetPath)}"
-            val process = Shizuku.newProcess(arrayOf("sh", "-c", command), null, null)
-            process.waitFor() == 0
-        } catch (_: Exception) {
-            false
-        }
-    }
-
-    private fun shellQuote(value: String): String {
-        return "'" + value.replace("'", "'\\''") + "'"
-    }
+    fun copyFileWithShizuku(sourcePath: String, targetPath: String): Boolean = false
 }
