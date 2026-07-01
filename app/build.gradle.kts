@@ -13,7 +13,7 @@ android {
     defaultConfig {
         applicationId = "compress.joshattic.us"
         minSdk = 24
-        targetSdk = 37
+        targetSdk = 36
         versionCode = 22
         versionName = "1.5.7"
 
@@ -32,6 +32,7 @@ android {
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
+        isCoreLibraryDesugaringEnabled = true
     }
     kotlinOptions {
         jvmTarget = "11"
@@ -62,6 +63,7 @@ dependencies {
     implementation(libs.androidx.ui)
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
+    coreLibraryDesugaring(libs.desugar.jdk.libs)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)

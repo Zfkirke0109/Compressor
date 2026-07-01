@@ -65,4 +65,19 @@ object ShizukuSupport {
             "Unavailable"
         }
     }
+
+    fun copyFileWithShizuku(sourcePath: String, targetPath: String): Boolean {
+        if (!hasPermission()) return false
+        return try {
+            val command = "cp ${shellQuote(sourcePath)} ${shellQuote(targetPath)} && chmod 0644 ${shellQuote(targetPath)}"
+            val process = Shizuku.newProcess(arrayOf("sh", "-c", command), null, null)
+            process.waitFor() == 0
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun shellQuote(value: String): String {
+        return "'" + value.replace("'", "'\\''") + "'"
+    }
 }
