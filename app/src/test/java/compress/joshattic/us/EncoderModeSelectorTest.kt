@@ -5,9 +5,9 @@ import org.junit.Test
 
 class EncoderModeSelectorTest {
     @Test
-    fun originalModeStartsWithCqAttempt() {
+    fun originalModeStartsWithMedia3HighQualityTargeting() {
         assertEquals(
-            EncoderMode.CQ,
+            EncoderMode.HIGH_QUALITY,
             EncoderModeSelector.chooseInitialMode(isOriginalMode = true)
         )
     }

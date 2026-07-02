@@ -872,15 +872,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     }
 
     private fun videoEncoderSettings(targetBitrate: Int, encoderMode: EncoderMode): VideoEncoderSettings {
-        return VideoEncoderSettings.Builder().apply {
-            if (encoderMode == EncoderMode.CQ) {
-                setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)
-                experimentalSetEnableHighQualityTargeting(true)
-            } else {
-                setBitrate(targetBitrate)
-                setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-            }
-        }.build()
+        return Media3VideoEncoderSettingsFactory.build(targetBitrate, encoderMode)
     }
 
     private fun encoderProgressSuffix(encoderMode: EncoderMode): String {
@@ -932,7 +924,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     ): EncodeResult = withContext(Dispatchers.Main) {
         val outputDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
         val outputFile = File(outputDir, item.outputName(quality))
-        val cqSupported = supportsEncoderBitrateMode(
+        val hardwareCqSupported = supportsEncoderBitrateMode(
             videoMimeType,
             MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ
         )
@@ -941,7 +933,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         )
         Log.i(
             BATCH_LOG_TAG,
-            "Starting export: file=${item.originalName}, quality=${quality.label}, mime=$videoMimeType, cqSupported=$cqSupported, requestedEncoderMode=${initialMode.reportLabel}"
+            "Starting export: file=${item.originalName}, quality=${quality.label}, mime=$videoMimeType, hardwareCqSupported=$hardwareCqSupported, requestedEncoderMode=${initialMode.reportLabel}"
         )
 
         try {
@@ -952,17 +944,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             )
             EncodeResult(outputFile, initialMode)
         } catch (error: Exception) {
-            if (error is kotlinx.coroutines.CancellationException || initialMode != EncoderMode.CQ) {
+            if (error is kotlinx.coroutines.CancellationException || initialMode != EncoderMode.HIGH_QUALITY) {
                 throw error
             }
             Log.w(
                 BATCH_LOG_TAG,
-                "CQ export failed; retrying VBR fallback: file=${item.originalName}, mime=$videoMimeType, cqSupported=$cqSupported, error=${error.fullMessage()}",
+                "High-quality export failed; retrying VBR fallback: file=${item.originalName}, mime=$videoMimeType, hardwareCqSupported=$hardwareCqSupported, error=${error.fullMessage()}",
                 error
             )
             if (outputFile.exists()) outputFile.delete()
             updateItem(index) {
-                it.copy(message = "CQ encoder failed to initialize; retrying with high-bitrate VBR fallback.")
+                it.copy(message = "High-quality encoder failed to initialize; retrying with high-bitrate VBR fallback.")
             }
             runTransformerExport(
                 context = context,
