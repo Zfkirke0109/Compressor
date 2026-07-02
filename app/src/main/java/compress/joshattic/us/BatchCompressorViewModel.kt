@@ -63,12 +63,6 @@ private enum class BatchFrameRateOption(val label: String, val targetFps: Int?) 
     FPS24("24 fps", 24)
 }
 
-private enum class BatchCodecOption(val label: String) {
-    AUTO("Auto"),
-    HEVC("HEVC"),
-    H264("H.264")
-}
-
 enum class BatchItemStatus {
     Pending,
     Compressing,
@@ -118,6 +112,11 @@ data class BatchCompressorUiState(
     val qualityPreset: String = BatchQualityPreset.ORIGINAL.label,
     val frameRateOption: String = BatchFrameRateOption.ORIGINAL.label,
     val codecOption: String = BatchCodecOption.AUTO.label,
+    val availableCodecOptions: List<String> = listOf(
+        BatchCodecOption.AUTO.label,
+        BatchCodecOption.HEVC.label,
+        BatchCodecOption.H264.label
+    ),
     val selectedPreset: String? = null,
     val metadataPrivacyMode: String = MetadataPrivacyMode.PRESERVE_ALL.label,
     val thermalMode: String = ThermalBatchMode.BALANCED.label,
@@ -143,7 +142,16 @@ data class BatchCompressorUiState(
     val totalOutputBytes: Long get() = items.sumOf { it.outputSize }
     val totalCurrentOutputBytes: Long get() = items.sumOf { if (it.outputSize > 0L) it.outputSize else it.currentOutputSize }
     val totalTargetOutputBytes: Long get() = items.sumOf { it.targetOutputSize }
-    val totalSavedBytes: Long get() = (totalOriginalBytes - totalOutputBytes).coerceAtLeast(0L)
+    val totalSavedBytes: Long
+        get() = BatchSavingsCalculator.savedBytes(
+            items.map { item ->
+                BatchSavingsInput(
+                    originalSize = item.originalSize,
+                    outputSize = item.outputSize,
+                    hasOutput = item.hasCompletedOutput
+                )
+            }
+        )
     val currentBatchProgress: Float get() = if (items.isEmpty()) 0f else items.sumOf { it.progress.toDouble() }.toFloat() / items.size
     val formattedTotalOriginal: String get() = formatFileSize(totalOriginalBytes)
     val formattedTotalOutput: String get() = formatFileSize(totalOutputBytes)
@@ -152,13 +160,26 @@ data class BatchCompressorUiState(
     val formattedTotalSaved: String get() = formatFileSize(totalSavedBytes)
 }
 
+private val BatchVideoItem.hasCompletedOutput: Boolean
+    get() = outputSize > 0L &&
+        (status == BatchItemStatus.Done || status == BatchItemStatus.Replaced || status == BatchItemStatus.SavedCopy)
+
 @OptIn(UnstableApi::class)
 class BatchCompressorViewModel(application: Application) : AndroidViewModel(application) {
-    private val _uiState = MutableStateFlow(BatchCompressorUiState())
+    private val _uiState = MutableStateFlow(
+        BatchCompressorUiState(
+            availableCodecOptions = BatchCodecSelector.availableLabels(supportedOutputCodecs())
+        )
+    )
     val uiState = _uiState.asStateFlow()
 
     private var compressionJob: Job? = null
     private var activeTransformer: Transformer? = null
+
+    private data class EncodeResult(
+        val file: File,
+        val encoderMode: EncoderMode
+    )
 
     fun refreshShizukuStatus(context: Context) {
         val installed = ShizukuSupport.isShizukuPackageInstalled(context)
@@ -211,11 +232,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     fun setCodec(label: String) {
         _uiState.update { state ->
+            val safeLabel = if (state.availableCodecOptions.contains(label)) label else BatchCodecOption.AUTO.label
             val quality = qualityFromLabel(state.qualityPreset)
-            val codec = codecFromLabel(label)
+            val codec = codecFromLabel(safeLabel)
             val frameRate = frameRateFromLabel(state.frameRateOption)
             state.copy(
-                codecOption = label,
+                codecOption = safeLabel,
                 selectedPreset = null,
                 items = state.items.map { item ->
                     if (item.isAlreadyCompressed) item else item.copy(targetOutputSize = estimateOutputSize(item, quality, codec, frameRate))
@@ -432,6 +454,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val codec = codecFromLabel(_uiState.value.codecOption)
             val privacyMode = MetadataPrivacyMode.fromLabel(_uiState.value.metadataPrivacyMode)
             val preferredMime = chooseOutputMime(codec)
+            val preferredCodecLabel = BatchCodecSelector.labelForMime(preferredMime)
             clearBatchCache()
 
             _uiState.update { state ->
@@ -476,8 +499,6 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 val thermalWindow = waitForThermalWindow(context, item.originalName)
                 val itemStartedAt = System.currentTimeMillis()
                 val plannedFps = outputFpsFor(item, frameRate)
-                val codecLabel = if (preferredMime == MimeTypes.VIDEO_H265) "HEVC" else "H.264"
-                val operationLabel = if (quality == BatchQualityPreset.REMUX_ONLY) "Remux" else "Encode"
                 updateItem(index) {
                     it.copy(
                         status = BatchItemStatus.Compressing,
@@ -487,32 +508,59 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         message = if (quality == BatchQualityPreset.REMUX_ONLY) {
                             "Remuxing: video/audio copied unchanged • no re-encode • ${thermalWindow.thermalLabel}"
                         } else {
-                            "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality, codec, frameRate))} • $codecLabel${plannedFps?.let { fps -> " • ${fps}fps" } ?: " • source FPS"} • ${thermalWindow.thermalLabel}"
+                            "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality, codec, frameRate))} • $preferredCodecLabel${plannedFps?.let { fps -> " • ${fps}fps" } ?: " • source FPS"} • ${thermalWindow.thermalLabel}"
                         }
                     )
                 }
                 try {
+                    var encoderMode = EncoderMode.NOT_EXPOSED
+                    var outputQuality = quality
+                    var fallbackMessage: String? = null
                     val remuxResult = if (quality == BatchQualityPreset.REMUX_ONLY) {
                         remuxOnlyOne(context, item, index, privacyMode)
                     } else {
-                        val encodedFile = compressOne(context, item, index, quality, frameRate, preferredMime)
-                        withContext(Dispatchers.IO) {
-                            Mp4MetadataRemuxer.remuxWithSourceMetadata(
-                                context,
-                                encodedFile,
-                                item.metadataSnapshot.filteredForPrivacy(privacyMode)
-                            )
+                        try {
+                            val encoded = compressOne(context, item, index, quality, frameRate, preferredMime)
+                            encoderMode = encoded.encoderMode
+                            withContext(Dispatchers.IO) {
+                                Mp4MetadataRemuxer.remuxWithSourceMetadata(
+                                    context,
+                                    encoded.file,
+                                    item.metadataSnapshot.filteredForPrivacy(privacyMode)
+                                )
+                            }
+                        } catch (encodeError: Exception) {
+                            if (encodeError is kotlinx.coroutines.CancellationException ||
+                                quality != BatchQualityPreset.ORIGINAL ||
+                                !shouldTryOriginalRemuxFallback(encodeError)
+                            ) {
+                                throw encodeError
+                            }
+                            encoderMode = EncoderMode.NOT_EXPOSED
+                            outputQuality = BatchQualityPreset.REMUX_ONLY
+                            fallbackMessage = "Original encode failed in Android's HEVC/HDR codec path; saved a zero-loss Remux Only fallback instead. Size may stay similar."
+                            updateItem(index) {
+                                it.copy(message = "Original encode failed; trying zero-loss Remux Only fallback.")
+                            }
+                            remuxOnlyOne(context, item, index, privacyMode)
                         }
                     }
                     val outputFile = remuxResult.outputFile
                     val outputUri = Uri.fromFile(outputFile)
                     val outputSize = outputFile.length()
                     val verification = withContext(Dispatchers.IO) {
-                        OutputVerifier.verify(context, item, outputFile, quality.label, privacyMode)
+                        OutputVerifier.verify(context, item, outputFile, outputQuality.label, privacyMode, encoderMode)
                     }
                     val thermalEnd = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
+                    val actualOperationLabel = if (fallbackMessage != null) {
+                        "Remux fallback"
+                    } else if (outputQuality == BatchQualityPreset.REMUX_ONLY) {
+                        "Remux"
+                    } else {
+                        "Encode"
+                    }
                     val metrics = BatchItemMetrics(
-                        operationLabel = operationLabel,
+                        operationLabel = actualOperationLabel,
                         elapsedMs = System.currentTimeMillis() - itemStartedAt,
                         outputBytes = outputSize,
                         savedBytes = (item.originalSize - outputSize).coerceAtLeast(0L),
@@ -531,10 +579,19 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             outputUri = outputUri,
                             outputPath = outputFile.absolutePath,
                             outputSize = outputSize,
-                            outputMode = quality.label,
+                            outputMode = outputQuality.label,
                             verificationReport = verification,
                             metrics = metrics,
-                            message = completionMessage(it, quality, outputSize, plannedFps, codecLabel, remuxResult.message, verification, privacyMode)
+                            message = completionMessage(
+                                item = it,
+                                quality = outputQuality,
+                                outputSize = outputSize,
+                                plannedFps = plannedFps,
+                                codecLabel = preferredCodecLabel,
+                                muxerMessage = fallbackMessage ?: remuxResult.message,
+                                verification = verification,
+                                privacyMode = privacyMode
+                            )
                         )
                     }
 
@@ -544,7 +601,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             item = item,
                             outputFile = outputFile,
                             useShizukuFallback = _uiState.value.useShizukuFallback,
-                            quality = quality,
+                            quality = outputQuality,
                             verification = verification,
                             backupBeforeReplace = _uiState.value.backupBeforeReplace,
                             privacyMode = privacyMode
@@ -575,7 +632,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         it.copy(
                             status = BatchItemStatus.Failed,
                             progress = 0f,
-                            message = e.message ?: "Compression failed"
+                            message = userFacingCompressionError(e)
                         )
                     }
                 }
@@ -598,6 +655,33 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 )
             }
         }
+    }
+
+    private fun shouldTryOriginalRemuxFallback(error: Throwable): Boolean {
+        if (error is ExportException) return true
+        val message = error.fullMessage()
+        return message.contains("Codec exception", ignoreCase = true) ||
+            message.contains("VideoDecoder", ignoreCase = true) ||
+            message.contains("decoder", ignoreCase = true) ||
+            message.contains("video/hevc", ignoreCase = true)
+    }
+
+    private fun userFacingCompressionError(error: Throwable): String {
+        val message = error.fullMessage()
+        return when {
+            message.contains("Codec exception", ignoreCase = true) &&
+                (message.contains("VideoDecoder", ignoreCase = true) || message.contains("decoder", ignoreCase = true)) ->
+                "Android's video decoder failed during re-encode. No compressed output was saved. Try Remux Only for a zero-loss copy, or use H.264/High if you need a compatibility re-encode."
+            message.contains("Codec exception", ignoreCase = true) ->
+                "Android's media codec failed during compression. No output was saved. Try Remux Only for zero-loss output or choose a different codec."
+            else -> error.message ?: "Compression failed"
+        }
+    }
+
+    private fun Throwable.fullMessage(): String {
+        return generateSequence(this) { it.cause }
+            .mapNotNull { it.message }
+            .joinToString(separator = " ")
     }
 
     fun cancelCompression() {
@@ -769,30 +853,70 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     }
 
     private fun chooseOutputMime(codec: BatchCodecOption): String {
-        val hevcSupported = hasEncoder(MimeTypes.VIDEO_H265)
-        return when (codec) {
-            BatchCodecOption.HEVC -> if (hevcSupported) MimeTypes.VIDEO_H265 else MimeTypes.VIDEO_H264
-            BatchCodecOption.H264 -> MimeTypes.VIDEO_H264
-            BatchCodecOption.AUTO -> {
-                val supported = mutableListOf(MimeTypes.VIDEO_H264)
-                if (hevcSupported) supported.add(MimeTypes.VIDEO_H265)
-                val profileChoice = DeviceCapabilityProfiles.current().chooseDefaultVideoCodec(supported)
-                if (supported.contains(profileChoice)) profileChoice else MimeTypes.VIDEO_H264
-            }
+        return BatchCodecSelector.chooseOutputMime(
+            requested = codec,
+            supportedCodecs = supportedOutputCodecs(),
+            profile = DeviceCapabilityProfiles.current()
+        )
+    }
+
+    private fun supportedOutputCodecs(): Set<String> {
+        return buildSet {
+            add(MimeTypes.VIDEO_H264)
+            if (hasEncoder(MimeTypes.VIDEO_H265)) add(MimeTypes.VIDEO_H265)
+            if (hasEncoder(MimeTypes.VIDEO_AV1)) add(MimeTypes.VIDEO_AV1)
         }
+    }
+
+    private fun videoEncoderSettings(targetBitrate: Int, encoderMode: EncoderMode): VideoEncoderSettings {
+        return VideoEncoderSettings.Builder().apply {
+            if (encoderMode == EncoderMode.CQ) {
+                setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)
+                experimentalSetEnableHighQualityTargeting(true)
+            } else {
+                setBitrate(targetBitrate)
+                setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+            }
+        }.build()
+    }
+
+    private fun encoderProgressSuffix(encoderMode: EncoderMode): String {
+        return if (encoderMode == EncoderMode.NOT_EXPOSED) "" else " • encoder ${encoderMode.reportLabel}"
     }
 
     private fun hasEncoder(mimeType: String): Boolean {
         return try {
             val list = android.media.MediaCodecList(android.media.MediaCodecList.ALL_CODECS)
+            list.codecInfos.any { it.isHardwareEncoderFor(mimeType) }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun supportsEncoderBitrateMode(mimeType: String, bitrateMode: Int): Boolean {
+        return try {
+            val list = android.media.MediaCodecList(android.media.MediaCodecList.ALL_CODECS)
             list.codecInfos.any { info ->
-                info.isEncoder &&
-                    (!Build.VERSION.SDK_INT.let { it >= Build.VERSION_CODES.Q } || !info.isSoftwareOnly) &&
-                    info.supportedTypes.any { it.equals(mimeType, ignoreCase = true) }
+                val supportedType = info.supportedTypes.firstOrNull { it.equals(mimeType, ignoreCase = true) }
+                if (supportedType == null || !info.isHardwareEncoderFor(mimeType)) {
+                    false
+                } else {
+                    runCatching {
+                        info.getCapabilitiesForType(supportedType)
+                            .encoderCapabilities
+                            ?.isBitrateModeSupported(bitrateMode) == true
+                    }.getOrDefault(false)
+                }
             }
         } catch (_: Exception) {
             false
         }
+    }
+
+    private fun MediaCodecInfo.isHardwareEncoderFor(mimeType: String): Boolean {
+        return isEncoder &&
+            (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || !isSoftwareOnly) &&
+            supportedTypes.any { it.equals(mimeType, ignoreCase = true) }
     }
 
     private suspend fun compressOne(
@@ -802,10 +926,53 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         quality: BatchQualityPreset,
         frameRate: BatchFrameRateOption,
         videoMimeType: String
+    ): EncodeResult = withContext(Dispatchers.Main) {
+        val outputDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
+        val outputFile = File(outputDir, item.outputName(quality))
+        val initialMode = EncoderModeSelector.chooseForOriginal(
+            isOriginalMode = quality == BatchQualityPreset.ORIGINAL,
+            cqSupported = supportsEncoderBitrateMode(
+                videoMimeType,
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ
+            )
+        )
+
+        try {
+            runTransformerExport(context, item, index, quality, frameRate, videoMimeType, outputFile, initialMode)
+            EncodeResult(outputFile, initialMode)
+        } catch (error: Exception) {
+            if (error is kotlinx.coroutines.CancellationException || initialMode != EncoderMode.CQ) {
+                throw error
+            }
+            if (outputFile.exists()) outputFile.delete()
+            updateItem(index) {
+                it.copy(message = "CQ encoder failed to initialize; retrying with high-bitrate VBR fallback.")
+            }
+            runTransformerExport(
+                context = context,
+                item = item,
+                index = index,
+                quality = quality,
+                frameRate = frameRate,
+                videoMimeType = videoMimeType,
+                outputFile = outputFile,
+                encoderMode = EncoderMode.VBR_FALLBACK
+            )
+            EncodeResult(outputFile, EncoderMode.VBR_FALLBACK)
+        }
+    }
+
+    private suspend fun runTransformerExport(
+        context: Context,
+        item: BatchVideoItem,
+        index: Int,
+        quality: BatchQualityPreset,
+        frameRate: BatchFrameRateOption,
+        videoMimeType: String,
+        outputFile: File,
+        encoderMode: EncoderMode
     ): File = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
-            val outputDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
-            val outputFile = File(outputDir, item.outputName(quality))
             if (outputFile.exists()) outputFile.delete()
 
             val targetBitrate = calculateVideoBitrate(item, quality, videoMimeType)
@@ -820,10 +987,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val encoderFactory = DefaultEncoderFactory.Builder(context)
                 .setEnableFallback(true)
                 .setRequestedVideoEncoderSettings(
-                    VideoEncoderSettings.Builder()
-                        .setBitrate(targetBitrate)
-                        .setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
-                        .build()
+                    videoEncoderSettings(targetBitrate, encoderMode)
                 )
                 .setRequestedAudioEncoderSettings(
                     AudioEncoderSettings.Builder()
@@ -847,7 +1011,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 progress = 1f,
                                 currentOutputSize = finalSize,
                                 targetOutputSize = estimatedOutputSize,
-                                message = "Compressing: ${formatFileSize(finalSize)} / est ${formatFileSize(estimatedOutputSize)} • 100%"
+                                message = "Compressing: ${formatFileSize(finalSize)} / est ${formatFileSize(estimatedOutputSize)} • 100%${encoderProgressSuffix(encoderMode)}"
                             )
                         }
                         if (continuation.isActive) continuation.resume(outputFile)
@@ -906,7 +1070,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             progress = progress,
                             currentOutputSize = currentSize,
                             targetOutputSize = estimatedOutputSize,
-                            message = "Compressing: ${formatFileSize(currentSize)} / est ${formatFileSize(estimatedOutputSize)} • ${(progress * 100f).toInt()}%${plannedFps?.let { fps -> " • ${fps}fps" } ?: ""}"
+                            message = "Compressing: ${formatFileSize(currentSize)} / est ${formatFileSize(estimatedOutputSize)} • ${(progress * 100f).toInt()}%${plannedFps?.let { fps -> " • ${fps}fps" } ?: ""}${encoderProgressSuffix(encoderMode)}"
                         )
                     }
                     delay(200)
@@ -960,11 +1124,15 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     }
 
     private fun codecFromLabel(label: String): BatchCodecOption {
-        return BatchCodecOption.entries.firstOrNull { it.label == label } ?: BatchCodecOption.AUTO
+        return BatchCodecOption.fromLabel(label)
     }
 
     private fun codecFromMime(mimeType: String): BatchCodecOption {
-        return if (mimeType == MimeTypes.VIDEO_H265) BatchCodecOption.HEVC else BatchCodecOption.H264
+        return when (mimeType) {
+            MimeTypes.VIDEO_AV1 -> BatchCodecOption.AV1
+            MimeTypes.VIDEO_H265 -> BatchCodecOption.HEVC
+            else -> BatchCodecOption.H264
+        }
     }
 
     private fun outputFpsFor(item: BatchVideoItem, option: BatchFrameRateOption): Int? {
@@ -991,12 +1159,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     ): Long {
         if (item.originalSize <= 0L) return 0L
         if (quality == BatchQualityPreset.REMUX_ONLY) return item.originalSize
+        if (quality == BatchQualityPreset.ORIGINAL) return item.originalSize
         val durationSec = (item.durationMs / 1000.0).coerceAtLeast(1.0)
-        val selectedMime = when (codec) {
-            BatchCodecOption.HEVC -> MimeTypes.VIDEO_H265
-            BatchCodecOption.H264 -> MimeTypes.VIDEO_H264
-            BatchCodecOption.AUTO -> if (hasEncoder(MimeTypes.VIDEO_H265)) MimeTypes.VIDEO_H265 else MimeTypes.VIDEO_H264
-        }
+        val selectedMime = chooseOutputMime(codec)
         val videoBitrate = calculateVideoBitrate(item, quality, selectedMime)
         val audioBitrate = calculateAudioBitrate(item, quality)
         val outputFps = outputFpsFor(item, frameRate)?.toFloat() ?: item.originalFps.coerceAtLeast(1f)
@@ -1025,9 +1190,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val originalTotal = if (item.originalBitrate > 0) item.originalBitrate else fallbackOriginalBitrate(item)
             val audio = if (item.originalAudioBitrate > 0) item.originalAudioBitrate else 192_000
             val originalVideo = (originalTotal - audio).coerceAtLeast(originalTotal / 2)
-            val efficiency = if (videoMimeType == MimeTypes.VIDEO_H265) 0.68 else 0.92
-            val target = (originalVideo * efficiency).toInt()
-            val floor = perceptualLosslessFloor(item)
+            val fallbackRatio = if (videoMimeType == MimeTypes.VIDEO_H264) 1.0 else 0.92
+            val target = (originalVideo * fallbackRatio).toInt()
+            val floor = highQualityVbrFloor(item)
             val safeFloor = minOf(floor, originalVideo)
             return target.coerceIn(safeFloor, originalVideo)
         }
@@ -1049,7 +1214,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         return calculated.coerceIn(floor, ceiling)
     }
 
-    private fun perceptualLosslessFloor(item: BatchVideoItem): Int {
+    private fun highQualityVbrFloor(item: BatchVideoItem): Int {
         val fpsBoost = if (item.originalFps >= 50f) 1.35 else 1.0
         val floor = when {
             item.originalHeight >= 2160 -> 24_000_000

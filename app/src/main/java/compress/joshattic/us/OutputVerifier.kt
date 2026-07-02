@@ -7,7 +7,6 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.media3.common.MimeTypes
 import java.io.File
-import kotlin.math.abs
 
 object OutputVerifier {
     fun verify(
@@ -15,7 +14,8 @@ object OutputVerifier {
         source: BatchVideoItem,
         outputFile: File,
         modeLabel: String,
-        privacyMode: MetadataPrivacyMode
+        privacyMode: MetadataPrivacyMode,
+        encoderMode: EncoderMode = EncoderMode.NOT_EXPOSED
     ): OutputVerificationReport {
         val outputProbe = readFileProbe(outputFile)
         val sourceTracks = readTrackProbe(context, source.sourceUri)
@@ -30,20 +30,65 @@ object OutputVerifier {
             outputTracks.videoCodec != null
 
         val remuxOnly = modeLabel == "Remux only"
+        val originalMode = modeLabel == "Original"
         val videoMatches = sameDimensions(source.originalWidth, source.originalHeight, outputProbe.width, outputProbe.height)
-        val fpsMatches = if (source.originalFps > 0f && outputProbe.fps > 0f) abs(source.originalFps - outputProbe.fps) <= 1.0f else true
+        val fpsComparison = OutputVerificationFormatter.fpsComparison(source.originalFps, outputProbe.fps)
+        val remuxFpsBlockReason = OutputVerificationFormatter.remuxFpsBlockReason(source.originalFps, outputProbe.fps)
+        val fpsMatches = fpsComparison != VerificationComparison.WARN
         val videoCodecMatches = codecsMatch(sourceTracks.videoCodec, outputTracks.videoCodec)
         val audioCodecMatches = codecsMatch(sourceTracks.audioCodec, outputTracks.audioCodec)
         val hdrMatches = sourceTracks.hdrLabel == "not exposed" || outputTracks.hdrLabel == "not exposed" || sourceTracks.hdrLabel == outputTracks.hdrLabel
+        val videoCodecComparison = if (remuxOnly) {
+            OutputVerificationFormatter.exposedComparison(
+                sourceExposed = sourceTracks.videoCodec != null,
+                outputExposed = outputTracks.videoCodec != null,
+                matches = videoCodecMatches
+            )
+        } else {
+            VerificationComparison.NEUTRAL
+        }
+        val audioCodecComparison = if (remuxOnly) {
+            OutputVerificationFormatter.exposedComparison(
+                sourceExposed = sourceTracks.audioCodec != null,
+                outputExposed = outputTracks.audioCodec != null,
+                matches = audioCodecMatches
+            )
+        } else {
+            VerificationComparison.NEUTRAL
+        }
+        val hdrComparison = OutputVerificationFormatter.exposedComparison(
+            sourceExposed = sourceTracks.hdrLabel != "not exposed",
+            outputExposed = outputTracks.hdrLabel != "not exposed",
+            matches = hdrMatches
+        )
+        val originalVbrWeakFps = originalMode &&
+            encoderMode == EncoderMode.VBR_FALLBACK &&
+            source.originalFps > 0f &&
+            outputProbe.fps <= 0f
+        val originalVbrMaterialReduction = originalMode &&
+            encoderMode == EncoderMode.VBR_FALLBACK &&
+            source.originalSize >= 200L * 1024L * 1024L &&
+            outputFile.length() > 0L &&
+            outputFile.length().toDouble() / source.originalSize.toDouble() < 0.80
 
-        val replacementSafe = playable && (!remuxOnly || (videoMatches && fpsMatches && videoCodecMatches && audioCodecMatches && hdrMatches))
+        val replacementSafe = playable && when {
+            remuxOnly -> videoMatches && fpsMatches && remuxFpsBlockReason == null && videoCodecMatches && audioCodecMatches && hdrMatches
+            originalMode -> videoMatches && fpsMatches && !originalVbrWeakFps && !originalVbrMaterialReduction
+            else -> true
+        }
         val blockReason = when {
             playable.not() -> "output did not pass playability verification"
             remuxOnly && !videoMatches -> "remux output changed resolution"
+            remuxOnly && remuxFpsBlockReason != null -> remuxFpsBlockReason
             remuxOnly && !fpsMatches -> "remux output changed FPS"
             remuxOnly && !videoCodecMatches -> "remux output changed video codec"
+            remuxOnly && sourceTracks.audioCodec != null && outputTracks.audioCodec == null -> "remux output audio codec was not exposed"
             remuxOnly && !audioCodecMatches -> "remux output changed audio codec"
             remuxOnly && !hdrMatches -> "remux output changed HDR/color metadata"
+            originalMode && !videoMatches -> "Original output changed resolution"
+            originalMode && !fpsMatches -> "Original output changed FPS"
+            originalVbrWeakFps -> "Original VBR fallback could not verify output FPS"
+            originalVbrMaterialReduction -> "Original VBR fallback output looked materially reduced"
             else -> null
         }
 
@@ -52,12 +97,37 @@ object OutputVerifier {
 
         return OutputVerificationReport(
             playability = if (playable) "opens" else "failed",
-            video = "${source.originalWidth}x${source.originalHeight} -> ${dimensionLabel(outputProbe.width, outputProbe.height)} ${if (videoMatches) "ok" else "warn"}",
-            fps = "${fpsLabel(source.originalFps)} -> ${fpsLabel(outputProbe.fps)} ${if (fpsMatches) "ok" else "warn"}",
-            videoCodec = "${codecLabel(sourceTracks.videoCodec)} -> ${codecLabel(outputTracks.videoCodec)} ${if (!remuxOnly || videoCodecMatches) "ok" else "warn"}",
-            audioCodec = "${codecLabel(sourceTracks.audioCodec)} -> ${codecLabel(outputTracks.audioCodec)} ${if (!remuxOnly || audioCodecMatches) "ok" else "warn"}",
+            encoderMode = encoderMode.reportLabel,
+            video = OutputVerificationFormatter.transition(
+                "${source.originalWidth}x${source.originalHeight}",
+                dimensionLabel(outputProbe.width, outputProbe.height),
+                OutputVerificationFormatter.exposedComparison(
+                    sourceExposed = source.originalWidth > 0 && source.originalHeight > 0,
+                    outputExposed = outputProbe.width > 0 && outputProbe.height > 0,
+                    matches = videoMatches
+                )
+            ),
+            fps = OutputVerificationFormatter.transition(
+                fpsLabel(source.originalFps),
+                fpsLabel(outputProbe.fps),
+                fpsComparison
+            ),
+            videoCodec = OutputVerificationFormatter.transition(
+                codecLabel(sourceTracks.videoCodec),
+                codecLabel(outputTracks.videoCodec),
+                videoCodecComparison
+            ),
+            audioCodec = OutputVerificationFormatter.transition(
+                codecLabel(sourceTracks.audioCodec),
+                codecLabel(outputTracks.audioCodec),
+                audioCodecComparison
+            ),
             audioBitrate = "${bitrateLabel(sourceTracks.audioBitrate)} -> ${bitrateLabel(outputTracks.audioBitrate)}",
-            hdr = "${sourceTracks.hdrLabel} -> ${outputTracks.hdrLabel} ${if (!remuxOnly || hdrMatches) "ok" else "warn"}",
+            hdr = OutputVerificationFormatter.transition(
+                sourceTracks.hdrLabel,
+                outputTracks.hdrLabel,
+                hdrComparison
+            ),
             date = when {
                 privacyMode.removeDate -> "omitted by privacy setting"
                 outputMetadata.hasDate -> "verified"
@@ -199,6 +269,7 @@ object OutputVerifier {
         return when (codec) {
             MimeTypes.VIDEO_H264 -> "H.264"
             MimeTypes.VIDEO_H265 -> "HEVC"
+            MimeTypes.VIDEO_AV1 -> "AV1"
             MimeTypes.AUDIO_AAC -> "AAC"
             null -> "not exposed"
             else -> codec.substringAfter("/")

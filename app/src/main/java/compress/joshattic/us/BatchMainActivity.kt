@@ -146,7 +146,7 @@ private fun BatchCompressorScreen(
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("Samsung Galaxy S23 Ultra optimized", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "Default is Original: keep 4K as 4K, keep source FPS/audio, and use perceptually lossless compression for storage savings.",
+                        "Default is Original: keep 4K as 4K, keep source FPS/audio, and use the highest-quality re-encode path. Remux Only is the guaranteed zero-loss mode.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -294,7 +294,7 @@ private fun BatchSettingsCard(
                 if (remuxOnly) {
                     "No re-encode: video/audio copied unchanged. This keeps quality exact but may not shrink much."
                 } else {
-                    "Original is perceptually lossless: keeps source resolution, source FPS, HDR mode, and audio bitrate. Medium/Low are explicit downgrade choices."
+                    "Original is the highest-quality re-encode: CQ when hardware supports it, high-bitrate fallback otherwise. Remux Only is the zero-quality-loss choice."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -302,7 +302,7 @@ private fun BatchSettingsCard(
 
             Text("Codec", style = MaterialTheme.typography.labelLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("Auto", "HEVC", "H.264").forEach { label ->
+                state.availableCodecOptions.forEach { label ->
                     FilterChip(
                         selected = state.codecOption == label,
                         onClick = { viewModel.setCodec(label) },
@@ -315,7 +315,7 @@ private fun BatchSettingsCard(
                 if (remuxOnly) {
                     "Disabled in Remux Only because the source codec is copied unchanged."
                 } else {
-                    "Auto chooses the best S23 Ultra hardware encoder. HEVC usually saves more storage; H.264 is best for compatibility."
+                    "Auto stays HEVC-first on S23 Ultra. AV1 appears only when a hardware encoder is exposed and remains opt-in; H.264 is best for compatibility."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
