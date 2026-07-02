@@ -168,7 +168,10 @@ private fun BatchCompressorScreen(
             }
 
             BatchSettingsCard(state, viewModel, context, requestOriginalMediaAccess)
-            if (state.items.isNotEmpty()) BatchSummaryCard(state)
+            if (state.items.isNotEmpty()) {
+                BatchSummaryCard(state)
+                PreservationReportCard(state)
+            }
 
             state.statusMessage?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary) }
             state.errorMessage?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error) }
@@ -427,21 +430,87 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
 }
 
 @Composable
-private fun BatchItemCard(index: Int, item: BatchVideoItem) {
+private fun PreservationReportCard(state: BatchCompressorUiState) {
+    val dateCount = state.items.count { it.metadataSnapshot.hasDate }
+    val locationCount = state.items.count { it.metadataSnapshot.hasLocation }
+    val outputCount = state.items.count { it.outputSize > 0L }
+    val skippedCount = state.items.count { it.status == BatchItemStatus.Skipped || it.isAlreadyCompressed }
+
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Preservation report", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Text(
-                "$index. ${item.originalName}",
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                "Source metadata found: date $dateCount/${state.items.size} • location $locationCount/${state.items.size}",
+                style = MaterialTheme.typography.bodyMedium
             )
             Text(
-                "Original: ${item.originalWidth}x${item.originalHeight} • ${item.originalFps.toInt()}fps • ${item.displaySize}",
+                "Outputs ready: $outputCount/${state.items.size} • skipped: $skippedCount",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+
+            if (state.hasOutputs) {
+                Text(
+                    "Saved outputs carry best-effort source date/location metadata when Android exposes it.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            } else {
+                Text(
+                    "Compress a batch to see before/after savings and final metadata status here.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun BatchItemCard(index: Int, item: BatchVideoItem) {
+    val skipped = item.status == BatchItemStatus.Skipped || item.isAlreadyCompressed
+    val cardColors = CardDefaults.outlinedCardColors(
+        containerColor = if (skipped) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface
+    )
+
+    OutlinedCard(
+        modifier = Modifier.fillMaxWidth(),
+        colors = cardColors
+    ) {
+        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "$index. ${item.originalName}",
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        "Original: ${item.originalWidth}x${item.originalHeight} • ${item.originalFps.toInt()}fps • ${item.displaySize}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Spacer(modifier = Modifier.width(10.dp))
+                AssistChip(
+                    onClick = {},
+                    enabled = false,
+                    label = { Text(item.shortStatusLabel()) }
+                )
+            }
+
+            Text(
+                item.preservationSummary(),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
             if (item.status == BatchItemStatus.Compressing) {
                 Text(
                     "Output: ${item.currentOutputDisplaySize} / est ${item.targetOutputDisplaySize} • ${item.progressPercent}%",
@@ -451,9 +520,72 @@ private fun BatchItemCard(index: Int, item: BatchVideoItem) {
                 )
                 LinearProgressIndicator(progress = { item.progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
             }
-            Text("Status: ${item.status.name}${item.message?.let { " — $it" } ?: ""}", style = MaterialTheme.typography.bodySmall)
-            if (item.outputSize > 0L) Text("Output: ${item.outputDisplaySize}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+
+            if (item.outputSize > 0L) {
+                HorizontalDivider()
+                Text(
+                    item.beforeAfterSummary(),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            item.message?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (item.status == BatchItemStatus.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         }
+    }
+}
+
+private fun BatchVideoItem.shortStatusLabel(): String {
+    return when {
+        status == BatchItemStatus.Skipped || isAlreadyCompressed -> "Skipped"
+        status == BatchItemStatus.Compressing -> "${progressPercent}%"
+        status == BatchItemStatus.Done -> "Done"
+        status == BatchItemStatus.Replaced -> "Replaced"
+        status == BatchItemStatus.SavedCopy -> "Saved"
+        status == BatchItemStatus.Failed -> "Failed"
+        else -> "Ready"
+    }
+}
+
+private fun BatchVideoItem.preservationSummary(): String {
+    val date = if (metadataSnapshot.hasDate) "date ✓" else "date —"
+    val location = if (metadataSnapshot.hasLocation) "location ✓" else "location —"
+    val replacement = when (status) {
+        BatchItemStatus.Replaced -> "original replaced"
+        BatchItemStatus.SavedCopy -> "safe copy saved"
+        BatchItemStatus.Done -> "copy ready"
+        BatchItemStatus.Skipped -> "skipped"
+        BatchItemStatus.Failed -> "failed"
+        BatchItemStatus.Compressing -> "compressing"
+        else -> "ready"
+    }
+    return "Metadata: $date • $location • $replacement"
+}
+
+private fun BatchVideoItem.beforeAfterSummary(): String {
+    if (outputSize <= 0L) return "Output pending"
+    val savedBytes = (originalSize - outputSize).coerceAtLeast(0L)
+    val savedPercent = if (originalSize > 0L) ((savedBytes * 100.0) / originalSize).toInt() else 0
+    return "Before/after: ${formatCardBytes(originalSize)} → ${formatCardBytes(outputSize)} • saved ${formatCardBytes(savedBytes)} ($savedPercent%)"
+}
+
+private fun formatCardBytes(bytes: Long): String {
+    val safe = bytes.coerceAtLeast(0L).toDouble()
+    val kb = 1024.0
+    val mb = kb * 1024.0
+    val gb = mb * 1024.0
+    return when {
+        safe >= gb -> String.format(java.util.Locale.US, "%.2f GB", safe / gb)
+        safe >= mb -> String.format(java.util.Locale.US, "%.1f MB", safe / mb)
+        safe >= kb -> String.format(java.util.Locale.US, "%.1f KB", safe / kb)
+        else -> "${bytes.coerceAtLeast(0L)} B"
     }
 }
 
