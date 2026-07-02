@@ -14,8 +14,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -36,7 +36,7 @@ class BatchMainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        consumeIncomingVideos(intent)
+        val startupIntent = intent
         setContent {
             CompressorTheme {
                 BatchCompressorScreen(
@@ -45,6 +45,7 @@ class BatchMainActivity : ComponentActivity() {
                 )
             }
         }
+        window.decorView.post { consumeIncomingVideos(startupIntent) }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -90,7 +91,6 @@ private fun BatchCompressorScreen(
 ) {
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
-    val scrollState = rememberScrollState()
     var pickAfterMetadataGrant by remember { mutableStateOf(false) }
     val pickVideos = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments(),
@@ -121,7 +121,10 @@ private fun BatchCompressorScreen(
         }
     }
 
-    LaunchedEffect(Unit) { viewModel.refreshShizukuStatus(context) }
+    LaunchedEffect(Unit) {
+        withFrameNanos { }
+        viewModel.refreshShizukuStatus(context)
+    }
 
     Scaffold(
         topBar = {
@@ -131,103 +134,120 @@ private fun BatchCompressorScreen(
             )
         }
     ) { innerPadding ->
-        Column(
+        LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(innerPadding)
-                .verticalScroll(scrollState)
-                .padding(20.dp),
+                .padding(innerPadding),
+            contentPadding = PaddingValues(20.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            OutlinedCard(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
-            ) {
-                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Text("Samsung Galaxy S23 Ultra optimized", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text(
-                        "Default is Original: keep 4K as 4K, keep source FPS/audio, and use perceptually lossless compression for storage savings.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Button(
-                        onClick = {
-                            if (needsOriginalMediaLocationPermission(context)) {
-                                pickAfterMetadataGrant = true
-                                metadataAccessLauncher.launch(Manifest.permission.ACCESS_MEDIA_LOCATION)
-                            } else {
-                                pickVideos.launch(arrayOf("video/*"))
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        enabled = !state.isCompressing && !state.isLoading
-                    ) {
-                        Text(if (state.items.isEmpty()) "Select videos with write access" else "Select different videos")
+            item {
+                OutlinedCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Text("Samsung Galaxy S23 Ultra optimized", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "Default is Original: keep 4K as 4K, keep source FPS/audio, and use perceptually lossless compression for storage savings.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Button(
+                            onClick = {
+                                if (needsOriginalMediaLocationPermission(context)) {
+                                    pickAfterMetadataGrant = true
+                                    metadataAccessLauncher.launch(Manifest.permission.ACCESS_MEDIA_LOCATION)
+                                } else {
+                                    pickVideos.launch(arrayOf("video/*"))
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            enabled = !state.isCompressing && !state.isLoading
+                        ) {
+                            Text(if (state.items.isEmpty()) "Select videos with write access" else "Select different videos")
+                        }
                     }
                 }
             }
 
-            BatchSettingsCard(state, viewModel, context, requestOriginalMediaAccess)
+            item { BatchSettingsCard(state, viewModel, context, requestOriginalMediaAccess) }
             if (state.items.isNotEmpty()) {
-                BatchSummaryCard(state)
-                PreservationReportCard(state)
-                state.batchMetrics?.let { BatchMetricsCard(it) }
+                item { BatchSummaryCard(state) }
+                item { PreservationReportCard(state) }
+                state.batchMetrics?.let { metrics ->
+                    item { BatchMetricsCard(metrics) }
+                }
             }
 
-            state.statusMessage?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary) }
-            state.errorMessage?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error) }
+            state.statusMessage?.let { message ->
+                item { Text(message, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary) }
+            }
+            state.errorMessage?.let { message ->
+                item { Text(message, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error) }
+            }
 
             if (state.items.isNotEmpty()) {
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    Button(
-                        onClick = { viewModel.startCompression(context) },
-                        modifier = Modifier.weight(1f),
-                        enabled = !state.isCompressing && !state.isLoading
-                    ) { Text("Compress ${state.items.size}") }
-                    OutlinedButton(
-                        onClick = { viewModel.cancelCompression() },
-                        modifier = Modifier.weight(1f),
-                        enabled = state.isCompressing
-                    ) { Text("Cancel") }
+                item {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Button(
+                            onClick = { viewModel.startCompression(context) },
+                            modifier = Modifier.weight(1f),
+                            enabled = !state.isCompressing && !state.isLoading
+                        ) { Text("Compress ${state.items.size}") }
+                        OutlinedButton(
+                            onClick = { viewModel.cancelCompression() },
+                            modifier = Modifier.weight(1f),
+                            enabled = state.isCompressing
+                        ) { Text("Cancel") }
+                    }
                 }
 
                 if (state.hasOutputs) {
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        OutlinedButton(
-                            onClick = { viewModel.saveAllCopiesToGallery(context) },
-                            modifier = Modifier.weight(1f),
-                            enabled = !state.isCompressing
-                        ) { Text("Save copies") }
-                        OutlinedButton(
-                            onClick = onShareOutputs,
-                            modifier = Modifier.weight(1f),
-                            enabled = !state.isCompressing
-                        ) { Text("Share") }
+                    item {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                            OutlinedButton(
+                                onClick = { viewModel.saveAllCopiesToGallery(context) },
+                                modifier = Modifier.weight(1f),
+                                enabled = !state.isCompressing
+                            ) { Text("Save copies") }
+                            OutlinedButton(
+                                onClick = onShareOutputs,
+                                modifier = Modifier.weight(1f),
+                                enabled = !state.isCompressing
+                            ) { Text("Share") }
+                        }
                     }
                 }
 
-                TextButton(
-                    onClick = { viewModel.clear() },
-                    modifier = Modifier.align(Alignment.CenterHorizontally),
-                    enabled = !state.isCompressing
-                ) { Text("Clear batch") }
-
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    state.items.forEachIndexed { index, item ->
-                        BatchItemCard(
-                            index = index + 1,
-                            item = item,
-                            recommendationEnabled = !state.isCompressing,
-                            onApplyRecommendation = { viewModel.applyRecommendation(item.sourceUri) }
-                        )
+                item {
+                    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+                        TextButton(
+                            onClick = { viewModel.clear() },
+                            enabled = !state.isCompressing
+                        ) { Text("Clear batch") }
                     }
+                }
+
+                itemsIndexed(
+                    items = state.items,
+                    key = { _, item -> item.sourceUri.toString() }
+                ) { index, item ->
+                    BatchItemCard(
+                        index = index + 1,
+                        item = item,
+                        recommendationEnabled = !state.isCompressing,
+                        onApplyRecommendation = { viewModel.applyRecommendation(item.sourceUri) }
+                    )
                 }
             } else if (!state.isLoading) {
-                Text(
-                    "For true replace-original mode, pick videos inside Compressor with the file picker. Videos shared from Gallery may be read-only and may need a safe copy fallback.",
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                item {
+                    Text(
+                        "For true replace-original mode, pick videos inside Compressor with the file picker. Videos shared from Gallery may be read-only and may need a safe copy fallback.",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
         }
     }
