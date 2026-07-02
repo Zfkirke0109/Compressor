@@ -21,7 +21,31 @@ Lightning fast, ad free, super lightweight native video compressor for Android (
 
 ---
 
-## Stats & Downloads
+## About This Fork
+
+This fork is based on [JoshAtticus/Compressor](https://github.com/JoshAtticus/Compressor). Huge thanks to JoshAtticus for creating the original fast, lightweight, native Android video compressor that this work builds on.
+
+This fork keeps the original Kotlin and Android media foundation, then focuses on Samsung Galaxy S23 Ultra batch workflows, stronger metadata preservation, safer replace-original behavior, and clearer trust/reporting around what happened to each video.
+
+## What Is Different From JoshAtticus/Compressor?
+
+- Batch-first compression for selecting and processing multiple videos.
+- S23 Ultra-oriented controls for quality, codec, frame rate, thermal pacing, and presets.
+- `Original` mode for perceptually lossless re-encoding that keeps resolution, source FPS where possible, source audio bitrate where possible, and HDR mode.
+- `Remux only` / no re-encode mode for compatible files, copying video and audio tracks unchanged with `MediaExtractor` and `MediaMuxer`.
+- Metadata preservation for source date/time, MP4/retriever date tags, location, rotation, and relative gallery path where Android exposes or allows it.
+- Preservation diagnostics that show whether date/location came from MediaStore, MP4 metadata, retriever metadata, or other supported sources.
+- Output verification reports that reread the finished file for resolution, FPS, codec, audio, HDR/color data, date, location, rotation, size, and playability.
+- Safer replace-original flow with verification before replacement, backup support, Android writable-document handling, optional Shizuku fallback, and safe-copy fallback.
+- Smart compression recommendations, performance metrics, and battery/thermal reporting for longer batch sessions.
+- Metadata privacy controls for preserving or intentionally removing date/location while keeping technical video metadata separate.
+- Stable debug signing workflow for PR APKs so future test builds can install as updates.
+
+---
+
+## Original App Stats & Downloads
+
+These badges link to the upstream app package, releases, and store listings from [JoshAtticus/Compressor](https://github.com/JoshAtticus/Compressor). This fork may provide its own test builds through pull request artifacts or fork releases.
 
 [![RB Status](https://shields.rbtlog.dev/simple/compress.joshattic.us?style=for-the-badge)](https://shields.rbtlog.dev/compress.joshattic.us) ![IzzyOnDroid Version](https://img.shields.io/endpoint?url=https://apt.izzysoft.de/fdroid/api/v1/shield/compress.joshattic.us&label=IzzyOnDroid%20Version&style=for-the-badge) ![Stars](https://img.shields.io/github/stars/JoshAtticus/Compressor?style=for-the-badge) ![Forks](https://img.shields.io/github/forks/JoshAtticus/Compressor?style=for-the-badge)
 
@@ -29,7 +53,7 @@ Lightning fast, ad free, super lightweight native video compressor for Android (
 
 ---
 
-Do you like Compressor? Consider supporting development by [buying me a coffee](https://www.buymeacoffee.com/joshatticus) ☕️
+Do you like the original Compressor? Consider supporting JoshAtticus by [buying a coffee](https://www.buymeacoffee.com/joshatticus) ☕️
 
 You can also donate with crypto:
 - **Bitcoin:** `bc1q8hkcv5xejcg4n4vf5839pqytp87v92rtgyyccr`
