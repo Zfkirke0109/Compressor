@@ -113,6 +113,9 @@ data class BatchCompressorUiState(
     val qualityPreset: String = BatchQualityPreset.ORIGINAL.label,
     val frameRateOption: String = BatchFrameRateOption.ORIGINAL.label,
     val codecOption: String = BatchCodecOption.AUTO.label,
+    val thermalMode: String = ThermalBatchMode.BALANCED.label,
+    val cooldownSeconds: Int = 10,
+    val thermalStatus: String = "Thermal: not checked",
     val replaceOriginals: Boolean = false,
     val useShizukuFallback: Boolean = false,
     val shizukuStatus: String = "Unavailable",
@@ -187,6 +190,19 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     fun setCodec(label: String) {
         _uiState.update { it.copy(codecOption = label) }
+    }
+
+    fun setThermalMode(label: String) {
+        _uiState.update { it.copy(thermalMode = ThermalBatchGovernor.modeFromLabel(label).label) }
+    }
+
+    fun setCooldownSeconds(seconds: Int) {
+        _uiState.update { it.copy(cooldownSeconds = seconds.coerceIn(0, 60)) }
+    }
+
+    fun refreshThermalStatus(context: Context) {
+        val snapshot = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
+        _uiState.update { it.copy(thermalStatus = snapshot.summary) }
     }
 
     fun toggleReplaceOriginals() {
@@ -305,7 +321,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 it.copy(
                     isCompressing = true,
                     errorMessage = null,
-                    statusMessage = "Compressing sequentially with Samsung-safe thermal pacing."
+                    statusMessage = "Compressing with thermal-safe batch pacing."
                 )
             }
 
@@ -348,6 +364,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             _uiState.value.items.forEachIndexed { index, item ->
                 if (item.isAlreadyCompressed) return@forEachIndexed
 
+                val thermalWindow = waitForThermalWindow(context, item.originalName)
                 val plannedFps = outputFpsFor(item, frameRate)
                 val codecLabel = if (preferredMime == MimeTypes.VIDEO_H265) "HEVC" else "H.264"
                 updateItem(index) {
@@ -356,7 +373,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         progress = 0f,
                         currentOutputSize = 0L,
                         targetOutputSize = estimateOutputSize(it, quality, codec, frameRate),
-                        message = "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality, codec, frameRate))} • $codecLabel${plannedFps?.let { fps -> " • ${fps}fps" } ?: " • source FPS"}"
+                        message = "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality, codec, frameRate))} • $codecLabel${plannedFps?.let { fps -> " • ${fps}fps" } ?: " • source FPS"} • ${thermalWindow.thermalLabel}"
                     )
                 }
                 try {
@@ -390,7 +407,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         }
                     }
 
-                    if (index < _uiState.value.items.lastIndex) delay(900)
+                    if (index < _uiState.value.items.lastIndex) {
+                        val cooldown = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
+                        _uiState.update {
+                            it.copy(
+                                thermalStatus = cooldown.summary,
+                                statusMessage = "Cooling down ${cooldown.postItemDelayMs / 1000}s before next video."
+                            )
+                        }
+                        if (cooldown.postItemDelayMs > 0L) delay(cooldown.postItemDelayMs)
+                    }
                 } catch (e: Exception) {
                     updateItem(index) {
                         it.copy(
@@ -435,6 +461,34 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
             _uiState.update { it.copy(statusMessage = "Saved $saved compressed cop${if (saved == 1) "y" else "ies"} to Movies/Compressor with best-effort source date/location metadata.") }
         }
+    }
+
+    private suspend fun waitForThermalWindow(context: Context, itemName: String): ThermalBatchSnapshot {
+        var snapshot = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
+
+        while (snapshot.shouldPause) {
+            _uiState.update {
+                it.copy(
+                    thermalStatus = snapshot.summary,
+                    statusMessage = "Phone is ${snapshot.thermalLabel} or battery is too low — cooling before $itemName."
+                )
+            }
+            delay(30_000L)
+            snapshot = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
+        }
+
+        if (snapshot.preItemDelayMs > 0L) {
+            _uiState.update {
+                it.copy(
+                    thermalStatus = snapshot.summary,
+                    statusMessage = "Phone warm — slowing batch before $itemName."
+                )
+            }
+            delay(snapshot.preItemDelayMs)
+        }
+
+        _uiState.update { it.copy(thermalStatus = snapshot.summary) }
+        return snapshot
     }
 
     private fun updateItem(index: Int, transform: (BatchVideoItem) -> BatchVideoItem) {

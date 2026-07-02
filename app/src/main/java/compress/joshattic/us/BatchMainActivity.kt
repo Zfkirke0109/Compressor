@@ -305,6 +305,50 @@ private fun BatchSettingsCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
+            Text("Thermal safety", style = MaterialTheme.typography.labelLarge)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("Conservative", "Balanced", "Fast").forEach { label ->
+                    FilterChip(
+                        selected = state.thermalMode == label,
+                        onClick = { viewModel.setThermalMode(label) },
+                        label = { Text(label, maxLines = 1) },
+                        enabled = !state.isCompressing
+                    )
+                }
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                OutlinedButton(
+                    onClick = { viewModel.setCooldownSeconds(state.cooldownSeconds - 5) },
+                    enabled = !state.isCompressing && state.cooldownSeconds > 0
+                ) { Text("-5s") }
+
+                Text(
+                    "Cooldown: ${state.cooldownSeconds}s",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium
+                )
+
+                OutlinedButton(
+                    onClick = { viewModel.setCooldownSeconds(state.cooldownSeconds + 5) },
+                    enabled = !state.isCompressing && state.cooldownSeconds < 60
+                ) { Text("+5s") }
+            }
+            Text(
+                state.thermalStatus,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            OutlinedButton(
+                onClick = { viewModel.refreshThermalStatus(context) },
+                enabled = !state.isCompressing
+            ) {
+                Text("Check heat/battery")
+            }
+
             HorizontalDivider()
             SettingSwitchRow("Replace originals after compression", "Off by default. Best results require selecting videos inside Compressor with write access.", state.replaceOriginals, !state.isCompressing) { viewModel.toggleReplaceOriginals() }
             SettingSwitchRow("Use Shizuku fallback", "Uses Shizuku only after normal Android replacement fails.", state.useShizukuFallback, state.replaceOriginals && !state.isCompressing) { viewModel.toggleShizukuFallback() }
@@ -359,6 +403,7 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
             Text("Videos: ${state.items.size} • Done: ${state.doneCount} • Failed: ${state.failedCount}")
             Text("Original: ${state.formattedTotalOriginal}")
             Text("Mode: ${state.qualityPreset} • Codec: ${state.codecOption} • FPS: ${state.frameRateOption}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Thermal: ${state.thermalMode} • Cooldown: ${state.cooldownSeconds}s", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (state.isCompressing) {
                 state.activeItem?.let { active ->
                     Text(
