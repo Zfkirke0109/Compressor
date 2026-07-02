@@ -7,7 +7,6 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.media3.common.MimeTypes
 import java.io.File
-import kotlin.math.abs
 
 object OutputVerifier {
     fun verify(
@@ -31,16 +30,17 @@ object OutputVerifier {
 
         val remuxOnly = modeLabel == "Remux only"
         val videoMatches = sameDimensions(source.originalWidth, source.originalHeight, outputProbe.width, outputProbe.height)
-        val fpsMatches = if (source.originalFps > 0f && outputProbe.fps > 0f) abs(source.originalFps - outputProbe.fps) <= 1.0f else true
+        val fpsComparison = OutputVerificationFormatter.fpsComparison(source.originalFps, outputProbe.fps)
+        val remuxFpsBlockReason = OutputVerificationFormatter.remuxFpsBlockReason(source.originalFps, outputProbe.fps)
         val videoCodecMatches = codecsMatch(sourceTracks.videoCodec, outputTracks.videoCodec)
         val audioCodecMatches = codecsMatch(sourceTracks.audioCodec, outputTracks.audioCodec)
         val hdrMatches = sourceTracks.hdrLabel == "not exposed" || outputTracks.hdrLabel == "not exposed" || sourceTracks.hdrLabel == outputTracks.hdrLabel
 
-        val replacementSafe = playable && (!remuxOnly || (videoMatches && fpsMatches && videoCodecMatches && audioCodecMatches && hdrMatches))
+        val replacementSafe = playable && (!remuxOnly || (videoMatches && remuxFpsBlockReason == null && videoCodecMatches && audioCodecMatches && hdrMatches))
         val blockReason = when {
             playable.not() -> "output did not pass playability verification"
             remuxOnly && !videoMatches -> "remux output changed resolution"
-            remuxOnly && !fpsMatches -> "remux output changed FPS"
+            remuxOnly && remuxFpsBlockReason != null -> remuxFpsBlockReason
             remuxOnly && !videoCodecMatches -> "remux output changed video codec"
             remuxOnly && !audioCodecMatches -> "remux output changed audio codec"
             remuxOnly && !hdrMatches -> "remux output changed HDR/color metadata"
@@ -53,7 +53,11 @@ object OutputVerifier {
         return OutputVerificationReport(
             playability = if (playable) "opens" else "failed",
             video = "${source.originalWidth}x${source.originalHeight} -> ${dimensionLabel(outputProbe.width, outputProbe.height)} ${if (videoMatches) "ok" else "warn"}",
-            fps = "${fpsLabel(source.originalFps)} -> ${fpsLabel(outputProbe.fps)} ${if (fpsMatches) "ok" else "warn"}",
+            fps = OutputVerificationFormatter.transition(
+                fpsLabel(source.originalFps),
+                fpsLabel(outputProbe.fps),
+                fpsComparison
+            ),
             videoCodec = "${codecLabel(sourceTracks.videoCodec)} -> ${codecLabel(outputTracks.videoCodec)} ${if (!remuxOnly || videoCodecMatches) "ok" else "warn"}",
             audioCodec = "${codecLabel(sourceTracks.audioCodec)} -> ${codecLabel(outputTracks.audioCodec)} ${if (!remuxOnly || audioCodecMatches) "ok" else "warn"}",
             audioBitrate = "${bitrateLabel(sourceTracks.audioBitrate)} -> ${bitrateLabel(outputTracks.audioBitrate)}",
