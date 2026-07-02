@@ -43,6 +43,21 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
+      - name: Restore stable debug signing key
+        shell: bash
+        env:
+          COMPRESSOR_DEBUG_KEYSTORE_BASE64: ${{ secrets.COMPRESSOR_DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$COMPRESSOR_DEBUG_KEYSTORE_BASE64" ]; then
+            echo "$COMPRESSOR_DEBUG_KEYSTORE_BASE64" | base64 --decode > ci-debug.keystore
+            chmod 600 ci-debug.keystore
+            echo "STABLE_DEBUG_SIGNING=true" >> "$GITHUB_ENV"
+            echo "Stable debug signing key restored."
+          else
+            echo "STABLE_DEBUG_SIGNING=false" >> "$GITHUB_ENV"
+            echo "No stable debug signing key secret found. Falling back to default debug signing."
+          fi
+
       # 1. FIND OR CREATE THE INITIAL COMMENT
       - name: Post "Building" Comment
         continue-on-error: true
@@ -84,6 +99,10 @@ jobs:
       - name: Build Debug APK
         id: build_apk
         shell: bash
+        env:
+          COMPRESSOR_DEBUG_KEYSTORE_PASSWORD: ${{ secrets.COMPRESSOR_DEBUG_KEYSTORE_PASSWORD }}
+          COMPRESSOR_DEBUG_KEY_ALIAS: ${{ secrets.COMPRESSOR_DEBUG_KEY_ALIAS }}
+          COMPRESSOR_DEBUG_KEY_PASSWORD: ${{ secrets.COMPRESSOR_DEBUG_KEY_PASSWORD }}
         run: |
           set -o pipefail
           ./gradlew assembleDebug --stacktrace | tee build.log
@@ -123,6 +142,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           STATUS: ${{ job.status }}
           PR_NUMBER: ${{ env.PR_NUMBER }}
+          STABLE_DEBUG_SIGNING: ${{ env.STABLE_DEBUG_SIGNING }}
         with:
           script: |
             const marker = '<!-- bot-pr-build-comment -->';
@@ -144,7 +164,7 @@ jobs:
                  
                 [Download from Artifacts](${runUrl})
                  
-                **Note:** You may need to uninstall the existing version before installing this debug build.`
+                **Signing:** ${process.env.STABLE_DEBUG_SIGNING === 'true' ? 'Stable debug signing enabled. Future PR APKs should install as updates.' : 'Fallback debug signing. Configure stable signing secrets to avoid uninstall/reinstall.'}`
               : `**The build encountered errors.** See the logs below for details.`;
 
             const body = `${marker}
