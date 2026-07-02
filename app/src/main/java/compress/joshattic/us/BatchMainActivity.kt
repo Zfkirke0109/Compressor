@@ -171,6 +171,7 @@ private fun BatchCompressorScreen(
             if (state.items.isNotEmpty()) {
                 BatchSummaryCard(state)
                 PreservationReportCard(state)
+                state.batchMetrics?.let { BatchMetricsCard(it) }
             }
 
             state.statusMessage?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary) }
@@ -212,7 +213,14 @@ private fun BatchCompressorScreen(
                 ) { Text("Clear batch") }
 
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    state.items.forEachIndexed { index, item -> BatchItemCard(index + 1, item) }
+                    state.items.forEachIndexed { index, item ->
+                        BatchItemCard(
+                            index = index + 1,
+                            item = item,
+                            recommendationEnabled = !state.isCompressing,
+                            onApplyRecommendation = { viewModel.applyRecommendation(item.sourceUri) }
+                        )
+                    }
                 }
             } else if (!state.isLoading) {
                 Text(
@@ -234,11 +242,35 @@ private fun BatchSettingsCard(
 ) {
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            val remuxOnly = state.qualityPreset == "Remux only"
             Text("Batch settings", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Text("Video quality", style = MaterialTheme.typography.labelLarge)
+
+            Text("S23 Ultra presets", style = MaterialTheme.typography.labelLarge)
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf(
+                    "S23 Ultra Best Quality",
+                    "S23 Ultra Storage Saver",
+                    "Social Upload",
+                    "Archive Mode",
+                    "HDR Safe Mode"
+                ).forEach { label ->
+                    FilterChip(
+                        selected = state.selectedPreset == label,
+                        onClick = { viewModel.applyPreset(label) },
+                        label = { Text(label, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !state.isCompressing
+                    )
+                }
+            }
+            state.selectedPreset?.let {
+                Text("Preset: $it. Manual changes are still allowed.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+            }
+
+            Text("Video mode", style = MaterialTheme.typography.labelLarge)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Original", "High").forEach { label ->
+                    listOf("Remux only", "Original").forEach { label ->
                         FilterChip(
                             selected = state.qualityPreset == label,
                             onClick = { viewModel.setQuality(label) },
@@ -248,7 +280,7 @@ private fun BatchSettingsCard(
                     }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Medium", "Low").forEach { label ->
+                    listOf("High", "Medium", "Low").forEach { label ->
                         FilterChip(
                             selected = state.qualityPreset == label,
                             onClick = { viewModel.setQuality(label) },
@@ -259,7 +291,11 @@ private fun BatchSettingsCard(
                 }
             }
             Text(
-                "Original is the default perceptually lossless mode: keeps source resolution, source FPS, HDR mode, and audio bitrate. Medium/Low are explicit downgrade choices.",
+                if (remuxOnly) {
+                    "No re-encode: video/audio copied unchanged. This keeps quality exact but may not shrink much."
+                } else {
+                    "Original is perceptually lossless: keeps source resolution, source FPS, HDR mode, and audio bitrate. Medium/Low are explicit downgrade choices."
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -271,12 +307,16 @@ private fun BatchSettingsCard(
                         selected = state.codecOption == label,
                         onClick = { viewModel.setCodec(label) },
                         label = { Text(label, maxLines = 1) },
-                        enabled = !state.isCompressing
+                        enabled = !state.isCompressing && !remuxOnly
                     )
                 }
             }
             Text(
-                "Auto chooses the best S23 Ultra hardware encoder. HEVC usually saves more storage; H.264 is best for compatibility.",
+                if (remuxOnly) {
+                    "Disabled in Remux Only because the source codec is copied unchanged."
+                } else {
+                    "Auto chooses the best S23 Ultra hardware encoder. HEVC usually saves more storage; H.264 is best for compatibility."
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -289,7 +329,7 @@ private fun BatchSettingsCard(
                             selected = state.frameRateOption == label,
                             onClick = { viewModel.setFrameRate(label) },
                             label = { Text(label, maxLines = 1) },
-                            enabled = !state.isCompressing
+                            enabled = !state.isCompressing && !remuxOnly
                         )
                     }
                 }
@@ -298,12 +338,41 @@ private fun BatchSettingsCard(
                         selected = state.frameRateOption == "24 fps",
                         onClick = { viewModel.setFrameRate("24 fps") },
                         label = { Text("24 fps", maxLines = 1) },
+                        enabled = !state.isCompressing && !remuxOnly
+                    )
+                }
+            }
+            Text(
+                if (remuxOnly) {
+                    "Disabled in Remux Only because source timestamps and FPS are copied unchanged."
+                } else {
+                    "Original keeps source FPS. 60 caps high-frame-rate clips to 60. 30/24 lower higher-frame-rate clips only when selected."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Text("Metadata privacy", style = MaterialTheme.typography.labelLarge)
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf(
+                    "Preserve all metadata",
+                    "Remove location only",
+                    "Remove date only",
+                    "Remove location + date",
+                    "Keep camera/video technical metadata",
+                    "Privacy mode for sharing"
+                ).forEach { label ->
+                    FilterChip(
+                        selected = state.metadataPrivacyMode == label,
+                        onClick = { viewModel.setMetadataPrivacyMode(label) },
+                        label = { Text(label, maxLines = 2, overflow = TextOverflow.Ellipsis) },
+                        modifier = Modifier.fillMaxWidth(),
                         enabled = !state.isCompressing
                     )
                 }
             }
             Text(
-                "Original keeps source FPS. 60 caps high-frame-rate clips to 60. 30/24 lower higher-frame-rate clips only when selected.",
+                MetadataPrivacyMode.fromLabel(state.metadataPrivacyMode).description,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -354,6 +423,8 @@ private fun BatchSettingsCard(
 
             HorizontalDivider()
             SettingSwitchRow("Replace originals after compression", "Off by default. Best results require selecting videos inside Compressor with write access.", state.replaceOriginals, !state.isCompressing) { viewModel.toggleReplaceOriginals() }
+            SettingSwitchRow("Backup before replace", "When enabled, a backup copy is saved before any original is overwritten.", state.backupBeforeReplace, state.replaceOriginals && !state.isCompressing) { viewModel.toggleBackupBeforeReplace() }
+            Text("Replace only after verification: On", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
             SettingSwitchRow("Use Shizuku fallback", "Uses Shizuku only after normal Android replacement fails.", state.useShizukuFallback, state.replaceOriginals && !state.isCompressing) { viewModel.toggleShizukuFallback() }
             Text("Shizuku: ${state.shizukuStatus}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text(
@@ -406,6 +477,7 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
             Text("Videos: ${state.items.size} • Done: ${state.doneCount} • Failed: ${state.failedCount}")
             Text("Original: ${state.formattedTotalOriginal}")
             Text("Mode: ${state.qualityPreset} • Codec: ${state.codecOption} • FPS: ${state.frameRateOption}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Metadata: ${MetadataPrivacyMode.fromLabel(state.metadataPrivacyMode).summary}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Thermal: ${state.thermalMode} • Cooldown: ${state.cooldownSeconds}s", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (state.isCompressing) {
                 state.activeItem?.let { active ->
@@ -424,7 +496,19 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
                     )
                 }
             }
-            if (state.totalOutputBytes > 0) Text("Compressed: ${state.formattedTotalOutput} • Saved: ${state.formattedTotalSaved}")
+            if (state.totalOutputBytes > 0) Text("Outputs: ${state.formattedTotalOutput} • Saved: ${state.formattedTotalSaved}")
+        }
+    }
+}
+
+@Composable
+private fun BatchMetricsCard(metrics: BatchMetricsSummary) {
+    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Batch metrics", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            metrics.summaryLines.forEach { line ->
+                Text(line, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
     }
 }
@@ -459,7 +543,7 @@ private fun PreservationReportCard(state: BatchCompressorUiState) {
 
             if (state.hasOutputs) {
                 Text(
-                    "Saved outputs carry best-effort source date/location metadata when Android exposes it.",
+                    "Saved outputs follow the selected metadata privacy mode when Android exposes those fields.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.primary
                 )
@@ -475,7 +559,12 @@ private fun PreservationReportCard(state: BatchCompressorUiState) {
 }
 
 @Composable
-private fun BatchItemCard(index: Int, item: BatchVideoItem) {
+private fun BatchItemCard(
+    index: Int,
+    item: BatchVideoItem,
+    recommendationEnabled: Boolean,
+    onApplyRecommendation: () -> Unit
+) {
     val skipped = item.status == BatchItemStatus.Skipped || item.isAlreadyCompressed
     val cardColors = CardDefaults.outlinedCardColors(
         containerColor = if (skipped) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.surface
@@ -519,6 +608,24 @@ private fun BatchItemCard(index: Int, item: BatchVideoItem) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
+            item.recommendation?.takeIf { item.status == BatchItemStatus.Pending }?.let { recommendation ->
+                HorizontalDivider()
+                Text(
+                    recommendation.summary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    recommendation.reason,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedButton(onClick = onApplyRecommendation, enabled = recommendationEnabled) {
+                    Text("Apply recommendation")
+                }
+            }
+
             if (item.status == BatchItemStatus.Compressing) {
                 Text(
                     "Output: ${item.currentOutputDisplaySize} / est ${item.targetOutputDisplaySize} • ${item.progressPercent}%",
@@ -536,6 +643,33 @@ private fun BatchItemCard(index: Int, item: BatchVideoItem) {
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.primary,
                     fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            item.verificationReport?.let { report ->
+                HorizontalDivider()
+                Text("Verification", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                report.summaryLines.forEach { line ->
+                    Text(
+                        line,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                report.replacementBlockReason?.let { reason ->
+                    Text(
+                        "Replacement blocked: $reason",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                }
+            }
+
+            item.metrics?.let { metrics ->
+                Text(
+                    metrics.summary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
 
@@ -581,6 +715,10 @@ private fun BatchVideoItem.beforeAfterSummary(): String {
     if (outputSize <= 0L) return "Output pending"
     val savedBytes = (originalSize - outputSize).coerceAtLeast(0L)
     val savedPercent = if (originalSize > 0L) ((savedBytes * 100.0) / originalSize).toInt() else 0
+    val similarSize = originalSize > 0L && kotlin.math.abs(outputSize - originalSize).toDouble() / originalSize.toDouble() < 0.03
+    if (outputMode == "Remux only" && similarSize) {
+        return "Before/after: ${formatCardBytes(originalSize)} -> ${formatCardBytes(outputSize)} • size similar"
+    }
     return "Before/after: ${formatCardBytes(originalSize)} → ${formatCardBytes(outputSize)} • saved ${formatCardBytes(savedBytes)} ($savedPercent%)"
 }
 
