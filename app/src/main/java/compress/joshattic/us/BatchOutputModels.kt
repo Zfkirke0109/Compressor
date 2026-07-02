@@ -89,6 +89,7 @@ data class CompressionRecommendation(
 
 data class OutputVerificationReport(
     val playability: String,
+    val encoderMode: String,
     val video: String,
     val fps: String,
     val videoCodec: String,
@@ -105,6 +106,7 @@ data class OutputVerificationReport(
     val summaryLines: List<String>
         get() = listOf(
             "Playability: $playability",
+            "Encoder mode: $encoderMode",
             "Video: $video",
             "FPS: $fps",
             "Codec: $videoCodec",
