@@ -9,10 +9,15 @@ import android.os.Build
 import android.provider.MediaStore
 import androidx.exifinterface.media.ExifInterface
 import java.io.File
+import java.io.FileInputStream
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import kotlin.math.max
+import kotlin.math.min
 
 data class VideoMetadataSnapshot(
     val dateTakenMs: Long? = null,
@@ -72,12 +77,15 @@ data class MetadataRestoreReport(
 }
 
 object VideoMetadataPreserver {
+    private const val MP4_LOCATION_SCAN_CHUNK_BYTES = 16 * 1024 * 1024
+
     fun capture(
         context: Context,
         uri: Uri,
         retriever: MediaMetadataRetriever? = null
     ): VideoMetadataSnapshot {
         var snapshot = VideoMetadataSnapshot()
+        var mediaStoreLocation: Pair<Double, Double>? = null
 
         runCatching {
             context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
@@ -92,15 +100,19 @@ object VideoMetadataPreserver {
                             null
                         }
                     )
+                    mediaStoreLocation = cursor.locationOrNull()
                 }
             }
         }
 
-        val rawLocation = runCatching {
+        val retrieverLocation = runCatching {
             retriever?.extractMetadata(MediaMetadataRetriever.METADATA_KEY_LOCATION)
         }.getOrNull()
 
-        val parsedLocation = parseIso6709Location(rawLocation)
+        val scannedLocation = scanMp4TextLocation(context, uri)
+        val parsedLocation = parseIso6709Location(retrieverLocation)
+            ?: scannedLocation?.let { parseIso6709Location(it) }
+            ?: mediaStoreLocation
 
         val rotation = runCatching {
             retriever?.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull()
@@ -109,7 +121,7 @@ object VideoMetadataPreserver {
         return snapshot.copy(
             latitude = parsedLocation?.first,
             longitude = parsedLocation?.second,
-            rawLocationTag = rawLocation,
+            rawLocationTag = retrieverLocation ?: scannedLocation,
             rotationDegrees = rotation
         )
     }
@@ -219,6 +231,46 @@ object VideoMetadataPreserver {
         }.format(Date(timeMs))
     }
 
+    private fun scanMp4TextLocation(context: Context, uri: Uri): String? {
+        return runCatching {
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+                val statSize = descriptor.statSize
+                FileInputStream(descriptor.fileDescriptor).use { stream ->
+                    val channel = stream.channel
+                    val chunks = mutableListOf<ByteArray>()
+                    val firstSize = if (statSize > 0L) min(MP4_LOCATION_SCAN_CHUNK_BYTES.toLong(), statSize).toInt() else MP4_LOCATION_SCAN_CHUNK_BYTES
+                    chunks += readChunk(channel, 0L, firstSize)
+                    if (statSize > MP4_LOCATION_SCAN_CHUNK_BYTES) {
+                        val tailStart = max(0L, statSize - MP4_LOCATION_SCAN_CHUNK_BYTES)
+                        chunks += readChunk(channel, tailStart, MP4_LOCATION_SCAN_CHUNK_BYTES)
+                    }
+                    chunks.asSequence()
+                        .mapNotNull { bytes -> findIso6709LocationInText(bytes.toString(StandardCharsets.ISO_8859_1)) }
+                        .firstOrNull()
+                }
+            }
+        }.getOrNull()
+    }
+
+    private fun readChunk(channel: java.nio.channels.FileChannel, position: Long, maxBytes: Int): ByteArray {
+        if (maxBytes <= 0) return ByteArray(0)
+        channel.position(position)
+        val buffer = ByteBuffer.allocate(maxBytes)
+        val bytesRead = channel.read(buffer)
+        if (bytesRead <= 0) return ByteArray(0)
+        val output = ByteArray(bytesRead)
+        buffer.flip()
+        buffer.get(output)
+        return output
+    }
+
+    private fun findIso6709LocationInText(text: String): String? {
+        val pattern = Regex("([+-](?:[0-8]?\\d(?:\\.\\d+)?|90(?:\\.0+)?))([+-](?:(?:0?\\d?\\d|1[0-7]\\d)(?:\\.\\d+)?|180(?:\\.0+)?))(?:[+-]\\d+(?:\\.\\d+)?)?/?")
+        return pattern.findAll(text)
+            .map { it.value }
+            .firstOrNull { parseIso6709Location(it) != null }
+    }
+
     private fun parseIso6709Location(value: String?): Pair<Double, Double>? {
         if (value.isNullOrBlank()) return null
 
@@ -239,8 +291,21 @@ object VideoMetadataPreserver {
         return if (index >= 0 && !isNull(index)) getLong(index) else null
     }
 
+    private fun Cursor.doubleOrNull(column: String): Double? {
+        val index = getColumnIndex(column)
+        return if (index >= 0 && !isNull(index)) getDouble(index) else null
+    }
+
     private fun Cursor.stringOrNull(column: String): String? {
         val index = getColumnIndex(column)
         return if (index >= 0 && !isNull(index)) getString(index) else null
+    }
+
+    private fun Cursor.locationOrNull(): Pair<Double, Double>? {
+        val latitude = doubleOrNull("latitude") ?: doubleOrNull("GPSLatitude") ?: doubleOrNull("gps_latitude")
+        val longitude = doubleOrNull("longitude") ?: doubleOrNull("GPSLongitude") ?: doubleOrNull("gps_longitude")
+        if (latitude == null || longitude == null) return null
+        if (latitude !in -90.0..90.0 || longitude !in -180.0..180.0) return null
+        return latitude to longitude
     }
 }
