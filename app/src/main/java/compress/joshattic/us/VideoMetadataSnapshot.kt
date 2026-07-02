@@ -16,8 +16,6 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
-import kotlin.math.max
-import kotlin.math.min
 
 data class VideoMetadataSnapshot(
     val dateTakenMs: Long? = null,
@@ -77,7 +75,12 @@ data class MetadataRestoreReport(
 }
 
 object VideoMetadataPreserver {
-    private const val MP4_LOCATION_SCAN_CHUNK_BYTES = 16 * 1024 * 1024
+    private const val MAX_LOCATION_ATOM_BYTES = 64 * 1024
+    private const val MAX_MP4_SCAN_DEPTH = 16
+
+    private val mp4ContainerTypes = setOf(
+        "moov", "udta", "meta", "ilst", "trak", "mdia", "minf", "dinf", "stbl", "edts"
+    )
 
     fun capture(
         context: Context,
@@ -109,10 +112,10 @@ object VideoMetadataPreserver {
             retriever?.extractMetadata(MediaMetadataRetriever.METADATA_KEY_LOCATION)
         }.getOrNull()
 
-        val scannedLocation = scanMp4TextLocation(context, uri)
+        val atomLocation = readMp4LocationAtom(context, uri)
         val parsedLocation = parseIso6709Location(retrieverLocation)
-            ?: scannedLocation?.let { parseIso6709Location(it) }
             ?: mediaStoreLocation
+            ?: atomLocation?.let { parseIso6709Location(it) }
 
         val rotation = runCatching {
             retriever?.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull()
@@ -121,7 +124,7 @@ object VideoMetadataPreserver {
         return snapshot.copy(
             latitude = parsedLocation?.first,
             longitude = parsedLocation?.second,
-            rawLocationTag = retrieverLocation ?: scannedLocation,
+            rawLocationTag = retrieverLocation ?: atomLocation,
             rotationDegrees = rotation
         )
     }
@@ -231,25 +234,85 @@ object VideoMetadataPreserver {
         }.format(Date(timeMs))
     }
 
-    private fun scanMp4TextLocation(context: Context, uri: Uri): String? {
+    private fun readMp4LocationAtom(context: Context, uri: Uri): String? {
         return runCatching {
             context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
-                val statSize = descriptor.statSize
+                val statSize = descriptor.statSize.takeIf { it > 0L } ?: return@use null
                 FileInputStream(descriptor.fileDescriptor).use { stream ->
-                    val channel = stream.channel
-                    val chunks = mutableListOf<ByteArray>()
-                    val firstSize = if (statSize > 0L) min(MP4_LOCATION_SCAN_CHUNK_BYTES.toLong(), statSize).toInt() else MP4_LOCATION_SCAN_CHUNK_BYTES
-                    chunks += readChunk(channel, 0L, firstSize)
-                    if (statSize > MP4_LOCATION_SCAN_CHUNK_BYTES) {
-                        val tailStart = max(0L, statSize - MP4_LOCATION_SCAN_CHUNK_BYTES)
-                        chunks += readChunk(channel, tailStart, MP4_LOCATION_SCAN_CHUNK_BYTES)
-                    }
-                    chunks.asSequence()
-                        .mapNotNull { bytes -> findIso6709LocationInText(bytes.toString(StandardCharsets.ISO_8859_1)) }
-                        .firstOrNull()
+                    findLocationInBoxes(stream.channel, 0L, statSize, 0, emptyList())
                 }
             }
         }.getOrNull()
+    }
+
+    private fun findLocationInBoxes(
+        channel: java.nio.channels.FileChannel,
+        start: Long,
+        end: Long,
+        depth: Int,
+        path: List<String>
+    ): String? {
+        if (depth > MAX_MP4_SCAN_DEPTH || end <= start + 8L) return null
+
+        var offset = start
+        while (offset + 8L <= end) {
+            val header = readChunk(channel, offset, 16)
+            if (header.size < 8) return null
+
+            val size32 = readUInt32(header, 0)
+            val type = String(header, 4, 4, StandardCharsets.ISO_8859_1)
+            var headerSize = 8L
+            val boxSize = when (size32) {
+                0L -> end - offset
+                1L -> {
+                    if (header.size < 16) return null
+                    headerSize = 16L
+                    readUInt64(header, 8)
+                }
+                else -> size32
+            }
+
+            if (boxSize < headerSize || offset + boxSize > end) return null
+
+            val payloadStart = offset + headerSize
+            val payloadEnd = offset + boxSize
+            val currentPath = path + type
+
+            val locationFromKnownAtom = when {
+                isLocationBox(type) -> readLocationText(channel, payloadStart, payloadEnd)
+                type == "data" && path.any { isLocationBox(it) } -> {
+                    val dataTextStart = if (payloadStart + 8L < payloadEnd) payloadStart + 8L else payloadStart
+                    readLocationText(channel, dataTextStart, payloadEnd)
+                }
+                else -> null
+            }
+            if (locationFromKnownAtom != null) return locationFromKnownAtom
+
+            if (type in mp4ContainerTypes) {
+                val childStart = if (type == "meta" && payloadStart + 4L < payloadEnd) payloadStart + 4L else payloadStart
+                val nested = findLocationInBoxes(channel, childStart, payloadEnd, depth + 1, currentPath)
+                if (nested != null) return nested
+            }
+
+            offset += boxSize
+        }
+
+        return null
+    }
+
+    private fun isLocationBox(type: String): Boolean {
+        return type == "\u00A9xyz" || type.trim() == "xyz"
+    }
+
+    private fun readLocationText(
+        channel: java.nio.channels.FileChannel,
+        start: Long,
+        end: Long
+    ): String? {
+        if (end <= start) return null
+        val length = (end - start).coerceAtMost(MAX_LOCATION_ATOM_BYTES.toLong()).toInt()
+        val text = readChunk(channel, start, length).toString(StandardCharsets.ISO_8859_1)
+        return findPreciseIso6709LocationInText(text)
     }
 
     private fun readChunk(channel: java.nio.channels.FileChannel, position: Long, maxBytes: Int): ByteArray {
@@ -264,8 +327,23 @@ object VideoMetadataPreserver {
         return output
     }
 
-    private fun findIso6709LocationInText(text: String): String? {
-        val pattern = Regex("([+-](?:[0-8]?\\d(?:\\.\\d+)?|90(?:\\.0+)?))([+-](?:(?:0?\\d?\\d|1[0-7]\\d)(?:\\.\\d+)?|180(?:\\.0+)?))(?:[+-]\\d+(?:\\.\\d+)?)?/?")
+    private fun readUInt32(bytes: ByteArray, offset: Int): Long {
+        return ((bytes[offset].toLong() and 0xffL) shl 24) or
+            ((bytes[offset + 1].toLong() and 0xffL) shl 16) or
+            ((bytes[offset + 2].toLong() and 0xffL) shl 8) or
+            (bytes[offset + 3].toLong() and 0xffL)
+    }
+
+    private fun readUInt64(bytes: ByteArray, offset: Int): Long {
+        var value = 0L
+        for (i in 0 until 8) {
+            value = (value shl 8) or (bytes[offset + i].toLong() and 0xffL)
+        }
+        return value
+    }
+
+    private fun findPreciseIso6709LocationInText(text: String): String? {
+        val pattern = Regex("([+-]\\d{1,2}\\.\\d{3,})([+-]\\d{1,3}\\.\\d{3,})(?:[+-]\\d+(?:\\.\\d+)?)?/?")
         return pattern.findAll(text)
             .map { it.value }
             .firstOrNull { parseIso6709Location(it) != null }
@@ -283,6 +361,7 @@ object VideoMetadataPreserver {
         val longitude = match.groupValues.getOrNull(2)?.toDoubleOrNull() ?: return null
 
         if (latitude !in -90.0..90.0 || longitude !in -180.0..180.0) return null
+        if (latitude == 0.0 && longitude == 0.0) return null
         return latitude to longitude
     }
 
@@ -306,6 +385,7 @@ object VideoMetadataPreserver {
         val longitude = doubleOrNull("longitude") ?: doubleOrNull("GPSLongitude") ?: doubleOrNull("gps_longitude")
         if (latitude == null || longitude == null) return null
         if (latitude !in -90.0..90.0 || longitude !in -180.0..180.0) return null
+        if (latitude == 0.0 && longitude == 0.0) return null
         return latitude to longitude
     }
 }
