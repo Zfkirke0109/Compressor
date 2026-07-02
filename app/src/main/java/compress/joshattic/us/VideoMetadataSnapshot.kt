@@ -89,6 +89,7 @@ object VideoMetadataPreserver {
     ): VideoMetadataSnapshot {
         var snapshot = VideoMetadataSnapshot()
         var mediaStoreLocation: Pair<Double, Double>? = null
+        val originalUri = requireOriginalMediaUri(uri)
 
         runCatching {
             context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
@@ -108,11 +109,10 @@ object VideoMetadataPreserver {
             }
         }
 
-        val retrieverLocation = runCatching {
-            retriever?.extractMetadata(MediaMetadataRetriever.METADATA_KEY_LOCATION)
-        }.getOrNull()
+        val retrieverLocation = extractRetrieverLocation(context, originalUri)
+            ?: runCatching { retriever?.extractMetadata(MediaMetadataRetriever.METADATA_KEY_LOCATION) }.getOrNull()
 
-        val atomLocation = readMp4LocationAtom(context, uri)
+        val atomLocation = readMp4LocationAtom(context, originalUri)
         val parsedLocation = parseIso6709Location(retrieverLocation)
             ?: mediaStoreLocation
             ?: atomLocation?.let { parseIso6709Location(it) }
@@ -232,6 +232,26 @@ object VideoMetadataPreserver {
         return SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).apply {
             timeZone = TimeZone.getDefault()
         }.format(Date(timeMs))
+    }
+
+    private fun requireOriginalMediaUri(uri: Uri): Uri {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching { MediaStore.setRequireOriginal(uri) }.getOrDefault(uri)
+        } else {
+            uri
+        }
+    }
+
+    private fun extractRetrieverLocation(context: Context, uri: Uri): String? {
+        return runCatching {
+            val metadataRetriever = MediaMetadataRetriever()
+            try {
+                metadataRetriever.setDataSource(context, uri)
+                metadataRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_LOCATION)
+            } finally {
+                runCatching { metadataRetriever.release() }
+            }
+        }.getOrNull()
     }
 
     private fun readMp4LocationAtom(context: Context, uri: Uri): String? {
