@@ -1,7 +1,9 @@
 package compress.joshattic.us
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -22,6 +24,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import compress.joshattic.us.ui.theme.CompressorTheme
 import java.io.File
@@ -88,6 +91,7 @@ private fun BatchCompressorScreen(
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
     val scrollState = rememberScrollState()
+    var pickAfterMetadataGrant by remember { mutableStateOf(false) }
     val pickVideos = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments(),
         onResult = { uris ->
@@ -97,6 +101,25 @@ private fun BatchCompressorScreen(
             }
         }
     )
+    val metadataAccessLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { granted ->
+            if (granted && state.items.isNotEmpty()) {
+                viewModel.loadUris(context, state.items.map { it.sourceUri })
+            }
+            if (granted && pickAfterMetadataGrant) {
+                pickVideos.launch(arrayOf("video/*"))
+            }
+            pickAfterMetadataGrant = false
+        }
+    )
+    val requestOriginalMediaAccess = {
+        if (needsOriginalMediaLocationPermission(context)) {
+            metadataAccessLauncher.launch(Manifest.permission.ACCESS_MEDIA_LOCATION)
+        } else if (state.items.isNotEmpty()) {
+            viewModel.loadUris(context, state.items.map { it.sourceUri })
+        }
+    }
 
     LaunchedEffect(Unit) { viewModel.refreshShizukuStatus(context) }
 
@@ -128,7 +151,14 @@ private fun BatchCompressorScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Button(
-                        onClick = { pickVideos.launch(arrayOf("video/*")) },
+                        onClick = {
+                            if (needsOriginalMediaLocationPermission(context)) {
+                                pickAfterMetadataGrant = true
+                                metadataAccessLauncher.launch(Manifest.permission.ACCESS_MEDIA_LOCATION)
+                            } else {
+                                pickVideos.launch(arrayOf("video/*"))
+                            }
+                        },
                         modifier = Modifier.fillMaxWidth(),
                         enabled = !state.isCompressing && !state.isLoading
                     ) {
@@ -137,7 +167,7 @@ private fun BatchCompressorScreen(
                 }
             }
 
-            BatchSettingsCard(state, viewModel, context)
+            BatchSettingsCard(state, viewModel, context, requestOriginalMediaAccess)
             if (state.items.isNotEmpty()) BatchSummaryCard(state)
 
             state.statusMessage?.let { Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary) }
@@ -196,7 +226,8 @@ private fun BatchCompressorScreen(
 private fun BatchSettingsCard(
     state: BatchCompressorUiState,
     viewModel: BatchCompressorViewModel,
-    context: Context
+    context: Context,
+    onRequestOriginalMediaAccess: () -> Unit
 ) {
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -278,9 +309,17 @@ private fun BatchSettingsCard(
             SettingSwitchRow("Replace originals after compression", "Off by default. Best results require selecting videos inside Compressor with write access.", state.replaceOriginals, !state.isCompressing) { viewModel.toggleReplaceOriginals() }
             SettingSwitchRow("Use Shizuku fallback", "Uses Shizuku only after normal Android replacement fails.", state.useShizukuFallback, state.replaceOriginals && !state.isCompressing) { viewModel.toggleShizukuFallback() }
             Text("Shizuku: ${state.shizukuStatus}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                "Location metadata: grant original media access, then reselect or reload videos so Android allows unredacted GPS reads.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = { viewModel.requestShizukuPermission(context) }, enabled = !state.isCompressing) {
                     Text("Authorize")
+                }
+                OutlinedButton(onClick = onRequestOriginalMediaAccess, enabled = !state.isCompressing) {
+                    Text("Metadata access")
                 }
                 OutlinedButton(onClick = { viewModel.testReplacementAccess(context) }, enabled = !state.isCompressing) {
                     Text("Test access")
@@ -380,6 +419,14 @@ private fun persistVideoPermissions(context: Context, uris: List<Uri>) {
         runCatching { resolver.takePersistableUriPermission(uri, readWriteFlags) }
             .recoverCatching { resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
     }
+}
+
+private fun needsOriginalMediaLocationPermission(context: Context): Boolean {
+    return Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ACCESS_MEDIA_LOCATION
+        ) != PackageManager.PERMISSION_GRANTED
 }
 
 private fun shareCompressedOutputs(context: Context, state: BatchCompressorUiState) {
