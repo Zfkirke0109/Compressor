@@ -7,11 +7,10 @@ enum class EncoderMode(val reportLabel: String) {
 }
 
 internal object EncoderModeSelector {
-    fun chooseForOriginal(isOriginalMode: Boolean, cqSupported: Boolean): EncoderMode {
+    fun chooseInitialMode(isOriginalMode: Boolean): EncoderMode {
         return when {
             !isOriginalMode -> EncoderMode.NOT_EXPOSED
-            cqSupported -> EncoderMode.CQ
-            else -> EncoderMode.VBR_FALLBACK
+            else -> EncoderMode.CQ
         }
     }
 }

@@ -5,18 +5,10 @@ import org.junit.Test
 
 class EncoderModeSelectorTest {
     @Test
-    fun originalModeChoosesCqWhenSupported() {
+    fun originalModeStartsWithCqAttempt() {
         assertEquals(
             EncoderMode.CQ,
-            EncoderModeSelector.chooseForOriginal(isOriginalMode = true, cqSupported = true)
-        )
-    }
-
-    @Test
-    fun originalModeChoosesVbrFallbackWhenCqUnsupported() {
-        assertEquals(
-            EncoderMode.VBR_FALLBACK,
-            EncoderModeSelector.chooseForOriginal(isOriginalMode = true, cqSupported = false)
+            EncoderModeSelector.chooseInitialMode(isOriginalMode = true)
         )
     }
 
@@ -24,7 +16,7 @@ class EncoderModeSelectorTest {
     fun nonOriginalModeLeavesEncoderModeNeutral() {
         assertEquals(
             EncoderMode.NOT_EXPOSED,
-            EncoderModeSelector.chooseForOriginal(isOriginalMode = false, cqSupported = true)
+            EncoderModeSelector.chooseInitialMode(isOriginalMode = false)
         )
     }
 }

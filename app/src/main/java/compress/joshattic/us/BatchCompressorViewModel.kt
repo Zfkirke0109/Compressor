@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.util.Log
 import androidx.annotation.OptIn
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -47,6 +48,8 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+
+private const val BATCH_LOG_TAG = "CompressorBatch"
 
 private enum class BatchQualityPreset(val label: String, val targetRatio: Float) {
     REMUX_ONLY("Remux only", 1.0f),
@@ -929,21 +932,34 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     ): EncodeResult = withContext(Dispatchers.Main) {
         val outputDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
         val outputFile = File(outputDir, item.outputName(quality))
-        val initialMode = EncoderModeSelector.chooseForOriginal(
-            isOriginalMode = quality == BatchQualityPreset.ORIGINAL,
-            cqSupported = supportsEncoderBitrateMode(
-                videoMimeType,
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ
-            )
+        val cqSupported = supportsEncoderBitrateMode(
+            videoMimeType,
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ
+        )
+        val initialMode = EncoderModeSelector.chooseInitialMode(
+            isOriginalMode = quality == BatchQualityPreset.ORIGINAL
+        )
+        Log.i(
+            BATCH_LOG_TAG,
+            "Starting export: file=${item.originalName}, quality=${quality.label}, mime=$videoMimeType, cqSupported=$cqSupported, requestedEncoderMode=${initialMode.reportLabel}"
         )
 
         try {
             runTransformerExport(context, item, index, quality, frameRate, videoMimeType, outputFile, initialMode)
+            Log.i(
+                BATCH_LOG_TAG,
+                "Export completed: file=${item.originalName}, mime=$videoMimeType, encoderMode=${initialMode.reportLabel}, bytes=${outputFile.length()}"
+            )
             EncodeResult(outputFile, initialMode)
         } catch (error: Exception) {
             if (error is kotlinx.coroutines.CancellationException || initialMode != EncoderMode.CQ) {
                 throw error
             }
+            Log.w(
+                BATCH_LOG_TAG,
+                "CQ export failed; retrying VBR fallback: file=${item.originalName}, mime=$videoMimeType, cqSupported=$cqSupported, error=${error.fullMessage()}",
+                error
+            )
             if (outputFile.exists()) outputFile.delete()
             updateItem(index) {
                 it.copy(message = "CQ encoder failed to initialize; retrying with high-bitrate VBR fallback.")
@@ -957,6 +973,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 videoMimeType = videoMimeType,
                 outputFile = outputFile,
                 encoderMode = EncoderMode.VBR_FALLBACK
+            )
+            Log.i(
+                BATCH_LOG_TAG,
+                "VBR fallback completed: file=${item.originalName}, mime=$videoMimeType, bytes=${outputFile.length()}"
             )
             EncodeResult(outputFile, EncoderMode.VBR_FALLBACK)
         }
