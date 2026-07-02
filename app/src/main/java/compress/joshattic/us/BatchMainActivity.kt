@@ -432,6 +432,7 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
 @Composable
 private fun PreservationReportCard(state: BatchCompressorUiState) {
     val dateCount = state.items.count { it.metadataSnapshot.hasDate }
+    val mp4DateCount = state.items.count { !it.metadataSnapshot.rawDateTag.isNullOrBlank() }
     val locationCount = state.items.count { it.metadataSnapshot.hasLocation }
     val outputCount = state.items.count { it.outputSize > 0L }
     val skippedCount = state.items.count { it.status == BatchItemStatus.Skipped || it.isAlreadyCompressed }
@@ -448,6 +449,13 @@ private fun PreservationReportCard(state: BatchCompressorUiState) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            if (mp4DateCount > 0) {
+                Text(
+                    "Date diagnostics: $mp4DateCount source date tag${if (mp4DateCount == 1) "" else "s"} found through MP4/retriever metadata.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
 
             if (state.hasOutputs) {
                 Text(
@@ -555,7 +563,7 @@ private fun BatchVideoItem.shortStatusLabel(): String {
 }
 
 private fun BatchVideoItem.preservationSummary(): String {
-    val date = if (metadataSnapshot.hasDate) "date ✓" else "date —"
+    val date = if (metadataSnapshot.hasDate) "${metadataSnapshot.dateDiagnosticLabel} ✓" else "date —"
     val location = if (metadataSnapshot.hasLocation) "location ✓" else "location —"
     val replacement = when (status) {
         BatchItemStatus.Replaced -> "original replaced"

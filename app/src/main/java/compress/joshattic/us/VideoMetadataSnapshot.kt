@@ -21,6 +21,8 @@ data class VideoMetadataSnapshot(
     val dateTakenMs: Long? = null,
     val dateModifiedSeconds: Long? = null,
     val dateAddedSeconds: Long? = null,
+    val rawDateTag: String? = null,
+    val dateSource: String? = null,
     val latitude: Double? = null,
     val longitude: Double? = null,
     val rawLocationTag: String? = null,
@@ -35,6 +37,14 @@ data class VideoMetadataSnapshot(
 
     val hasRawLocation: Boolean
         get() = !rawLocationTag.isNullOrBlank()
+
+    val dateDiagnosticLabel: String
+        get() = dateSource ?: when {
+            dateTakenMs != null -> "source date"
+            dateModifiedSeconds != null -> "modified date"
+            dateAddedSeconds != null -> "added date"
+            else -> "date"
+        }
 }
 
 data class MetadataRestoreReport(
@@ -109,6 +119,17 @@ object VideoMetadataPreserver {
             }
         }
 
+        val retrieverDate = extractRetrieverDate(context, originalUri)
+            ?: runCatching { retriever?.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DATE) }.getOrNull()
+        val retrieverDateMs = parseRetrieverDateMs(retrieverDate)
+        val existingDateSource = when {
+            snapshot.dateTakenMs != null -> "MediaStore date"
+            snapshot.dateModifiedSeconds != null -> "MediaStore modified"
+            snapshot.dateAddedSeconds != null -> "MediaStore added"
+            else -> null
+        }
+        val finalDateSource = existingDateSource ?: if (retrieverDateMs != null) "MP4/retriever date" else null
+
         val retrieverLocation = extractRetrieverLocation(context, originalUri)
             ?: runCatching { retriever?.extractMetadata(MediaMetadataRetriever.METADATA_KEY_LOCATION) }.getOrNull()
 
@@ -122,6 +143,9 @@ object VideoMetadataPreserver {
         }.getOrNull()
 
         return snapshot.copy(
+            dateTakenMs = snapshot.dateTakenMs ?: retrieverDateMs,
+            rawDateTag = retrieverDate,
+            dateSource = finalDateSource,
             latitude = parsedLocation?.first,
             longitude = parsedLocation?.second,
             rawLocationTag = retrieverLocation ?: atomLocation,
@@ -242,6 +266,18 @@ object VideoMetadataPreserver {
         }
     }
 
+    private fun extractRetrieverDate(context: Context, uri: Uri): String? {
+        return runCatching {
+            val metadataRetriever = MediaMetadataRetriever()
+            try {
+                metadataRetriever.setDataSource(context, uri)
+                metadataRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DATE)
+            } finally {
+                runCatching { metadataRetriever.release() }
+            }
+        }.getOrNull()
+    }
+
     private fun extractRetrieverLocation(context: Context, uri: Uri): String? {
         return runCatching {
             val metadataRetriever = MediaMetadataRetriever()
@@ -331,7 +367,7 @@ object VideoMetadataPreserver {
     ): String? {
         if (end <= start) return null
         val length = (end - start).coerceAtMost(MAX_LOCATION_ATOM_BYTES.toLong()).toInt()
-        val text = readChunk(channel, start, length).toString(StandardCharsets.ISO_8859_1)
+        val text = String(readChunk(channel, start, length), StandardCharsets.ISO_8859_1)
         return findPreciseIso6709LocationInText(text)
     }
 
@@ -367,6 +403,40 @@ object VideoMetadataPreserver {
         return pattern.findAll(text)
             .map { it.value }
             .firstOrNull { parseIso6709Location(it) != null }
+    }
+
+    private fun parseRetrieverDateMs(value: String?): Long? {
+        if (value.isNullOrBlank()) return null
+
+        val raw = value.trim()
+        val normalized = raw.replace(Regex("([+-]\\d{2}):(\\d{2})$"), "$1$2")
+
+        val utc = TimeZone.getTimeZone("UTC")
+        val candidates = listOf(
+            "yyyyMMdd'T'HHmmss.SSS'Z'" to utc,
+            "yyyyMMdd'T'HHmmss'Z'" to utc,
+            "yyyyMMdd'T'HHmmss.SSSZ" to null,
+            "yyyyMMdd'T'HHmmssZ" to null,
+            "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'" to utc,
+            "yyyy-MM-dd'T'HH:mm:ss'Z'" to utc,
+            "yyyy-MM-dd'T'HH:mm:ss.SSSZ" to null,
+            "yyyy-MM-dd'T'HH:mm:ssZ" to null,
+            "yyyy:MM:dd HH:mm:ss" to TimeZone.getDefault(),
+            "yyyy-MM-dd HH:mm:ss" to TimeZone.getDefault()
+        )
+
+        for ((pattern, zone) in candidates) {
+            val parsed = runCatching {
+                SimpleDateFormat(pattern, Locale.US).apply {
+                    isLenient = false
+                    if (zone != null) timeZone = zone
+                }.parse(normalized)?.time
+            }.getOrNull()
+
+            if (parsed != null && parsed > 0L) return parsed
+        }
+
+        return null
     }
 
     private fun parseIso6709Location(value: String?): Pair<Double, Double>? {
