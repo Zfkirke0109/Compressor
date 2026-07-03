@@ -569,16 +569,23 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             if (
                                 BatchQualityBitratePolicy.shouldUseRemuxFallbackForPerceptualOutput(
                                     quality = quality,
-                                    originalSize = item.originalSize,
+                                    baselineSize = item.originalSize,
                                     outputSize = metadataRemuxResult.outputFile.length()
                                 )
                             ) {
+                                val candidateSize = metadataRemuxResult.outputFile.length()
+                                val toleranceBytes = BatchQualityBitratePolicy.perceptualOversizeToleranceBytes(item.originalSize)
+                                Log.w(
+                                    BATCH_LOG_TAG,
+                                    "Perceptually Lossless encoder overshot target; candidate larger than source. " +
+                                        "sourceBytes=${item.originalSize}, candidateBytes=$candidateSize, toleranceBytes=$toleranceBytes"
+                                )
                                 encoderMode = EncoderMode.NOT_EXPOSED
                                 outputQuality = BatchQualityPreset.REMUX_ONLY
-                                fallbackMessage = "Perceptually Lossless re-encode was not smaller than the source; saved a zero-loss Remux Only fallback instead."
+                                fallbackMessage = BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE
                                 runCatching { metadataRemuxResult.outputFile.delete() }
                                 updateItem(index) {
-                                    it.copy(message = "Perceptually Lossless was not smaller; saving zero-loss Remux Only fallback.")
+                                    it.copy(message = BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE)
                                 }
                                 remuxOnlyOne(context, item, index, privacyMode)
                             } else {

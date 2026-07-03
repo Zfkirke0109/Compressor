@@ -12,6 +12,12 @@ internal data class BatchBitrateSource(
 )
 
 internal object BatchQualityBitratePolicy {
+    const val PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE =
+        "Source was already highly efficient; kept exact remux instead of larger re-encode."
+
+    private const val PERCEPTUAL_OVERSIZE_TOLERANCE_RATIO = 0.01
+    private const val PERCEPTUAL_OVERSIZE_TOLERANCE_BYTES = 16L * 1024L * 1024L
+
     fun audioBitrate(source: BatchBitrateSource, quality: BatchQualityPreset): Int {
         val original = if (source.originalAudioBitrate > 0) source.originalAudioBitrate else 192_000
         return when (quality) {
@@ -30,7 +36,7 @@ internal object BatchQualityBitratePolicy {
             val originalTotal = if (source.originalBitrate > 0) source.originalBitrate else fallbackOriginalBitrate(source)
             val audio = if (source.originalAudioBitrate > 0) source.originalAudioBitrate else 192_000
             val originalVideo = (originalTotal - audio).coerceAtLeast(originalTotal / 2)
-            val ratio = if (videoMimeType == MimeTypes.VIDEO_H264) 0.95 else 0.82
+            val ratio = if (videoMimeType == MimeTypes.VIDEO_H264) 0.95 else 0.88
             val target = (originalVideo * ratio).toInt()
             val floor = perceptualLosslessFloor(source, originalVideo)
             return target.coerceIn(floor, originalVideo)
@@ -64,12 +70,19 @@ internal object BatchQualityBitratePolicy {
 
     fun shouldUseRemuxFallbackForPerceptualOutput(
         quality: BatchQualityPreset,
-        originalSize: Long,
+        baselineSize: Long,
         outputSize: Long
     ): Boolean {
-        return quality == BatchQualityPreset.PERCEPTUALLY_LOSSLESS &&
-            originalSize > 0L &&
-            outputSize >= originalSize
+        if (quality != BatchQualityPreset.PERCEPTUALLY_LOSSLESS) return false
+        if (baselineSize <= 0L || outputSize <= 0L) return false
+        val tolerance = perceptualOversizeToleranceBytes(baselineSize)
+        return outputSize > baselineSize + tolerance
+    }
+
+    fun perceptualOversizeToleranceBytes(baselineSize: Long): Long {
+        if (baselineSize <= 0L) return 0L
+        val ratioTolerance = (baselineSize * PERCEPTUAL_OVERSIZE_TOLERANCE_RATIO).toLong()
+        return minOf(ratioTolerance, PERCEPTUAL_OVERSIZE_TOLERANCE_BYTES)
     }
 
     private fun perceptualLosslessFloor(source: BatchBitrateSource, originalVideoBitrate: Int): Int {

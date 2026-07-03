@@ -38,4 +38,19 @@ class BatchSavingsCalculatorTest {
 
         assertEquals(300L, saved)
     }
+
+    @Test
+    fun largerFallbackOutputsDoNotReportSavings() {
+        val saved = BatchSavingsCalculator.savedBytes(
+            listOf(
+                BatchSavingsInput(
+                    originalSize = 4_131_195_352L,
+                    outputSize = 4_234_288_900L,
+                    hasOutput = true
+                )
+            )
+        )
+
+        assertEquals(0L, saved)
+    }
 }

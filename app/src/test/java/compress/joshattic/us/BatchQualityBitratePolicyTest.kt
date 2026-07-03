@@ -65,19 +65,41 @@ class BatchQualityBitratePolicyTest {
     }
 
     @Test
-    fun perceptuallyLosslessFallsBackToRemuxWhenEncodeIsNotSmaller() {
-        assertTrue(
+    fun perceptuallyLosslessKeepsReencodeWhenSmallerThanSource() {
+        assertFalse(
             BatchQualityBitratePolicy.shouldUseRemuxFallbackForPerceptualOutput(
                 quality = BatchQualityPreset.PERCEPTUALLY_LOSSLESS,
-                originalSize = 1_000L,
-                outputSize = 1_000L
+                baselineSize = 1_000L,
+                outputSize = 999L
             )
         )
+    }
+
+    @Test
+    fun perceptuallyLosslessKeepsReencodeWhenWithinOversizeTolerance() {
+        val sourceSize = 4_131_195_352L
+        val tolerance = 16L * 1024L * 1024L
+
+        assertEquals(
+            tolerance,
+            BatchQualityBitratePolicy.perceptualOversizeToleranceBytes(sourceSize)
+        )
+        assertFalse(
+            BatchQualityBitratePolicy.shouldUseRemuxFallbackForPerceptualOutput(
+                quality = BatchQualityPreset.PERCEPTUALLY_LOSSLESS,
+                baselineSize = sourceSize,
+                outputSize = sourceSize + tolerance
+            )
+        )
+    }
+
+    @Test
+    fun perceptuallyLosslessFallsBackToRemuxWhenS23OutputExceedsTolerance() {
         assertTrue(
             BatchQualityBitratePolicy.shouldUseRemuxFallbackForPerceptualOutput(
                 quality = BatchQualityPreset.PERCEPTUALLY_LOSSLESS,
-                originalSize = 1_000L,
-                outputSize = 1_100L
+                baselineSize = 4_131_195_352L,
+                outputSize = 4_234_288_900L
             )
         )
     }
@@ -87,9 +109,17 @@ class BatchQualityBitratePolicyTest {
         assertFalse(
             BatchQualityBitratePolicy.shouldUseRemuxFallbackForPerceptualOutput(
                 quality = BatchQualityPreset.HIGH_QUALITY,
-                originalSize = 1_000L,
+                baselineSize = 1_000L,
                 outputSize = 1_100L
             )
+        )
+    }
+
+    @Test
+    fun perceptualOversizeFallbackMessageIsExact() {
+        assertEquals(
+            "Source was already highly efficient; kept exact remux instead of larger re-encode.",
+            BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE
         )
     }
 }
