@@ -25,4 +25,4 @@ output-metadata.json
 *.log
 ci-debug.keystore
 app/release/baselineProfiles/0/app-release.dm
-app/release/baselineProfiles/0/app-release.dm
+.codex-remote-attachments/
