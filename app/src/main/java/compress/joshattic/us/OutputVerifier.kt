@@ -29,8 +29,9 @@ object OutputVerifier {
             outputProbe.durationMs > 0L &&
             outputTracks.videoCodec != null
 
-        val remuxOnly = modeLabel == "Remux only"
-        val originalMode = modeLabel == "Original"
+        val quality = BatchQualityPreset.fromLabel(modeLabel)
+        val remuxOnly = quality == BatchQualityPreset.REMUX_ONLY
+        val perceptuallyLossless = quality == BatchQualityPreset.PERCEPTUALLY_LOSSLESS
         val videoMatches = sameDimensions(source.originalWidth, source.originalHeight, outputProbe.width, outputProbe.height)
         val fpsComparison = OutputVerificationFormatter.fpsComparison(source.originalFps, outputProbe.fps)
         val remuxFpsBlockReason = OutputVerificationFormatter.remuxFpsBlockReason(source.originalFps, outputProbe.fps)
@@ -61,11 +62,11 @@ object OutputVerifier {
             outputExposed = outputTracks.hdrLabel != "not exposed",
             matches = hdrMatches
         )
-        val originalVbrWeakFps = originalMode &&
+        val perceptualVbrWeakFps = perceptuallyLossless &&
             encoderMode == EncoderMode.VBR_FALLBACK &&
             source.originalFps > 0f &&
             outputProbe.fps <= 0f
-        val originalVbrMaterialReduction = originalMode &&
+        val perceptualMaterialReduction = perceptuallyLossless &&
             encoderMode == EncoderMode.VBR_FALLBACK &&
             source.originalSize >= 200L * 1024L * 1024L &&
             outputFile.length() > 0L &&
@@ -73,7 +74,7 @@ object OutputVerifier {
 
         val replacementSafe = playable && when {
             remuxOnly -> videoMatches && fpsMatches && remuxFpsBlockReason == null && videoCodecMatches && audioCodecMatches && hdrMatches
-            originalMode -> videoMatches && fpsMatches && !originalVbrWeakFps && !originalVbrMaterialReduction
+            perceptuallyLossless -> videoMatches && fpsMatches && !perceptualVbrWeakFps && !perceptualMaterialReduction
             else -> true
         }
         val blockReason = when {
@@ -85,14 +86,13 @@ object OutputVerifier {
             remuxOnly && sourceTracks.audioCodec != null && outputTracks.audioCodec == null -> "remux output audio codec was not exposed"
             remuxOnly && !audioCodecMatches -> "remux output changed audio codec"
             remuxOnly && !hdrMatches -> "remux output changed HDR/color metadata"
-            originalMode && !videoMatches -> "Original output changed resolution"
-            originalMode && !fpsMatches -> "Original output changed FPS"
-            originalVbrWeakFps -> "Original VBR fallback could not verify output FPS"
-            originalVbrMaterialReduction -> "Original VBR fallback output looked materially reduced"
+            perceptuallyLossless && !videoMatches -> "Perceptually Lossless output changed resolution"
+            perceptuallyLossless && !fpsMatches -> "Perceptually Lossless output changed FPS"
+            perceptualVbrWeakFps -> "Perceptually Lossless VBR fallback could not verify output FPS"
+            perceptualMaterialReduction -> "Perceptually Lossless VBR fallback output looked materially reduced"
             else -> null
         }
 
-        val sourceDateText = if (source.metadataSnapshot.hasDate && !privacyMode.removeDate) "source date" else "not required"
         val sourceLocationText = if (source.metadataSnapshot.hasLocation && !privacyMode.removeLocation) "source location" else "not required"
 
         return OutputVerificationReport(
@@ -128,12 +128,16 @@ object OutputVerifier {
                 outputTracks.hdrLabel,
                 hdrComparison
             ),
-            date = when {
-                privacyMode.removeDate -> "omitted by privacy setting"
-                outputMetadata.hasDate -> "verified"
-                source.metadataSnapshot.hasDate -> "$sourceDateText will be restored where Android allows"
-                else -> "not exposed"
-            },
+            galleryDate = OutputDateVerificationFormatter.galleryDateStatus(
+                sourceHasDate = source.metadataSnapshot.hasDate,
+                outputHasGalleryDate = outputMetadata.dateSource?.startsWith("MediaStore") == true,
+                privacyMode = privacyMode
+            ),
+            mp4CreationTime = OutputDateVerificationFormatter.mp4CreationTimeStatus(
+                sourceRawDateTag = source.metadataSnapshot.rawDateTag,
+                outputRawDateTag = outputMetadata.rawDateTag,
+                privacyMode = privacyMode
+            ),
             location = when {
                 privacyMode.removeLocation -> "omitted by privacy setting"
                 outputMetadata.hasLocation -> "verified"

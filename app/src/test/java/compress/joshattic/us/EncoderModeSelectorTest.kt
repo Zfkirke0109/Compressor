@@ -5,18 +5,34 @@ import org.junit.Test
 
 class EncoderModeSelectorTest {
     @Test
-    fun originalModeStartsWithMedia3HighQualityTargeting() {
+    fun perceptuallyLosslessUsesConservativeVbr() {
         assertEquals(
-            EncoderMode.HIGH_QUALITY,
-            EncoderModeSelector.chooseInitialMode(isOriginalMode = true)
+            EncoderMode.PERCEPTUAL_VBR,
+            EncoderModeSelector.chooseInitialMode(BatchQualityPreset.PERCEPTUALLY_LOSSLESS)
         )
     }
 
     @Test
-    fun nonOriginalModeLeavesEncoderModeNeutral() {
+    fun highQualityUsesMedia3HighQualityTargeting() {
+        assertEquals(
+            EncoderMode.HIGH_QUALITY,
+            EncoderModeSelector.chooseInitialMode(BatchQualityPreset.HIGH_QUALITY)
+        )
+    }
+
+    @Test
+    fun storageSaverUsesStorageSaverVbr() {
+        assertEquals(
+            EncoderMode.STORAGE_SAVER,
+            EncoderModeSelector.chooseInitialMode(BatchQualityPreset.STORAGE_SAVER)
+        )
+    }
+
+    @Test
+    fun remuxModeLeavesEncoderModeNeutral() {
         assertEquals(
             EncoderMode.NOT_EXPOSED,
-            EncoderModeSelector.chooseInitialMode(isOriginalMode = false)
+            EncoderModeSelector.chooseInitialMode(BatchQualityPreset.REMUX_ONLY)
         )
     }
 }

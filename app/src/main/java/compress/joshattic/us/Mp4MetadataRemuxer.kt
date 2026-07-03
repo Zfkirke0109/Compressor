@@ -18,7 +18,7 @@ data class Mp4MetadataRemuxResult(
 
 object Mp4MetadataRemuxer {
     private const val DEFAULT_BUFFER_SIZE = 4 * 1024 * 1024
-    const val REMUX_ONLY_UNSUPPORTED_MESSAGE = "Remux-only is not supported for this file. Use Original mode instead."
+    const val REMUX_ONLY_UNSUPPORTED_MESSAGE = "Remux-only is not supported for this file. Use Perceptually Lossless instead."
 
     fun remuxSourceWithoutReencode(
         context: Context,

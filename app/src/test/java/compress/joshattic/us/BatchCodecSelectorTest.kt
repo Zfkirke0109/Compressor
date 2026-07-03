@@ -57,6 +57,23 @@ class BatchCodecSelectorTest {
     }
 
     @Test
+    fun autoStaysHevcFirstForS23UltraCameraArchiveWorkflow() {
+        val s23UltraProfile = DeviceCapabilityProfile(
+            name = "Samsung Galaxy S23 Ultra",
+            isGalaxyS23Ultra = true,
+            preferHevcForDefaultCompression = true,
+            avoidAv1EncodingByDefault = true,
+            recommendedBatchParallelism = 1
+        )
+        val supported = setOf(MimeTypes.VIDEO_H264, MimeTypes.VIDEO_H265, MimeTypes.VIDEO_AV1)
+
+        assertEquals(
+            MimeTypes.VIDEO_H265,
+            BatchCodecSelector.chooseOutputMime(BatchCodecOption.AUTO, supported, s23UltraProfile)
+        )
+    }
+
+    @Test
     fun availableLabelsShowAv1OnlyWhenSupported() {
         assertTrue(
             BatchCodecSelector.availableLabels(

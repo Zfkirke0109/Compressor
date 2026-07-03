@@ -146,7 +146,7 @@ private fun BatchCompressorScreen(
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("Samsung Galaxy S23 Ultra optimized", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "Default is Original: keep 4K as 4K, keep source FPS/audio, and use the highest-quality re-encode path. Remux Only is the guaranteed zero-loss mode.",
+                        "Default is Perceptually Lossless: keep 4K as 4K, keep source FPS/audio, and use a conservative high-bitrate re-encode path. Remux Only is the guaranteed zero-loss mode.",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -242,7 +242,8 @@ private fun BatchSettingsCard(
 ) {
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            val remuxOnly = state.qualityPreset == "Remux only"
+            val remuxOnly = state.qualityPreset == BatchQualityPreset.REMUX_ONLY.label
+            val perceptuallyLossless = state.qualityPreset == BatchQualityPreset.PERCEPTUALLY_LOSSLESS.label
             Text("Batch settings", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
 
             Text("S23 Ultra presets", style = MaterialTheme.typography.labelLarge)
@@ -269,33 +270,31 @@ private fun BatchSettingsCard(
 
             Text("Video mode", style = MaterialTheme.typography.labelLarge)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Remux only", "Original").forEach { label ->
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    listOf(BatchQualityPreset.REMUX_ONLY, BatchQualityPreset.PERCEPTUALLY_LOSSLESS).forEach { mode ->
                         FilterChip(
-                            selected = state.qualityPreset == label,
-                            onClick = { viewModel.setQuality(label) },
-                            label = { Text(label, maxLines = 1) },
+                            selected = state.qualityPreset == mode.label,
+                            onClick = { viewModel.setQuality(mode.label) },
+                            label = { Text(mode.label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                            modifier = Modifier.weight(1f),
                             enabled = !state.isCompressing
                         )
                     }
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("High", "Medium", "Low").forEach { label ->
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    listOf(BatchQualityPreset.HIGH_QUALITY, BatchQualityPreset.STORAGE_SAVER).forEach { mode ->
                         FilterChip(
-                            selected = state.qualityPreset == label,
-                            onClick = { viewModel.setQuality(label) },
-                            label = { Text(label, maxLines = 1) },
+                            selected = state.qualityPreset == mode.label,
+                            onClick = { viewModel.setQuality(mode.label) },
+                            label = { Text(mode.label, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                            modifier = Modifier.weight(1f),
                             enabled = !state.isCompressing
                         )
                     }
                 }
             }
             Text(
-                if (remuxOnly) {
-                    "No re-encode: video/audio copied unchanged. This keeps quality exact but may not shrink much."
-                } else {
-                    "Original is the highest-quality re-encode: CQ when hardware supports it, high-bitrate fallback otherwise. Remux Only is the zero-quality-loss choice."
-                },
+                BatchQualityPreset.fromLabel(state.qualityPreset).description,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -329,7 +328,7 @@ private fun BatchSettingsCard(
                             selected = state.frameRateOption == label,
                             onClick = { viewModel.setFrameRate(label) },
                             label = { Text(label, maxLines = 1) },
-                            enabled = !state.isCompressing && !remuxOnly
+                            enabled = !state.isCompressing && !remuxOnly && !perceptuallyLossless
                         )
                     }
                 }
@@ -338,15 +337,17 @@ private fun BatchSettingsCard(
                         selected = state.frameRateOption == "24 fps",
                         onClick = { viewModel.setFrameRate("24 fps") },
                         label = { Text("24 fps", maxLines = 1) },
-                        enabled = !state.isCompressing && !remuxOnly
+                        enabled = !state.isCompressing && !remuxOnly && !perceptuallyLossless
                     )
                 }
             }
             Text(
                 if (remuxOnly) {
                     "Disabled in Remux Only because source timestamps and FPS are copied unchanged."
+                } else if (perceptuallyLossless) {
+                    "Disabled in Perceptually Lossless because source FPS is preserved."
                 } else {
-                    "Original keeps source FPS. 60 caps high-frame-rate clips to 60. 30/24 lower higher-frame-rate clips only when selected."
+                    "Original FPS keeps source FPS. 60 caps high-frame-rate clips to 60. 30/24 lower higher-frame-rate clips only when selected."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -716,7 +717,7 @@ private fun BatchVideoItem.beforeAfterSummary(): String {
     val savedBytes = (originalSize - outputSize).coerceAtLeast(0L)
     val savedPercent = if (originalSize > 0L) ((savedBytes * 100.0) / originalSize).toInt() else 0
     val similarSize = originalSize > 0L && kotlin.math.abs(outputSize - originalSize).toDouble() / originalSize.toDouble() < 0.03
-    if (outputMode == "Remux only" && similarSize) {
+    if (outputMode == BatchQualityPreset.REMUX_ONLY.label && similarSize) {
         return "Before/after: ${formatCardBytes(originalSize)} -> ${formatCardBytes(outputSize)} • size similar"
     }
     return "Before/after: ${formatCardBytes(originalSize)} → ${formatCardBytes(outputSize)} • saved ${formatCardBytes(savedBytes)} ($savedPercent%)"
