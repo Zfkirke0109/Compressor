@@ -11,12 +11,26 @@ internal data class BatchBitrateSource(
     val durationMs: Long
 )
 
+internal data class PerceptualEncodeDecision(
+    val shouldEncode: Boolean,
+    val targetBitrate: Int,
+    val visualTargetBitrate: Int,
+    val safeBudgetBitrate: Int,
+    val floorBitrate: Int,
+    val originalVideoBitrate: Int,
+    val overshootFactor: Double
+)
+
 internal object BatchQualityBitratePolicy {
     const val PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE =
         "Source was already highly efficient; kept exact remux instead of larger re-encode."
 
     private const val PERCEPTUAL_OVERSIZE_TOLERANCE_RATIO = 0.01
     private const val PERCEPTUAL_OVERSIZE_TOLERANCE_BYTES = 16L * 1024L * 1024L
+    private const val PERCEPTUAL_SIZE_BUDGET_RATIO = 0.98
+    private const val PERCEPTUAL_MUX_OVERHEAD_MIN_BYTES = 1_500_000.0
+    private const val PERCEPTUAL_MUX_OVERHEAD_RATIO = 0.003
+    private const val MIN_OVERSHOOT_FACTOR = 1.0
 
     fun audioBitrate(source: BatchBitrateSource, quality: BatchQualityPreset): Int {
         val original = if (source.originalAudioBitrate > 0) source.originalAudioBitrate else 192_000
@@ -28,18 +42,17 @@ internal object BatchQualityBitratePolicy {
         }
     }
 
-    fun videoBitrate(source: BatchBitrateSource, quality: BatchQualityPreset, videoMimeType: String): Int {
+    fun videoBitrate(
+        source: BatchBitrateSource,
+        quality: BatchQualityPreset,
+        videoMimeType: String,
+        perceptualHevcOvershootFactor: Double = MIN_OVERSHOOT_FACTOR
+    ): Int {
         if (quality == BatchQualityPreset.REMUX_ONLY) {
             return source.originalBitrate.takeIf { it > 0 } ?: fallbackOriginalBitrate(source)
         }
         if (quality == BatchQualityPreset.PERCEPTUALLY_LOSSLESS) {
-            val originalTotal = if (source.originalBitrate > 0) source.originalBitrate else fallbackOriginalBitrate(source)
-            val audio = if (source.originalAudioBitrate > 0) source.originalAudioBitrate else 192_000
-            val originalVideo = (originalTotal - audio).coerceAtLeast(originalTotal / 2)
-            val ratio = if (videoMimeType == MimeTypes.VIDEO_H264) 0.95 else 0.88
-            val target = (originalVideo * ratio).toInt()
-            val floor = perceptualLosslessFloor(source, originalVideo)
-            return target.coerceIn(floor, originalVideo)
+            return perceptualEncodeDecision(source, videoMimeType, perceptualHevcOvershootFactor).targetBitrate
         }
 
         val durationSec = (source.durationMs / 1000.0).coerceAtLeast(1.0)
@@ -68,6 +81,36 @@ internal object BatchQualityBitratePolicy {
         }.coerceAtLeast(2)
     }
 
+    fun perceptualEncodeDecision(
+        source: BatchBitrateSource,
+        videoMimeType: String,
+        perceptualHevcOvershootFactor: Double = MIN_OVERSHOOT_FACTOR
+    ): PerceptualEncodeDecision {
+        val originalTotal = if (source.originalBitrate > 0) source.originalBitrate else fallbackOriginalBitrate(source)
+        val audio = if (source.originalAudioBitrate > 0) source.originalAudioBitrate else 192_000
+        val originalVideo = (originalTotal - audio).coerceAtLeast(originalTotal / 2)
+        val ratio = if (videoMimeType == MimeTypes.VIDEO_H264) 0.95 else 0.88
+        val visualTarget = (originalVideo * ratio).toInt().coerceAtMost(originalVideo)
+        val floor = perceptualLosslessFloor(source, originalVideo)
+        val effectiveOvershootFactor = if (videoMimeType == MimeTypes.VIDEO_H265) {
+            perceptualHevcOvershootFactor.coerceAtLeast(MIN_OVERSHOOT_FACTOR)
+        } else {
+            MIN_OVERSHOOT_FACTOR
+        }
+        val safeBudget = perceptualSafeBudgetBitrate(source, audio, originalVideo, effectiveOvershootFactor)
+        val target = minOf(visualTarget, safeBudget).coerceAtMost(originalVideo).coerceAtLeast(0)
+
+        return PerceptualEncodeDecision(
+            shouldEncode = target >= floor,
+            targetBitrate = target,
+            visualTargetBitrate = visualTarget,
+            safeBudgetBitrate = safeBudget,
+            floorBitrate = floor,
+            originalVideoBitrate = originalVideo,
+            overshootFactor = effectiveOvershootFactor
+        )
+    }
+
     fun shouldUseRemuxFallbackForPerceptualOutput(
         quality: BatchQualityPreset,
         baselineSize: Long,
@@ -83,6 +126,30 @@ internal object BatchQualityBitratePolicy {
         if (baselineSize <= 0L) return 0L
         val ratioTolerance = (baselineSize * PERCEPTUAL_OVERSIZE_TOLERANCE_RATIO).toLong()
         return minOf(ratioTolerance, PERCEPTUAL_OVERSIZE_TOLERANCE_BYTES)
+    }
+
+    private fun perceptualSafeBudgetBitrate(
+        source: BatchBitrateSource,
+        audioBitrate: Int,
+        originalVideoBitrate: Int,
+        overshootFactor: Double
+    ): Int {
+        if (source.originalSize <= 0L || source.durationMs <= 0L) {
+            return originalVideoBitrate
+        }
+
+        val durationSec = (source.durationMs / 1000.0).coerceAtLeast(1.0)
+        val maxFinalBytes = source.originalSize.toDouble() * PERCEPTUAL_SIZE_BUDGET_RATIO
+        val audioBytes = (audioBitrate / 8.0) * durationSec
+        val muxOverheadBytes = maxOf(
+            PERCEPTUAL_MUX_OVERHEAD_MIN_BYTES,
+            source.originalSize.toDouble() * PERCEPTUAL_MUX_OVERHEAD_RATIO
+        )
+        val videoBudgetBytes = (maxFinalBytes - audioBytes - muxOverheadBytes).coerceAtLeast(0.0)
+        return ((videoBudgetBytes * 8.0) / durationSec / overshootFactor)
+            .toInt()
+            .coerceAtMost(originalVideoBitrate)
+            .coerceAtLeast(0)
     }
 
     private fun perceptualLosslessFloor(source: BatchBitrateSource, originalVideoBitrate: Int): Int {

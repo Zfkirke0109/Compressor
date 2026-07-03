@@ -14,6 +14,7 @@ data class DeviceCapabilityProfile(
     val preferHevcForDefaultCompression: Boolean,
     val avoidAv1EncodingByDefault: Boolean,
     val recommendedBatchParallelism: Int,
+    val perceptualHevcVbrOvershootFactor: Double = 1.0,
     val notes: List<String> = emptyList()
 ) {
     fun chooseDefaultVideoCodec(supportedCodecs: List<String>): String {
@@ -47,9 +48,11 @@ object DeviceCapabilityProfiles {
                 preferHevcForDefaultCompression = true,
                 avoidAv1EncodingByDefault = true,
                 recommendedBatchParallelism = 1,
+                perceptualHevcVbrOvershootFactor = 1.28,
                 notes = listOf(
                     "Prefer HEVC/H.265 for camera videos to keep quality high at smaller file sizes.",
                     "Run batch compression sequentially to avoid thermal throttling during long 4K/8K jobs.",
+                    "Budget Perceptually Lossless HEVC VBR for measured Qualcomm Codec2 overshoot on this device.",
                     "Avoid AV1 as a default encode target even if a codec advertises support; keep it opt-in after device testing."
                 )
             )

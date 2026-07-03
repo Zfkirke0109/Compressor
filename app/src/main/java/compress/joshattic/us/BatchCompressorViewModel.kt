@@ -557,39 +557,63 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         remuxOnlyOne(context, item, index, privacyMode)
                     } else {
                         try {
-                            val encoded = compressOne(context, item, index, quality, frameRate, preferredMime)
-                            encoderMode = encoded.encoderMode
-                            val metadataRemuxResult = withContext(Dispatchers.IO) {
-                                Mp4MetadataRemuxer.remuxWithSourceMetadata(
-                                    context,
-                                    encoded.file,
-                                    item.metadataSnapshot.filteredForPrivacy(privacyMode)
-                                )
+                            val perceptualDecision = if (quality == BatchQualityPreset.PERCEPTUALLY_LOSSLESS) {
+                                perceptualEncodeDecision(item, preferredMime)
+                            } else {
+                                null
                             }
-                            if (
-                                BatchQualityBitratePolicy.shouldUseRemuxFallbackForPerceptualOutput(
-                                    quality = quality,
-                                    baselineSize = item.originalSize,
-                                    outputSize = metadataRemuxResult.outputFile.length()
-                                )
-                            ) {
-                                val candidateSize = metadataRemuxResult.outputFile.length()
-                                val toleranceBytes = BatchQualityBitratePolicy.perceptualOversizeToleranceBytes(item.originalSize)
+                            if (perceptualDecision?.shouldEncode == false) {
                                 Log.w(
                                     BATCH_LOG_TAG,
-                                    "Perceptually Lossless encoder overshot target; candidate larger than source. " +
-                                        "sourceBytes=${item.originalSize}, candidateBytes=$candidateSize, toleranceBytes=$toleranceBytes"
+                                    "Skipping Perceptually Lossless encode; safe target is below visual floor. " +
+                                        "targetBitrate=${perceptualDecision.targetBitrate}, " +
+                                        "safeBudgetBitrate=${perceptualDecision.safeBudgetBitrate}, " +
+                                        "visualTargetBitrate=${perceptualDecision.visualTargetBitrate}, " +
+                                        "floorBitrate=${perceptualDecision.floorBitrate}, " +
+                                        "overshootFactor=${perceptualDecision.overshootFactor}"
                                 )
                                 encoderMode = EncoderMode.NOT_EXPOSED
                                 outputQuality = BatchQualityPreset.REMUX_ONLY
                                 fallbackMessage = BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE
-                                runCatching { metadataRemuxResult.outputFile.delete() }
                                 updateItem(index) {
                                     it.copy(message = BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE)
                                 }
                                 remuxOnlyOne(context, item, index, privacyMode)
                             } else {
-                                metadataRemuxResult
+                                val encoded = compressOne(context, item, index, quality, frameRate, preferredMime)
+                                encoderMode = encoded.encoderMode
+                                val metadataRemuxResult = withContext(Dispatchers.IO) {
+                                    Mp4MetadataRemuxer.remuxWithSourceMetadata(
+                                        context,
+                                        encoded.file,
+                                        item.metadataSnapshot.filteredForPrivacy(privacyMode)
+                                    )
+                                }
+                                if (
+                                    BatchQualityBitratePolicy.shouldUseRemuxFallbackForPerceptualOutput(
+                                        quality = quality,
+                                        baselineSize = item.originalSize,
+                                        outputSize = metadataRemuxResult.outputFile.length()
+                                    )
+                                ) {
+                                    val candidateSize = metadataRemuxResult.outputFile.length()
+                                    val toleranceBytes = BatchQualityBitratePolicy.perceptualOversizeToleranceBytes(item.originalSize)
+                                    Log.w(
+                                        BATCH_LOG_TAG,
+                                        "Perceptually Lossless encoder overshot target; candidate larger than source. " +
+                                            "sourceBytes=${item.originalSize}, candidateBytes=$candidateSize, toleranceBytes=$toleranceBytes"
+                                    )
+                                    encoderMode = EncoderMode.NOT_EXPOSED
+                                    outputQuality = BatchQualityPreset.REMUX_ONLY
+                                    fallbackMessage = BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE
+                                    runCatching { metadataRemuxResult.outputFile.delete() }
+                                    updateItem(index) {
+                                        it.copy(message = BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE)
+                                    }
+                                    remuxOnlyOne(context, item, index, privacyMode)
+                                } else {
+                                    metadataRemuxResult
+                                }
                             }
                         } catch (encodeError: Exception) {
                             if (encodeError is kotlinx.coroutines.CancellationException ||
@@ -1223,7 +1247,20 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     }
 
     private fun calculateVideoBitrate(item: BatchVideoItem, quality: BatchQualityPreset, videoMimeType: String): Int {
-        return BatchQualityBitratePolicy.videoBitrate(item.toBitrateSource(), quality, videoMimeType)
+        return BatchQualityBitratePolicy.videoBitrate(
+            item.toBitrateSource(),
+            quality,
+            videoMimeType,
+            DeviceCapabilityProfiles.current().perceptualHevcVbrOvershootFactor
+        )
+    }
+
+    private fun perceptualEncodeDecision(item: BatchVideoItem, videoMimeType: String): PerceptualEncodeDecision {
+        return BatchQualityBitratePolicy.perceptualEncodeDecision(
+            item.toBitrateSource(),
+            videoMimeType,
+            DeviceCapabilityProfiles.current().perceptualHevcVbrOvershootFactor
+        )
     }
 
     private fun targetHeightFor(item: BatchVideoItem, quality: BatchQualityPreset): Int {

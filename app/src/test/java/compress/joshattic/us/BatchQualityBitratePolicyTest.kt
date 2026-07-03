@@ -7,6 +7,8 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BatchQualityBitratePolicyTest {
+    private val s23HevcOvershootFactor = 1.28
+
     private val s23HdrSource = BatchBitrateSource(
         originalSize = 1_500_000_000L,
         originalBitrate = 119_900_000,
@@ -17,11 +19,12 @@ class BatchQualityBitratePolicyTest {
     )
 
     @Test
-    fun perceptuallyLosslessBitrateIsMoreConservativeThanCompressionModes() {
+    fun perceptuallyLosslessBitrateUsesMeasuredS23SafeBudget() {
         val perceptual = BatchQualityBitratePolicy.videoBitrate(
             s23HdrSource,
             BatchQualityPreset.PERCEPTUALLY_LOSSLESS,
-            MimeTypes.VIDEO_H265
+            MimeTypes.VIDEO_H265,
+            s23HevcOvershootFactor
         )
         val highQuality = BatchQualityBitratePolicy.videoBitrate(
             s23HdrSource,
@@ -37,7 +40,35 @@ class BatchQualityBitratePolicyTest {
         assertTrue(perceptual > highQuality)
         assertTrue(highQuality > storageSaver)
         assertTrue(perceptual >= 85_000_000)
+        assertTrue(perceptual in 90_000_000..95_000_000)
         assertTrue(perceptual <= s23HdrSource.originalBitrate)
+    }
+
+    @Test
+    fun perceptuallyLosslessKeepsVisualTargetWithoutMeasuredOvershoot() {
+        val originalVideo = s23HdrSource.originalBitrate - s23HdrSource.originalAudioBitrate
+        val decision = BatchQualityBitratePolicy.perceptualEncodeDecision(
+            s23HdrSource,
+            MimeTypes.VIDEO_H265
+        )
+
+        assertTrue(decision.shouldEncode)
+        assertEquals((originalVideo * 0.88).toInt(), decision.targetBitrate)
+        assertEquals(1.0, decision.overshootFactor, 0.0)
+    }
+
+    @Test
+    fun perceptuallyLosslessSkipsEncodeWhenMeasuredSafeBudgetFallsBelowVisualFloor() {
+        val alreadyEfficientSource = s23HdrSource.copy(originalSize = 900_000_000L)
+        val decision = BatchQualityBitratePolicy.perceptualEncodeDecision(
+            alreadyEfficientSource,
+            MimeTypes.VIDEO_H265,
+            s23HevcOvershootFactor
+        )
+
+        assertFalse(decision.shouldEncode)
+        assertTrue(decision.targetBitrate < decision.floorBitrate)
+        assertEquals(85_000_000, decision.floorBitrate)
     }
 
     @Test
