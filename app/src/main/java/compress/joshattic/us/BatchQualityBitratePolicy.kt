@@ -8,7 +8,9 @@ internal data class BatchBitrateSource(
     val originalAudioBitrate: Int,
     val originalHeight: Int,
     val originalFps: Float,
-    val durationMs: Long
+    val durationMs: Long,
+    val originalVideoMimeType: String? = null,
+    val originalHdrLike: Boolean = false
 )
 
 internal data class PerceptualEncodeDecision(
@@ -89,7 +91,7 @@ internal object BatchQualityBitratePolicy {
         val originalTotal = if (source.originalBitrate > 0) source.originalBitrate else fallbackOriginalBitrate(source)
         val audio = if (source.originalAudioBitrate > 0) source.originalAudioBitrate else 192_000
         val originalVideo = (originalTotal - audio).coerceAtLeast(originalTotal / 2)
-        val ratio = if (videoMimeType == MimeTypes.VIDEO_H264) 0.95 else 0.88
+        val ratio = perceptualVisualTargetRatio(source, videoMimeType)
         val visualTarget = (originalVideo * ratio).toInt().coerceAtMost(originalVideo)
         val floor = perceptualLosslessFloor(source, originalVideo)
         val effectiveOvershootFactor = if (videoMimeType == MimeTypes.VIDEO_H265) {
@@ -152,8 +154,16 @@ internal object BatchQualityBitratePolicy {
             .coerceAtLeast(0)
     }
 
+    private fun perceptualVisualTargetRatio(source: BatchBitrateSource, videoMimeType: String): Double {
+        return when {
+            isFourKSixtyHevcHdr(source) -> 0.95
+            videoMimeType == MimeTypes.VIDEO_H264 -> 0.95
+            else -> 0.88
+        }
+    }
+
     private fun perceptualLosslessFloor(source: BatchBitrateSource, originalVideoBitrate: Int): Int {
-        val floor = when {
+        val staticFloor = when {
             source.originalHeight >= 2160 && source.originalFps >= 50f -> 85_000_000
             source.originalHeight >= 2160 -> 55_000_000
             source.originalHeight >= 1440 -> 36_000_000
@@ -161,7 +171,20 @@ internal object BatchQualityBitratePolicy {
             source.originalHeight >= 720 -> 10_000_000
             else -> 4_000_000
         }
+        val dynamicFloor = if (isFourKSixtyHevcHdr(source)) {
+            (originalVideoBitrate * 0.95).toInt()
+        } else {
+            0
+        }
+        val floor = maxOf(staticFloor, dynamicFloor)
         return minOf(floor, originalVideoBitrate)
+    }
+
+    private fun isFourKSixtyHevcHdr(source: BatchBitrateSource): Boolean {
+        return source.originalHeight >= 2160 &&
+            source.originalFps >= 50f &&
+            source.originalVideoMimeType == MimeTypes.VIDEO_H265 &&
+            source.originalHdrLike
     }
 
     private fun fallbackOriginalBitrate(source: BatchBitrateSource): Int {

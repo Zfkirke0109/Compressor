@@ -15,7 +15,9 @@ object OutputVerifier {
         outputFile: File,
         modeLabel: String,
         privacyMode: MetadataPrivacyMode,
-        encoderMode: EncoderMode = EncoderMode.NOT_EXPOSED
+        encoderMode: EncoderMode = EncoderMode.NOT_EXPOSED,
+        perceptualStatusOverride: PerceptualLosslessStatus? = null,
+        perceptualStatusReason: String? = null
     ): OutputVerificationReport {
         val outputProbe = readFileProbe(outputFile)
         val sourceTracks = readTrackProbe(context, source.sourceUri)
@@ -40,7 +42,15 @@ object OutputVerifier {
         val fpsMatches = fpsComparison != VerificationComparison.WARN
         val videoCodecMatches = codecsMatch(sourceTracks.videoCodec, outputTracks.videoCodec)
         val audioCodecMatches = codecsMatch(sourceTracks.audioCodec, outputTracks.audioCodec)
-        val hdrMatches = sourceTracks.hdrLabel == "not exposed" || outputTracks.hdrLabel == "not exposed" || sourceTracks.hdrLabel == outputTracks.hdrLabel
+        val colorTransferMatches = sourceTracks.colorTransfer == null ||
+            outputTracks.colorTransfer == null ||
+            sourceTracks.colorTransfer == outputTracks.colorTransfer
+        val colorStandardMatches = sourceTracks.colorStandard == null ||
+            outputTracks.colorStandard == null ||
+            sourceTracks.colorStandard == outputTracks.colorStandard
+        val hdrMatches = colorTransferMatches &&
+            colorStandardMatches &&
+            (sourceTracks.hdrLabel == "not exposed" || outputTracks.hdrLabel == "not exposed" || sourceTracks.hdrLabel == outputTracks.hdrLabel)
         val videoCodecComparison = if (remuxOnly) {
             OutputVerificationFormatter.exposedComparison(
                 sourceExposed = sourceTracks.videoCodec != null,
@@ -64,19 +74,42 @@ object OutputVerifier {
             outputExposed = outputTracks.hdrLabel != "not exposed",
             matches = hdrMatches
         )
-        val perceptualVbrWeakFps = perceptuallyLossless &&
-            encoderMode == EncoderMode.VBR_FALLBACK &&
-            sourceFps > 0f &&
-            outputFps <= 0f
-        val perceptualMaterialReduction = perceptuallyLossless &&
-            encoderMode == EncoderMode.VBR_FALLBACK &&
-            source.originalSize >= 200L * 1024L * 1024L &&
-            outputFile.length() > 0L &&
-            outputFile.length().toDouble() / source.originalSize.toDouble() < 0.80
+        val sourceVideoBitrate = sourceVideoBitrate(source, sourceTracks)
+        val outputVideoBitrate = outputTracks.videoBitrate
+        val fourKSixtyHdr = isFourKSixtyHdr(source, sourceTracks, sourceFps)
+        val perceptualResult = if (perceptuallyLossless) {
+            PerceptualLosslessVerifier.verify(
+                PerceptualLosslessVerificationInput(
+                    playable = playable,
+                    sourceWidth = source.originalWidth,
+                    sourceHeight = source.originalHeight,
+                    outputWidth = outputProbe.width,
+                    outputHeight = outputProbe.height,
+                    sourceFps = sourceFps,
+                    outputFps = outputFps,
+                    sourceVideoBitrate = sourceVideoBitrate,
+                    outputVideoBitrate = outputVideoBitrate,
+                    sourceHdrLike = source.originalHdrLike || sourceTracks.hdrLabel != "not exposed",
+                    sourceColorTransfer = sourceTracks.colorTransfer,
+                    outputColorTransfer = outputTracks.colorTransfer,
+                    sourceColorStandard = sourceTracks.colorStandard,
+                    outputColorStandard = outputTracks.colorStandard,
+                    sourceRotationDegrees = source.metadataSnapshot.rotationDegrees,
+                    outputRotationDegrees = outputProbe.rotationDegrees,
+                    sourceAudioCodec = sourceTracks.audioCodec,
+                    outputAudioCodec = outputTracks.audioCodec,
+                    fourKSixtyHdr = fourKSixtyHdr
+                )
+            )
+        } else {
+            null
+        }
+        val finalPerceptualStatus = perceptualStatusOverride ?: perceptualResult?.status
+        val finalPerceptualReason = perceptualStatusReason ?: perceptualResult?.reason
 
         val replacementSafe = playable && when {
             remuxOnly -> videoMatches && fpsMatches && remuxFpsBlockReason == null && videoCodecMatches && audioCodecMatches && hdrMatches
-            perceptuallyLossless -> videoMatches && fpsMatches && !perceptualVbrWeakFps && !perceptualMaterialReduction
+            perceptuallyLossless -> perceptualResult?.status == PerceptualLosslessStatus.PL_VERIFIED
             else -> true
         }
         val blockReason = when {
@@ -90,8 +123,8 @@ object OutputVerifier {
             remuxOnly && !hdrMatches -> "remux output changed HDR/color metadata"
             perceptuallyLossless && !videoMatches -> "Perceptually Lossless output changed resolution"
             perceptuallyLossless && !fpsMatches -> "Perceptually Lossless output changed FPS"
-            perceptualVbrWeakFps -> "Perceptually Lossless VBR fallback could not verify output FPS"
-            perceptualMaterialReduction -> "Perceptually Lossless VBR fallback output looked materially reduced"
+            perceptuallyLossless && perceptualResult?.status == PerceptualLosslessStatus.PL_UNVERIFIED ->
+                "Perceptually Lossless verification failed: ${perceptualResult.reason}"
             else -> null
         }
 
@@ -149,7 +182,11 @@ object OutputVerifier {
             rotation = "${rotationLabel(source.metadataSnapshot.rotationDegrees)} -> ${rotationLabel(outputProbe.rotationDegrees)}",
             fileSize = "${formatFileSize(source.originalSize)} -> ${formatFileSize(outputFile.length())}",
             replacementSafe = replacementSafe,
-            replacementBlockReason = blockReason
+            replacementBlockReason = blockReason,
+            perceptualStatus = finalPerceptualStatus?.reportLabel,
+            perceptualReason = finalPerceptualReason,
+            sourceVideoBitrate = sourceVideoBitrate,
+            outputVideoBitrate = outputVideoBitrate
         )
     }
 
@@ -164,9 +201,12 @@ object OutputVerifier {
     private data class TrackProbe(
         val videoCodec: String?,
         val audioCodec: String?,
+        val videoBitrate: Int,
         val audioBitrate: Int,
         val hdrLabel: String,
-        val videoFrameRate: Float
+        val videoFrameRate: Float,
+        val colorTransfer: Int?,
+        val colorStandard: Int?
     )
 
     private fun readFileProbe(file: File): FileProbe {
@@ -201,7 +241,7 @@ object OutputVerifier {
             extractor.setDataSource(context, uri, null)
             readTrackProbe(extractor)
         } catch (_: Exception) {
-            TrackProbe(null, null, 0, "not exposed", 0f)
+            TrackProbe(null, null, 0, 0, "not exposed", 0f, null, null)
         } finally {
             extractor.release()
         }
@@ -213,7 +253,7 @@ object OutputVerifier {
             extractor.setDataSource(path)
             readTrackProbe(extractor)
         } catch (_: Exception) {
-            TrackProbe(null, null, 0, "not exposed", 0f)
+            TrackProbe(null, null, 0, 0, "not exposed", 0f, null, null)
         } finally {
             extractor.release()
         }
@@ -222,6 +262,7 @@ object OutputVerifier {
     private fun readTrackProbe(extractor: MediaExtractor): TrackProbe {
         var videoCodec: String? = null
         var audioCodec: String? = null
+        var videoBitrate = 0
         var audioBitrate = 0
         var videoFrameRate = 0f
         var colorTransfer: Int? = null
@@ -233,6 +274,7 @@ object OutputVerifier {
             when {
                 mime?.startsWith("video/") == true -> {
                     if (videoCodec == null) videoCodec = mime
+                    videoBitrate = format.intOrNull(MediaFormat.KEY_BIT_RATE) ?: videoBitrate
                     videoFrameRate = format.floatOrIntOrNull(MediaFormat.KEY_FRAME_RATE) ?: videoFrameRate
                     colorTransfer = format.intOrNull(MediaFormat.KEY_COLOR_TRANSFER) ?: colorTransfer
                     colorStandard = format.intOrNull(MediaFormat.KEY_COLOR_STANDARD) ?: colorStandard
@@ -252,7 +294,7 @@ object OutputVerifier {
             else -> "transfer $colorTransfer"
         }
 
-        return TrackProbe(videoCodec, audioCodec, audioBitrate, hdrLabel, videoFrameRate)
+        return TrackProbe(videoCodec, audioCodec, videoBitrate, audioBitrate, hdrLabel, videoFrameRate, colorTransfer, colorStandard)
     }
 
     private fun sameDimensions(sourceWidth: Int, sourceHeight: Int, outputWidth: Int, outputHeight: Int): Boolean {
@@ -291,6 +333,25 @@ object OutputVerifier {
 
     private fun rotationLabel(rotation: Int?): String {
         return rotation?.let { "${it}deg" } ?: "not exposed"
+    }
+
+    private fun sourceVideoBitrate(source: BatchVideoItem, sourceTracks: TrackProbe): Int {
+        if (sourceTracks.videoBitrate > 0) return sourceTracks.videoBitrate
+        val originalTotal = source.originalBitrate
+        val audio = if (source.originalAudioBitrate > 0) source.originalAudioBitrate else sourceTracks.audioBitrate
+        return if (originalTotal > 0) (originalTotal - audio).coerceAtLeast(originalTotal / 2) else 0
+    }
+
+    private fun isFourKSixtyHdr(source: BatchVideoItem, sourceTracks: TrackProbe, sourceFps: Float): Boolean {
+        val sourceMime = source.originalVideoMimeType ?: sourceTracks.videoCodec
+        val hdrLike = source.originalHdrLike ||
+            sourceTracks.colorTransfer == MediaFormat.COLOR_TRANSFER_ST2084 ||
+            sourceTracks.colorTransfer == MediaFormat.COLOR_TRANSFER_HLG ||
+            sourceTracks.colorStandard == MediaFormat.COLOR_STANDARD_BT2020
+        return source.originalHeight >= 2160 &&
+            sourceFps >= 50f &&
+            sourceMime == MimeTypes.VIDEO_H265 &&
+            hdrLike
     }
 
     private fun MediaFormat.intOrNull(key: String): Int? {

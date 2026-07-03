@@ -102,10 +102,17 @@ data class OutputVerificationReport(
     val rotation: String,
     val fileSize: String,
     val replacementSafe: Boolean,
-    val replacementBlockReason: String? = null
+    val replacementBlockReason: String? = null,
+    val perceptualStatus: String? = null,
+    val perceptualReason: String? = null,
+    val sourceVideoBitrate: Int = 0,
+    val outputVideoBitrate: Int = 0
 ) {
     val summaryLines: List<String>
-        get() = listOf(
+        get() = buildList {
+            perceptualStatus?.let { add("PL status: $it") }
+            perceptualReason?.let { add("PL reason: $it") }
+            addAll(listOf(
             "Playability: $playability",
             "Encoder mode: $encoderMode",
             "Video: $video",
@@ -119,7 +126,8 @@ data class OutputVerificationReport(
             "Location: $location",
             "Rotation: $rotation",
             "Size: $fileSize"
-        )
+            ))
+        }
 }
 
 data class BatchItemMetrics(

@@ -120,6 +120,8 @@ data class BatchVideoItem(
     val originalAudioBitrate: Int,
     val originalFps: Float,
     val durationMs: Long,
+    val originalVideoMimeType: String? = null,
+    val originalHdrLike: Boolean = false,
     val metadataSnapshot: VideoMetadataSnapshot = VideoMetadataSnapshot(),
     val isAlreadyCompressed: Boolean = false,
     val status: BatchItemStatus = BatchItemStatus.Pending,
@@ -553,28 +555,39 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     var encoderMode = EncoderMode.NOT_EXPOSED
                     var outputQuality = quality
                     var fallbackMessage: String? = null
+                    var finalPerceptualStatusOverride: PerceptualLosslessStatus? = null
+                    var finalPerceptualReason: String? = null
                     val remuxResult = if (quality == BatchQualityPreset.REMUX_ONLY) {
                         remuxOnlyOne(context, item, index, privacyMode)
                     } else {
                         try {
                             val perceptualDecision = if (quality == BatchQualityPreset.PERCEPTUALLY_LOSSLESS) {
+                                HevcCqCapabilityProbe.logIfTargetValidationBuild()
                                 perceptualEncodeDecision(item, preferredMime)
                             } else {
                                 null
                             }
                             if (perceptualDecision?.shouldEncode == false) {
+                                fallbackMessage = BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE
+                                finalPerceptualStatusOverride = PerceptualLosslessStatus.REMUX_KEPT
+                                finalPerceptualReason = fallbackMessage
                                 Log.w(
                                     BATCH_LOG_TAG,
                                     "Skipping Perceptually Lossless encode; safe target is below visual floor. " +
+                                        "sourceBytes=${item.originalSize}, " +
+                                        "candidateBytes=0, " +
+                                        "outputBitrate=0, " +
                                         "targetBitrate=${perceptualDecision.targetBitrate}, " +
                                         "safeBudgetBitrate=${perceptualDecision.safeBudgetBitrate}, " +
                                         "visualTargetBitrate=${perceptualDecision.visualTargetBitrate}, " +
                                         "floorBitrate=${perceptualDecision.floorBitrate}, " +
-                                        "overshootFactor=${perceptualDecision.overshootFactor}"
+                                        "sourceVideoBitrate=${perceptualDecision.originalVideoBitrate}, " +
+                                        "overshootFactor=${perceptualDecision.overshootFactor}, " +
+                                        "plStatus=${PerceptualLosslessStatus.REMUX_KEPT.reportLabel}, " +
+                                        "reason=$fallbackMessage"
                                 )
                                 encoderMode = EncoderMode.NOT_EXPOSED
                                 outputQuality = BatchQualityPreset.REMUX_ONLY
-                                fallbackMessage = BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE
                                 updateItem(index) {
                                     it.copy(message = BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE)
                                 }
@@ -589,26 +602,61 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                         item.metadataSnapshot.filteredForPrivacy(privacyMode)
                                     )
                                 }
-                                if (
+                                val candidateVerification = if (quality == BatchQualityPreset.PERCEPTUALLY_LOSSLESS) {
+                                    withContext(Dispatchers.IO) {
+                                        OutputVerifier.verify(context, item, metadataRemuxResult.outputFile, quality.label, privacyMode, encoderMode)
+                                    }
+                                } else {
+                                    null
+                                }
+                                candidateVerification?.let {
+                                    logPerceptualValidation(
+                                        item = item,
+                                        candidateBytes = metadataRemuxResult.outputFile.length(),
+                                        outputBitrate = it.outputVideoBitrate,
+                                        decision = perceptualDecision,
+                                        status = PerceptualLosslessStatus.entries.firstOrNull { status ->
+                                            status.reportLabel == it.perceptualStatus
+                                        } ?: PerceptualLosslessStatus.PL_UNVERIFIED,
+                                        reason = it.perceptualReason ?: "not exposed"
+                                    )
+                                }
+                                val oversizeFallback =
                                     BatchQualityBitratePolicy.shouldUseRemuxFallbackForPerceptualOutput(
                                         quality = quality,
                                         baselineSize = item.originalSize,
                                         outputSize = metadataRemuxResult.outputFile.length()
                                     )
-                                ) {
+                                val plUnverified = candidateVerification?.perceptualStatus == PerceptualLosslessStatus.PL_UNVERIFIED.reportLabel
+                                if (oversizeFallback || plUnverified) {
                                     val candidateSize = metadataRemuxResult.outputFile.length()
                                     val toleranceBytes = BatchQualityBitratePolicy.perceptualOversizeToleranceBytes(item.originalSize)
+                                    fallbackMessage = if (oversizeFallback) {
+                                        BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE
+                                    } else {
+                                        "Perceptually Lossless verification failed; kept exact remux instead."
+                                    }
+                                    finalPerceptualStatusOverride = PerceptualLosslessStatus.REMUX_KEPT
+                                    finalPerceptualReason = fallbackMessage
                                     Log.w(
                                         BATCH_LOG_TAG,
-                                        "Perceptually Lossless encoder overshot target; candidate larger than source. " +
-                                            "sourceBytes=${item.originalSize}, candidateBytes=$candidateSize, toleranceBytes=$toleranceBytes"
+                                        "Perceptually Lossless candidate discarded; " +
+                                            "sourceBytes=${item.originalSize}, " +
+                                            "candidateBytes=$candidateSize, " +
+                                            "outputBitrate=${candidateVerification?.outputVideoBitrate ?: 0}, " +
+                                            "sourceVideoBitrate=${candidateVerification?.sourceVideoBitrate ?: perceptualDecision?.originalVideoBitrate ?: 0}, " +
+                                            "floorBitrate=${perceptualDecision?.floorBitrate ?: 0}, " +
+                                            "safeBudgetBitrate=${perceptualDecision?.safeBudgetBitrate ?: 0}, " +
+                                            "toleranceBytes=$toleranceBytes, " +
+                                            "plStatus=${PerceptualLosslessStatus.REMUX_KEPT.reportLabel}, " +
+                                            "reason=${candidateVerification?.perceptualReason ?: fallbackMessage}, " +
+                                            "largerThanSource=$oversizeFallback"
                                     )
                                     encoderMode = EncoderMode.NOT_EXPOSED
                                     outputQuality = BatchQualityPreset.REMUX_ONLY
-                                    fallbackMessage = BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE
                                     runCatching { metadataRemuxResult.outputFile.delete() }
                                     updateItem(index) {
-                                        it.copy(message = BatchQualityBitratePolicy.PERCEPTUAL_OVERSIZE_REMUX_FALLBACK_MESSAGE)
+                                        it.copy(message = fallbackMessage)
                                     }
                                     remuxOnlyOne(context, item, index, privacyMode)
                                 } else {
@@ -625,6 +673,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             encoderMode = EncoderMode.NOT_EXPOSED
                             outputQuality = BatchQualityPreset.REMUX_ONLY
                             fallbackMessage = "Perceptually Lossless encode failed in Android's HEVC/HDR codec path; saved a zero-loss Remux Only fallback instead. Size may stay similar."
+                            finalPerceptualStatusOverride = PerceptualLosslessStatus.REMUX_KEPT
+                            finalPerceptualReason = fallbackMessage
                             updateItem(index) {
                                 it.copy(message = "Perceptually Lossless encode failed; trying zero-loss Remux Only fallback.")
                             }
@@ -635,7 +685,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     val outputUri = Uri.fromFile(outputFile)
                     val outputSize = outputFile.length()
                     val verification = withContext(Dispatchers.IO) {
-                        OutputVerifier.verify(context, item, outputFile, outputQuality.label, privacyMode, encoderMode)
+                        OutputVerifier.verify(
+                            context = context,
+                            source = item,
+                            outputFile = outputFile,
+                            modeLabel = outputQuality.label,
+                            privacyMode = privacyMode,
+                            encoderMode = encoderMode,
+                            perceptualStatusOverride = finalPerceptualStatusOverride,
+                            perceptualStatusReason = finalPerceptualReason
+                        )
                     }
                     val thermalEnd = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
                     val actualOperationLabel = if (fallbackMessage != null) {
@@ -849,7 +908,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         var bitrate = 0
         var fps = 30f
         var duration = 0L
-        var audioBitrate = 0
+        var sourceTrackMetadata = BatchSourceTrackMetadata()
         var metadataSnapshot = VideoMetadataSnapshot()
 
         try {
@@ -863,7 +922,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 }
             }
 
-            audioBitrate = getAudioBitrate(context, uri)
+            sourceTrackMetadata = readSourceTrackMetadata(context, uri)
             retriever.setDataSource(context, uri)
             metadataSnapshot = VideoMetadataPreserver.capture(context, uri, retriever)
             width = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
@@ -876,7 +935,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
             bitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull() ?: 0
             duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-            fps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull() ?: getVideoFrameRate(context, uri)
+            fps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull()
+                ?: sourceTrackMetadata.videoFrameRate
+                ?: getVideoFrameRate(context, uri)
             if (fps <= 0f) fps = 30f
         } finally {
             try { retriever.release() } catch (_: Exception) {}
@@ -889,11 +950,62 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             originalWidth = width,
             originalHeight = height,
             originalBitrate = bitrate,
-            originalAudioBitrate = audioBitrate,
+            originalAudioBitrate = sourceTrackMetadata.audioBitrate,
             originalFps = fps,
             durationMs = duration,
+            originalVideoMimeType = sourceTrackMetadata.videoMimeType,
+            originalHdrLike = sourceTrackMetadata.hdrLike,
             metadataSnapshot = metadataSnapshot
         )
+    }
+
+    private data class BatchSourceTrackMetadata(
+        val videoMimeType: String? = null,
+        val audioBitrate: Int = 0,
+        val videoFrameRate: Float? = null,
+        val hdrLike: Boolean = false
+    )
+
+    private fun readSourceTrackMetadata(context: Context, uri: Uri): BatchSourceTrackMetadata {
+        val extractor = MediaExtractor()
+        return try {
+            extractor.setDataSource(context, uri, null)
+            var videoMimeType: String? = null
+            var audioBitrate = 0
+            var videoFrameRate: Float? = null
+            var hdrLike = false
+
+            for (i in 0 until extractor.trackCount) {
+                val format = extractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME)
+                when {
+                    mime?.startsWith("video/") == true -> {
+                        if (videoMimeType == null) videoMimeType = mime
+                        videoFrameRate = format.floatOrIntOrNull(MediaFormat.KEY_FRAME_RATE) ?: videoFrameRate
+                        val colorTransfer = format.intOrNull(MediaFormat.KEY_COLOR_TRANSFER)
+                        val colorStandard = format.intOrNull(MediaFormat.KEY_COLOR_STANDARD)
+                        hdrLike = hdrLike ||
+                            colorTransfer == MediaFormat.COLOR_TRANSFER_ST2084 ||
+                            colorTransfer == MediaFormat.COLOR_TRANSFER_HLG ||
+                            colorStandard == MediaFormat.COLOR_STANDARD_BT2020
+                    }
+                    mime?.startsWith("audio/") == true && audioBitrate <= 0 -> {
+                        audioBitrate = format.intOrNull(MediaFormat.KEY_BIT_RATE) ?: 0
+                    }
+                }
+            }
+
+            BatchSourceTrackMetadata(
+                videoMimeType = videoMimeType,
+                audioBitrate = audioBitrate,
+                videoFrameRate = videoFrameRate,
+                hdrLike = hdrLike
+            )
+        } catch (_: Exception) {
+            BatchSourceTrackMetadata()
+        } finally {
+            extractor.release()
+        }
     }
 
     private fun getAudioBitrate(context: Context, uri: Uri): Int {
@@ -1263,6 +1375,28 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         )
     }
 
+    private fun logPerceptualValidation(
+        item: BatchVideoItem,
+        candidateBytes: Long,
+        outputBitrate: Int,
+        decision: PerceptualEncodeDecision?,
+        status: PerceptualLosslessStatus,
+        reason: String
+    ) {
+        Log.i(
+            BATCH_LOG_TAG,
+            "PL validation: " +
+                "sourceBytes=${item.originalSize}, " +
+                "candidateBytes=$candidateBytes, " +
+                "outputBitrate=$outputBitrate, " +
+                "sourceVideoBitrate=${decision?.originalVideoBitrate ?: 0}, " +
+                "floorBitrate=${decision?.floorBitrate ?: 0}, " +
+                "safeBudgetBitrate=${decision?.safeBudgetBitrate ?: 0}, " +
+                "plStatus=${status.reportLabel}, " +
+                "reason=$reason"
+        )
+    }
+
     private fun targetHeightFor(item: BatchVideoItem, quality: BatchQualityPreset): Int {
         return BatchQualityBitratePolicy.targetHeight(item.toBitrateSource(), quality)
     }
@@ -1274,7 +1408,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             originalAudioBitrate = originalAudioBitrate,
             originalHeight = originalHeight,
             originalFps = originalFps,
-            durationMs = durationMs
+            durationMs = durationMs,
+            originalVideoMimeType = originalVideoMimeType,
+            originalHdrLike = originalHdrLike
         )
     }
 
@@ -1601,5 +1737,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val dir = File(getApplication<Application>().cacheDir, "batch_compressed_videos")
             if (dir.exists()) dir.listFiles()?.forEach { it.delete() }
         }
+    }
+
+    private fun MediaFormat.intOrNull(key: String): Int? {
+        return if (containsKey(key)) runCatching { getInteger(key) }.getOrNull() else null
+    }
+
+    private fun MediaFormat.floatOrIntOrNull(key: String): Float? {
+        if (!containsKey(key)) return null
+        return runCatching { getInteger(key).toFloat() }
+            .recoverCatching { getFloat(key) }
+            .getOrNull()
     }
 }

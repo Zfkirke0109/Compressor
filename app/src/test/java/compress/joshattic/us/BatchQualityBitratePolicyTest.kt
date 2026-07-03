@@ -15,11 +15,13 @@ class BatchQualityBitratePolicyTest {
         originalAudioBitrate = 256_015,
         originalHeight = 2160,
         originalFps = 60f,
-        durationMs = 100_000L
+        durationMs = 100_000L,
+        originalVideoMimeType = MimeTypes.VIDEO_H265,
+        originalHdrLike = true
     )
 
     @Test
-    fun perceptuallyLosslessBitrateUsesMeasuredS23SafeBudget() {
+    fun perceptuallyLosslessBitrateUsesMeasuredS23SafeBudgetButDoesNotForceEncodeBelowFloor() {
         val perceptual = BatchQualityBitratePolicy.videoBitrate(
             s23HdrSource,
             BatchQualityPreset.PERCEPTUALLY_LOSSLESS,
@@ -42,10 +44,18 @@ class BatchQualityBitratePolicyTest {
         assertTrue(perceptual >= 85_000_000)
         assertTrue(perceptual in 90_000_000..95_000_000)
         assertTrue(perceptual <= s23HdrSource.originalBitrate)
+
+        val decision = BatchQualityBitratePolicy.perceptualEncodeDecision(
+            s23HdrSource,
+            MimeTypes.VIDEO_H265,
+            s23HevcOvershootFactor
+        )
+        assertFalse(decision.shouldEncode)
+        assertTrue(decision.safeBudgetBitrate < decision.floorBitrate)
     }
 
     @Test
-    fun perceptuallyLosslessKeepsVisualTargetWithoutMeasuredOvershoot() {
+    fun fourKSixtyHevcHdrUsesSourceRelativeVisualTargetWithoutMeasuredOvershoot() {
         val originalVideo = s23HdrSource.originalBitrate - s23HdrSource.originalAudioBitrate
         val decision = BatchQualityBitratePolicy.perceptualEncodeDecision(
             s23HdrSource,
@@ -53,7 +63,8 @@ class BatchQualityBitratePolicyTest {
         )
 
         assertTrue(decision.shouldEncode)
-        assertEquals((originalVideo * 0.88).toInt(), decision.targetBitrate)
+        assertEquals((originalVideo * 0.95).toInt(), decision.targetBitrate)
+        assertEquals((originalVideo * 0.95).toInt(), decision.floorBitrate)
         assertEquals(1.0, decision.overshootFactor, 0.0)
     }
 
@@ -68,7 +79,20 @@ class BatchQualityBitratePolicyTest {
 
         assertFalse(decision.shouldEncode)
         assertTrue(decision.targetBitrate < decision.floorBitrate)
-        assertEquals(85_000_000, decision.floorBitrate)
+        assertEquals(((s23HdrSource.originalBitrate - s23HdrSource.originalAudioBitrate) * 0.95).toInt(), decision.floorBitrate)
+    }
+
+    @Test
+    fun perceptuallyLosslessAllowsEncodeWhenSafeBudgetReachesDynamicFloor() {
+        val roomySource = s23HdrSource.copy(originalSize = 2_400_000_000L)
+        val decision = BatchQualityBitratePolicy.perceptualEncodeDecision(
+            roomySource,
+            MimeTypes.VIDEO_H265,
+            s23HevcOvershootFactor
+        )
+
+        assertTrue(decision.shouldEncode)
+        assertTrue(decision.targetBitrate >= decision.floorBitrate)
     }
 
     @Test
