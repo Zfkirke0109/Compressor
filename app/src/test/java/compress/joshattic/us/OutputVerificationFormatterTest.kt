@@ -36,6 +36,18 @@ class OutputVerificationFormatterTest {
     }
 
     @Test
+    fun outputFpsUsesExtractorFallbackWhenRetrieverDoesNotExposeIt() {
+        val outputFps = OutputVerificationFormatter.effectiveFps(primaryFps = 0f, fallbackFps = 60f)
+        val comparison = OutputVerificationFormatter.fpsComparison(60f, outputFps)
+
+        assertEquals(60f, outputFps)
+        assertEquals(
+            "60 -> 60 ok",
+            OutputVerificationFormatter.transition("60", "60", comparison)
+        )
+    }
+
+    @Test
     fun remuxMissingOutputFpsBlocksReplacementSafety() {
         assertEquals(
             "remux output FPS was not exposed",

@@ -33,8 +33,10 @@ object OutputVerifier {
         val remuxOnly = quality == BatchQualityPreset.REMUX_ONLY
         val perceptuallyLossless = quality == BatchQualityPreset.PERCEPTUALLY_LOSSLESS
         val videoMatches = sameDimensions(source.originalWidth, source.originalHeight, outputProbe.width, outputProbe.height)
-        val fpsComparison = OutputVerificationFormatter.fpsComparison(source.originalFps, outputProbe.fps)
-        val remuxFpsBlockReason = OutputVerificationFormatter.remuxFpsBlockReason(source.originalFps, outputProbe.fps)
+        val sourceFps = OutputVerificationFormatter.effectiveFps(source.originalFps, sourceTracks.videoFrameRate)
+        val outputFps = OutputVerificationFormatter.effectiveFps(outputProbe.fps, outputTracks.videoFrameRate)
+        val fpsComparison = OutputVerificationFormatter.fpsComparison(sourceFps, outputFps)
+        val remuxFpsBlockReason = OutputVerificationFormatter.remuxFpsBlockReason(sourceFps, outputFps)
         val fpsMatches = fpsComparison != VerificationComparison.WARN
         val videoCodecMatches = codecsMatch(sourceTracks.videoCodec, outputTracks.videoCodec)
         val audioCodecMatches = codecsMatch(sourceTracks.audioCodec, outputTracks.audioCodec)
@@ -64,8 +66,8 @@ object OutputVerifier {
         )
         val perceptualVbrWeakFps = perceptuallyLossless &&
             encoderMode == EncoderMode.VBR_FALLBACK &&
-            source.originalFps > 0f &&
-            outputProbe.fps <= 0f
+            sourceFps > 0f &&
+            outputFps <= 0f
         val perceptualMaterialReduction = perceptuallyLossless &&
             encoderMode == EncoderMode.VBR_FALLBACK &&
             source.originalSize >= 200L * 1024L * 1024L &&
@@ -108,8 +110,8 @@ object OutputVerifier {
                 )
             ),
             fps = OutputVerificationFormatter.transition(
-                fpsLabel(source.originalFps),
-                fpsLabel(outputProbe.fps),
+                fpsLabel(sourceFps),
+                fpsLabel(outputFps),
                 fpsComparison
             ),
             videoCodec = OutputVerificationFormatter.transition(
@@ -163,7 +165,8 @@ object OutputVerifier {
         val videoCodec: String?,
         val audioCodec: String?,
         val audioBitrate: Int,
-        val hdrLabel: String
+        val hdrLabel: String,
+        val videoFrameRate: Float
     )
 
     private fun readFileProbe(file: File): FileProbe {
@@ -198,7 +201,7 @@ object OutputVerifier {
             extractor.setDataSource(context, uri, null)
             readTrackProbe(extractor)
         } catch (_: Exception) {
-            TrackProbe(null, null, 0, "not exposed")
+            TrackProbe(null, null, 0, "not exposed", 0f)
         } finally {
             extractor.release()
         }
@@ -210,7 +213,7 @@ object OutputVerifier {
             extractor.setDataSource(path)
             readTrackProbe(extractor)
         } catch (_: Exception) {
-            TrackProbe(null, null, 0, "not exposed")
+            TrackProbe(null, null, 0, "not exposed", 0f)
         } finally {
             extractor.release()
         }
@@ -220,6 +223,7 @@ object OutputVerifier {
         var videoCodec: String? = null
         var audioCodec: String? = null
         var audioBitrate = 0
+        var videoFrameRate = 0f
         var colorTransfer: Int? = null
         var colorStandard: Int? = null
 
@@ -229,6 +233,7 @@ object OutputVerifier {
             when {
                 mime?.startsWith("video/") == true -> {
                     if (videoCodec == null) videoCodec = mime
+                    videoFrameRate = format.floatOrIntOrNull(MediaFormat.KEY_FRAME_RATE) ?: videoFrameRate
                     colorTransfer = format.intOrNull(MediaFormat.KEY_COLOR_TRANSFER) ?: colorTransfer
                     colorStandard = format.intOrNull(MediaFormat.KEY_COLOR_STANDARD) ?: colorStandard
                 }
@@ -247,7 +252,7 @@ object OutputVerifier {
             else -> "transfer $colorTransfer"
         }
 
-        return TrackProbe(videoCodec, audioCodec, audioBitrate, hdrLabel)
+        return TrackProbe(videoCodec, audioCodec, audioBitrate, hdrLabel, videoFrameRate)
     }
 
     private fun sameDimensions(sourceWidth: Int, sourceHeight: Int, outputWidth: Int, outputHeight: Int): Boolean {
@@ -290,5 +295,12 @@ object OutputVerifier {
 
     private fun MediaFormat.intOrNull(key: String): Int? {
         return if (containsKey(key)) runCatching { getInteger(key) }.getOrNull() else null
+    }
+
+    private fun MediaFormat.floatOrIntOrNull(key: String): Float? {
+        if (!containsKey(key)) return null
+        return runCatching { getInteger(key).toFloat() }
+            .recoverCatching { getFloat(key) }
+            .getOrNull()
     }
 }

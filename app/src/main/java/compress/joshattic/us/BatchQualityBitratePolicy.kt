@@ -30,7 +30,7 @@ internal object BatchQualityBitratePolicy {
             val originalTotal = if (source.originalBitrate > 0) source.originalBitrate else fallbackOriginalBitrate(source)
             val audio = if (source.originalAudioBitrate > 0) source.originalAudioBitrate else 192_000
             val originalVideo = (originalTotal - audio).coerceAtLeast(originalTotal / 2)
-            val ratio = if (videoMimeType == MimeTypes.VIDEO_H264) 0.95 else 0.88
+            val ratio = if (videoMimeType == MimeTypes.VIDEO_H264) 0.95 else 0.82
             val target = (originalVideo * ratio).toInt()
             val floor = perceptualLosslessFloor(source, originalVideo)
             return target.coerceIn(floor, originalVideo)
@@ -60,6 +60,16 @@ internal object BatchQualityBitratePolicy {
             BatchQualityPreset.HIGH_QUALITY -> source.originalHeight
             BatchQualityPreset.STORAGE_SAVER -> minOf(source.originalHeight, 720)
         }.coerceAtLeast(2)
+    }
+
+    fun shouldUseRemuxFallbackForPerceptualOutput(
+        quality: BatchQualityPreset,
+        originalSize: Long,
+        outputSize: Long
+    ): Boolean {
+        return quality == BatchQualityPreset.PERCEPTUALLY_LOSSLESS &&
+            originalSize > 0L &&
+            outputSize >= originalSize
     }
 
     private fun perceptualLosslessFloor(source: BatchBitrateSource, originalVideoBitrate: Int): Int {

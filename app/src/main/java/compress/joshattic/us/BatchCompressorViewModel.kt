@@ -559,12 +559,30 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         try {
                             val encoded = compressOne(context, item, index, quality, frameRate, preferredMime)
                             encoderMode = encoded.encoderMode
-                            withContext(Dispatchers.IO) {
+                            val metadataRemuxResult = withContext(Dispatchers.IO) {
                                 Mp4MetadataRemuxer.remuxWithSourceMetadata(
                                     context,
                                     encoded.file,
                                     item.metadataSnapshot.filteredForPrivacy(privacyMode)
                                 )
+                            }
+                            if (
+                                BatchQualityBitratePolicy.shouldUseRemuxFallbackForPerceptualOutput(
+                                    quality = quality,
+                                    originalSize = item.originalSize,
+                                    outputSize = metadataRemuxResult.outputFile.length()
+                                )
+                            ) {
+                                encoderMode = EncoderMode.NOT_EXPOSED
+                                outputQuality = BatchQualityPreset.REMUX_ONLY
+                                fallbackMessage = "Perceptually Lossless re-encode was not smaller than the source; saved a zero-loss Remux Only fallback instead."
+                                runCatching { metadataRemuxResult.outputFile.delete() }
+                                updateItem(index) {
+                                    it.copy(message = "Perceptually Lossless was not smaller; saving zero-loss Remux Only fallback.")
+                                }
+                                remuxOnlyOne(context, item, index, privacyMode)
+                            } else {
+                                metadataRemuxResult
                             }
                         } catch (encodeError: Exception) {
                             if (encodeError is kotlinx.coroutines.CancellationException ||

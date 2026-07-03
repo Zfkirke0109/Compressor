@@ -36,6 +36,14 @@ internal object OutputVerificationFormatter {
         )
     }
 
+    fun effectiveFps(primaryFps: Float, fallbackFps: Float): Float {
+        return when {
+            primaryFps > 0f -> primaryFps
+            fallbackFps > 0f -> fallbackFps
+            else -> 0f
+        }
+    }
+
     fun remuxFpsBlockReason(sourceFps: Float, outputFps: Float): String? {
         return when {
             sourceFps <= 0f -> null
