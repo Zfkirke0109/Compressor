@@ -2,7 +2,6 @@ package compress.joshattic.us
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
-import org.junit.Assert.assertSame
 import org.junit.Test
 
 class OutputVerificationFormatterTest {
@@ -51,7 +50,7 @@ class OutputVerificationFormatterTest {
 
     @Test
     fun highFrameRateToleranceTreats119Point88As120() {
-        assertSame(
+        assertEquals(
             VerificationTransitionStatus.MATCH,
             OutputVerificationFormatter.fpsComparison(120f, 119.88f)
         )

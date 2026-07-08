@@ -400,6 +400,7 @@ object OutputVerifier {
         )
     }
 
+    // Treat missing/invalid dimensions as a failed match so replacement never proceeds on unverified geometry.
     internal fun sameDimensions(sourceWidth: Int, sourceHeight: Int, outputWidth: Int, outputHeight: Int): Boolean {
         if (sourceWidth <= 0 || sourceHeight <= 0 || outputWidth <= 0 || outputHeight <= 0) return false
         return sourceWidth == outputWidth && sourceHeight == outputHeight

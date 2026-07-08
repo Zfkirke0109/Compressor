@@ -820,7 +820,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         }
         if (!supported.contains(resolved)) {
             if (quality == BatchQualityPreset.ORIGINAL) {
-                throw IllegalStateException("Perceptually Lossless is blocked because ${codec.label} cannot preserve this source on this device.")
+                throw IllegalStateException("Perceptually Lossless is blocked because ${codec.label} cannot preserve this source on this device. Select HEVC, use Remux Only, or choose a lossy mode.")
             }
             return when {
                 supported.contains(MimeTypes.VIDEO_H265) -> MimeTypes.VIDEO_H265
@@ -829,7 +829,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
         }
         if (quality == BatchQualityPreset.ORIGINAL && sourceInfo.isHdr && resolved == MimeTypes.VIDEO_H264) {
-            throw IllegalStateException("Perceptually Lossless is blocked because H.264 cannot safely preserve HDR output.")
+            throw IllegalStateException("Perceptually Lossless is blocked because H.264 cannot safely preserve HDR output. Select HEVC or AV1, or use a different quality mode.")
         }
         return resolved
     }
@@ -872,14 +872,15 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         return runCatching {
             val caps = info.getCapabilitiesForType(mimeType)
             val videoCaps = caps.videoCapabilities ?: return@runCatching false
+            val requiredFps = kotlin.math.ceil(sourceInfo.frameRate.coerceAtLeast(1f).toDouble())
             val supported = videoCaps.areSizeAndRateSupported(
                 sourceInfo.width,
                 sourceInfo.height,
-                kotlin.math.ceil(sourceInfo.frameRate.coerceAtLeast(1f).toDouble())
+                requiredFps
             ) || videoCaps.areSizeAndRateSupported(
                 sourceInfo.height,
                 sourceInfo.width,
-                kotlin.math.ceil(sourceInfo.frameRate.coerceAtLeast(1f).toDouble())
+                requiredFps
             )
             supported && !(sourceInfo.isHdr && mimeType == MimeTypes.VIDEO_H264)
         }.getOrDefault(false)
