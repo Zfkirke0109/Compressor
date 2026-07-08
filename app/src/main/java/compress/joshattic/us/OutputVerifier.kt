@@ -265,6 +265,15 @@ object OutputVerifier {
             BatchQualityMode.HIGH_QUALITY -> "High Quality (lossy mode)"
             BatchQualityMode.STORAGE_SAVER -> "Storage Saver (lossy mode)"
         }
+        val bytesSaved = when (input.mode) {
+            BatchQualityMode.REMUX_ONLY -> 0L
+            else -> (input.sourceSize - input.outputSize).coerceAtLeast(0L)
+        }
+        val percentSaved = if (input.sourceSize > 0L && bytesSaved > 0L) {
+            ((bytesSaved.toDouble() / input.sourceSize.toDouble()) * 100.0).toInt()
+        } else {
+            0
+        }
 
         return OutputVerificationReport(
             verdict = verdict,
@@ -303,7 +312,22 @@ object OutputVerifier {
                 BatchQualityMode.REMUX_ONLY -> remuxVerified
                 BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance
                 else -> playable
-            }
+            },
+            selectedMode = input.mode.label,
+            finalModeDisplayed = input.mode.label,
+            outputDisposition = OutputDisposition.KEPT_ENCODE,
+            sourceBytes = input.sourceSize,
+            encodedBytes = input.outputSize,
+            finalOutputBytes = input.outputSize,
+            bytesSaved = bytesSaved,
+            percentSaved = percentSaved,
+            fallbackReason = if (input.mode == BatchQualityMode.REMUX_ONLY) {
+                "Remux Only is zero quality loss, but it is not compression."
+            } else {
+                null
+            },
+            deletedOversizedEncode = false,
+            usefulCompression = input.mode != BatchQualityMode.REMUX_ONLY && bytesSaved > 0L
         )
     }
 

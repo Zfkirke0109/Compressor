@@ -87,6 +87,13 @@ data class CompressionRecommendation(
         get() = "Recommended: $title • Expected savings: $expectedSavings • Quality risk: $qualityRisk"
 }
 
+enum class OutputDisposition(val label: String) {
+    KEPT_ENCODE("Kept encode"),
+    REMUX_FALLBACK("Remux Only fallback"),
+    NO_USEFUL_COMPRESSION("No useful compression"),
+    FAILED("Failed")
+}
+
 data class OutputVerificationReport(
     val verdict: String,
     val playability: String,
@@ -108,28 +115,48 @@ data class OutputVerificationReport(
     val replacementSafe: Boolean,
     val replacementBlockReason: String? = null,
     val criticalFieldsComplete: Boolean = false,
-    val verified: Boolean = false
+    val verified: Boolean = false,
+    val selectedMode: String = "",
+    val finalModeDisplayed: String = "",
+    val outputDisposition: OutputDisposition = OutputDisposition.KEPT_ENCODE,
+    val sourceBytes: Long = 0L,
+    val encodedBytes: Long? = null,
+    val finalOutputBytes: Long = 0L,
+    val bytesSaved: Long = 0L,
+    val percentSaved: Int = 0,
+    val fallbackReason: String? = null,
+    val deletedOversizedEncode: Boolean = false,
+    val usefulCompression: Boolean = false
 ) {
     val summaryLines: List<String>
-        get() = listOf(
-            "Verdict: $verdict",
-            "Playability: $playability",
-            "Video: $video",
-            "FPS: $fps",
-            "Video bitrate: $videoBitrate",
-            "Codec: $videoCodec",
-            "Audio: $audioCodec",
-            "Audio details: $audioDetails",
-            "Audio bitrate: $audioBitrate",
-            "HDR/color: $hdr",
-            "Color standard: $colorStandard",
-            "Color range: $colorRange",
-            "MediaStore date: $mediaStoreDate",
-            "MP4/retriever date: $mp4Date",
-            "Location: $location",
-            "Rotation: $rotation",
-            "Size: $fileSize"
-        )
+        get() = buildList {
+            if (selectedMode.isNotBlank()) add("Selected mode: $selectedMode")
+            if (finalModeDisplayed.isNotBlank()) add("Final mode: $finalModeDisplayed")
+            add("Final disposition: ${outputDisposition.label}")
+            if (sourceBytes > 0L) add("Source size: ${formatFileSize(sourceBytes)}")
+            encodedBytes?.let { add("Encoded attempt: ${formatFileSize(it)}") }
+            if (finalOutputBytes > 0L) add("Final output size: ${formatFileSize(finalOutputBytes)}") else if (outputDisposition == OutputDisposition.NO_USEFUL_COMPRESSION) add("Final output: original left unchanged")
+            add("Saved: ${if (bytesSaved == 0L) "0 bytes" else formatFileSize(bytesSaved)} / $percentSaved%")
+            if (deletedOversizedEncode) add("Result: Deleted larger re-encode.")
+            fallbackReason?.let { add("Note: $it") }
+            add("Verdict: $verdict")
+            add("Playability: $playability")
+            add("Video: $video")
+            add("FPS: $fps")
+            add("Video bitrate: $videoBitrate")
+            add("Codec: $videoCodec")
+            add("Audio: $audioCodec")
+            add("Audio details: $audioDetails")
+            add("Audio bitrate: $audioBitrate")
+            add("HDR/color: $hdr")
+            add("Color standard: $colorStandard")
+            add("Color range: $colorRange")
+            add("MediaStore date: $mediaStoreDate")
+            add("MP4/retriever date: $mp4Date")
+            add("Location: $location")
+            add("Rotation: $rotation")
+            add("Size: $fileSize")
+        }
 }
 
 data class BatchItemMetrics(

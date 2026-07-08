@@ -457,17 +457,12 @@ private fun BatchSettingsCard(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { viewModel.requestShizukuPermission(context) }, enabled = !state.isCompressing) {
-                    Text("Authorize")
-                }
-                OutlinedButton(onClick = onRequestOriginalMediaAccess, enabled = !state.isCompressing) {
-                    Text("Metadata access")
-                }
-                OutlinedButton(onClick = { viewModel.testReplacementAccess(context) }, enabled = !state.isCompressing) {
-                    Text("Test access")
-                }
-            }
+            ResponsiveActionButtonRow(
+                enabled = !state.isCompressing,
+                onAuthorize = { viewModel.requestShizukuPermission(context) },
+                onMetadataAccess = onRequestOriginalMediaAccess,
+                onTestAccess = { viewModel.testReplacementAccess(context) }
+            )
         }
     }
 }
@@ -488,6 +483,41 @@ private fun SettingSwitchRow(
         Column(modifier = Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
             Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+
+        @Composable
+        private fun ResponsiveActionButtonRow(
+            enabled: Boolean,
+            onAuthorize: () -> Unit,
+            onMetadataAccess: () -> Unit,
+            onTestAccess: () -> Unit
+        ) {
+            BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+                val stacked = maxWidth < 360.dp
+                val buttonModifier = if (stacked) {
+                    Modifier.fillMaxWidth()
+                } else {
+                    Modifier
+                        .weight(1f)
+                        .widthIn(min = 120.dp)
+                }
+                if (stacked) {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                        OutlinedButton(onClick = onAuthorize, enabled = enabled, modifier = buttonModifier) { Text("Authorize") }
+                        OutlinedButton(onClick = onMetadataAccess, enabled = enabled, modifier = buttonModifier) { Text("Metadata access") }
+                        OutlinedButton(onClick = onTestAccess, enabled = enabled, modifier = buttonModifier) { Text("Test access") }
+                    }
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(onClick = onAuthorize, enabled = enabled, modifier = buttonModifier) { Text("Authorize") }
+                        OutlinedButton(onClick = onMetadataAccess, enabled = enabled, modifier = buttonModifier) { Text("Metadata access") }
+                        OutlinedButton(onClick = onTestAccess, enabled = enabled, modifier = buttonModifier) { Text("Test access") }
+                    }
+                }
+            }
         }
         Spacer(modifier = Modifier.width(12.dp))
         Switch(checked = checked, onCheckedChange = { onCheckedChange() }, enabled = enabled)
@@ -661,7 +691,7 @@ private fun BatchItemCard(
                 LinearProgressIndicator(progress = { item.progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
             }
 
-            if (item.outputSize > 0L) {
+            if (item.outputSize > 0L || item.verificationReport != null) {
                 HorizontalDivider()
                 Text(
                     item.beforeAfterSummary(),
@@ -710,6 +740,21 @@ private fun BatchItemCard(
 }
 
 private fun BatchVideoItem.shortStatusLabel(): String {
+    verificationReport?.let { report ->
+        return when (report.outputDisposition) {
+            OutputDisposition.NO_USEFUL_COMPRESSION -> "No useful"
+            OutputDisposition.REMUX_FALLBACK -> "Remux"
+            else -> when {
+                status == BatchItemStatus.Skipped || isAlreadyCompressed -> "Skipped"
+                status == BatchItemStatus.Compressing -> "${progressPercent}%"
+                status == BatchItemStatus.Done -> "Done"
+                status == BatchItemStatus.Replaced -> "Replaced"
+                status == BatchItemStatus.SavedCopy -> "Saved"
+                status == BatchItemStatus.Failed -> "Failed"
+                else -> "Ready"
+            }
+        }
+    }
     return when {
         status == BatchItemStatus.Skipped || isAlreadyCompressed -> "Skipped"
         status == BatchItemStatus.Compressing -> "${progressPercent}%"
@@ -724,19 +769,32 @@ private fun BatchVideoItem.shortStatusLabel(): String {
 private fun BatchVideoItem.preservationSummary(): String {
     val date = if (metadataSnapshot.hasDate) "${metadataSnapshot.dateDiagnosticLabel} ✓" else "date —"
     val location = if (metadataSnapshot.hasLocation) "location ✓" else "location —"
-    val replacement = when (status) {
-        BatchItemStatus.Replaced -> "original replaced"
-        BatchItemStatus.SavedCopy -> "safe copy saved"
-        BatchItemStatus.Done -> "copy ready"
-        BatchItemStatus.Skipped -> "skipped"
-        BatchItemStatus.Failed -> "failed"
-        BatchItemStatus.Compressing -> "compressing"
-        else -> "ready"
+    val replacement = when (verificationReport?.outputDisposition) {
+        OutputDisposition.NO_USEFUL_COMPRESSION -> "original kept"
+        OutputDisposition.REMUX_FALLBACK -> "remux kept"
+        else -> when (status) {
+            BatchItemStatus.Replaced -> "original replaced"
+            BatchItemStatus.SavedCopy -> "safe copy saved"
+            BatchItemStatus.Done -> "copy ready"
+            BatchItemStatus.Skipped -> "skipped"
+            BatchItemStatus.Failed -> "failed"
+            BatchItemStatus.Compressing -> "compressing"
+            else -> "ready"
+        }
     }
     return "Metadata: $date • $location • $replacement"
 }
 
 private fun BatchVideoItem.beforeAfterSummary(): String {
+    verificationReport?.let { report ->
+        val sourceLabel = formatCardBytes(report.sourceBytes.takeIf { it > 0L } ?: originalSize)
+        val outputLabel = report.finalOutputBytes.takeIf { it > 0L }?.let(::formatCardBytes)
+        return when (report.outputDisposition) {
+            OutputDisposition.NO_USEFUL_COMPRESSION -> "Before/after: $sourceLabel -> original kept • saved 0 bytes (0%)"
+            OutputDisposition.REMUX_FALLBACK -> "Before/after: $sourceLabel -> ${outputLabel ?: sourceLabel} • saved 0 bytes (0%) • exact remux"
+            else -> "Before/after: $sourceLabel → ${outputLabel ?: formatCardBytes(outputSize)} • saved ${formatCardBytes(report.bytesSaved)} (${report.percentSaved}%)"
+        }
+    }
     if (outputSize <= 0L) return "Output pending"
     val savedBytes = (originalSize - outputSize).coerceAtLeast(0L)
     val savedPercent = if (originalSize > 0L) ((savedBytes * 100.0) / originalSize).toInt() else 0

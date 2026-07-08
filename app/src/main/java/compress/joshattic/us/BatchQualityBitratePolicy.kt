@@ -106,25 +106,25 @@ object BatchQualityBitratePolicy {
         return when (mode) {
             BatchQualityMode.REMUX_ONLY -> BatchModeProfile(
                 label = mode.label,
-                honestSummary = "No re-encode. Video/audio streams are copied unchanged.",
+                honestSummary = "Exact stream copy with zero quality loss, but it is not compression.",
                 allowsResolutionReduction = false,
                 allowsFrameRateReduction = false
             )
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> BatchModeProfile(
                 label = mode.label,
-                honestSummary = "Conservative re-encode that must preserve resolution, FPS, HDR/color, and audio or fall back to Remux Only.",
+                honestSummary = "Conservative re-encode that must preserve resolution, FPS, HDR/color, and audio; if it cannot shrink meaningfully, the original stays unchanged.",
                 allowsResolutionReduction = false,
                 allowsFrameRateReduction = false
             )
             BatchQualityMode.HIGH_QUALITY -> BatchModeProfile(
                 label = mode.label,
-                honestSummary = "Strong compression with measurable difference possible.",
+                honestSummary = "High Quality may save more space with visible/technical differences possible.",
                 allowsResolutionReduction = false,
                 allowsFrameRateReduction = false
             )
             BatchQualityMode.STORAGE_SAVER -> BatchModeProfile(
                 label = mode.label,
-                honestSummary = "Aggressive compression that prioritizes file size.",
+                honestSummary = "Storage Saver prioritizes smaller files and may show visible loss.",
                 visibleLossWarning = "Visible quality loss may occur.",
                 allowsResolutionReduction = true,
                 allowsFrameRateReduction = true
