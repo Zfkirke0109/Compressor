@@ -387,6 +387,86 @@ class BatchQualitySafetyTest {
     }
 
     @Test
+    fun overshootAwarePredictionPrefersRemuxWhenEncoderOvershoots() {
+        val source = VideoSourceInfo(
+            width = 2160,
+            height = 3840,
+            frameRate = 60f,
+            durationMs = 93_247,
+            totalBitrate = 120_202_307,
+            audioBitrate = 256_000,
+            videoMime = MimeTypes.VIDEO_H265,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT2020
+        )
+        val sourceBytes = 1_401_060_070L
+
+        // Without overshoot knowledge, the default 0.95 target predicts a useful saving.
+        assertFalse(
+            BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
+                source, MimeTypes.VIDEO_H265, sourceBytes, learnedTargetRatio = null
+            )
+        )
+        // With the measured S23 Ultra VBR overshoot (~1.25x), the same request predicts an output
+        // LARGER than the source, so the honest pre-encode decision is remux — no wasted encode.
+        assertTrue(
+            BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
+                source, MimeTypes.VIDEO_H265, sourceBytes,
+                learnedTargetRatio = null,
+                expectedOvershootFactor = 1.25
+            )
+        )
+        // A sub-1.0 (or corrupt) factor is clamped to 1.0 — it cannot fake extra headroom.
+        val predictedClamped = BatchQualityBitratePolicy.predictedPerceptualLosslessBytes(
+            source, MimeTypes.VIDEO_H265, null, expectedOvershootFactor = 0.10
+        )
+        val predictedBaseline = BatchQualityBitratePolicy.predictedPerceptualLosslessBytes(
+            source, MimeTypes.VIDEO_H265, null
+        )
+        assertEquals(predictedBaseline, predictedClamped)
+    }
+
+    @Test
+    fun cbrCapabilityProbeFailsClosedWithoutCrashing() {
+        // On a platform where the codec list is unavailable (or CQ/CBR unsupported), the probe
+        // must return false — the experiment silently stays on the safe VBR path, never crashes.
+        assertFalse(ExperimentalEncoderControls.isCbrSupportedByHardwareEncoder(MimeTypes.VIDEO_H265))
+    }
+
+    @Test
+    fun verifiedButNotSmallerOutputCannotReplaceOriginal() {
+        // Within the +3% verification tolerance but 1 byte larger than the source: the verdict
+        // stays honest ("Verified") but replacing the user's original must be blocked.
+        val report = OutputVerifier.verify(
+            hdr4k60VerificationInput(
+                outputSize = 1_401_060_071L,
+                sourceSize = 1_401_060_070L,
+                outputDurationMs = 93_247L
+            )
+        )
+
+        assertEquals("Perceptually Lossless Verified", report.verdict)
+        assertTrue(report.verified)
+        assertFalse(report.replacementSafe)
+        assertTrue(report.replacementBlockReason.orEmpty().contains("not smaller"))
+    }
+
+    @Test
+    fun experimentalEncoderCeilingFlagNeverBypassesVerificationInputs() {
+        // The experiment only changes how an encode is REQUESTED. The verifier has no knowledge
+        // of the flag: an oversized output fails identically with or without the experiment.
+        val report = OutputVerifier.verify(
+            hdr4k60VerificationInput(
+                outputSize = 1_500_000_000L,
+                sourceSize = 1_401_060_070L,
+                outputDurationMs = 93_247L
+            )
+        )
+        assertFalse(report.verified)
+        assertFalse(report.replacementSafe)
+    }
+
+    @Test
     fun outputFpsFallsBackToTrackFrameRateWhenRetrieverDoesNotExposeIt() {
         // The extractor-provided track frame rate keeps FPS verification working when
         // METADATA_KEY_CAPTURE_FRAMERATE is absent on the encoded output.

@@ -135,12 +135,47 @@ class SmartPerceptualProfileEngineTest {
             nextTargetRatio = 0.91,
             preferRemux = false,
             lastFailureReason = "hdr metadata lost",
-            lastOutputToSourceRatio = 0.88
+            lastOutputToSourceRatio = 0.88,
+            measuredOvershootFactor = 1.25
         )
         val decoded = SmartPerceptualProfileEngine.LearnedEncodeProfile.decode(original.encode())
         assertEquals(original, decoded)
         assertNull(SmartPerceptualProfileEngine.LearnedEncodeProfile.decode(null))
         assertNull(SmartPerceptualProfileEngine.LearnedEncodeProfile.decode(""))
+    }
+
+    @Test
+    fun overshootFactorIsLearnedBlendedAndClamped() {
+        val e = engine()
+        // No measurement yet: assume the encoder honors requests (factor 1.0).
+        assertEquals(1.0, e.expectedOvershootFactor(key()), 1e-9)
+
+        // The real S23 Ultra measurement from the device run: 142.3 / 113.9 ≈ 1.249.
+        e.recordFailure(key(), 0.95, "size grew", floorRatio = 0.80, measuredOvershootFactor = 1.249)
+        assertEquals(1.249, e.expectedOvershootFactor(key()), 1e-9)
+
+        // A second measurement is blended, not overwritten, so one outlier can't swing prediction.
+        e.recordFailure(key(), 0.97, "size grew", floorRatio = 0.80, measuredOvershootFactor = 1.0)
+        assertEquals((1.249 + 1.0) / 2.0, e.expectedOvershootFactor(key()), 1e-9)
+
+        // Absurd measurements are clamped into [1.0, 2.0] before blending.
+        e.recordVerifiedSuccess(key(), 0.95, 0.9, floorRatio = 0.80, measuredOvershootFactor = 50.0)
+        assertTrue(e.expectedOvershootFactor(key()) <= SmartPerceptualProfileEngine.MAX_OVERSHOOT_FACTOR)
+
+        // A corrupt/hostile stored value can never poison prediction below 1.0.
+        val store = SmartPerceptualProfileEngine.InMemoryProfileStore()
+        store.write(key().asKey(), "success=1;failure=0;highFail=0;nextRatio=0.95;preferRemux=false;lastReason=;lastSizeRatio=;overshoot=0.01")
+        val tampered = SmartPerceptualProfileEngine(store)
+        assertEquals(1.0, tampered.expectedOvershootFactor(key()), 1e-9)
+    }
+
+    @Test
+    fun attemptsWithoutOvershootMeasurementDoNotEraseLearnedFactor() {
+        val e = engine()
+        e.recordFailure(key(), 0.95, "size grew", floorRatio = 0.80, measuredOvershootFactor = 1.25)
+        // A later attempt where measurement was unavailable must keep the learned factor.
+        e.recordFailure(key(), 0.97, "unverified", floorRatio = 0.80, measuredOvershootFactor = null)
+        assertEquals(1.25, e.expectedOvershootFactor(key()), 1e-9)
     }
 
     @Test

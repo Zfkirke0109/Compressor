@@ -312,11 +312,16 @@ object BatchQualityBitratePolicy {
      * Predicted output bytes for a Perceptually Lossless encode at the given (or default) target
      * ratio. Uses a small realistic container overhead rather than the UI estimate's padding, so
      * the remux-vs-encode decision is not biased toward remux by an inflated estimate.
+     *
+     * [expectedOvershootFactor] scales the predicted video bitrate by the encoder's measured
+     * request-vs-actual behavior (the S23 Ultra HEVC VBR path measured ~1.25x on 4K60 HDR).
+     * A requested bitrate is not a guarantee; prediction must use what the encoder actually does.
      */
     fun predictedPerceptualLosslessBytes(
         source: VideoSourceInfo,
         outputMimeType: String,
-        learnedTargetRatio: Double? = null
+        learnedTargetRatio: Double? = null,
+        expectedOvershootFactor: Double = 1.0
     ): Long {
         val durationSec = (source.durationMs / 1000.0).coerceAtLeast(1.0)
         val videoBitrate = calculateVideoBitrate(
@@ -325,10 +330,11 @@ object BatchQualityBitratePolicy {
             outputMimeType = outputMimeType,
             learnedTargetRatio = learnedTargetRatio
         )
+        val overshoot = if (expectedOvershootFactor.isFinite()) expectedOvershootFactor.coerceIn(1.0, 2.0) else 1.0
         // Perceptually Lossless transmuxes (stream-copies) audio when possible, so predicted audio
         // bytes use the source audio bitrate rather than the re-encode request.
         val audioBitrate = source.audioBitrate.coerceAtLeast(0)
-        val estimatedBits = (videoBitrate + audioBitrate).toDouble() * durationSec
+        val estimatedBits = (videoBitrate * overshoot + audioBitrate) * durationSec
         return ((estimatedBits * 1.01) / 8.0).toLong().coerceAtLeast(1L)
     }
 
@@ -342,10 +348,16 @@ object BatchQualityBitratePolicy {
         source: VideoSourceInfo,
         outputMimeType: String,
         sourceSizeBytes: Long,
-        learnedTargetRatio: Double? = null
+        learnedTargetRatio: Double? = null,
+        expectedOvershootFactor: Double = 1.0
     ): Boolean {
         if (sourceSizeBytes <= 0L) return false
-        val predicted = predictedPerceptualLosslessBytes(source, outputMimeType, learnedTargetRatio)
+        val predicted = predictedPerceptualLosslessBytes(
+            source,
+            outputMimeType,
+            learnedTargetRatio,
+            expectedOvershootFactor
+        )
         val maxUseful = (sourceSizeBytes * (1.0 - MIN_PERCEPTUAL_LOSSLESS_PREDICTED_SAVINGS)).toLong()
         return predicted >= maxUseful
     }

@@ -184,7 +184,19 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val targetRatio: Double,
         val floorRatio: Double,
         val preferRemux: Boolean,
-        val remuxReason: String?
+        val remuxReason: String?,
+        // Tier-1 experimental encoder-ceiling diagnostics (debug builds only): request CBR so the
+        // QTI encoder cannot apply its VBR quality-boost overshoot. Judged by OutputVerifier only.
+        val useCbrCeiling: Boolean = false,
+        val expectedOvershootFactor: Double = 1.0
+    )
+
+    private data class EncodeAttemptResult(
+        val file: File,
+        val requestedVideoBitrate: Int,
+        val requestedBitrateModeLabel: String,
+        val videoEncoderName: String?,
+        val reportedAverageVideoBitrate: Int
     )
 
     fun refreshShizukuStatus(context: Context) {
@@ -546,26 +558,55 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         plannedFps,
                         perceptualPlan?.takeIf { !it.preferRemux }?.targetRatio
                     )
+                    var encodeAttempt: EncodeAttemptResult? = null
                     var remuxResult = if (effectiveQuality == BatchQualityPreset.REMUX_ONLY) {
                         remuxOnlyOne(context, item, index, privacyMode)
                     } else {
                         val safeResolvedMime = resolvedMime
                             ?: throw IllegalStateException("Encoder selection failed before export planning. Use Remux Only or choose a different codec.")
-                        val encodedFile = compressOne(
-                            context,
-                            item,
-                            index,
-                            quality,
-                            frameRate,
-                            safeResolvedMime,
-                            perceptualPlan?.targetRatio
-                        )
-                        withContext(Dispatchers.IO) {
-                            Mp4MetadataRemuxer.remuxWithSourceMetadata(
+                        try {
+                            val attempt = compressOne(
                                 context,
-                                encodedFile,
-                                item.metadataSnapshot.filteredForPrivacy(privacyMode)
+                                item,
+                                index,
+                                quality,
+                                frameRate,
+                                safeResolvedMime,
+                                perceptualPlan?.targetRatio,
+                                perceptualPlan?.useCbrCeiling == true
                             )
+                            encodeAttempt = attempt
+                            withContext(Dispatchers.IO) {
+                                Mp4MetadataRemuxer.remuxWithSourceMetadata(
+                                    context,
+                                    attempt.file,
+                                    item.metadataSnapshot.filteredForPrivacy(privacyMode)
+                                )
+                            }
+                        } catch (e: ExportException) {
+                            // A rejected encoder configuration or export failure must never strand
+                            // a Perceptually Lossless item as "Failed": the honest production
+                            // answer is the verified stream copy.
+                            if (perceptualPlan == null) throw e
+                            val reason = "encoder export failed (${e.errorCodeName})"
+                            Log.w(
+                                "CompressorBatch",
+                                "Perceptually lossless encode failed before verification for ${item.originalName}: $reason; falling back to remux"
+                            )
+                            val learned = learningEngine.recordFailure(
+                                perceptualPlan.profileKey,
+                                perceptualPlan.targetRatio,
+                                reason,
+                                perceptualPlan.floorRatio
+                            )
+                            Log.i(
+                                "CompressorLearning",
+                                "result=failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
+                                    "reason=$reason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
+                            )
+                            effectiveQuality = BatchQualityPreset.REMUX_ONLY
+                            preEncodeRemuxNote = "Remux Fallback Kept: the encoder rejected the perceptually lossless attempt ($reason)"
+                            remuxOnlyOne(context, item, index, privacyMode)
                         }
                     }
                     var outputFile = remuxResult.outputFile
@@ -573,6 +614,19 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     var outputSize = outputFile.length()
                     var verification = withContext(Dispatchers.IO) {
                         OutputVerifier.verify(context, item, outputFile, effectiveQuality.label, privacyMode)
+                    }
+                    // Measured request-vs-actual encoder behavior for this attempt. Prefer Media3's
+                    // own reported average; fall back to the size/duration measurement.
+                    val measuredOvershoot = encodeAttempt?.let { attempt ->
+                        when {
+                            attempt.requestedVideoBitrate <= 0 -> null
+                            attempt.reportedAverageVideoBitrate > 0 ->
+                                attempt.reportedAverageVideoBitrate.toDouble() / attempt.requestedVideoBitrate
+                            item.durationMs > 0 && outputSize > 0 ->
+                                ((outputSize * 8000.0 / item.durationMs) - item.originalAudioBitrate.coerceAtLeast(0)) /
+                                    attempt.requestedVideoBitrate
+                            else -> null
+                        }
                     }
                     if (effectiveQuality == BatchQualityPreset.ORIGINAL &&
                         PerceptualLosslessVerifier.shouldFallbackToRemux(verification, item.originalSize, outputSize)
@@ -592,11 +646,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 plan.profileKey,
                                 plan.targetRatio,
                                 failureReason,
-                                plan.floorRatio
+                                plan.floorRatio,
+                                measuredOvershoot
                             )
                             Log.i(
                                 "CompressorLearning",
                                 "result=failure; profileKey=${plan.profileKey.asKey()}; usedRatio=${plan.targetRatio}; " +
+                                    "bitrateMode=${encodeAttempt?.requestedBitrateModeLabel ?: "unknown"}; encoderName=${encodeAttempt?.videoEncoderName ?: "unknown"}; " +
+                                    "measuredOvershoot=${measuredOvershoot ?: "unknown"}; learnedOvershoot=${learned.measuredOvershootFactor ?: "none"}; " +
                                     "reason=$failureReason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
                             )
                         }
@@ -621,11 +678,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 plan.profileKey,
                                 plan.targetRatio,
                                 sizeRatio,
-                                plan.floorRatio
+                                plan.floorRatio,
+                                measuredOvershoot
                             )
                             Log.i(
                                 "CompressorLearning",
                                 "result=verified; profileKey=${plan.profileKey.asKey()}; usedRatio=${plan.targetRatio}; " +
+                                    "bitrateMode=${encodeAttempt?.requestedBitrateModeLabel ?: "unknown"}; encoderName=${encodeAttempt?.videoEncoderName ?: "unknown"}; " +
+                                    "measuredOvershoot=${measuredOvershoot ?: "unknown"}; learnedOvershoot=${learned.measuredOvershootFactor ?: "none"}; " +
                                     "sizeRatio=$sizeRatio; nextRatio=${learned.nextTargetRatio}"
                             )
                         }
@@ -991,11 +1051,20 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val defaultRatio = BatchQualityBitratePolicy.perceptualLosslessDefaultTargetRatio(source, outputMime)
         val targetRatio = learningEngine.recommendedTargetRatio(profileKey, defaultRatio, floorRatio)
         val profilePrefersRemux = learningEngine.shouldPreferRemux(profileKey)
+        // Tier-1 experiment (debug builds): request CBR so the QTI encoder cannot apply its VBR
+        // quality-boost overshoot. Gated on real device support, never assumed.
+        val useCbrCeiling = ExperimentalEncoderControls.isEnabled(getApplication()) &&
+            ExperimentalEncoderControls.isCbrSupportedByHardwareEncoder(outputMime)
+        // CBR is expected to hold the requested average; VBR predictions use the measured
+        // per-profile overshoot so the near-optimal gate reflects what the encoder actually does.
+        val learnedOvershoot = learningEngine.expectedOvershootFactor(profileKey)
+        val expectedOvershootFactor = if (useCbrCeiling) 1.0 else learnedOvershoot
         val nearOptimal = BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
             source = source,
             outputMimeType = outputMime,
             sourceSizeBytes = item.originalSize,
-            learnedTargetRatio = targetRatio
+            learnedTargetRatio = targetRatio,
+            expectedOvershootFactor = expectedOvershootFactor
         )
         val remuxReason = when {
             profilePrefersRemux ->
@@ -1007,14 +1076,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         Log.i(
             "CompressorLearning",
             "plan; profileKey=${profileKey.asKey()}; defaultRatio=$defaultRatio; learnedRatio=$targetRatio; " +
-                "floorRatio=$floorRatio; preferRemux=${remuxReason != null}; reason=${remuxReason ?: "none"}"
+                "floorRatio=$floorRatio; learnedOvershoot=$learnedOvershoot; expectedOvershoot=$expectedOvershootFactor; " +
+                "experimentalCbrCeiling=$useCbrCeiling; preferRemux=${remuxReason != null}; reason=${remuxReason ?: "none"}"
         )
         return PerceptualLosslessPlan(
             profileKey = profileKey,
             targetRatio = targetRatio,
             floorRatio = floorRatio,
             preferRemux = remuxReason != null,
-            remuxReason = remuxReason
+            remuxReason = remuxReason,
+            useCbrCeiling = useCbrCeiling,
+            expectedOvershootFactor = expectedOvershootFactor
         )
     }
 
@@ -1058,8 +1130,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         quality: BatchQualityPreset,
         frameRate: BatchFrameRateOption,
         videoMimeType: String,
-        learnedTargetRatio: Double? = null
-    ): File = withContext(Dispatchers.Main) {
+        learnedTargetRatio: Double? = null,
+        useCbrCeiling: Boolean = false
+    ): EncodeAttemptResult = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
             val outputDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
             val outputFile = File(outputDir, item.outputName(quality))
@@ -1072,16 +1145,30 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // FrameDropEffect can ever be attached in those modes.
             val plannedFps = outputFpsFor(item, frameRate, quality)
 
+            // Experimental Tier-1 ceiling: CBR holds the requested average, so the QTI VBR
+            // quality-boost overshoot (measured ~1.25x on this device class) cannot apply.
+            // A request is still not a guarantee — OutputVerifier judges the real output.
+            val bitrateMode = if (useCbrCeiling) {
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+            } else {
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+            }
+            val bitrateModeLabel = if (useCbrCeiling) "CBR" else "VBR"
+
             val decoderFactory = DefaultDecoderFactory.Builder(context)
                 .setEnableDecoderFallback(true)
                 .build()
 
+            // Under the experiment, disable Media3's silent "closest supported format" fallback:
+            // a Perceptually Lossless attempt must either encode exactly what was requested or
+            // fail fast into the honest remux fallback, never silently change truth-critical
+            // properties. Outside the experiment, production behavior is unchanged.
             val encoderFactory = DefaultEncoderFactory.Builder(context)
-                .setEnableFallback(true)
+                .setEnableFallback(!useCbrCeiling)
                 .setRequestedVideoEncoderSettings(
                     VideoEncoderSettings.Builder()
                         .setBitrate(targetBitrate)
-                        .setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                        .setBitrateMode(bitrateMode)
                         .build()
                 )
                 .setRequestedAudioEncoderSettings(
@@ -1100,6 +1187,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     override fun onCompleted(composition: Composition, exportResult: ExportResult) {
                         progressJob?.cancel()
                         val finalSize = outputFile.length()
+                        Log.i(
+                            "CompressorEncoderPlan",
+                            "encodeResult; mode=${quality.label}; requestedVideoBitrate=$targetBitrate; requestedBitrateMode=$bitrateModeLabel; " +
+                                "encoderName=${exportResult.videoEncoderName ?: "unknown"}; reportedAverageVideoBitrate=${exportResult.averageVideoBitrate}; " +
+                                "overshootFactor=${if (targetBitrate > 0 && exportResult.averageVideoBitrate > 0) "%.3f".format(exportResult.averageVideoBitrate.toDouble() / targetBitrate) else "unknown"}; " +
+                                "outputBytes=$finalSize"
+                        )
                         updateItem(index) {
                             it.copy(
                                 progress = 1f,
@@ -1108,7 +1202,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 message = "Compressing: ${formatFileSize(finalSize)} / est ${formatFileSize(estimatedOutputSize)} • 100%"
                             )
                         }
-                        if (continuation.isActive) continuation.resume(outputFile)
+                        if (continuation.isActive) {
+                            continuation.resume(
+                                EncodeAttemptResult(
+                                    file = outputFile,
+                                    requestedVideoBitrate = targetBitrate,
+                                    requestedBitrateModeLabel = bitrateModeLabel,
+                                    videoEncoderName = exportResult.videoEncoderName,
+                                    reportedAverageVideoBitrate = exportResult.averageVideoBitrate
+                                )
+                            )
+                        }
                     }
 
                     override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {

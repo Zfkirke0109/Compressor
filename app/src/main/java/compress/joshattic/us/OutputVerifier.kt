@@ -285,9 +285,15 @@ object OutputVerifier {
         val outputWithinTolerance = input.sourceSize <= 0L ||
             input.outputSize <= (input.sourceSize * (1.0 + BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_SIZE_TOLERANCE)).toLong()
 
+        // Replacing the original is destructive on a locked-down device, so Perceptually Lossless
+        // replacement demands a STRICTLY smaller output. A verified output inside the size
+        // tolerance but not smaller keeps its "Verified" verdict and may be saved as a copy — it
+        // just may not overwrite the user's original.
+        val strictlySmaller = input.sourceSize > 0L && input.outputSize in 1 until input.sourceSize
+
         val replacementSafe = when (input.mode) {
             BatchQualityMode.REMUX_ONLY -> remuxVerified
-            BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance
+            BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance && strictlySmaller
             else -> playable
         }
 
@@ -307,6 +313,7 @@ object OutputVerifier {
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !audioBitratePass -> "perceptually lossless output audio bitrate fell below the verified safety threshold"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !(hdrMatches && standardMatches && rangeMatches) -> "perceptually lossless output lost HDR/color metadata"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !outputWithinTolerance -> "perceptually lossless output exceeded the allowed size growth tolerance"
+            input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !strictlySmaller -> "perceptually lossless output is not smaller than the source, so replacing the original is blocked"
             else -> null
         }
 

@@ -85,7 +85,11 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         val nextTargetRatio: Double? = null,
         val preferRemux: Boolean = false,
         val lastFailureReason: String? = null,
-        val lastOutputToSourceRatio: Double? = null
+        val lastOutputToSourceRatio: Double? = null,
+        // Measured encoder overshoot (actual video bitrate / requested video bitrate) for this
+        // profile, e.g. the S23 Ultra HEVC VBR path measured ~1.25 on 4K60 HDR. Used only to make
+        // pre-encode size prediction honest; never to relax verification.
+        val measuredOvershootFactor: Double? = null
     ) {
         fun encode(): String = listOf(
             "success=$successCount",
@@ -94,7 +98,8 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             "nextRatio=${nextTargetRatio ?: ""}",
             "preferRemux=$preferRemux",
             "lastReason=${lastFailureReason.orEmpty().replace(";", ",")}",
-            "lastSizeRatio=${lastOutputToSourceRatio ?: ""}"
+            "lastSizeRatio=${lastOutputToSourceRatio ?: ""}",
+            "overshoot=${measuredOvershootFactor ?: ""}"
         ).joinToString(";")
 
         companion object {
@@ -112,7 +117,8 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
                         nextTargetRatio = fields["nextRatio"]?.toDoubleOrNull(),
                         preferRemux = fields["preferRemux"]?.toBooleanStrictOrNull() ?: false,
                         lastFailureReason = fields["lastReason"]?.ifBlank { null },
-                        lastOutputToSourceRatio = fields["lastSizeRatio"]?.toDoubleOrNull()
+                        lastOutputToSourceRatio = fields["lastSizeRatio"]?.toDoubleOrNull(),
+                        measuredOvershootFactor = fields["overshoot"]?.toDoubleOrNull()
                     )
                 }.getOrNull()
             }
@@ -142,6 +148,15 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
     fun shouldPreferRemux(key: EncodeProfileKey): Boolean = profile(key).preferRemux
 
     /**
+     * The expected encoder overshoot factor (actual/requested video bitrate) for this profile.
+     * Defaults to [DEFAULT_OVERSHOOT_FACTOR] (no overshoot assumed) until measured; always clamped
+     * to a sane range so a corrupt store cannot poison prediction.
+     */
+    fun expectedOvershootFactor(key: EncodeProfileKey): Double =
+        (profile(key).measuredOvershootFactor ?: DEFAULT_OVERSHOOT_FACTOR)
+            .coerceIn(MIN_OVERSHOOT_FACTOR, MAX_OVERSHOOT_FACTOR)
+
+    /**
      * Record a verification-passed Perceptually Lossless encode. The next recommendation steps
      * down cautiously (never below [floorRatio]) so later videos with this profile may save more.
      */
@@ -149,7 +164,8 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         key: EncodeProfileKey,
         usedTargetRatio: Double,
         outputToSourceBytesRatio: Double,
-        floorRatio: Double
+        floorRatio: Double,
+        measuredOvershootFactor: Double? = null
     ): LearnedEncodeProfile {
         val current = profile(key)
         val next = (usedTargetRatio - SUCCESS_STEP_DOWN)
@@ -160,7 +176,8 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             nextTargetRatio = next,
             preferRemux = false,
             lastFailureReason = null,
-            lastOutputToSourceRatio = outputToSourceBytesRatio
+            lastOutputToSourceRatio = outputToSourceBytesRatio,
+            measuredOvershootFactor = blendOvershoot(current.measuredOvershootFactor, measuredOvershootFactor)
         )
         store.write(key.asKey(), updated.encode())
         return updated
@@ -175,7 +192,8 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         key: EncodeProfileKey,
         usedTargetRatio: Double,
         reason: String,
-        floorRatio: Double
+        floorRatio: Double,
+        measuredOvershootFactor: Double? = null
     ): LearnedEncodeProfile {
         val current = profile(key)
         val next = (usedTargetRatio + FAILURE_STEP_UP)
@@ -190,10 +208,21 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             consecutiveHighRatioFailures = highRatioFailures,
             nextTargetRatio = next,
             preferRemux = highRatioFailures >= HIGH_RATIO_FAILURES_BEFORE_REMUX,
-            lastFailureReason = reason
+            lastFailureReason = reason,
+            measuredOvershootFactor = blendOvershoot(current.measuredOvershootFactor, measuredOvershootFactor)
         )
         store.write(key.asKey(), updated.encode())
         return updated
+    }
+
+    // Average the new measurement with the stored one so a single outlier run cannot swing the
+    // prediction; clamped into [MIN_OVERSHOOT_FACTOR, MAX_OVERSHOOT_FACTOR].
+    private fun blendOvershoot(stored: Double?, measured: Double?): Double? {
+        val clampedMeasured = measured?.takeIf { it.isFinite() && it > 0 }
+            ?.coerceIn(MIN_OVERSHOOT_FACTOR, MAX_OVERSHOOT_FACTOR)
+            ?: return stored
+        val base = stored?.coerceIn(MIN_OVERSHOOT_FACTOR, MAX_OVERSHOOT_FACTOR)
+        return if (base == null) clampedMeasured else (base + clampedMeasured) / 2.0
     }
 
     companion object {
@@ -205,6 +234,12 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         const val FAILURE_STEP_UP = 0.05
         const val HIGH_RATIO_FAILURE_THRESHOLD = 0.93
         const val HIGH_RATIO_FAILURES_BEFORE_REMUX = 2
+
+        // Overshoot factors are ratios of measured/requested video bitrate. 1.0 = encoder honored
+        // the request exactly; the S23 Ultra HEVC VBR path measured ~1.25 on 4K60 HDR sources.
+        const val DEFAULT_OVERSHOOT_FACTOR = 1.0
+        const val MIN_OVERSHOOT_FACTOR = 1.0
+        const val MAX_OVERSHOOT_FACTOR = 2.0
 
         fun profileKeyFor(
             source: VideoSourceInfo,

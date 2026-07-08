@@ -46,6 +46,8 @@ class BatchMainActivity : ComponentActivity() {
             }
         }
         window.decorView.post { consumeIncomingVideos(startupIntent) }
+        // Diagnostics-only: logs real encoder capabilities once per process in debug builds.
+        EncoderCapabilityDiagnostics.dumpOnceInBackground(this)
     }
 
     override fun onNewIntent(intent: Intent) {
