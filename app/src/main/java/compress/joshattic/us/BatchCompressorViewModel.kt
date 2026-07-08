@@ -820,7 +820,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         }
         if (!supported.contains(resolved)) {
             if (quality == BatchQualityPreset.ORIGINAL) {
-                throw IllegalStateException("Perceptually Lossless is blocked because ${codec.label} cannot preserve this source on this device. Select HEVC, use Remux Only, or choose a lossy mode.")
+                throw IllegalStateException(
+                    "Perceptually Lossless is blocked because ${codec.label} cannot preserve this source on this device. ${perceptualLosslessRecoveryHint(supported)}"
+                )
             }
             return when {
                 supported.contains(MimeTypes.VIDEO_H265) -> MimeTypes.VIDEO_H265
@@ -829,9 +831,32 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
         }
         if (quality == BatchQualityPreset.ORIGINAL && sourceInfo.isHdr && resolved == MimeTypes.VIDEO_H264) {
-            throw IllegalStateException("Perceptually Lossless is blocked because H.264 cannot safely preserve HDR output. Select HEVC or AV1, or use a different quality mode.")
+            val hdrSafeCodecs = supported.filter { it != MimeTypes.VIDEO_H264 }
+            throw IllegalStateException(
+                "Perceptually Lossless is blocked because H.264 cannot safely preserve HDR output. ${perceptualLosslessRecoveryHint(hdrSafeCodecs)}"
+            )
         }
         return resolved
+    }
+
+    private fun perceptualLosslessRecoveryHint(supported: List<String>): String {
+        val codecOptions = supported
+            .distinct()
+            .mapNotNull {
+                when (it) {
+                    MimeTypes.VIDEO_H265 -> "HEVC"
+                    MimeTypes.VIDEO_AV1 -> "AV1"
+                    MimeTypes.VIDEO_H264 -> "H.264"
+                    else -> null
+                }
+            }
+            .filter { it != "H.264" }
+        val codecHint = when {
+            codecOptions.isEmpty() -> "Use Remux Only or choose a lossy mode."
+            codecOptions.size == 1 -> "Select ${codecOptions.first()}, use Remux Only, or choose a lossy mode."
+            else -> "Select ${codecOptions.joinToString(" or ")}, use Remux Only, or choose a lossy mode."
+        }
+        return codecHint
     }
 
     private fun chooseAutoCodec(item: BatchVideoItem, quality: BatchQualityPreset, supported: List<String>): String {

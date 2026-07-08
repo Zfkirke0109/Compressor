@@ -93,6 +93,14 @@ data class BatchModeProfile(
 
 object BatchQualityBitratePolicy {
     const val PERCEPTUAL_LOSSLESS_SIZE_TOLERANCE = 0.03
+    private const val HDR_120_RATIO_FLOOR = 0.90
+    private const val HDR_4K60_RATIO_FLOOR = 0.80
+    private const val HDR_4K_RATIO_FLOOR = 0.75
+    private const val FPS120_RATIO_FLOOR = 0.88
+    private const val FPS60_4K_RATIO_FLOOR = 0.74
+    private const val FPS60_RATIO_FLOOR = 0.68
+    private const val UHD_RATIO_FLOOR = 0.62
+    private const val DEFAULT_RATIO_FLOOR = 0.55
 
     fun modeProfile(mode: BatchQualityMode): BatchModeProfile {
         return when (mode) {
@@ -236,16 +244,19 @@ object BatchQualityBitratePolicy {
             source.height >= 720 -> 6_000_000
             else -> 3_000_000
         }
+        // These ratio floors intentionally stay conservative for S23-class camera clips so
+        // Perceptually Lossless never targets the kind of large bitrate drops that caused visible
+        // degradation on 4K/8K HDR and 120fps footage.
         val ratioFloor = when {
-            source.isHdr && source.frameRate >= 110f -> 0.90
-            source.isHdr && (source.height >= 4320 || source.width >= 7680) -> 0.90
-            source.isHdr && (source.height >= 2160 || source.width >= 3840) && source.frameRate >= 59f -> 0.80
-            source.isHdr && (source.height >= 2160 || source.width >= 3840) -> 0.75
-            source.frameRate >= 110f -> 0.88
-            source.frameRate >= 59f && (source.height >= 2160 || source.width >= 3840) -> 0.74
-            source.frameRate >= 59f -> 0.68
-            source.height >= 2160 || source.width >= 3840 -> 0.62
-            else -> 0.55
+            source.isHdr && source.frameRate >= 110f -> HDR_120_RATIO_FLOOR
+            source.isHdr && (source.height >= 4320 || source.width >= 7680) -> HDR_120_RATIO_FLOOR
+            source.isHdr && (source.height >= 2160 || source.width >= 3840) && source.frameRate >= 59f -> HDR_4K60_RATIO_FLOOR
+            source.isHdr && (source.height >= 2160 || source.width >= 3840) -> HDR_4K_RATIO_FLOOR
+            source.frameRate >= 110f -> FPS120_RATIO_FLOOR
+            source.frameRate >= 59f && (source.height >= 2160 || source.width >= 3840) -> FPS60_4K_RATIO_FLOOR
+            source.frameRate >= 59f -> FPS60_RATIO_FLOOR
+            source.height >= 2160 || source.width >= 3840 -> UHD_RATIO_FLOOR
+            else -> DEFAULT_RATIO_FLOOR
         }
         val sourceVideoBitrate = source.videoBitrate.takeIf { it > 0 } ?: fallbackOriginalBitrate(source)
         return max(absoluteFloor, (sourceVideoBitrate * ratioFloor).toInt()).coerceAtMost(sourceVideoBitrate)
