@@ -166,34 +166,81 @@ object OutputVerifier {
         val sourceVideoBitrate = input.sourceTrackProbe.videoBitrate.takeIf { it > 0 }
             ?: input.source.videoBitrate.takeIf { it > 0 }
             ?: BatchQualityBitratePolicy.fallbackOriginalBitrate(input.source)
-        val outputVideoBitrate = input.outputTrackProbe.videoBitrate
+
+        // Both the batch and remux pipelines finish through Android's MediaMuxer, which does not
+        // write per-track bitrate metadata (btrt), so KEY_BIT_RATE is usually absent on outputs.
+        // The average bitrate is still measurable from the real file size and duration, so use
+        // that instead of failing verification on missing container metadata.
+        val measuredOutputTotalBitrate = if (input.outputSize > 0L && input.outputFileProbe.durationMs > 0L) {
+            ((input.outputSize * 8_000.0) / input.outputFileProbe.durationMs).toInt()
+        } else {
+            0
+        }
+
+        // Audio in Perceptually Lossless and Remux Only is stream-copied, never re-encoded; when
+        // the copied track's bitrate is not exposed but the codec/channels/sample-rate all match
+        // the source exactly, the source bitrate is the truthful value for the copied packets.
+        val audioLooksStreamCopied = input.outputTrackProbe.audioBitrate <= 0 &&
+            audioCodecMatches &&
+            input.sourceTrackProbe.audioCodec != null &&
+            audioShapeMatches &&
+            input.outputTrackProbe.audioChannelCount != null &&
+            input.outputTrackProbe.audioSampleRate != null
+        val effectiveOutputAudioBitrate = when {
+            input.outputTrackProbe.audioBitrate > 0 -> input.outputTrackProbe.audioBitrate
+            audioLooksStreamCopied -> input.sourceTrackProbe.audioBitrate
+            else -> 0
+        }
+
+        val effectiveOutputVideoBitrate = when {
+            input.outputTrackProbe.videoBitrate > 0 -> input.outputTrackProbe.videoBitrate
+            measuredOutputTotalBitrate > 0 -> {
+                val audioShare = effectiveOutputAudioBitrate.coerceAtLeast(0)
+                (measuredOutputTotalBitrate - audioShare).coerceAtLeast(measuredOutputTotalBitrate / 2)
+            }
+            else -> 0
+        }
+        val videoBitrateMeasured = input.outputTrackProbe.videoBitrate <= 0 && effectiveOutputVideoBitrate > 0
+
         val minPerceptualVideoBitrate = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(input.source)
         val bitratePass = when (input.mode) {
-            BatchQualityMode.PERCEPTUAL_LOSSLESS -> outputVideoBitrate > 0 && outputVideoBitrate >= minPerceptualVideoBitrate
-            BatchQualityMode.REMUX_ONLY -> outputVideoBitrate <= 0 || sourceVideoBitrate <= 0 || outputVideoBitrate >= (sourceVideoBitrate * 0.98).toInt()
+            BatchQualityMode.PERCEPTUAL_LOSSLESS -> effectiveOutputVideoBitrate > 0 && effectiveOutputVideoBitrate >= minPerceptualVideoBitrate
+            BatchQualityMode.REMUX_ONLY -> effectiveOutputVideoBitrate <= 0 || sourceVideoBitrate <= 0 || effectiveOutputVideoBitrate >= (sourceVideoBitrate * 0.98).toInt()
             else -> true
         }
         val audioBitratePass = when {
             input.sourceTrackProbe.audioCodec == null -> input.outputTrackProbe.audioCodec == null || input.mode != BatchQualityMode.REMUX_ONLY
+            // A stream-copied track carries the source packets verbatim, so bitrate parity holds
+            // even when neither container exposes a numeric value.
+            audioLooksStreamCopied -> true
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS -> {
                 val floor = maxOf(input.source.audioBitrate, 256_000)
-                input.outputTrackProbe.audioBitrate > 0 && input.outputTrackProbe.audioBitrate >= floor * 0.9
+                effectiveOutputAudioBitrate > 0 && effectiveOutputAudioBitrate >= floor * 0.9
             }
             input.mode == BatchQualityMode.REMUX_ONLY -> {
-                input.outputTrackProbe.audioBitrate > 0 && input.sourceTrackProbe.audioBitrate > 0 &&
-                    abs(input.outputTrackProbe.audioBitrate - input.sourceTrackProbe.audioBitrate) <= input.sourceTrackProbe.audioBitrate * 0.05
+                if (input.sourceTrackProbe.audioBitrate <= 0) {
+                    // Bitrate parity is unknowable when the source hides it; codec/shape/size
+                    // checks still gate the stream copy.
+                    true
+                } else {
+                    effectiveOutputAudioBitrate > 0 &&
+                        abs(effectiveOutputAudioBitrate - input.sourceTrackProbe.audioBitrate) <= input.sourceTrackProbe.audioBitrate * 0.05
+                }
             }
             else -> true
         }
 
         // playable already guarantees outputTrackProbe.videoCodec != null, so it is not re-checked.
+        // Audio bitrate counts as complete when exposed OR derivable from an exact stream copy;
+        // MediaMuxer outputs never carry btrt metadata, so requiring the raw key would make every
+        // on-device output permanently unverifiable.
         val criticalFieldsComplete = playable &&
             input.outputFileProbe.width > 0 &&
             input.outputFileProbe.height > 0 &&
             input.outputFileProbe.fps > 0f &&
             (input.sourceTrackProbe.audioCodec == null || (
                 input.outputTrackProbe.audioCodec != null &&
-                    input.outputTrackProbe.audioBitrate > 0 &&
+                    (effectiveOutputAudioBitrate > 0 || input.sourceTrackProbe.audioBitrate <= 0) &&
                     input.outputTrackProbe.audioChannelCount != null &&
                     input.outputTrackProbe.audioSampleRate != null
                 )) &&
@@ -283,11 +330,11 @@ object OutputVerifier {
                 fpsLabel(input.outputFileProbe.fps),
                 fpsComparison
             ),
-            videoBitrate = "${bitrateLabel(sourceVideoBitrate)} -> ${bitrateLabel(outputVideoBitrate)}${if (input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS) " (floor ${bitrateLabel(minPerceptualVideoBitrate)})" else ""}",
+            videoBitrate = "${bitrateLabel(sourceVideoBitrate)} -> ${bitrateLabel(effectiveOutputVideoBitrate)}${if (videoBitrateMeasured) " (measured from size)" else ""}${if (input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS) " (floor ${bitrateLabel(minPerceptualVideoBitrate)})" else ""}",
             videoCodec = "${codecLabel(input.sourceTrackProbe.videoCodec)} -> ${codecLabel(input.outputTrackProbe.videoCodec)} ${statusSuffix(videoCodecMatches)}",
             audioCodec = "${codecLabel(input.sourceTrackProbe.audioCodec)} -> ${codecLabel(input.outputTrackProbe.audioCodec)} ${statusSuffix(audioCodecMatches)}",
             audioDetails = "${sampleRateLabel(input.sourceTrackProbe.audioSampleRate)}/${channelLabel(input.sourceTrackProbe.audioChannelCount)} -> ${sampleRateLabel(input.outputTrackProbe.audioSampleRate)}/${channelLabel(input.outputTrackProbe.audioChannelCount)} ${statusSuffix(audioShapeMatches)}",
-            audioBitrate = "${bitrateLabel(input.sourceTrackProbe.audioBitrate)} -> ${bitrateLabel(input.outputTrackProbe.audioBitrate)} ${statusSuffix(audioBitratePass)}",
+            audioBitrate = "${bitrateLabel(input.sourceTrackProbe.audioBitrate)} -> ${bitrateLabel(effectiveOutputAudioBitrate)}${if (audioLooksStreamCopied) " (stream copied)" else ""} ${statusSuffix(audioBitratePass)}",
             hdr = "${input.sourceTrackProbe.hdrLabel} -> ${input.outputTrackProbe.hdrLabel} ${statusSuffix(hdrMatches)}",
             colorStandard = "${colorStandardLabel(input.sourceTrackProbe.colorStandard)} -> ${colorStandardLabel(input.outputTrackProbe.colorStandard)} ${statusSuffix(standardMatches)}",
             colorRange = "${colorRangeLabel(input.sourceTrackProbe.colorRange)} -> ${colorRangeLabel(input.outputTrackProbe.colorRange)} ${statusSuffix(rangeMatches)}",

@@ -582,6 +582,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             "CompressorBatch",
                             "Perceptually lossless fallback to remux for ${item.originalName}: $failureReason"
                         )
+                        // Log the full field-by-field report of the discarded attempt so device
+                        // logs show exactly which check failed or which field was not exposed.
+                        verification.summaryLines.forEach { line ->
+                            Log.w("CompressorVerification", "discarded PL attempt; $line")
+                        }
                         perceptualPlan?.let { plan ->
                             val learned = learningEngine.recordFailure(
                                 plan.profileKey,

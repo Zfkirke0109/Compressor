@@ -251,6 +251,141 @@ class BatchQualitySafetyTest {
         assertTrue(report.replacementBlockReason.orEmpty().contains("audio"))
     }
 
+    // MediaMuxer outputs never expose per-track bitrate (no btrt box); verification must fall
+    // back to bitrate measured from real output size/duration instead of failing forever.
+    private fun hdr4k60VerificationInput(
+        outputSize: Long,
+        sourceSize: Long,
+        outputDurationMs: Long
+    ): OutputVerifier.VerificationInput {
+        val sourceTracks = OutputVerifier.TrackProbe(
+            videoCodec = MimeTypes.VIDEO_H265,
+            audioCodec = MimeTypes.AUDIO_AAC,
+            videoBitrate = 119_946_000,
+            audioBitrate = 256_000,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT2020,
+            colorRange = MediaFormat.COLOR_RANGE_LIMITED,
+            audioChannelCount = 2,
+            audioSampleRate = 48_000
+        )
+        // Real S23 Ultra Transformer+MediaMuxer output: same codec/shape/HDR, bitrates hidden.
+        val outputTracks = sourceTracks.copy(videoBitrate = 0, audioBitrate = 0, videoFrameRate = 59f)
+        return OutputVerifier.VerificationInput(
+            mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
+            source = VideoSourceInfo(
+                width = 2160,
+                height = 3840,
+                frameRate = 60f,
+                durationMs = outputDurationMs,
+                totalBitrate = 120_202_307,
+                audioBitrate = 256_000,
+                videoMime = MimeTypes.VIDEO_H265,
+                audioMime = MimeTypes.AUDIO_AAC,
+                colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084,
+                colorStandard = MediaFormat.COLOR_STANDARD_BT2020,
+                colorRange = MediaFormat.COLOR_RANGE_LIMITED,
+                audioChannelCount = 2,
+                audioSampleRate = 48_000
+            ),
+            outputFileProbe = OutputVerifier.FileProbe(2160, 3840, 59f, outputDurationMs, 90),
+            sourceTrackProbe = sourceTracks,
+            outputTrackProbe = outputTracks,
+            sourceMetadata = VideoMetadataSnapshot(rawDateTag = "tag", rotationDegrees = 90),
+            outputMetadata = VideoMetadataSnapshot(rawDateTag = "tag", rotationDegrees = 90),
+            sourceSize = sourceSize,
+            outputSize = outputSize,
+            privacyMode = MetadataPrivacyMode.PRESERVE_ALL
+        )
+    }
+
+    @Test
+    fun perceptualLosslessVerifiesWithMeasuredBitrateWhenContainerHidesIt() {
+        // 93.247s output at ~1.19 GB measures to ~102 Mbps video — above the 95.9 Mbps floor —
+        // and the file shrank, so this must be verifiable despite hidden container bitrates.
+        val report = OutputVerifier.verify(
+            hdr4k60VerificationInput(
+                outputSize = 1_190_000_000L,
+                sourceSize = 1_401_060_070L,
+                outputDurationMs = 93_247L
+            )
+        )
+
+        assertEquals("Perceptually Lossless Verified", report.verdict)
+        assertTrue(report.verified)
+        assertTrue(report.replacementSafe)
+        assertTrue(report.videoBitrate.contains("measured from size"))
+        assertTrue(report.audioBitrate.contains("stream copied"))
+    }
+
+    @Test
+    fun perceptualLosslessSizeGrowthStillFailsWithMeasuredBitrate() {
+        // The real device run: encoder overshoot grew 1.3 GB to 1.5 GB. With measured bitrates
+        // the verdict must be a decisive size-tolerance failure, not "critical fields missing".
+        val report = OutputVerifier.verify(
+            hdr4k60VerificationInput(
+                outputSize = 1_500_000_000L,
+                sourceSize = 1_401_060_070L,
+                outputDurationMs = 93_247L
+            )
+        )
+
+        assertFalse(report.verified)
+        assertFalse(report.replacementSafe)
+        assertEquals("Perceptually Lossless Verification Failed", report.verdict)
+        assertTrue(report.replacementBlockReason.orEmpty().contains("size growth tolerance"))
+    }
+
+    @Test
+    fun remuxAcceptsHiddenOutputAudioBitrateWhenStreamShapeMatches() {
+        val sourceTracks = OutputVerifier.TrackProbe(
+            videoCodec = MimeTypes.VIDEO_H265,
+            audioCodec = MimeTypes.AUDIO_AAC,
+            videoBitrate = 79_500_000,
+            audioBitrate = 256_000,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_HLG,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT2020,
+            colorRange = MediaFormat.COLOR_RANGE_LIMITED,
+            audioChannelCount = 2,
+            audioSampleRate = 48_000
+        )
+        val outputTracks = sourceTracks.copy(videoBitrate = 0, audioBitrate = 0, videoFrameRate = 60f)
+
+        val report = OutputVerifier.verify(
+            OutputVerifier.VerificationInput(
+                mode = BatchQualityMode.REMUX_ONLY,
+                source = VideoSourceInfo(
+                    width = 3840,
+                    height = 2160,
+                    frameRate = 60f,
+                    durationMs = 60_000,
+                    totalBitrate = 80_000_000,
+                    audioBitrate = 256_000,
+                    videoMime = MimeTypes.VIDEO_H265,
+                    audioMime = MimeTypes.AUDIO_AAC,
+                    colorTransfer = MediaFormat.COLOR_TRANSFER_HLG,
+                    colorStandard = MediaFormat.COLOR_STANDARD_BT2020,
+                    colorRange = MediaFormat.COLOR_RANGE_LIMITED,
+                    audioChannelCount = 2,
+                    audioSampleRate = 48_000
+                ),
+                outputFileProbe = OutputVerifier.FileProbe(3840, 2160, 60f, 60_000, 90),
+                sourceTrackProbe = sourceTracks,
+                outputTrackProbe = outputTracks,
+                sourceMetadata = VideoMetadataSnapshot(rotationDegrees = 90),
+                outputMetadata = VideoMetadataSnapshot(rotationDegrees = 90),
+                sourceSize = 600_000_000L,
+                // Stream copy: essentially the same size, so measured bitrate matches the source.
+                outputSize = 599_999_000L,
+                privacyMode = MetadataPrivacyMode.PRESERVE_ALL
+            )
+        )
+
+        assertEquals("Remux Verified", report.verdict)
+        assertTrue(report.verified)
+        assertTrue(report.replacementSafe)
+    }
+
     @Test
     fun outputFpsFallsBackToTrackFrameRateWhenRetrieverDoesNotExposeIt() {
         // The extractor-provided track frame rate keeps FPS verification working when
