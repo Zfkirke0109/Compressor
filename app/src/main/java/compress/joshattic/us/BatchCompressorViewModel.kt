@@ -490,7 +490,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         message = if (quality == BatchQualityPreset.REMUX_ONLY) {
                             "Remuxing: video/audio copied unchanged • no re-encode • ${thermalWindow.thermalLabel}"
                         } else {
-                            "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality, codec, frameRate))} • $codecLabel${plannedFps?.let { fps -> " • ${fps}fps" } ?: " • source FPS"} • ${thermalWindow.thermalLabel}"
+                            "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality, codec, frameRate))} • ${codec.label}${plannedFps?.let { fps -> " • ${fps}fps" } ?: " • source FPS"} • ${thermalWindow.thermalLabel}"
                         }
                     )
                 }
