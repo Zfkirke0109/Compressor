@@ -28,7 +28,8 @@ object OutputVerifier {
         val colorStandard: Int?,
         val colorRange: Int?,
         val audioChannelCount: Int?,
-        val audioSampleRate: Int?
+        val audioSampleRate: Int?,
+        val videoFrameRate: Float = 0f
     ) {
         val hdrLabel: String
             get() = when (colorTransfer) {
@@ -60,9 +61,16 @@ object OutputVerifier {
         modeLabel: String,
         privacyMode: MetadataPrivacyMode
     ): OutputVerificationReport {
-        val outputProbe = readFileProbe(outputFile)
-        val sourceTracks = readTrackProbe(context, source.sourceUri)
+        val rawOutputProbe = readFileProbe(outputFile)
+        val sourceTracks = probeTracks(context, source.sourceUri)
         val outputTracks = readTrackProbe(outputFile.absolutePath)
+        // The retriever's CAPTURE_FRAMERATE is often absent on freshly encoded/remuxed files, so
+        // fall back to the extractor's track frame rate before treating FPS as "not exposed".
+        val outputProbe = if (rawOutputProbe.fps <= 0f && outputTracks.videoFrameRate > 0f) {
+            rawOutputProbe.copy(fps = outputTracks.videoFrameRate)
+        } else {
+            rawOutputProbe
+        }
         val outputMetadata = runCatching {
             VideoMetadataPreserver.capture(context, Uri.fromFile(outputFile))
         }.getOrDefault(VideoMetadataSnapshot())
@@ -178,11 +186,11 @@ object OutputVerifier {
             else -> true
         }
 
+        // playable already guarantees outputTrackProbe.videoCodec != null, so it is not re-checked.
         val criticalFieldsComplete = playable &&
             input.outputFileProbe.width > 0 &&
             input.outputFileProbe.height > 0 &&
             input.outputFileProbe.fps > 0f &&
-            input.outputTrackProbe.videoCodec != null &&
             (input.sourceTrackProbe.audioCodec == null || (
                 input.outputTrackProbe.audioCodec != null &&
                     input.outputTrackProbe.audioBitrate > 0 &&
@@ -333,7 +341,8 @@ object OutputVerifier {
         }
     }
 
-    private fun readTrackProbe(context: Context, uri: Uri): TrackProbe {
+    // Also used by encode planning to detect HDR/color and codec on the source before encoding.
+    internal fun probeTracks(context: Context, uri: Uri): TrackProbe {
         val extractor = MediaExtractor()
         return try {
             extractor.setDataSource(context, uri, null)
@@ -367,6 +376,7 @@ object OutputVerifier {
         var colorRange: Int? = null
         var audioChannels: Int? = null
         var audioSampleRate: Int? = null
+        var videoFrameRate = 0f
 
         for (i in 0 until extractor.trackCount) {
             val format = extractor.getTrackFormat(i)
@@ -378,6 +388,7 @@ object OutputVerifier {
                     colorTransfer = format.intOrNull(MediaFormat.KEY_COLOR_TRANSFER) ?: colorTransfer
                     colorStandard = format.intOrNull(MediaFormat.KEY_COLOR_STANDARD) ?: colorStandard
                     colorRange = format.intOrNull(MediaFormat.KEY_COLOR_RANGE) ?: colorRange
+                    if (videoFrameRate <= 0f) videoFrameRate = format.frameRateOrZero()
                 }
                 mime?.startsWith("audio/") == true -> {
                     if (audioCodec == null) audioCodec = mime
@@ -397,7 +408,8 @@ object OutputVerifier {
             colorStandard = colorStandard,
             colorRange = colorRange,
             audioChannelCount = audioChannels,
-            audioSampleRate = audioSampleRate
+            audioSampleRate = audioSampleRate,
+            videoFrameRate = videoFrameRate
         )
     }
 
@@ -490,5 +502,13 @@ object OutputVerifier {
 
     private fun MediaFormat.intOrNull(key: String): Int? {
         return if (containsKey(key)) runCatching { getInteger(key) }.getOrNull() else null
+    }
+
+    // KEY_FRAME_RATE may be stored as an int or a float depending on the container/framework path.
+    private fun MediaFormat.frameRateOrZero(): Float {
+        if (!containsKey(MediaFormat.KEY_FRAME_RATE)) return 0f
+        return runCatching { getInteger(MediaFormat.KEY_FRAME_RATE).toFloat() }
+            .recoverCatching { getFloat(MediaFormat.KEY_FRAME_RATE) }
+            .getOrDefault(0f)
     }
 }

@@ -35,10 +35,243 @@ class BatchQualitySafetyTest {
     }
 
     @Test
-    fun perceptuallyLosslessPreserves120FpsUnlessUserExplicitlyCapsIt() {
-        assertEquals(null, BatchQualityBitratePolicy.outputFpsFor(120f, BatchFrameRateChoice.SOURCE))
-        assertEquals(60, BatchQualityBitratePolicy.outputFpsFor(120f, BatchFrameRateChoice.FPS60))
-        assertEquals(120, BatchQualityBitratePolicy.outputFpsFor(120f, BatchFrameRateChoice.FPS120))
+    fun perceptuallyLosslessNeverCaps120FpsEvenWithExplicitFpsOption() {
+        // Perceptually Lossless and Remux Only always preserve source FPS/motion timing,
+        // no matter which FPS chip is selected.
+        for (choice in BatchFrameRateChoice.entries) {
+            assertEquals(
+                null,
+                BatchQualityBitratePolicy.plannedOutputFps(120f, BatchQualityMode.PERCEPTUAL_LOSSLESS, choice)
+            )
+            assertEquals(
+                null,
+                BatchQualityBitratePolicy.plannedOutputFps(120f, BatchQualityMode.REMUX_ONLY, choice)
+            )
+        }
+        // Lossy modes honor an explicit user cap.
+        assertEquals(
+            60,
+            BatchQualityBitratePolicy.plannedOutputFps(120f, BatchQualityMode.HIGH_QUALITY, BatchFrameRateChoice.FPS60)
+        )
+        assertEquals(
+            30,
+            BatchQualityBitratePolicy.plannedOutputFps(120f, BatchQualityMode.STORAGE_SAVER, BatchFrameRateChoice.FPS30)
+        )
+        assertEquals(
+            null,
+            BatchQualityBitratePolicy.plannedOutputFps(120f, BatchQualityMode.HIGH_QUALITY, BatchFrameRateChoice.SOURCE)
+        )
+    }
+
+    @Test
+    fun perceptualLossless120FpsFloorsAreStricterThan60FpsFloors() {
+        fun source(fps: Float, hdr: Boolean) = VideoSourceInfo(
+            width = 3840,
+            height = 2160,
+            frameRate = fps,
+            durationMs = 60_000,
+            totalBitrate = 119_900_000,
+            audioBitrate = 320_000,
+            videoMime = MimeTypes.VIDEO_H265,
+            colorTransfer = if (hdr) MediaFormat.COLOR_TRANSFER_ST2084 else MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
+            colorStandard = if (hdr) MediaFormat.COLOR_STANDARD_BT2020 else MediaFormat.COLOR_STANDARD_BT709
+        )
+
+        val hdr120Floor = BatchQualityBitratePolicy.perceptualLosslessRatioFloor(source(120f, hdr = true))
+        val hdr60Floor = BatchQualityBitratePolicy.perceptualLosslessRatioFloor(source(60f, hdr = true))
+        val sdr120Floor = BatchQualityBitratePolicy.perceptualLosslessRatioFloor(source(120f, hdr = false))
+        val sdr60Floor = BatchQualityBitratePolicy.perceptualLosslessRatioFloor(source(60f, hdr = false))
+
+        assertTrue(hdr120Floor > hdr60Floor)
+        assertTrue(sdr120Floor > sdr60Floor)
+        assertTrue(hdr120Floor >= 0.90)
+        assertTrue(hdr60Floor >= 0.80)
+    }
+
+    @Test
+    fun perceptualLossless8kPreservesResolutionAndKeepsHighBitrateFloor() {
+        val source = VideoSourceInfo(
+            width = 7680,
+            height = 4320,
+            frameRate = 30f,
+            durationMs = 60_000,
+            totalBitrate = 200_000_000,
+            audioBitrate = 320_000,
+            videoMime = MimeTypes.VIDEO_H265,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_HLG,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT2020
+        )
+
+        assertEquals(4320, BatchQualityBitratePolicy.targetHeightFor(4320, BatchQualityMode.PERCEPTUAL_LOSSLESS))
+
+        val floor = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(source)
+        assertTrue(floor >= 100_000_000)
+
+        val target = BatchQualityBitratePolicy.calculateVideoBitrate(
+            source = source,
+            mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
+            outputMimeType = MimeTypes.VIDEO_H265
+        )
+        assertTrue(target >= floor)
+        assertTrue(target <= source.videoBitrate)
+    }
+
+    @Test
+    fun learnedRatioCannotDropPerceptualLosslessBelowSafetyFloor() {
+        val source = VideoSourceInfo(
+            width = 3840,
+            height = 2160,
+            frameRate = 120f,
+            durationMs = 60_000,
+            totalBitrate = 119_900_000,
+            audioBitrate = 320_000,
+            videoMime = MimeTypes.VIDEO_H265,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT2020
+        )
+
+        // Even a hostile learned ratio of 0.10 must be clamped to the HDR-120fps floor (0.90).
+        val target = BatchQualityBitratePolicy.calculateVideoBitrate(
+            source = source,
+            mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
+            outputMimeType = MimeTypes.VIDEO_H265,
+            learnedTargetRatio = 0.10
+        )
+        val floor = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(source)
+        assertTrue(target >= floor)
+    }
+
+    @Test
+    fun nearOptimalSourcePrefersRemuxInsteadOfPointlessReencode() {
+        val source = VideoSourceInfo(
+            width = 3840,
+            height = 2160,
+            frameRate = 60f,
+            durationMs = 60_000,
+            totalBitrate = 119_900_000,
+            audioBitrate = 320_000,
+            videoMime = MimeTypes.VIDEO_H265,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT2020
+        )
+        val sourceBytes = 119_900_000L * 60L / 8L
+
+        // A target ratio pushed to the maximum cannot save >= 3%, so remux is the honest choice.
+        assertTrue(
+            BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
+                source = source,
+                outputMimeType = MimeTypes.VIDEO_H265,
+                sourceSizeBytes = sourceBytes,
+                learnedTargetRatio = BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO
+            )
+        )
+
+        // The default conservative ratio still predicts a useful saving, so the encode proceeds
+        // and verification decides the truth.
+        assertFalse(
+            BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
+                source = source,
+                outputMimeType = MimeTypes.VIDEO_H265,
+                sourceSizeBytes = sourceBytes,
+                learnedTargetRatio = null
+            )
+        )
+    }
+
+    @Test
+    fun perceptualLosslessSizeEstimateIgnoresFpsChoice() {
+        val source = VideoSourceInfo(
+            width = 3840,
+            height = 2160,
+            frameRate = 120f,
+            durationMs = 60_000,
+            totalBitrate = 119_900_000,
+            audioBitrate = 320_000,
+            videoMime = MimeTypes.VIDEO_H265,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084
+        )
+
+        val estimateSourceFps = BatchQualityBitratePolicy.estimateOutputSize(
+            source, BatchQualityMode.PERCEPTUAL_LOSSLESS, MimeTypes.VIDEO_H265, BatchFrameRateChoice.SOURCE
+        )
+        val estimateCappedFps = BatchQualityBitratePolicy.estimateOutputSize(
+            source, BatchQualityMode.PERCEPTUAL_LOSSLESS, MimeTypes.VIDEO_H265, BatchFrameRateChoice.FPS30
+        )
+
+        assertEquals(estimateSourceFps, estimateCappedFps)
+    }
+
+    @Test
+    fun audioDegradationAloneFailsPerceptualLosslessVerification() {
+        val sourceTracks = OutputVerifier.TrackProbe(
+            videoCodec = MimeTypes.VIDEO_H265,
+            audioCodec = MimeTypes.AUDIO_AAC,
+            videoBitrate = 119_000_000,
+            audioBitrate = 320_000,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT2020,
+            colorRange = MediaFormat.COLOR_RANGE_LIMITED,
+            audioChannelCount = 2,
+            audioSampleRate = 48_000
+        )
+        // Video is fully preserved; only the audio bitrate degraded well below the source.
+        val outputTracks = sourceTracks.copy(videoBitrate = 115_000_000, audioBitrate = 96_000)
+
+        val report = OutputVerifier.verify(
+            OutputVerifier.VerificationInput(
+                mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
+                source = VideoSourceInfo(
+                    width = 3840,
+                    height = 2160,
+                    frameRate = 60f,
+                    durationMs = 60_000,
+                    totalBitrate = 119_900_000,
+                    audioBitrate = 320_000,
+                    videoMime = MimeTypes.VIDEO_H265,
+                    audioMime = MimeTypes.AUDIO_AAC,
+                    colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084,
+                    colorStandard = MediaFormat.COLOR_STANDARD_BT2020,
+                    colorRange = MediaFormat.COLOR_RANGE_LIMITED,
+                    audioChannelCount = 2,
+                    audioSampleRate = 48_000
+                ),
+                outputFileProbe = OutputVerifier.FileProbe(3840, 2160, 60f, 60_000, 90),
+                sourceTrackProbe = sourceTracks,
+                outputTrackProbe = outputTracks,
+                sourceMetadata = VideoMetadataSnapshot(rotationDegrees = 90),
+                outputMetadata = VideoMetadataSnapshot(rotationDegrees = 90),
+                sourceSize = 900L * 1024L * 1024L,
+                outputSize = 860L * 1024L * 1024L,
+                privacyMode = MetadataPrivacyMode.PRESERVE_ALL
+            )
+        )
+
+        assertFalse(report.verified)
+        assertFalse(report.replacementSafe)
+        assertTrue(report.replacementBlockReason.orEmpty().contains("audio"))
+    }
+
+    @Test
+    fun outputFpsFallsBackToTrackFrameRateWhenRetrieverDoesNotExposeIt() {
+        // The extractor-provided track frame rate keeps FPS verification working when
+        // METADATA_KEY_CAPTURE_FRAMERATE is absent on the encoded output.
+        val probe = OutputVerifier.TrackProbe(
+            videoCodec = MimeTypes.VIDEO_H265,
+            audioCodec = null,
+            videoBitrate = 50_000_000,
+            audioBitrate = 0,
+            colorTransfer = null,
+            colorStandard = null,
+            colorRange = null,
+            audioChannelCount = null,
+            audioSampleRate = null,
+            videoFrameRate = 119.88f
+        )
+        assertEquals(119.88f, probe.videoFrameRate, 0.001f)
+        assertEquals(
+            VerificationTransitionStatus.MATCH,
+            OutputVerificationFormatter.fpsComparison(120f, probe.videoFrameRate)
+        )
     }
 
     @Test

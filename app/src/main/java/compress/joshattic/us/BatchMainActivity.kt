@@ -346,6 +346,8 @@ private fun BatchSettingsCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
+            val perceptuallyLossless = state.qualityPreset == "Perceptually Lossless"
+            val fpsLocked = remuxOnly || perceptuallyLossless
             Text("Frame rate", style = MaterialTheme.typography.labelLarge)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -354,7 +356,7 @@ private fun BatchSettingsCard(
                             selected = state.frameRateOption == label,
                             onClick = { viewModel.setFrameRate(label) },
                             label = { Text(label, maxLines = 1) },
-                            enabled = !state.isCompressing && !remuxOnly
+                            enabled = !state.isCompressing && !fpsLocked
                         )
                     }
                 }
@@ -363,15 +365,15 @@ private fun BatchSettingsCard(
                         selected = state.frameRateOption == "24 fps",
                         onClick = { viewModel.setFrameRate("24 fps") },
                         label = { Text("24 fps", maxLines = 1) },
-                        enabled = !state.isCompressing && !remuxOnly
+                        enabled = !state.isCompressing && !fpsLocked
                     )
                 }
             }
             Text(
-                if (remuxOnly) {
-                    "Disabled in Remux Only because source timestamps and FPS are copied unchanged."
-                } else {
-                    "Original/source FPS is preserved by default, including 120fps. 120/60/30/24 caps are applied only when you explicitly choose them."
+                when {
+                    remuxOnly -> "Disabled in Remux Only because source timestamps and FPS are copied unchanged."
+                    perceptuallyLossless -> "Disabled in Perceptually Lossless because source FPS/motion (including 120fps) is always preserved. Choose High Quality or Storage Saver to cap FPS."
+                    else -> "Original/source FPS is preserved by default, including 120fps. 120/60/30/24 caps are applied only when you explicitly choose them."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant

@@ -93,6 +93,15 @@ data class BatchModeProfile(
 
 object BatchQualityBitratePolicy {
     const val PERCEPTUAL_LOSSLESS_SIZE_TOLERANCE = 0.03
+
+    // Minimum predicted savings before a Perceptually Lossless re-encode is worth attempting.
+    // Below this, the safe bitrate is so close to the source that Remux Only is the honest choice.
+    const val MIN_PERCEPTUAL_LOSSLESS_PREDICTED_SAVINGS = 0.03
+
+    // Perceptually Lossless targets may never exceed this fraction of the source video bitrate;
+    // above it the re-encode cannot meaningfully shrink the file and remux should win instead.
+    const val PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO = 0.97
+
     private const val HDR_120_RATIO_FLOOR = 0.90
     private const val HDR_4K60_RATIO_FLOOR = 0.80
     private const val HDR_4K_RATIO_FLOOR = 0.75
@@ -143,6 +152,20 @@ object BatchQualityBitratePolicy {
         return if (sourceFps > target + tolerance) target else null
     }
 
+    /**
+     * Mode-aware FPS planning. Remux Only copies timestamps unchanged and Perceptually Lossless
+     * must preserve source FPS/motion (including 120fps), so both ignore the FPS option entirely.
+     * Only the lossy modes (High Quality / Storage Saver) honor an explicit FPS cap.
+     */
+    fun plannedOutputFps(sourceFps: Float, mode: BatchQualityMode, option: BatchFrameRateChoice): Int? {
+        return when (mode) {
+            BatchQualityMode.REMUX_ONLY,
+            BatchQualityMode.PERCEPTUAL_LOSSLESS -> null
+            BatchQualityMode.HIGH_QUALITY,
+            BatchQualityMode.STORAGE_SAVER -> outputFpsFor(sourceFps, option)
+        }
+    }
+
     fun targetHeightFor(sourceHeight: Int, mode: BatchQualityMode): Int {
         return when (mode) {
             BatchQualityMode.REMUX_ONLY,
@@ -179,12 +202,26 @@ object BatchQualityBitratePolicy {
         return (base * fpsScale).toInt()
     }
 
+    /**
+     * Default Perceptually Lossless target as a fraction of the source video bitrate,
+     * before any local learning adjustment. Kept deliberately conservative.
+     */
+    fun perceptualLosslessDefaultTargetRatio(source: VideoSourceInfo, outputMimeType: String): Double {
+        return when {
+            outputMimeType == MimeTypes.VIDEO_H265 && source.videoMime == MimeTypes.VIDEO_H264 -> 0.90
+            outputMimeType == source.videoMime -> 0.95
+            outputMimeType == MimeTypes.VIDEO_H265 -> 0.93
+            else -> 0.97
+        }
+    }
+
     fun calculateVideoBitrate(
         source: VideoSourceInfo,
         mode: BatchQualityMode,
         outputMimeType: String,
         outputFps: Int? = null,
-        outputHeight: Int = source.height
+        outputHeight: Int = source.height,
+        learnedTargetRatio: Double? = null
     ): Int {
         val originalVideoBitrate = source.videoBitrate.takeIf { it > 0 } ?: fallbackOriginalBitrate(source)
         if (mode == BatchQualityMode.REMUX_ONLY) return originalVideoBitrate
@@ -200,12 +237,12 @@ object BatchQualityBitratePolicy {
 
         return when (mode) {
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> {
-                val targetRatio = when {
-                    outputMimeType == MimeTypes.VIDEO_H265 && source.videoMime == MimeTypes.VIDEO_H264 -> 0.90
-                    outputMimeType == source.videoMime -> 0.95
-                    outputMimeType == MimeTypes.VIDEO_H265 -> 0.93
-                    else -> 0.97
-                }
+                val defaultRatio = perceptualLosslessDefaultTargetRatio(source, outputMimeType)
+                // A learned ratio can only move the target inside [safety floor, max ratio];
+                // verification remains the final gate regardless of what was learned.
+                val targetRatio = learnedTargetRatio
+                    ?.coerceIn(perceptualLosslessRatioFloor(source), PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO)
+                    ?: defaultRatio
                 val floor = perceptualLosslessBitrateFloor(source)
                 val target = (originalVideoBitrate * targetRatio).toInt()
                 target.coerceIn(floor.coerceAtMost(originalVideoBitrate), originalVideoBitrate)
@@ -235,19 +272,16 @@ object BatchQualityBitratePolicy {
         }
     }
 
-    fun perceptualLosslessBitrateFloor(source: VideoSourceInfo): Int {
-        val absoluteFloor = when {
-            source.height >= 4320 || source.width >= 7680 -> 100_000_000
-            source.height >= 2160 || source.width >= 3840 -> 48_000_000
-            source.height >= 1440 -> 18_000_000
-            source.height >= 1080 -> 10_000_000
-            source.height >= 720 -> 6_000_000
-            else -> 3_000_000
-        }
+    /**
+     * The ratio floor (fraction of source video bitrate) that Perceptually Lossless may never go
+     * below. 120fps floors are deliberately higher than 60fps floors, and HDR floors are higher
+     * than SDR floors, because those sources degrade visibly first.
+     */
+    fun perceptualLosslessRatioFloor(source: VideoSourceInfo): Double {
         // These ratio floors intentionally stay conservative for S23-class camera clips so
         // Perceptually Lossless never targets the kind of large bitrate drops that caused visible
         // degradation on 4K/8K HDR and 120fps footage.
-        val ratioFloor = when {
+        return when {
             source.isHdr && source.frameRate >= 110f -> HDR_120_RATIO_FLOOR
             source.isHdr && (source.height >= 4320 || source.width >= 7680) -> HDR_120_RATIO_FLOOR
             source.isHdr && (source.height >= 2160 || source.width >= 3840) && source.frameRate >= 59f -> HDR_4K60_RATIO_FLOOR
@@ -258,8 +292,62 @@ object BatchQualityBitratePolicy {
             source.height >= 2160 || source.width >= 3840 -> UHD_RATIO_FLOOR
             else -> DEFAULT_RATIO_FLOOR
         }
+    }
+
+    fun perceptualLosslessBitrateFloor(source: VideoSourceInfo): Int {
+        val absoluteFloor = when {
+            source.height >= 4320 || source.width >= 7680 -> 100_000_000
+            source.height >= 2160 || source.width >= 3840 -> 48_000_000
+            source.height >= 1440 -> 18_000_000
+            source.height >= 1080 -> 10_000_000
+            source.height >= 720 -> 6_000_000
+            else -> 3_000_000
+        }
+        val ratioFloor = perceptualLosslessRatioFloor(source)
         val sourceVideoBitrate = source.videoBitrate.takeIf { it > 0 } ?: fallbackOriginalBitrate(source)
         return max(absoluteFloor, (sourceVideoBitrate * ratioFloor).toInt()).coerceAtMost(sourceVideoBitrate)
+    }
+
+    /**
+     * Predicted output bytes for a Perceptually Lossless encode at the given (or default) target
+     * ratio. Uses a small realistic container overhead rather than the UI estimate's padding, so
+     * the remux-vs-encode decision is not biased toward remux by an inflated estimate.
+     */
+    fun predictedPerceptualLosslessBytes(
+        source: VideoSourceInfo,
+        outputMimeType: String,
+        learnedTargetRatio: Double? = null
+    ): Long {
+        val durationSec = (source.durationMs / 1000.0).coerceAtLeast(1.0)
+        val videoBitrate = calculateVideoBitrate(
+            source = source,
+            mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
+            outputMimeType = outputMimeType,
+            learnedTargetRatio = learnedTargetRatio
+        )
+        // Perceptually Lossless transmuxes (stream-copies) audio when possible, so predicted audio
+        // bytes use the source audio bitrate rather than the re-encode request.
+        val audioBitrate = source.audioBitrate.coerceAtLeast(0)
+        val estimatedBits = (videoBitrate + audioBitrate).toDouble() * durationSec
+        return ((estimatedBits * 1.01) / 8.0).toLong().coerceAtLeast(1L)
+    }
+
+    /**
+     * True when the safe Perceptually Lossless bitrate cannot shrink the file meaningfully
+     * (predicted savings below [MIN_PERCEPTUAL_LOSSLESS_PREDICTED_SAVINGS]). In that case the
+     * honest action is Remux Only: the source is already near optimal, so keep the exact
+     * stream copy instead of spending a re-encode that verification would likely discard.
+     */
+    fun shouldPreferRemuxForPerceptualLossless(
+        source: VideoSourceInfo,
+        outputMimeType: String,
+        sourceSizeBytes: Long,
+        learnedTargetRatio: Double? = null
+    ): Boolean {
+        if (sourceSizeBytes <= 0L) return false
+        val predicted = predictedPerceptualLosslessBytes(source, outputMimeType, learnedTargetRatio)
+        val maxUseful = (sourceSizeBytes * (1.0 - MIN_PERCEPTUAL_LOSSLESS_PREDICTED_SAVINGS)).toLong()
+        return predicted >= maxUseful
     }
 
     fun estimateOutputSize(
@@ -274,7 +362,7 @@ object BatchQualityBitratePolicy {
             return ((bitrate * durationSec) / 8.0).toLong().coerceAtLeast(1L)
         }
         val durationSec = (source.durationMs / 1000.0).coerceAtLeast(1.0)
-        val outputFps = outputFpsFor(source.frameRate, frameRateChoice)
+        val outputFps = plannedOutputFps(source.frameRate, mode, frameRateChoice)
         val outputHeight = targetHeightFor(source.height, mode)
         val videoBitrate = calculateVideoBitrate(source, mode, outputMimeType, outputFps, outputHeight)
         val audioBitrate = calculateAudioBitrate(source, mode)
