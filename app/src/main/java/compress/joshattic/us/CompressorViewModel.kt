@@ -501,7 +501,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 showBitrate = showBitrate,
                 useMbps = useMbps,
                 supportedCodecs = supportedCodecs
-            ).autoAdjust(defaultTargetMb)
+            )
         }
     }
     
@@ -537,9 +537,9 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                          targetResolutionHeight = current.originalHeight,
                          targetFps = 0,
                          targetSizeMb = (current.originalSize / (1024.0 * 1024.0) * 0.7).toFloat().coerceAtLeast(0.1f),
-                         audioBitrate = 320_000,
+                         audioBitrate = 0,
                          removeAudio = false
-                     ).autoAdjust((current.originalSize / (1024.0 * 1024.0) * 0.7).toFloat().coerceAtLeast(0.1f), lockAudioBitrate = true, allowUpward = false)
+                     )
                  }
             }
             QualityPreset.MEDIUM -> {

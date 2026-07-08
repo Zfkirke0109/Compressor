@@ -24,6 +24,17 @@ data class DeviceCapabilityProfile(
             else -> MimeTypes.VIDEO_H264
         }
     }
+
+    fun chooseDefaultVideoCodec(supportedCodecs: List<String>, source: VideoSourceInfo?): String {
+        if (source != null) {
+            val preferHevcForSource = preferHevcForDefaultCompression &&
+                (source.isHdr || source.height >= 2160 || source.width >= 3840 || source.frameRate >= 50f)
+            if (preferHevcForSource && supportedCodecs.contains(MimeTypes.VIDEO_H265)) {
+                return MimeTypes.VIDEO_H265
+            }
+        }
+        return chooseDefaultVideoCodec(supportedCodecs)
+    }
 }
 
 object DeviceCapabilityProfiles {
