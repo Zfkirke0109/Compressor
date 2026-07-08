@@ -510,7 +510,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     var remuxResult = if (quality == BatchQualityPreset.REMUX_ONLY) {
                         remuxOnlyOne(context, item, index, privacyMode)
                     } else {
-                        val encodedFile = compressOne(context, item, index, quality, frameRate, resolvedMime!!)
+                        val safeResolvedMime = resolvedMime
+                            ?: throw IllegalStateException("Encoder selection failed before export planning. Use Remux Only or choose a different codec.")
+                        val encodedFile = compressOne(context, item, index, quality, frameRate, safeResolvedMime)
                         withContext(Dispatchers.IO) {
                             Mp4MetadataRemuxer.remuxWithSourceMetadata(
                                 context,
@@ -897,7 +899,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         return runCatching {
             val caps = info.getCapabilitiesForType(mimeType)
             val videoCaps = caps.videoCapabilities ?: return@runCatching false
-            val requiredFps = kotlin.math.ceil(sourceInfo.frameRate.coerceAtLeast(1f).toDouble())
+            val requiredFps = sourceInfo.frameRate.coerceAtLeast(1f).toDouble()
             val supported = videoCaps.areSizeAndRateSupported(
                 sourceInfo.width,
                 sourceInfo.height,

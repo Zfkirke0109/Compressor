@@ -7,6 +7,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import androidx.media3.common.MimeTypes
 import java.io.File
+import java.util.Locale
 import kotlin.math.abs
 
 object OutputVerifier {
@@ -429,7 +430,7 @@ object OutputVerifier {
     }
 
     private fun fpsLabel(fps: Float): String {
-        return if (fps > 0f) String.format("%.1f", fps) else "not exposed"
+        return if (fps > 0f) String.format(Locale.US, "%.1f", fps) else "not exposed"
     }
 
     private fun codecLabel(codec: String?): String {
