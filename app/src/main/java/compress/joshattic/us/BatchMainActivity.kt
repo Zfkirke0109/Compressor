@@ -46,6 +46,8 @@ class BatchMainActivity : ComponentActivity() {
             }
         }
         window.decorView.post { consumeIncomingVideos(startupIntent) }
+        // Diagnostics-only: logs real encoder capabilities once per process in debug builds.
+        EncoderCapabilityDiagnostics.dumpOnceInBackground(this)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -149,7 +151,7 @@ private fun BatchCompressorScreen(
                     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text("Samsung Galaxy S23 Ultra optimized", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                         Text(
-                            "Default is Original: keep 4K as 4K, keep source FPS/audio, and use perceptually lossless compression for storage savings.",
+                            "Default is Perceptually Lossless: keep 4K as 4K, keep source FPS/audio, and fall back to Remux Only if safety cannot be verified.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -262,7 +264,7 @@ private fun BatchSettingsCard(
 ) {
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            val remuxOnly = state.qualityPreset == "Remux only"
+            val remuxOnly = state.qualityPreset == "Remux Only"
             Text("Batch settings", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
 
             Text("S23 Ultra presets", style = MaterialTheme.typography.labelLarge)
@@ -290,17 +292,17 @@ private fun BatchSettingsCard(
             Text("Video mode", style = MaterialTheme.typography.labelLarge)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Remux only", "Original").forEach { label ->
+                    listOf("Remux Only", "Perceptually Lossless").forEach { label ->
                         FilterChip(
                             selected = state.qualityPreset == label,
                             onClick = { viewModel.setQuality(label) },
-                            label = { Text(label, maxLines = 1) },
+                            label = { Text(label, maxLines = 2, overflow = TextOverflow.Ellipsis) },
                             enabled = !state.isCompressing
                         )
                     }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("High", "Medium", "Low").forEach { label ->
+                    listOf("High Quality", "Storage Saver").forEach { label ->
                         FilterChip(
                             selected = state.qualityPreset == label,
                             onClick = { viewModel.setQuality(label) },
@@ -314,7 +316,7 @@ private fun BatchSettingsCard(
                 if (remuxOnly) {
                     "No re-encode: video/audio copied unchanged. This keeps quality exact but may not shrink much."
                 } else {
-                    "Original is perceptually lossless: keeps source resolution, source FPS, HDR mode, and audio bitrate. Medium/Low are explicit downgrade choices."
+                    "Perceptually Lossless must preserve source resolution, FPS, HDR/color, and audio or fall back to Remux Only. High Quality is lossy. Storage Saver warns about visible loss."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -322,7 +324,12 @@ private fun BatchSettingsCard(
 
             Text("Codec", style = MaterialTheme.typography.labelLarge)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf("Auto", "HEVC", "H.264").forEach { label ->
+                buildList {
+                    add("Auto")
+                    add("HEVC")
+                    add("H.264")
+                    if (state.hasHardwareAv1Encoder) add("AV1")
+                }.forEach { label ->
                     FilterChip(
                         selected = state.codecOption == label,
                         onClick = { viewModel.setCodec(label) },
@@ -335,38 +342,42 @@ private fun BatchSettingsCard(
                 if (remuxOnly) {
                     "Disabled in Remux Only because the source codec is copied unchanged."
                 } else {
-                    "Auto chooses the best S23 Ultra hardware encoder. HEVC usually saves more storage; H.264 is best for compatibility."
+                    "Auto stays HEVC-first for camera/archive/HDR clips. AV1 is explicit opt-in only when real hardware support exists."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
+            val perceptuallyLossless = state.qualityPreset == "Perceptually Lossless"
+            val fpsLocked = remuxOnly || perceptuallyLossless
             Text("Frame rate", style = MaterialTheme.typography.labelLarge)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Original", "60 fps", "30 fps").forEach { label ->
+                    listOf("Original", "120 fps", "60 fps").forEach { label ->
                         FilterChip(
                             selected = state.frameRateOption == label,
                             onClick = { viewModel.setFrameRate(label) },
                             label = { Text(label, maxLines = 1) },
-                            enabled = !state.isCompressing && !remuxOnly
+                            enabled = !state.isCompressing && !fpsLocked
                         )
                     }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = state.frameRateOption == "24 fps",
-                        onClick = { viewModel.setFrameRate("24 fps") },
-                        label = { Text("24 fps", maxLines = 1) },
-                        enabled = !state.isCompressing && !remuxOnly
-                    )
+                    listOf("30 fps", "24 fps").forEach { label ->
+                        FilterChip(
+                            selected = state.frameRateOption == label,
+                            onClick = { viewModel.setFrameRate(label) },
+                            label = { Text(label, maxLines = 1) },
+                            enabled = !state.isCompressing && !fpsLocked
+                        )
+                    }
                 }
             }
             Text(
-                if (remuxOnly) {
-                    "Disabled in Remux Only because source timestamps and FPS are copied unchanged."
-                } else {
-                    "Original keeps source FPS. 60 caps high-frame-rate clips to 60. 30/24 lower higher-frame-rate clips only when selected."
+                when {
+                    remuxOnly -> "Disabled in Remux Only because source timestamps and FPS are copied unchanged."
+                    perceptuallyLossless -> "Disabled in Perceptually Lossless because source FPS/motion (including 120fps) is always preserved. Choose High Quality or Storage Saver to cap FPS."
+                    else -> "Original/source FPS is preserved by default, including 120fps. 120/60/30/24 caps are applied only when you explicitly choose them."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -736,7 +747,7 @@ private fun BatchVideoItem.beforeAfterSummary(): String {
     val savedBytes = (originalSize - outputSize).coerceAtLeast(0L)
     val savedPercent = if (originalSize > 0L) ((savedBytes * 100.0) / originalSize).toInt() else 0
     val similarSize = originalSize > 0L && kotlin.math.abs(outputSize - originalSize).toDouble() / originalSize.toDouble() < 0.03
-    if (outputMode == "Remux only" && similarSize) {
+    if (outputMode == "Remux Only" && similarSize) {
         return "Before/after: ${formatCardBytes(originalSize)} -> ${formatCardBytes(outputSize)} • size similar"
     }
     return "Before/after: ${formatCardBytes(originalSize)} → ${formatCardBytes(outputSize)} • saved ${formatCardBytes(savedBytes)} ($savedPercent%)"

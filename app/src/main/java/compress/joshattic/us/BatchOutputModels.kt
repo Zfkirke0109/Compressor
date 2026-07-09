@@ -88,34 +88,49 @@ data class CompressionRecommendation(
 }
 
 data class OutputVerificationReport(
+    val verdict: String,
     val playability: String,
     val video: String,
     val fps: String,
+    val videoBitrate: String,
     val videoCodec: String,
     val audioCodec: String,
+    val audioDetails: String,
     val audioBitrate: String,
     val hdr: String,
-    val date: String,
+    val colorStandard: String,
+    val colorRange: String,
+    val mediaStoreDate: String,
+    val mp4Date: String,
     val location: String,
     val rotation: String,
     val fileSize: String,
     val replacementSafe: Boolean,
-    val replacementBlockReason: String? = null
+    val replacementBlockReason: String? = null,
+    val criticalFieldsComplete: Boolean = false,
+    val verified: Boolean = false,
+    val durationParity: String = ""
 ) {
     val summaryLines: List<String>
         get() = listOf(
+            "Verdict: $verdict",
             "Playability: $playability",
             "Video: $video",
             "FPS: $fps",
+            "Video bitrate: $videoBitrate",
             "Codec: $videoCodec",
             "Audio: $audioCodec",
+            "Audio details: $audioDetails",
             "Audio bitrate: $audioBitrate",
             "HDR/color: $hdr",
-            "Date: $date",
+            "Color standard: $colorStandard",
+            "Color range: $colorRange",
+            "MediaStore date: $mediaStoreDate",
+            "MP4/retriever date: $mp4Date",
             "Location: $location",
             "Rotation: $rotation",
             "Size: $fileSize"
-        )
+        ) + (if (durationParity.isNotBlank()) listOf("Duration/frames: $durationParity") else emptyList())
 }
 
 data class BatchItemMetrics(

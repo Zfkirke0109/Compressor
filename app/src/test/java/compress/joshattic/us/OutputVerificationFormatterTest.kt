@@ -47,4 +47,12 @@ class OutputVerificationFormatterTest {
     fun remuxMatchingFpsDoesNotBlockReplacementSafety() {
         assertNull(OutputVerificationFormatter.remuxFpsBlockReason(60f, 60f))
     }
+
+    @Test
+    fun highFrameRateToleranceTreats119Point88As120() {
+        assertEquals(
+            VerificationTransitionStatus.MATCH,
+            OutputVerificationFormatter.fpsComparison(120f, 119.88f)
+        )
+    }
 }

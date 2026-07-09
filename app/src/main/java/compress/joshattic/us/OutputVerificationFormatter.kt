@@ -25,7 +25,12 @@ internal object OutputVerificationFormatter {
 
     fun fpsComparison(sourceFps: Float, outputFps: Float): VerificationTransitionStatus {
         if (sourceFps <= 0f || outputFps <= 0f) return VerificationTransitionStatus.NOT_EXPOSED
-        return if (abs(sourceFps - outputFps) <= 1.0f) {
+        val tolerance = when {
+            sourceFps >= 110f -> 2.5f
+            sourceFps >= 50f -> 1.0f
+            else -> 0.5f
+        }
+        return if (abs(sourceFps - outputFps) <= tolerance) {
             VerificationTransitionStatus.MATCH
         } else {
             VerificationTransitionStatus.MISMATCH
