@@ -427,6 +427,145 @@ class BatchQualitySafetyTest {
     }
 
     @Test
+    fun truncatedOutputCannotPassPerceptualLosslessVerification() {
+        // Codex-accepted finding: a 5s output of a 93s source is "strictly smaller" and could
+        // previously pass every per-field check. Duration parity must fail it decisively.
+        val input = hdr4k60VerificationInput(
+            outputSize = 90_000_000L,
+            sourceSize = 1_401_060_070L,
+            outputDurationMs = 93_247L
+        )
+        val truncated = input.copy(
+            outputFileProbe = input.outputFileProbe.copy(durationMs = 5_000L)
+        )
+        val report = OutputVerifier.verify(truncated)
+
+        assertFalse(report.verified)
+        assertFalse(report.replacementSafe)
+        assertTrue(report.replacementBlockReason.orEmpty().contains("truncation"))
+    }
+
+    @Test
+    fun frameCountMismatchFailsVerificationWhenExposed() {
+        val input = hdr4k60VerificationInput(
+            outputSize = 1_190_000_000L,
+            sourceSize = 1_401_060_070L,
+            outputDurationMs = 93_247L
+        )
+        // ~5595 source frames at 60fps; output lost 20% of them but kept duration/metadata.
+        val dropped = input.copy(
+            sourceFrameCount = 5_595,
+            outputFileProbe = input.outputFileProbe.copy(frameCount = 4_476)
+        )
+        val report = OutputVerifier.verify(dropped)
+        assertFalse(report.verified)
+        assertTrue(report.replacementBlockReason.orEmpty().contains("frame count"))
+
+        // Equal counts (within 1%) pass.
+        val intact = input.copy(
+            sourceFrameCount = 5_595,
+            outputFileProbe = input.outputFileProbe.copy(frameCount = 5_594)
+        )
+        assertTrue(OutputVerifier.verify(intact).verified)
+    }
+
+    @Test
+    fun vfrStreamCopyUsesSameMeasurementMethodForFps() {
+        // Samsung Super Steady: retriever reports the nominal 60fps for the source while the
+        // extractor measures ~57fps on both files. A byte-identical stream copy must verify.
+        val sourceTracks = OutputVerifier.TrackProbe(
+            videoCodec = MimeTypes.VIDEO_H265,
+            audioCodec = MimeTypes.AUDIO_AAC,
+            videoBitrate = 33_876_215,
+            audioBitrate = 256_000,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT709,
+            colorRange = MediaFormat.COLOR_RANGE_LIMITED,
+            audioChannelCount = 2,
+            audioSampleRate = 48_000,
+            videoFrameRate = 57.2f
+        )
+        val outputTracks = sourceTracks.copy(videoBitrate = 0, audioBitrate = 0)
+
+        val report = OutputVerifier.verify(
+            OutputVerifier.VerificationInput(
+                mode = BatchQualityMode.REMUX_ONLY,
+                source = VideoSourceInfo(
+                    width = 1440,
+                    height = 2560,
+                    frameRate = 60f, // nominal capture rate from the retriever
+                    durationMs = 12_080,
+                    totalBitrate = 34_132_215,
+                    audioBitrate = 256_000,
+                    videoMime = MimeTypes.VIDEO_H265,
+                    audioMime = MimeTypes.AUDIO_AAC,
+                    colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
+                    colorStandard = MediaFormat.COLOR_STANDARD_BT709,
+                    colorRange = MediaFormat.COLOR_RANGE_LIMITED,
+                    audioChannelCount = 2,
+                    audioSampleRate = 48_000
+                ),
+                // The output probe carries the extractor-measured ~57fps (the entry point patches
+                // it in when CAPTURE_FRAMERATE is absent); against the nominal source 60 this
+                // failed before the same-method fix.
+                outputFileProbe = OutputVerifier.FileProbe(1440, 2560, 57.2f, 12_080, 90),
+                sourceTrackProbe = sourceTracks,
+                outputTrackProbe = outputTracks,
+                sourceMetadata = VideoMetadataSnapshot(rotationDegrees = 90),
+                outputMetadata = VideoMetadataSnapshot(rotationDegrees = 90),
+                sourceSize = 51_540_072L,
+                outputSize = 51_262_031L,
+                privacyMode = MetadataPrivacyMode.PRESERVE_ALL
+            )
+        )
+
+        assertEquals("Remux Verified", report.verdict)
+        assertTrue(report.verified)
+        assertTrue(report.replacementSafe)
+    }
+
+    @Test
+    fun portraitQhdIsNotClassedAsFourK() {
+        // Super Steady portrait 1440x2560@60: raw height (2560) exceeds 2160, but the clip is
+        // QHD-class by long edge. It must get QHD floors, not the 48 Mbps 4K absolute floor that
+        // forced target == source bitrate and a false "near optimal" remux preference.
+        val source = VideoSourceInfo(
+            width = 1440,
+            height = 2560,
+            frameRate = 60f,
+            durationMs = 12_080,
+            totalBitrate = 34_132_215,
+            audioBitrate = 256_000,
+            videoMime = MimeTypes.VIDEO_H265,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT709
+        )
+
+        assertEquals(0.68, BatchQualityBitratePolicy.perceptualLosslessRatioFloor(source), 1e-9)
+
+        val target = BatchQualityBitratePolicy.calculateVideoBitrate(
+            source = source,
+            mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
+            outputMimeType = MimeTypes.VIDEO_H265
+        )
+        // Default HEVC->HEVC ratio 0.95 of ~33.9 Mbps video — no longer clamped up to source.
+        assertTrue(target < source.videoBitrate)
+
+        // And the pre-encode gate now predicts a real saving instead of preferring remux.
+        assertFalse(
+            BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
+                source, MimeTypes.VIDEO_H265, 51_540_072L,
+                learnedTargetRatio = null,
+                expectedOvershootFactor = 1.0
+            )
+        )
+
+        // True 4K (landscape or portrait) keeps its 4K floors.
+        val portrait4k = source.copy(width = 2160, height = 3840, totalBitrate = 120_202_307)
+        assertEquals(0.74, BatchQualityBitratePolicy.perceptualLosslessRatioFloor(portrait4k), 1e-9)
+    }
+
+    @Test
     fun cbrCapabilityProbeFailsClosedWithoutCrashing() {
         // On a platform where the codec list is unavailable (or CQ/CBR unsupported), the probe
         // must return false — the experiment silently stays on the safe VBR path, never crashes.

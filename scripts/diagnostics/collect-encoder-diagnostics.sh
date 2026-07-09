@@ -29,10 +29,11 @@ echo "collecting media_session sessions ..."
 adb shell cmd media_session list-sessions > "$OUT/04-media-sessions.txt" 2>&1
 
 # UI hierarchy (accessibility tree) instead of screenshots.
+# Note: double slashes so Git Bash on Windows does not rewrite the device path.
 echo "collecting UI hierarchy ..."
-adb shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1
-adb exec-out cat /sdcard/window.xml > "$OUT/05-window.xml" 2>/dev/null
-adb shell rm -f /sdcard/window.xml >/dev/null 2>&1
+adb shell uiautomator dump //sdcard/window.xml >/dev/null 2>&1
+adb exec-out cat //sdcard/window.xml > "$OUT/05-window.xml" 2>/dev/null
+adb shell rm -f //sdcard/window.xml >/dev/null 2>&1
 
 # In-app capability dump (requires a debug build of Compressor to be launched once).
 echo "collecting CompressorCodecCaps logcat (launch the debug app first if empty) ..."

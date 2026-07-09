@@ -185,13 +185,22 @@ object BatchQualityBitratePolicy {
         }
     }
 
+    // Resolution classing must be orientation-agnostic: a portrait 1440x2560 clip is QHD-class,
+    // not 4K-class, even though its raw height exceeds 2160. Long/short edge, not width/height.
+    private fun longEdge(source: VideoSourceInfo): Int = maxOf(source.width, source.height)
+    private fun shortEdge(source: VideoSourceInfo): Int = minOf(source.width, source.height)
+    internal fun is8kClass(source: VideoSourceInfo): Boolean =
+        longEdge(source) >= 7680 || shortEdge(source) >= 4320
+    internal fun is4kClass(source: VideoSourceInfo): Boolean =
+        longEdge(source) >= 3840 || shortEdge(source) >= 2160
+
     fun fallbackOriginalBitrate(source: VideoSourceInfo): Int {
         val base = when {
-            source.height >= 4320 || source.width >= 7680 -> 120_000_000
-            source.height >= 2160 || source.width >= 3840 -> 75_000_000
-            source.height >= 1440 -> 32_000_000
-            source.height >= 1080 -> 20_000_000
-            source.height >= 720 -> 10_000_000
+            is8kClass(source) -> 120_000_000
+            is4kClass(source) -> 75_000_000
+            longEdge(source) >= 2560 -> 32_000_000
+            longEdge(source) >= 1920 -> 20_000_000
+            longEdge(source) >= 1280 -> 10_000_000
             else -> 5_000_000
         }
         val fpsScale = when {
@@ -283,24 +292,24 @@ object BatchQualityBitratePolicy {
         // degradation on 4K/8K HDR and 120fps footage.
         return when {
             source.isHdr && source.frameRate >= 110f -> HDR_120_RATIO_FLOOR
-            source.isHdr && (source.height >= 4320 || source.width >= 7680) -> HDR_120_RATIO_FLOOR
-            source.isHdr && (source.height >= 2160 || source.width >= 3840) && source.frameRate >= 59f -> HDR_4K60_RATIO_FLOOR
-            source.isHdr && (source.height >= 2160 || source.width >= 3840) -> HDR_4K_RATIO_FLOOR
+            source.isHdr && is8kClass(source) -> HDR_120_RATIO_FLOOR
+            source.isHdr && is4kClass(source) && source.frameRate >= 59f -> HDR_4K60_RATIO_FLOOR
+            source.isHdr && is4kClass(source) -> HDR_4K_RATIO_FLOOR
             source.frameRate >= 110f -> FPS120_RATIO_FLOOR
-            source.frameRate >= 59f && (source.height >= 2160 || source.width >= 3840) -> FPS60_4K_RATIO_FLOOR
+            source.frameRate >= 59f && is4kClass(source) -> FPS60_4K_RATIO_FLOOR
             source.frameRate >= 59f -> FPS60_RATIO_FLOOR
-            source.height >= 2160 || source.width >= 3840 -> UHD_RATIO_FLOOR
+            is4kClass(source) -> UHD_RATIO_FLOOR
             else -> DEFAULT_RATIO_FLOOR
         }
     }
 
     fun perceptualLosslessBitrateFloor(source: VideoSourceInfo): Int {
         val absoluteFloor = when {
-            source.height >= 4320 || source.width >= 7680 -> 100_000_000
-            source.height >= 2160 || source.width >= 3840 -> 48_000_000
-            source.height >= 1440 -> 18_000_000
-            source.height >= 1080 -> 10_000_000
-            source.height >= 720 -> 6_000_000
+            is8kClass(source) -> 100_000_000
+            is4kClass(source) -> 48_000_000
+            longEdge(source) >= 2560 -> 18_000_000
+            longEdge(source) >= 1920 -> 10_000_000
+            longEdge(source) >= 1280 -> 6_000_000
             else -> 3_000_000
         }
         val ratioFloor = perceptualLosslessRatioFloor(source)

@@ -108,7 +108,8 @@ data class OutputVerificationReport(
     val replacementSafe: Boolean,
     val replacementBlockReason: String? = null,
     val criticalFieldsComplete: Boolean = false,
-    val verified: Boolean = false
+    val verified: Boolean = false,
+    val durationParity: String = ""
 ) {
     val summaryLines: List<String>
         get() = listOf(
@@ -129,7 +130,7 @@ data class OutputVerificationReport(
             "Location: $location",
             "Rotation: $rotation",
             "Size: $fileSize"
-        )
+        ) + (if (durationParity.isNotBlank()) listOf("Duration/frames: $durationParity") else emptyList())
 }
 
 data class BatchItemMetrics(

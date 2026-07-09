@@ -16,7 +16,8 @@ object OutputVerifier {
         val height: Int,
         val fps: Float,
         val durationMs: Long,
-        val rotationDegrees: Int?
+        val rotationDegrees: Int?,
+        val frameCount: Int = 0
     )
 
     internal data class TrackProbe(
@@ -51,7 +52,9 @@ object OutputVerifier {
         val outputMetadata: VideoMetadataSnapshot,
         val sourceSize: Long,
         val outputSize: Long,
-        val privacyMode: MetadataPrivacyMode
+        val privacyMode: MetadataPrivacyMode,
+        // Video frame count of the source when the platform exposes it (API 28+); 0 = unknown.
+        val sourceFrameCount: Int = 0
     )
 
     fun verify(
@@ -105,7 +108,8 @@ object OutputVerifier {
                 outputMetadata = outputMetadata,
                 sourceSize = source.originalSize,
                 outputSize = outputFile.length(),
-                privacyMode = privacyMode
+                privacyMode = privacyMode,
+                sourceFrameCount = readSourceFrameCount(context, source.sourceUri)
             )
         )
     }
@@ -121,9 +125,18 @@ object OutputVerifier {
             input.outputFileProbe.width,
             input.outputFileProbe.height
         )
+        // VFR sources (e.g. Samsung Super Steady) expose a nominal capture rate through the
+        // retriever (60) but an averaged rate through the extractor (~57). Comparing a nominal
+        // source value against a measured output value falsely fails FPS verification on a
+        // byte-identical stream copy — so when BOTH sides expose the extractor's track frame
+        // rate, compare those (same measurement method on both files).
+        val sameMethodFps = input.sourceTrackProbe.videoFrameRate > 0f &&
+            input.outputTrackProbe.videoFrameRate > 0f
+        val fpsSourceShown = if (sameMethodFps) input.sourceTrackProbe.videoFrameRate else input.source.frameRate
+        val fpsOutputShown = if (sameMethodFps) input.outputTrackProbe.videoFrameRate else input.outputFileProbe.fps
         val fpsComparison = OutputVerificationFormatter.fpsComparison(
-            input.source.frameRate,
-            input.outputFileProbe.fps
+            fpsSourceShown,
+            fpsOutputShown
         )
         val videoCodecMatches = codecsMatch(input.sourceTrackProbe.videoCodec, input.outputTrackProbe.videoCodec)
         val audioCodecMatches = codecsMatch(input.sourceTrackProbe.audioCodec, input.outputTrackProbe.audioCodec)
@@ -146,6 +159,22 @@ object OutputVerifier {
             input.sourceTrackProbe.colorRange,
             input.outputTrackProbe.colorRange
         )
+        // Duration parity closes the truncated-output hole: a 5-second output of a 60-second
+        // source must never pass Perceptually Lossless or Remux verification, no matter how good
+        // its per-field metadata looks (a truncated file is also "strictly smaller", so without
+        // this check it could even qualify for replacement).
+        val durationMatches = input.source.durationMs <= 0L ||
+            input.outputFileProbe.durationMs <= 0L ||
+            abs(input.outputFileProbe.durationMs - input.source.durationMs) <=
+            maxOf(500L, (input.source.durationMs * 0.02).toLong())
+
+        // Frame-count parity (when the platform exposes it on both files) catches dropped or
+        // duplicated frames that metadata-level FPS tolerance cannot see.
+        val frameCountMatches = input.sourceFrameCount <= 0 ||
+            input.outputFileProbe.frameCount <= 0 ||
+            abs(input.outputFileProbe.frameCount - input.sourceFrameCount) <=
+            maxOf(2, (input.sourceFrameCount * 0.01).toInt())
+
         val rotationMatches = input.sourceMetadata.rotationDegrees == null ||
             input.outputFileProbe.rotationDegrees == input.sourceMetadata.rotationDegrees
         val locationMatches = when {
@@ -252,6 +281,8 @@ object OutputVerifier {
 
         val perceptuallyLosslessVerified = playable &&
             criticalFieldsComplete &&
+            durationMatches &&
+            frameCountMatches &&
             videoMatches &&
             fpsComparison == VerificationTransitionStatus.MATCH &&
             hdrMatches &&
@@ -268,6 +299,8 @@ object OutputVerifier {
 
         val remuxVerified = playable &&
             criticalFieldsComplete &&
+            durationMatches &&
+            frameCountMatches &&
             videoMatches &&
             fpsComparison == VerificationTransitionStatus.MATCH &&
             videoCodecMatches &&
@@ -299,6 +332,8 @@ object OutputVerifier {
 
         val blockReason = when {
             !playable -> "output did not pass playability verification"
+            !durationMatches -> "output duration differs from the source (possible truncation)"
+            !frameCountMatches -> "output video frame count differs from the source"
             input.mode == BatchQualityMode.REMUX_ONLY && !criticalFieldsComplete -> "stream-copy verification was incomplete"
             input.mode == BatchQualityMode.REMUX_ONLY && !videoMatches -> "remux output changed resolution"
             input.mode == BatchQualityMode.REMUX_ONLY && fpsComparison != VerificationTransitionStatus.MATCH -> "remux output changed FPS"
@@ -333,8 +368,8 @@ object OutputVerifier {
             playability = if (playable) "opens" else "failed",
             video = "${dimensionLabel(input.source.width, input.source.height)} -> ${dimensionLabel(input.outputFileProbe.width, input.outputFileProbe.height)} ${statusSuffix(videoMatches)}",
             fps = OutputVerificationFormatter.transition(
-                fpsLabel(input.source.frameRate),
-                fpsLabel(input.outputFileProbe.fps),
+                fpsLabel(fpsSourceShown),
+                fpsLabel(fpsOutputShown),
                 fpsComparison
             ),
             videoBitrate = "${bitrateLabel(sourceVideoBitrate)} -> ${bitrateLabel(effectiveOutputVideoBitrate)}${if (videoBitrateMeasured) " (measured from size)" else ""}${if (input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS) " (floor ${bitrateLabel(minPerceptualVideoBitrate)})" else ""}",
@@ -365,7 +400,13 @@ object OutputVerifier {
                 BatchQualityMode.REMUX_ONLY -> remuxVerified
                 BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance
                 else -> playable
-            }
+            },
+            durationParity = "${input.source.durationMs}ms -> ${input.outputFileProbe.durationMs}ms ${statusSuffix(durationMatches)}" +
+                if (input.sourceFrameCount > 0 && input.outputFileProbe.frameCount > 0) {
+                    "; frames ${input.sourceFrameCount} -> ${input.outputFileProbe.frameCount} ${statusSuffix(frameCountMatches)}"
+                } else {
+                    "; frames not exposed"
+                }
         )
     }
 
@@ -386,10 +427,33 @@ object OutputVerifier {
                 height = height,
                 fps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull() ?: 0f,
                 durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L,
-                rotationDegrees = rotation
+                rotationDegrees = rotation,
+                frameCount = readFrameCount(retriever)
             )
         } catch (_: Exception) {
             FileProbe(0, 0, 0f, 0L, null)
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
+    // METADATA_KEY_VIDEO_FRAME_COUNT is available on API 28+; 0 means "not exposed".
+    private fun readFrameCount(retriever: MediaMetadataRetriever): Int {
+        if (android.os.Build.VERSION.SDK_INT < 28) return 0
+        return runCatching {
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)?.toIntOrNull() ?: 0
+        }.getOrDefault(0)
+    }
+
+    // Source-side frame count for parity checking, probed from the source Uri.
+    private fun readSourceFrameCount(context: Context, uri: Uri): Int {
+        if (android.os.Build.VERSION.SDK_INT < 28) return 0
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, uri)
+            readFrameCount(retriever)
+        } catch (_: Exception) {
+            0
         } finally {
             runCatching { retriever.release() }
         }
