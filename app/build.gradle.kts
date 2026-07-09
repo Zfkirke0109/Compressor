@@ -11,7 +11,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "compress.joshattic.us"
+        applicationId = "io.github.zfkirke0109.galaxycompressor"
         minSdk = 24
         targetSdk = 36
         versionCode = 25

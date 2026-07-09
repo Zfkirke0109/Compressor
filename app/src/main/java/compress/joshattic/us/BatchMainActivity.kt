@@ -296,7 +296,7 @@ private fun BatchSettingsCard(
                         FilterChip(
                             selected = state.qualityPreset == label,
                             onClick = { viewModel.setQuality(label) },
-                            label = { Text(label, maxLines = 1) },
+                            label = { Text(label, maxLines = 2, overflow = TextOverflow.Ellipsis) },
                             enabled = !state.isCompressing
                         )
                     }
@@ -353,7 +353,7 @@ private fun BatchSettingsCard(
             Text("Frame rate", style = MaterialTheme.typography.labelLarge)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    listOf("Original", "120 fps", "60 fps", "30 fps").forEach { label ->
+                    listOf("Original", "120 fps", "60 fps").forEach { label ->
                         FilterChip(
                             selected = state.frameRateOption == label,
                             onClick = { viewModel.setFrameRate(label) },
@@ -363,12 +363,14 @@ private fun BatchSettingsCard(
                     }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FilterChip(
-                        selected = state.frameRateOption == "24 fps",
-                        onClick = { viewModel.setFrameRate("24 fps") },
-                        label = { Text("24 fps", maxLines = 1) },
-                        enabled = !state.isCompressing && !fpsLocked
-                    )
+                    listOf("30 fps", "24 fps").forEach { label ->
+                        FilterChip(
+                            selected = state.frameRateOption == label,
+                            onClick = { viewModel.setFrameRate(label) },
+                            label = { Text(label, maxLines = 1) },
+                            enabled = !state.isCompressing && !fpsLocked
+                        )
+                    }
                 }
             }
             Text(

@@ -2,7 +2,7 @@
 
 Android updates an installed APK only when the replacement APK uses the same application ID and signing certificate.
 
-For this project the application ID stays `compress.joshattic.us`. The important part is to keep the same debug signing key across APK artifacts.
+For this fork the application ID is `io.github.zfkirke0109.galaxycompressor` (renamed from upstream's `compress.joshattic.us`, so this fork installs alongside the published upstream app instead of colliding with it). The important part is to keep the same debug signing key across APK artifacts.
 
 ## Local builds
 
