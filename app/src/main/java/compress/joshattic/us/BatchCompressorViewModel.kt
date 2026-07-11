@@ -1762,15 +1762,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     }
 
     private fun isLikelyCompressorOutput(name: String): Boolean {
+        // Only skip files that match THIS app's own output naming (see [outputName]:
+        // "<base>_Compressed.mp4" / "<base>_Remuxed.mp4"). The previous heuristic also matched
+        // generic web/tool conventions ("compressed_video.mp4", "video_compressed_final.mp4"),
+        // which silently skipped legitimate downloaded videos. Downloaded media must be inspected,
+        // not skipped on a name guess, so only the exact app suffix qualifies.
         val base = name.substringBeforeLast('.').lowercase()
         return base.endsWith("_compressed") ||
             base.endsWith("-compressed") ||
             base.endsWith("_remuxed") ||
-            base.endsWith("-remuxed") ||
-            base.contains("_compressed_") ||
-            base.contains("_remuxed_") ||
-            base.startsWith("compressed_") ||
-            base.startsWith("remuxed_")
+            base.endsWith("-remuxed")
     }
 
     private fun BatchVideoItem.outputName(quality: BatchQualityPreset): String {
