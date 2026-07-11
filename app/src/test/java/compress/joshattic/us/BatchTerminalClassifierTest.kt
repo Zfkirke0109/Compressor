@@ -32,7 +32,7 @@ class BatchTerminalClassifierTest {
         skippedAlreadyCompressed = skipped,
         cancelled = cancelled,
         hardFailure = hardFailure,
-        preEncodeNearOptimal = nearOptimal,
+        preEncodeSourceAlreadyEfficient = nearOptimal,
         unsupportedContainer = unsupported,
         encoderFailed = encoderFailed
     )
@@ -42,6 +42,7 @@ class BatchTerminalClassifierTest {
         val r = BatchTerminalClassifier.classify(input())
         assertEquals(BatchTerminalResult.TRANSCODED_SMALLER, r)
         assertTrue(r.countsAsRealCompression)
+        assertTrue(r.allowsOriginalReplacement)
     }
 
     @Test
@@ -62,6 +63,9 @@ class BatchTerminalClassifierTest {
         assertFalse(explicit.countsAsRealCompression)
         assertFalse(nearOptimal.countsAsRealCompression)
         assertFalse(fallback.countsAsRealCompression)
+        assertTrue(explicit.allowsOriginalReplacement)
+        assertFalse(nearOptimal.allowsOriginalReplacement)
+        assertFalse(fallback.allowsOriginalReplacement)
     }
 
     @Test
@@ -70,6 +74,19 @@ class BatchTerminalClassifierTest {
         val r = BatchTerminalClassifier.classify(input(sourceSize = 100_000_000, outputSize = 99_000_000))
         assertEquals(BatchTerminalResult.TRANSCODED_NOT_MEANINGFULLY_SMALLER, r)
         assertFalse(r.countsAsRealCompression)
+        assertFalse(r.allowsOriginalReplacement)
+    }
+
+    @Test
+    fun meaningfulSavingsThresholdIsExactlyThreePercent() {
+        val justBelow = BatchTerminalClassifier.classify(
+            input(sourceSize = 100_000_000, outputSize = 97_010_000)
+        )
+        val atThreshold = BatchTerminalClassifier.classify(
+            input(sourceSize = 100_000_000, outputSize = 97_000_000)
+        )
+        assertEquals(BatchTerminalResult.TRANSCODED_NOT_MEANINGFULLY_SMALLER, justBelow)
+        assertEquals(BatchTerminalResult.TRANSCODED_SMALLER, atThreshold)
     }
 
     @Test
@@ -85,6 +102,22 @@ class BatchTerminalClassifierTest {
         assertEquals(BatchTerminalResult.OUTPUT_VALIDATION_FAILED, r)
         assertTrue(r.isFailure)
         assertFalse(r.countsAsRealCompression)
+    }
+
+    @Test
+    fun failedVerificationOnStreamCopyIsAFailureAndCannotReplace() {
+        val unverified = BatchTerminalClassifier.classify(
+            input(
+                requested = BatchQualityMode.REMUX_ONLY,
+                effective = BatchQualityMode.REMUX_ONLY,
+                streamCopy = true,
+                verified = false,
+                replacementSafe = false
+            )
+        )
+        assertEquals(BatchTerminalResult.OUTPUT_VALIDATION_FAILED, unverified)
+        assertTrue(unverified.isFailure)
+        assertFalse(unverified.allowsOriginalReplacement)
     }
 
     @Test
@@ -111,5 +144,29 @@ class BatchTerminalClassifierTest {
         )
         assertEquals(BatchTerminalResult.UNEXPECTED_REMUX, r)
         assertFalse(r.countsAsRealCompression)
+    }
+
+    @Test
+    fun mixedAccountingCountsOnlyVerifiedEncodedSavings() {
+        val summary = BatchTerminalAccounting.summarize(
+            listOf(
+                BatchTerminalAccountingEntry(BatchTerminalResult.TRANSCODED_SMALLER, 100, 80),
+                // A materially smaller remux is still a stream copy, never compression savings.
+                BatchTerminalAccountingEntry(BatchTerminalResult.EXPLICIT_REMUX, 100, 80),
+                BatchTerminalAccountingEntry(BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED, 100, 0),
+                BatchTerminalAccountingEntry(BatchTerminalResult.FAILED, 100, 0),
+                BatchTerminalAccountingEntry(BatchTerminalResult.CANCELLED, 100, 0)
+            )
+        )
+
+        assertEquals(5, summary.processedCount)
+        assertEquals(1, summary.realCompressionCount)
+        assertEquals(1, summary.nonCompressionCount)
+        assertEquals(1, summary.failedCount)
+        assertEquals(1, summary.skippedCount)
+        assertEquals(1, summary.cancelledCount)
+        assertEquals(20, summary.totalBytesSaved)
+        assertEquals(100, summary.realCompressionInputBytes)
+        assertEquals(80, summary.realCompressionOutputBytes)
     }
 }

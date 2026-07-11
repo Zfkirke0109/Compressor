@@ -3,6 +3,7 @@ package compress.joshattic.us
 import android.app.Application
 import android.content.ContentValues
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.media.MediaCodecInfo
 import android.media.MediaMetadataRetriever
 import android.net.Uri
@@ -34,9 +35,13 @@ import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.VideoEncoderSettings
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -77,7 +82,8 @@ enum class BatchItemStatus {
     Failed,
     Replaced,
     SavedCopy,
-    Skipped
+    Skipped,
+    Cancelled
 }
 
 data class BatchVideoItem(
@@ -87,6 +93,7 @@ data class BatchVideoItem(
     val originalWidth: Int,
     val originalHeight: Int,
     val originalBitrate: Int,
+    val originalBitrateWasMeasured: Boolean = false,
     val originalAudioBitrate: Int,
     val originalFps: Float,
     val durationMs: Long,
@@ -112,6 +119,7 @@ data class BatchVideoItem(
     val recommendation: CompressionRecommendation? = null,
     val verificationReport: OutputVerificationReport? = null,
     val metrics: BatchItemMetrics? = null,
+    val terminalResult: BatchTerminalResult? = null,
     val message: String? = null
 ) {
     val displaySize: String get() = formatFileSize(originalSize)
@@ -146,6 +154,7 @@ data class BatchCompressorUiState(
     val doneCount: Int get() = items.count { it.status == BatchItemStatus.Done || it.status == BatchItemStatus.Replaced || it.status == BatchItemStatus.SavedCopy }
     val failedCount: Int get() = items.count { it.status == BatchItemStatus.Failed }
     val skippedCount: Int get() = items.count { it.status == BatchItemStatus.Skipped || it.isAlreadyCompressed }
+    val cancelledCount: Int get() = items.count { it.terminalResult == BatchTerminalResult.CANCELLED }
     val compressibleCount: Int get() = items.count { !it.isAlreadyCompressed && it.status != BatchItemStatus.Skipped }
     val activeIndex: Int get() = items.indexOfFirst { it.status == BatchItemStatus.Compressing }
     val activeItem: BatchVideoItem? get() = items.getOrNull(activeIndex)
@@ -154,7 +163,17 @@ data class BatchCompressorUiState(
     val totalOutputBytes: Long get() = items.sumOf { it.outputSize }
     val totalCurrentOutputBytes: Long get() = items.sumOf { if (it.outputSize > 0L) it.outputSize else it.currentOutputSize }
     val totalTargetOutputBytes: Long get() = items.sumOf { it.targetOutputSize }
-    val totalSavedBytes: Long get() = (totalOriginalBytes - totalOutputBytes).coerceAtLeast(0L)
+    val terminalAccounting: BatchTerminalAccountingSummary
+        get() = BatchTerminalAccounting.summarize(
+            items.mapNotNull { item ->
+                item.terminalResult?.let { terminal ->
+                    BatchTerminalAccountingEntry(terminal, item.originalSize, item.outputSize)
+                }
+            }
+        )
+    val realCompressionCount: Int get() = terminalAccounting.realCompressionCount
+    val nonCompressionCount: Int get() = terminalAccounting.nonCompressionCount
+    val totalSavedBytes: Long get() = terminalAccounting.totalBytesSaved
     val currentBatchProgress: Float get() = if (items.isEmpty()) 0f else items.sumOf { it.progress.toDouble() }.toFloat() / items.size
     val formattedTotalOriginal: String get() = formatFileSize(totalOriginalBytes)
     val formattedTotalOutput: String get() = formatFileSize(totalOutputBytes)
@@ -185,6 +204,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val floorRatio: Double,
         val preferRemux: Boolean,
         val remuxReason: String?,
+        val remuxWasSourceEfficient: Boolean,
         // Tier-1 experimental encoder-ceiling diagnostics (debug builds only): request CBR so the
         // QTI encoder cannot apply its VBR quality-boost overshoot. Judged by OutputVerifier only.
         val useCbrCeiling: Boolean = false,
@@ -349,7 +369,21 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     }
 
     fun clear() {
-        cancelCompression()
+        val runningJob = compressionJob?.takeIf { !it.isCompleted }
+        if (runningJob != null) {
+            cancelCompression()
+            viewModelScope.launch {
+                // Preserve the selected items until the cancelled run records one terminal
+                // diagnostic for each of them. Clearing early would produce an incomplete session.
+                runningJob.join()
+                clearBatchState()
+            }
+            return
+        }
+        clearBatchState()
+    }
+
+    private fun clearBatchState() {
         clearBatchCache()
         _uiState.update {
             it.copy(
@@ -382,6 +416,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             status = BatchItemStatus.Skipped,
                             progress = 1f,
                             targetOutputSize = 0L,
+                            terminalResult = BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED,
                             message = "Already compressed by Compressor — skipped."
                         )
                     } else {
@@ -450,7 +485,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     fun startCompression(context: Context) {
         val current = _uiState.value
-        if (current.items.isEmpty() || current.isCompressing) return
+        if (current.items.isEmpty() || current.isCompressing || compressionJob?.isCompleted == false) return
         if (current.compressibleCount == 0) {
             _uiState.update { it.copy(statusMessage = "All selected videos already look compressed by Compressor, so nothing was recompressed.") }
             return
@@ -488,6 +523,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 outputMode = null,
                                 verificationReport = null,
                                 metrics = null,
+                                terminalResult = BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED,
                                 message = "Already compressed by Compressor — skipped."
                             )
                         } else {
@@ -502,6 +538,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 outputMode = null,
                                 verificationReport = null,
                                 metrics = null,
+                                terminalResult = null,
                                 message = null
                             )
                         }
@@ -509,31 +546,76 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 )
             }
 
-            _uiState.value.items.forEachIndexed { index, item ->
-                if (item.isAlreadyCompressed) return@forEachIndexed
-
-                val thermalWindow = waitForThermalWindow(context, item.originalName)
-                val itemStartedAt = System.currentTimeMillis()
-                val plannedFps = outputFpsFor(item, frameRate, quality)
-                updateItem(index) {
-                    it.copy(
-                        status = BatchItemStatus.Compressing,
-                        progress = 0f,
-                        currentOutputSize = 0L,
-                        targetOutputSize = estimateOutputSize(it, quality, codec, frameRate),
-                        message = if (quality == BatchQualityPreset.REMUX_ONLY) {
-                            "Remuxing: video/audio copied unchanged • no re-encode • ${thermalWindow.thermalLabel}"
-                        } else {
-                            "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality, codec, frameRate))} • ${codec.label}${plannedFps?.let { fps -> " • ${fps}fps" } ?: " • source FPS"} • ${thermalWindow.thermalLabel}"
-                        }
-                    )
+            val diagnostics = DiagnosticsRecorder.start(
+                context = context,
+                batchId = "batch_$batchStartedAt",
+                mode = quality.label,
+                selectedCount = _uiState.value.items.size,
+                appVersion = runCatching {
+                    context.packageManager.getPackageInfo(context.packageName, 0).versionName
+                }.getOrNull() ?: "unknown",
+                buildType = if (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+                    "debug"
+                } else {
+                    "release"
                 }
-                try {
+            )
+            _uiState.value.items.filter { it.isAlreadyCompressed }.forEach { skippedItem ->
+                recordDiagnosticJob(
+                    diagnostics = diagnostics,
+                    item = skippedItem,
+                    requestedQuality = quality,
+                    effectiveQuality = quality,
+                    resolvedMime = null,
+                    plannedTargetRatio = null,
+                    plannedTargetVideoBitrate = null,
+                    wasStreamCopy = false,
+                    verification = null,
+                    outputSize = 0L,
+                    terminal = BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED,
+                    elapsedMs = 0L
+                )
+            }
+            var runCancelled = false
+
+            try {
+                _uiState.value.items.forEachIndexed { index, item ->
+                    if (item.isAlreadyCompressed) {
+                        return@forEachIndexed
+                    }
+
+                    val thermalWindow = waitForThermalWindow(context, item.originalName)
+                    val itemStartedAt = System.currentTimeMillis()
+                    val plannedFps = outputFpsFor(item, frameRate, quality)
+                    var diagnosticEffectiveQuality = quality
+                    var diagnosticResolvedMime: String? = null
+                    var diagnosticTargetRatio: Double? = null
+                    var diagnosticTargetVideoBitrate: Int? = null
+                    var diagnosticDecisionReason: String? = null
+                    var diagnosticSourceAlreadyEfficient = false
+                    var diagnosticEncoderFailed = false
+                    val candidateFiles = linkedSetOf<File>()
+                    var itemOutputAccepted = false
+                    updateItem(index) {
+                        it.copy(
+                            status = BatchItemStatus.Compressing,
+                            progress = 0f,
+                            currentOutputSize = 0L,
+                            targetOutputSize = estimateOutputSize(it, quality, codec, frameRate),
+                            message = if (quality == BatchQualityPreset.REMUX_ONLY) {
+                                "Remuxing: video/audio copied unchanged • no re-encode • ${thermalWindow.thermalLabel}"
+                            } else {
+                                "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality, codec, frameRate))} • ${codec.label}${plannedFps?.let { fps -> " • ${fps}fps" } ?: " • source FPS"} • ${thermalWindow.thermalLabel}"
+                            }
+                        )
+                    }
+                    try {
                     val resolvedMime = if (quality == BatchQualityPreset.REMUX_ONLY) {
                         null
                     } else {
                         chooseOutputMime(codec, item, quality)
                     }
+                    diagnosticResolvedMime = resolvedMime
                     val codecLabel = when (resolvedMime) {
                         MimeTypes.VIDEO_H265 -> "HEVC"
                         MimeTypes.VIDEO_AV1 -> "AV1"
@@ -546,10 +628,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     } else {
                         null
                     }
+                    diagnosticTargetRatio = perceptualPlan?.targetRatio
+                    diagnosticDecisionReason = perceptualPlan?.remuxReason
+                    diagnosticTargetVideoBitrate = resolvedMime?.let {
+                        calculateVideoBitrate(item, quality, it, perceptualPlan?.targetRatio)
+                    }
+                    diagnosticSourceAlreadyEfficient = perceptualPlan?.remuxWasSourceEfficient == true
                     if (perceptualPlan?.preferRemux == true) {
                         effectiveQuality = BatchQualityPreset.REMUX_ONLY
                         preEncodeRemuxNote = perceptualPlan.remuxReason
                     }
+                    diagnosticEffectiveQuality = effectiveQuality
                     logEncoderPlan(
                         item,
                         effectiveQuality,
@@ -560,11 +649,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     )
                     var encodeAttempt: EncodeAttemptResult? = null
                     var remuxResult = if (effectiveQuality == BatchQualityPreset.REMUX_ONLY) {
+                        candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
                         remuxOnlyOne(context, item, index, privacyMode)
                     } else {
                         val safeResolvedMime = resolvedMime
                             ?: throw IllegalStateException("Encoder selection failed before export planning. Use Remux Only or choose a different codec.")
                         try {
+                            candidateFiles += item.cacheOutputFile(context, quality)
                             val attempt = compressOne(
                                 context,
                                 item,
@@ -577,13 +668,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             )
                             encodeAttempt = attempt
                             withContext(Dispatchers.IO) {
+                                val remuxContext = currentCoroutineContext()
                                 Mp4MetadataRemuxer.remuxWithSourceMetadata(
                                     context,
                                     attempt.file,
-                                    item.metadataSnapshot.filteredForPrivacy(privacyMode)
+                                    item.metadataSnapshot.filteredForPrivacy(privacyMode),
+                                    cancellationCheck = { remuxContext.ensureActive() }
                                 )
                             }
                         } catch (e: ExportException) {
+                            diagnosticEncoderFailed = true
                             // A rejected encoder configuration or export failure must never strand
                             // a Perceptually Lossless item as "Failed": the honest production
                             // answer is the verified stream copy.
@@ -591,7 +685,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             val reason = "encoder export failed (${e.errorCodeName})"
                             Log.w(
                                 "CompressorBatch",
-                                "Perceptually lossless encode failed before verification for ${item.originalName}: $reason; falling back to remux"
+                                "Perceptually lossless encode failed before verification for ${diagnosticJobId(item)}: $reason; falling back to remux"
                             )
                             val learned = learningEngine.recordFailure(
                                 perceptualPlan.profileKey,
@@ -605,7 +699,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                     "reason=$reason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
                             )
                             effectiveQuality = BatchQualityPreset.REMUX_ONLY
+                            diagnosticEffectiveQuality = effectiveQuality
                             preEncodeRemuxNote = "Remux Fallback Kept: the encoder rejected the perceptually lossless attempt ($reason)"
+                            candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
                             remuxOnlyOne(context, item, index, privacyMode)
                         }
                     }
@@ -634,7 +730,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         val failureReason = verification.replacementBlockReason ?: verification.verdict
                         Log.w(
                             "CompressorBatch",
-                            "Perceptually lossless fallback to remux for ${item.originalName}: $failureReason"
+                            "Perceptually lossless fallback to remux for ${diagnosticJobId(item)}: $failureReason"
                         )
                         // Log the full field-by-field report of the discarded attempt so device
                         // logs show exactly which check failed or which field was not exposed.
@@ -658,11 +754,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             )
                         }
                         runCatching { outputFile.delete() }
+                        candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
                         remuxResult = remuxOnlyOne(context, item, index, privacyMode)
                         outputFile = remuxResult.outputFile
                         outputUri = Uri.fromFile(outputFile)
                         outputSize = outputFile.length()
                         effectiveQuality = BatchQualityPreset.REMUX_ONLY
+                        diagnosticEffectiveQuality = effectiveQuality
                         preEncodeRemuxNote = "Remux Fallback Kept: perceptually lossless could not be verified ($failureReason)"
                         verification = withContext(Dispatchers.IO) {
                             OutputVerifier.verify(context, item, outputFile, effectiveQuality.label, privacyMode)
@@ -692,11 +790,27 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     }
                     logVerificationResult(item, effectiveQuality, verification, outputSize)
                     val thermalEnd = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
+                    val terminal = BatchTerminalClassifier.classify(
+                        BatchTerminalInput(
+                            requestedMode = quality.toMode(),
+                            effectiveMode = effectiveQuality.toMode(),
+                            wasStreamCopy = effectiveQuality == BatchQualityPreset.REMUX_ONLY,
+                            verified = verification.verified,
+                            replacementSafe = verification.replacementSafe,
+                            sourceSize = item.originalSize,
+                            outputSize = outputSize,
+                            preEncodeSourceAlreadyEfficient = diagnosticSourceAlreadyEfficient,
+                            encoderFailed = diagnosticEncoderFailed
+                        )
+                    )
+                    val terminalSavedBytes = BatchTerminalAccounting.savedBytes(
+                        BatchTerminalAccountingEntry(terminal, item.originalSize, outputSize)
+                    )
                     val metrics = BatchItemMetrics(
                         operationLabel = if (effectiveQuality == BatchQualityPreset.REMUX_ONLY) "Remux" else "Encode",
                         elapsedMs = System.currentTimeMillis() - itemStartedAt,
                         outputBytes = outputSize,
-                        savedBytes = (item.originalSize - outputSize).coerceAtLeast(0L),
+                        savedBytes = terminalSavedBytes,
                         thermalStart = thermalWindow.thermalLabel,
                         thermalEnd = thermalEnd.thermalLabel,
                         batteryStart = thermalWindow.batteryPercent,
@@ -704,46 +818,94 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         cooldownMs = 0L
                     )
 
-                    updateItem(index) {
-                        it.copy(
-                            status = BatchItemStatus.Done,
-                            progress = 1f,
-                            currentOutputSize = outputSize,
-                            outputUri = outputUri,
-                            outputPath = outputFile.absolutePath,
-                            outputSize = outputSize,
-                            outputMode = effectiveQuality.label,
-                            verificationReport = verification,
-                            metrics = metrics,
-                            message = completionMessage(
-                                it,
-                                effectiveQuality,
-                                outputSize,
-                                plannedFps,
-                                codecLabel,
-                                preEncodeRemuxNote?.let { note -> "${remuxResult.message} • $note" } ?: remuxResult.message,
-                                verification,
-                                privacyMode
-                            )
-                        )
-                    }
+                    recordDiagnosticJob(
+                        diagnostics = diagnostics,
+                        item = item,
+                        requestedQuality = quality,
+                        effectiveQuality = effectiveQuality,
+                        resolvedMime = diagnosticResolvedMime,
+                        plannedTargetRatio = diagnosticTargetRatio,
+                        plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
+                        plannedDecisionReason = diagnosticDecisionReason,
+                        wasStreamCopy = effectiveQuality == BatchQualityPreset.REMUX_ONLY,
+                        verification = verification,
+                        outputSize = outputSize,
+                        terminal = terminal,
+                        elapsedMs = metrics.elapsedMs
+                    )
 
-                    if (_uiState.value.replaceOriginals) {
-                        val replacement = replaceOriginalSafely(
-                            context = context,
-                            item = item,
-                            outputFile = outputFile,
-                            useShizukuFallback = _uiState.value.useShizukuFallback,
-                            quality = effectiveQuality,
-                            verification = verification,
-                            backupBeforeReplace = _uiState.value.backupBeforeReplace,
-                            privacyMode = privacyMode
-                        )
+                    if (terminal.isFailure) {
+                        // An unverified remux/encode is evidence, not an output. Keep its measured
+                        // size in diagnostics, then remove the cache file and expose no share/save/
+                        // replacement path to the UI.
+                        runCatching { outputFile.delete() }
                         updateItem(index) {
                             it.copy(
-                                status = if (replacement.success) BatchItemStatus.Replaced else BatchItemStatus.SavedCopy,
-                                message = replacement.message
+                                status = BatchItemStatus.Failed,
+                                progress = 1f,
+                                currentOutputSize = 0L,
+                                outputUri = null,
+                                outputPath = null,
+                                outputSize = 0L,
+                                outputMode = effectiveQuality.label,
+                                verificationReport = verification,
+                                metrics = metrics,
+                                terminalResult = terminal,
+                                message = buildString {
+                                    append(terminal.label)
+                                    verification.replacementBlockReason?.let { append(": ").append(it) }
+                                }
                             )
+                        }
+                    } else {
+                        updateItem(index) {
+                            it.copy(
+                                status = BatchItemStatus.Done,
+                                progress = 1f,
+                                currentOutputSize = outputSize,
+                                outputUri = outputUri,
+                                outputPath = outputFile.absolutePath,
+                                outputSize = outputSize,
+                                outputMode = effectiveQuality.label,
+                                verificationReport = verification,
+                                metrics = metrics,
+                                terminalResult = terminal,
+                                message = completionMessage(
+                                    it,
+                                    effectiveQuality,
+                                    outputSize,
+                                    plannedFps,
+                                    codecLabel,
+                                    preEncodeRemuxNote?.let { note -> "${remuxResult.message} • $note" } ?: remuxResult.message,
+                                    verification,
+                                    privacyMode
+                                )
+                            )
+                        }
+                        itemOutputAccepted = true
+                    }
+
+                    if (terminal.allowsOriginalReplacement && _uiState.value.replaceOriginals) {
+                        // Once destructive replacement starts, finish it and publish its disposition
+                        // atomically before honoring cancellation. This prevents an original from
+                        // changing while the UI remains stuck at a pre-replacement Done state.
+                        withContext(NonCancellable) {
+                            val replacement = replaceOriginalSafely(
+                                context = context,
+                                item = item,
+                                outputFile = outputFile,
+                                useShizukuFallback = _uiState.value.useShizukuFallback,
+                                quality = effectiveQuality,
+                                verification = verification,
+                                backupBeforeReplace = _uiState.value.backupBeforeReplace,
+                                privacyMode = privacyMode
+                            )
+                            updateItem(index) {
+                                it.copy(
+                                    status = if (replacement.success) BatchItemStatus.Replaced else BatchItemStatus.SavedCopy,
+                                    message = replacement.message
+                                )
+                            }
                         }
                     }
 
@@ -760,32 +922,144 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         }
                         if (cooldown.postItemDelayMs > 0L) delay(cooldown.postItemDelayMs)
                     }
-                } catch (e: Exception) {
+                    } catch (e: CancellationException) {
+                        if (!itemOutputAccepted) candidateFiles.forEach { runCatching { it.delete() } }
+                        throw e
+                    } catch (e: Exception) {
+                        if (!itemOutputAccepted) candidateFiles.forEach { runCatching { it.delete() } }
+                        val unsupported = e.message?.contains(Mp4MetadataRemuxer.REMUX_ONLY_UNSUPPORTED_MESSAGE) == true
+                        val encoderFailure = diagnosticEncoderFailed || e is ExportException
+                        val terminal = BatchTerminalClassifier.classify(
+                            BatchTerminalInput(
+                                requestedMode = quality.toMode(),
+                                effectiveMode = diagnosticEffectiveQuality.toMode(),
+                                wasStreamCopy = false,
+                                verified = false,
+                                replacementSafe = false,
+                                sourceSize = item.originalSize,
+                                outputSize = 0L,
+                                hardFailure = !unsupported && !encoderFailure,
+                                unsupportedContainer = unsupported,
+                                encoderFailed = encoderFailure
+                            )
+                        )
+                        val elapsedMs = System.currentTimeMillis() - itemStartedAt
                     updateItem(index) {
                         it.copy(
                             status = BatchItemStatus.Failed,
-                            progress = 0f,
+                            progress = 1f,
+                            currentOutputSize = 0L,
+                            outputUri = null,
+                            outputPath = null,
+                            outputSize = 0L,
+                                terminalResult = terminal,
                             message = e.message ?: "Compression failed"
                         )
                     }
+                        recordDiagnosticJob(
+                            diagnostics = diagnostics,
+                            item = item,
+                            requestedQuality = quality,
+                            effectiveQuality = diagnosticEffectiveQuality,
+                            resolvedMime = diagnosticResolvedMime,
+                            plannedTargetRatio = diagnosticTargetRatio,
+                            plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
+                            plannedDecisionReason = diagnosticDecisionReason,
+                            wasStreamCopy = false,
+                            verification = null,
+                            outputSize = 0L,
+                            terminal = terminal,
+                            elapsedMs = elapsedMs
+                        )
+                    }
                 }
-            }
 
-            _uiState.update {
-                val metrics = BatchMetricsSummary(
-                    totalElapsedMs = System.currentTimeMillis() - batchStartedAt,
-                    totalCooldownMs = it.items.sumOf { item -> item.metrics?.cooldownMs ?: 0L },
-                    doneCount = it.doneCount,
-                    failedCount = it.failedCount,
-                    skippedCount = it.skippedCount,
-                    totalSavedBytes = it.totalSavedBytes
-                )
-                it.copy(
-                    isCompressing = false,
-                    batchMetrics = metrics,
-                    statusMessage = "Finished ${it.doneCount}/${it.items.size}. Skipped ${it.skippedCount}. Saved ${it.formattedTotalSaved} total.",
-                    errorMessage = if (it.failedCount > 0) "${it.failedCount} item${if (it.failedCount == 1) "" else "s"} failed. Tap each item for details." else null
-                )
+                _uiState.update {
+                    val accounting = it.terminalAccounting
+                    val metrics = BatchMetricsSummary(
+                        totalElapsedMs = System.currentTimeMillis() - batchStartedAt,
+                        totalCooldownMs = it.items.sumOf { item -> item.metrics?.cooldownMs ?: 0L },
+                        processedCount = accounting.processedCount,
+                        realCompressionCount = accounting.realCompressionCount,
+                        nonCompressionCount = accounting.nonCompressionCount,
+                        failedCount = accounting.failedCount,
+                        skippedCount = accounting.skippedCount,
+                        cancelledCount = accounting.cancelledCount,
+                        totalSavedBytes = accounting.totalBytesSaved
+                    )
+                    it.copy(
+                        isCompressing = false,
+                        batchMetrics = metrics,
+                        statusMessage = "Finished ${it.doneCount} output${if (it.doneCount == 1) "" else "s"}. " +
+                            "Real compressions: ${accounting.realCompressionCount}. " +
+                            "Saved ${formatFileSize(accounting.totalBytesSaved)} by real compression.",
+                        errorMessage = if (accounting.failedCount > 0) {
+                            "${accounting.failedCount} item${if (accounting.failedCount == 1) "" else "s"} failed. Tap each item for details."
+                        } else {
+                            null
+                        }
+                    )
+                }
+            } catch (e: CancellationException) {
+                runCancelled = true
+                throw e
+            } finally {
+                if (runCancelled) {
+                    val cancelledItems = _uiState.value.items.filter { it.terminalResult == null }
+                    _uiState.update { state ->
+                        state.copy(
+                            items = state.items.map { item ->
+                                if (item.terminalResult == null) {
+                                    item.copy(
+                                        status = BatchItemStatus.Cancelled,
+                                        terminalResult = BatchTerminalResult.CANCELLED,
+                                        message = "Cancelled — no compression result accepted."
+                                    )
+                                } else {
+                                    item
+                                }
+                            }
+                        )
+                    }
+                    cancelledItems.forEach { item ->
+                        recordDiagnosticJob(
+                            diagnostics = diagnostics,
+                            item = item,
+                            requestedQuality = quality,
+                            effectiveQuality = quality,
+                            resolvedMime = null,
+                            plannedTargetRatio = null,
+                            plannedTargetVideoBitrate = null,
+                            wasStreamCopy = false,
+                            verification = null,
+                            outputSize = 0L,
+                            terminal = BatchTerminalResult.CANCELLED,
+                            elapsedMs = 0L
+                        )
+                    }
+                    _uiState.update {
+                        val accounting = it.terminalAccounting
+                        it.copy(
+                            isCompressing = false,
+                            batchMetrics = BatchMetricsSummary(
+                                totalElapsedMs = System.currentTimeMillis() - batchStartedAt,
+                                totalCooldownMs = it.items.sumOf { item -> item.metrics?.cooldownMs ?: 0L },
+                                processedCount = accounting.processedCount,
+                                realCompressionCount = accounting.realCompressionCount,
+                                nonCompressionCount = accounting.nonCompressionCount,
+                                failedCount = accounting.failedCount,
+                                skippedCount = accounting.skippedCount,
+                                cancelledCount = accounting.cancelledCount,
+                                totalSavedBytes = accounting.totalBytesSaved
+                            ),
+                            statusMessage = "Compression canceled. ${accounting.cancelledCount} item${if (accounting.cancelledCount == 1) "" else "s"} canceled.",
+                            errorMessage = null
+                        )
+                    }
+                }
+                diagnostics.sessionSummary(System.currentTimeMillis() - batchStartedAt)
+                activeTransformer = null
+                compressionJob = null
             }
         }
     }
@@ -793,7 +1067,19 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     fun cancelCompression() {
         activeTransformer?.cancel()
         compressionJob?.cancel()
-        _uiState.update { it.copy(isCompressing = false, statusMessage = "Compression canceled.") }
+        // The coroutine's finally block owns the transition to idle and final accounting. Leaving
+        // isCompressing true prevents a second run from racing the cancelled run's cleanup.
+        _uiState.update {
+            val cancellationPending = compressionJob?.isCompleted == false
+            it.copy(
+                isCompressing = cancellationPending,
+                statusMessage = if (cancellationPending) {
+                    "Canceling compression…"
+                } else {
+                    "Compression canceled."
+                }
+            )
+        }
     }
 
     fun saveAllCopiesToGallery(context: Context) {
@@ -867,6 +1153,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         var width = 0
         var height = 0
         var bitrate = 0
+        var bitrateWasMeasured = false
         var fps = 30f
         var duration = 0L
         var metadataSnapshot = VideoMetadataSnapshot()
@@ -903,9 +1190,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             if (bitrate <= 0 && size > 0L && duration > 0L) {
                 bitrate = (size * 8000.0 / duration.toDouble())
                     .toLong().coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                bitrateWasMeasured = true
                 Log.i(
                     "CompressorEncoderPlan",
-                    "measured source bitrate from size/duration for $name: ${bitrate} bps " +
+                    "measured source bitrate from size/duration for ${DiagnosticsRecorder.redactedJobId(uri.toString())}: ${bitrate} bps " +
                         "(container exposed no overall bitrate)"
                 )
             }
@@ -924,6 +1212,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             originalWidth = width,
             originalHeight = height,
             originalBitrate = bitrate,
+            originalBitrateWasMeasured = bitrateWasMeasured,
             originalAudioBitrate = trackProbe.audioBitrate,
             originalFps = fps,
             durationMs = duration,
@@ -1072,7 +1361,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // per-profile overshoot so the near-optimal gate reflects what the encoder actually does.
         val learnedOvershoot = learningEngine.expectedOvershootFactor(profileKey)
         val expectedOvershootFactor = if (useCbrCeiling) 1.0 else learnedOvershoot
-        val nearOptimal = BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
+        val preserveSourceCodec = BatchQualityBitratePolicy.shouldPreserveSourceCodecForPerceptualLossless(
+            source.videoMime,
+            outputMime
+        )
+        val nearOptimal = !preserveSourceCodec && BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
             source = source,
             outputMimeType = outputMime,
             sourceSizeBytes = item.originalSize,
@@ -1082,6 +1375,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val remuxReason = when {
             profilePrefersRemux ->
                 "This device profile repeatedly failed perceptually lossless verification, so the exact stream copy was kept."
+            preserveSourceCodec ->
+                "Source codec is already more efficient than the available output codec; kept exact stream copy."
             nearOptimal ->
                 "Source is already near optimal; kept exact stream copy."
             else -> null
@@ -1098,6 +1393,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             floorRatio = floorRatio,
             preferRemux = remuxReason != null,
             remuxReason = remuxReason,
+            remuxWasSourceEfficient = (preserveSourceCodec || nearOptimal) && !profilePrefersRemux,
             useCbrCeiling = useCbrCeiling,
             expectedOvershootFactor = expectedOvershootFactor
         )
@@ -1131,7 +1427,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     ) {
         Log.i(
             "CompressorVerification",
-            "mode=${quality.label}; file=${item.originalName}; verification=${verification.verdict}; playable=${verification.playability}; " +
+            "mode=${quality.label}; job=${diagnosticJobId(item)}; verification=${verification.verdict}; playable=${verification.playability}; " +
                 "replaceAllowed=${verification.replacementSafe}; blockReason=${verification.replacementBlockReason ?: "none"}; outputSize=${outputSize}"
         )
     }
@@ -1147,8 +1443,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         useCbrCeiling: Boolean = false
     ): EncodeAttemptResult = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
-            val outputDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
-            val outputFile = File(outputDir, item.outputName(quality))
+            val outputFile = item.cacheOutputFile(context, quality)
             if (outputFile.exists()) outputFile.delete()
 
             val targetBitrate = calculateVideoBitrate(item, quality, videoMimeType, learnedTargetRatio)
@@ -1230,6 +1525,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
                     override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {
                         progressJob?.cancel()
+                        runCatching { outputFile.delete() }
                         if (continuation.isActive) continuation.resumeWithException(exportException)
                     }
                 })
@@ -1239,6 +1535,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             continuation.invokeOnCancellation {
                 progressJob?.cancel()
                 transformer.cancel()
+                runCatching { outputFile.delete() }
             }
 
             val effectsList = mutableListOf<Effect>()
@@ -1296,8 +1593,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         index: Int,
         privacyMode: MetadataPrivacyMode
     ): Mp4MetadataRemuxResult = withContext(Dispatchers.IO) {
-        val outputDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
-        val outputFile = File(outputDir, item.outputName(BatchQualityPreset.REMUX_ONLY))
+        val remuxContext = currentCoroutineContext()
+        val outputFile = item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
         val estimatedOutputSize = estimateOutputSize(
             item = item,
             quality = BatchQualityPreset.REMUX_ONLY,
@@ -1310,6 +1607,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             outputFile = outputFile,
             snapshot = item.metadataSnapshot.filteredForPrivacy(privacyMode)
         ) { copiedBytes, outputBytes ->
+            remuxContext.ensureActive()
             val progress = if (item.originalSize > 0L) {
                 (copiedBytes.toFloat() / item.originalSize.toFloat()).coerceIn(0f, 0.99f)
             } else {
@@ -1460,6 +1758,56 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val target = BatchQualityBitratePolicy.targetHeightFor(item.originalHeight, quality.toMode())
         return if (quality == BatchQualityPreset.LOW) minOf(target, 720).coerceAtLeast(2) else target
     }
+
+    private fun recordDiagnosticJob(
+        diagnostics: DiagnosticsRecorder,
+        item: BatchVideoItem,
+        requestedQuality: BatchQualityPreset,
+        effectiveQuality: BatchQualityPreset,
+        resolvedMime: String?,
+        plannedTargetRatio: Double?,
+        plannedTargetVideoBitrate: Int?,
+        plannedDecisionReason: String? = null,
+        wasStreamCopy: Boolean,
+        verification: OutputVerificationReport?,
+        outputSize: Long,
+        terminal: BatchTerminalResult,
+        elapsedMs: Long
+    ) {
+        diagnostics.job(
+            // The recorder hashes both values before emission; raw URI/name never leave this call.
+            sourceKey = item.sourceUri.toString(),
+            displayNameForHashOnly = item.originalName,
+            sourceMime = item.sourceVideoMime,
+            width = item.originalWidth,
+            height = item.originalHeight,
+            fps = item.originalFps,
+            durationMs = item.durationMs,
+            sourceSize = item.originalSize,
+            sourceTotalBitrate = item.originalBitrate,
+            bitrateWasMeasured = item.originalBitrateWasMeasured,
+            hdr = item.toSourceInfo().isHdr,
+            audioMime = item.sourceAudioMime,
+            audioBitrate = item.originalAudioBitrate,
+            requestedMode = requestedQuality.label,
+            effectiveMode = effectiveQuality.label,
+            plannedOutputMime = resolvedMime,
+            plannedTargetRatio = plannedTargetRatio,
+            plannedTargetVideoBitrate = plannedTargetVideoBitrate,
+            plannedDecisionReason = plannedDecisionReason,
+            wasStreamCopy = wasStreamCopy,
+            verdict = verification?.verdict,
+            verified = verification?.verified == true,
+            replacementSafe = verification?.replacementSafe == true,
+            blockReason = verification?.replacementBlockReason,
+            outputSize = outputSize,
+            terminal = terminal,
+            elapsedMs = elapsedMs
+        )
+    }
+
+    private fun diagnosticJobId(item: BatchVideoItem): String =
+        DiagnosticsRecorder.redactedJobId(item.sourceUri.toString())
 
     private fun completionMessage(
         item: BatchVideoItem,
@@ -1778,6 +2126,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val base = originalName.substringBeforeLast(".").ifBlank { "Video_${System.currentTimeMillis()}" }
         val suffix = if (quality == BatchQualityPreset.REMUX_ONLY) "Remuxed" else "Compressed"
         return "${base}_$suffix.mp4"
+    }
+
+    private fun BatchVideoItem.cacheOutputFile(
+        context: Context,
+        quality: BatchQualityPreset
+    ): File {
+        val outputDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
+        val base = originalName.substringBeforeLast(".").ifBlank { "Video" }
+        val suffix = if (quality == BatchQualityPreset.REMUX_ONLY) "Remuxed" else "Compressed"
+        val sourceToken = DiagnosticsRecorder.redactedJobId(sourceUri.toString()).removePrefix("job_")
+        return File(outputDir, "${base}_${sourceToken}_$suffix.mp4")
     }
 
     private fun clearBatchCache() {

@@ -24,20 +24,16 @@ class DiagnosticsRecorder private constructor(
     private val batchId: String,
     private val sessionFile: File?
 ) {
-    private var completed = 0
-    private var failed = 0
-    private var skipped = 0
-    private var realCompressions = 0
-    private var totalInputBytes = 0L
-    private var totalAcceptedOutputBytes = 0L
+    private val outcomes = mutableListOf<BatchTerminalAccountingEntry>()
 
-    fun jobId(sourceKey: String): String = "job_" + stableHash(sourceKey)
+    fun jobId(sourceKey: String): String = redactedJobId(sourceKey)
 
     /** One record. [type] names the record; [fields] must already be privacy-safe. */
     fun record(type: String, fields: Map<String, Any?>) {
         val obj = JSONObject()
         obj.put("batchId", batchId)
         obj.put("type", type)
+        obj.put("timestampMs", System.currentTimeMillis())
         for ((k, v) in fields) obj.put(k, v ?: JSONObject.NULL)
         val line = obj.toString()
         Log.i(TAG, line)
@@ -56,7 +52,6 @@ class DiagnosticsRecorder private constructor(
                 "manufacturer" to Build.MANUFACTURER,
                 "androidRelease" to Build.VERSION.RELEASE,
                 "sdkInt" to Build.VERSION.SDK_INT,
-                "samsungOneUi" to readOneUiVersion(),
                 "mode" to mode,
                 "selectedCount" to selectedCount,
                 "privacy" to "redacted-hashes"
@@ -84,6 +79,7 @@ class DiagnosticsRecorder private constructor(
         plannedOutputMime: String?,
         plannedTargetRatio: Double?,
         plannedTargetVideoBitrate: Int?,
+        plannedDecisionReason: String?,
         wasStreamCopy: Boolean,
         verdict: String?,
         verified: Boolean,
@@ -93,21 +89,20 @@ class DiagnosticsRecorder private constructor(
         terminal: BatchTerminalResult,
         elapsedMs: Long
     ) {
-        completed++
-        if (terminal.isFailure) failed++
-        if (terminal == BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED) skipped++
-        if (terminal.countsAsRealCompression) realCompressions++
-        totalInputBytes += sourceSize.coerceAtLeast(0)
-        // Only count output bytes for outputs we actually accept as a real compression.
-        if (terminal.countsAsRealCompression) totalAcceptedOutputBytes += outputSize.coerceAtLeast(0)
-
-        val savedBytes = (sourceSize - outputSize)
-        val savedPct = if (sourceSize > 0) savedBytes.toDouble() / sourceSize.toDouble() else 0.0
+        val accountingEntry = BatchTerminalAccountingEntry(terminal, sourceSize, outputSize)
+        outcomes += accountingEntry
+        val rawByteDelta = sourceSize - outputSize
+        val savedBytes = BatchTerminalAccounting.savedBytes(accountingEntry)
+        val savedPct = if (sourceSize > 0 && terminal.countsAsRealCompression) {
+            savedBytes.toDouble() / sourceSize.toDouble()
+        } else {
+            0.0
+        }
         record(
             "job",
             mapOf(
                 "id" to jobId(sourceKey),
-                "nameHash" to stableHash(displayNameForHashOnly),
+                "nameHash" to redactedNameHash(displayNameForHashOnly),
                 "ext" to (displayNameForHashOnly.substringAfterLast('.', "none").lowercase()),
                 "sourceMime" to sourceMime,
                 "w" to width, "h" to height, "fps" to fps, "durationMs" to durationMs,
@@ -121,12 +116,14 @@ class DiagnosticsRecorder private constructor(
                 "plannedOutputMime" to plannedOutputMime,
                 "plannedTargetRatio" to plannedTargetRatio,
                 "plannedTargetVideoBitrate" to plannedTargetVideoBitrate,
+                "plannedDecisionReason" to plannedDecisionReason,
                 "wasStreamCopy" to wasStreamCopy,
                 "verdict" to verdict,
                 "verified" to verified,
                 "replacementSafe" to replacementSafe,
                 "blockReason" to blockReason,
                 "outputSize" to outputSize,
+                "rawByteDelta" to rawByteDelta,
                 "savedBytes" to savedBytes,
                 "savedPct" to savedPct,
                 "terminal" to terminal.name,
@@ -137,32 +134,23 @@ class DiagnosticsRecorder private constructor(
     }
 
     fun sessionSummary(totalElapsedMs: Long) {
-        val saved = (totalInputBytes - totalAcceptedOutputBytes).coerceAtLeast(0)
+        val summary = BatchTerminalAccounting.summarize(outcomes)
         record(
             "session_summary",
             mapOf(
-                "completed" to completed,
-                "failed" to failed,
-                "skipped" to skipped,
-                "realCompressions" to realCompressions,
-                "totalInputBytes" to totalInputBytes,
-                "totalAcceptedOutputBytes" to totalAcceptedOutputBytes,
-                "totalBytesSaved" to saved,
+                "processed" to summary.processedCount,
+                "failed" to summary.failedCount,
+                "skipped" to summary.skippedCount,
+                "cancelled" to summary.cancelledCount,
+                "realCompressions" to summary.realCompressionCount,
+                "nonCompressions" to summary.nonCompressionCount,
+                "realCompressionInputBytes" to summary.realCompressionInputBytes,
+                "realCompressionOutputBytes" to summary.realCompressionOutputBytes,
+                "totalBytesSaved" to summary.totalBytesSaved,
                 "totalElapsedMs" to totalElapsedMs
             )
         )
     }
-
-    private fun stableHash(value: String): String {
-        val md = java.security.MessageDigest.getInstance("SHA-1")
-        md.update(SALT.toByteArray())
-        md.update(value.toByteArray(Charsets.UTF_8))
-        return md.digest().joinToString("") { "%02x".format(it) }.substring(0, 12)
-    }
-
-    // One UI version has no stable public API; best-effort read of the common system property.
-    private fun readOneUiVersion(): String? =
-        runCatching { System.getProperty("ro.build.version.oneui") }.getOrNull()
 
     companion object {
         const val TAG = "CompressorDiag"
@@ -171,6 +159,16 @@ class DiagnosticsRecorder private constructor(
         // Per-process random-free salt: a fixed app salt keeps hashes stable across the before/after
         // runs (so jobs correlate) while still not being a reversible identifier.
         private const val SALT = "galaxycompressor-diag-v1"
+
+        internal fun redactedJobId(sourceKey: String): String = "job_" + stableHash(sourceKey)
+        internal fun redactedNameHash(displayName: String): String = stableHash(displayName)
+
+        private fun stableHash(value: String): String {
+            val md = java.security.MessageDigest.getInstance("SHA-1")
+            md.update(SALT.toByteArray())
+            md.update(value.toByteArray(Charsets.UTF_8))
+            return md.digest().joinToString("") { "%02x".format(it) }.substring(0, 12)
+        }
 
         fun start(
             context: Context,

@@ -9,19 +9,29 @@ package compress.joshattic.us
  * compression* — so a remux, copy, skip, rejected output, or same-size result can never be
  * counted or reported as a successful compression.
  *
- * [countsAsRealCompression] is true only when actual encoded video bytes replaced the source AND
- * verification proved quality was preserved AND the file genuinely shrank.
+ * [countsAsRealCompression] is true only when an actual encoded output was accepted, verification
+ * passed, and the file became meaningfully smaller. Saving a separate copy versus replacing the
+ * source is an orthogonal output-disposition choice.
  */
 enum class BatchTerminalResult(
     val label: String,
     val countsAsRealCompression: Boolean,
-    val isFailure: Boolean = false
+    val isFailure: Boolean = false,
+    val allowsOriginalReplacement: Boolean = false
 ) {
     /** Real perceptually-lossless (or lossy-mode) transcode that verified and shrank the file. */
-    TRANSCODED_SMALLER("Compressed", countsAsRealCompression = true),
+    TRANSCODED_SMALLER(
+        "Compressed",
+        countsAsRealCompression = true,
+        allowsOriginalReplacement = true
+    ),
 
     /** A lossy mode (High Quality / Storage Saver) that verified and shrank — honest, but not PL. */
-    LOSSY_SMALLER("Compressed (lossy mode)", countsAsRealCompression = true),
+    LOSSY_SMALLER(
+        "Compressed (lossy mode)",
+        countsAsRealCompression = true,
+        allowsOriginalReplacement = true
+    ),
 
     /** Real transcode that verified but did not get meaningfully smaller; original kept. */
     TRANSCODED_NOT_MEANINGFULLY_SMALLER("Re-encoded — no meaningful size win; original kept", countsAsRealCompression = false),
@@ -30,7 +40,11 @@ enum class BatchTerminalResult(
     ALREADY_HIGHLY_OPTIMIZED("Already efficient — kept original bytes", countsAsRealCompression = false),
 
     /** User explicitly chose Remux Only: container repackage, never claimed as compression. */
-    EXPLICIT_REMUX("Remuxed (container only, not compressed)", countsAsRealCompression = false),
+    EXPLICIT_REMUX(
+        "Remuxed (container only, not compressed)",
+        countsAsRealCompression = false,
+        allowsOriginalReplacement = true
+    ),
 
     /** PL attempted a real encode but fell back to a stream copy (encoder/verify failure). */
     UNEXPECTED_REMUX("Kept original — re-encode could not be verified", countsAsRealCompression = false),
@@ -70,8 +84,8 @@ data class BatchTerminalInput(
     val skippedAlreadyCompressed: Boolean = false,
     val cancelled: Boolean = false,
     val hardFailure: Boolean = false,
-    /** Set when a remux was chosen up-front because the source was already near-optimal. */
-    val preEncodeNearOptimal: Boolean = false,
+    /** Set when a remux was chosen up-front because the source was already efficiently encoded. */
+    val preEncodeSourceAlreadyEfficient: Boolean = false,
     /** Set when a remux/transcode failed because the container/codec is unsupported. */
     val unsupportedContainer: Boolean = false,
     /** Set when an encoder configuration/runtime error forced a fallback. */
@@ -115,15 +129,74 @@ object BatchTerminalClassifier {
             return BatchTerminalResult.OUTPUT_VALIDATION_FAILED
         }
 
+        // A remux/copy is only an accepted non-compression outcome after independent verification.
+        // Never turn an unverified stream copy into a friendly "Remuxed" or "Already efficient"
+        // result, and never allow it into Done/accounting paths.
+        if (input.wasStreamCopy && (!input.verified || !input.replacementSafe)) {
+            return BatchTerminalResult.OUTPUT_VALIDATION_FAILED
+        }
+
         // Stream-copy outcomes: never real compression. Distinguish WHY.
         return when {
             input.encoderFailed -> BatchTerminalResult.UNEXPECTED_REMUX
             input.requestedMode == BatchQualityMode.REMUX_ONLY -> BatchTerminalResult.EXPLICIT_REMUX
-            input.preEncodeNearOptimal -> BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED
+            input.preEncodeSourceAlreadyEfficient -> BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED
             // PL requested but ended as a stream copy without a clear near-optimal/encoder reason:
             // a verification-driven fallback.
             input.requestedMode == BatchQualityMode.PERCEPTUAL_LOSSLESS -> BatchTerminalResult.UNEXPECTED_REMUX
             else -> BatchTerminalResult.EXPLICIT_REMUX
         }
+    }
+}
+
+data class BatchTerminalAccountingEntry(
+    val terminal: BatchTerminalResult,
+    val sourceBytes: Long,
+    val outputBytes: Long
+)
+
+data class BatchTerminalAccountingSummary(
+    val processedCount: Int,
+    val realCompressionCount: Int,
+    val nonCompressionCount: Int,
+    val failedCount: Int,
+    val skippedCount: Int,
+    val cancelledCount: Int,
+    val realCompressionInputBytes: Long,
+    val realCompressionOutputBytes: Long,
+    val totalBytesSaved: Long
+)
+
+/** One accounting contract shared by the UI, batch metrics, and structured diagnostics. */
+object BatchTerminalAccounting {
+    fun savedBytes(entry: BatchTerminalAccountingEntry): Long =
+        if (entry.terminal.countsAsRealCompression) {
+            (entry.sourceBytes - entry.outputBytes).coerceAtLeast(0L)
+        } else {
+            0L
+        }
+
+    fun summarize(entries: List<BatchTerminalAccountingEntry>): BatchTerminalAccountingSummary {
+        val real = entries.filter { it.terminal.countsAsRealCompression }
+        val skipped = entries.count { it.terminal == BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED }
+        val cancelled = entries.count { it.terminal == BatchTerminalResult.CANCELLED }
+        val failed = entries.count { it.terminal.isFailure }
+        val nonCompression = entries.count {
+            !it.terminal.countsAsRealCompression &&
+                !it.terminal.isFailure &&
+                it.terminal != BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED &&
+                it.terminal != BatchTerminalResult.CANCELLED
+        }
+        return BatchTerminalAccountingSummary(
+            processedCount = entries.size,
+            realCompressionCount = real.size,
+            nonCompressionCount = nonCompression,
+            failedCount = failed,
+            skippedCount = skipped,
+            cancelledCount = cancelled,
+            realCompressionInputBytes = real.sumOf { it.sourceBytes.coerceAtLeast(0L) },
+            realCompressionOutputBytes = real.sumOf { it.outputBytes.coerceAtLeast(0L) },
+            totalBytesSaved = entries.sumOf(::savedBytes)
+        )
     }
 }

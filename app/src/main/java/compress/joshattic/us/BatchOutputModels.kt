@@ -164,17 +164,22 @@ data class BatchItemMetrics(
 data class BatchMetricsSummary(
     val totalElapsedMs: Long,
     val totalCooldownMs: Long,
-    val doneCount: Int,
+    val processedCount: Int,
+    val realCompressionCount: Int,
+    val nonCompressionCount: Int,
     val failedCount: Int,
     val skippedCount: Int,
+    val cancelledCount: Int,
     val totalSavedBytes: Long
 ) {
     val summaryLines: List<String>
         get() = listOf(
             "Elapsed: ${String.format(Locale.US, "%.1f min", totalElapsedMs.coerceAtLeast(0L) / 60000.0)}",
             "Cooldown used: ${totalCooldownMs / 1000}s",
-            "Saved: ${formatFileSize(totalSavedBytes.coerceAtLeast(0L))}",
-            "Done: $doneCount • Failed: $failedCount • Skipped: $skippedCount"
+            "Saved by real compression: ${formatFileSize(totalSavedBytes.coerceAtLeast(0L))}",
+            "Processed: $processedCount • Real compressions: $realCompressionCount",
+            "Remuxed/kept/no size win: $nonCompressionCount",
+            "Failed: $failedCount • Skipped: $skippedCount • Cancelled: $cancelledCount"
         )
 }
 
