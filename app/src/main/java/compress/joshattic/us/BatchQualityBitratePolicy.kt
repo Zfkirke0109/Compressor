@@ -314,7 +314,18 @@ object BatchQualityBitratePolicy {
         }
         val ratioFloor = perceptualLosslessRatioFloor(source)
         val sourceVideoBitrate = source.videoBitrate.takeIf { it > 0 } ?: fallbackOriginalBitrate(source)
-        return max(absoluteFloor, (sourceVideoBitrate * ratioFloor).toInt()).coerceAtMost(sourceVideoBitrate)
+        // The absolute floor is a *camera-quality* guard: it stops a high-bitrate source from being
+        // driven below the bitrate its resolution needs to stay perceptually lossless. It must only
+        // apply to sources that actually start at or above it. A downloaded / low-bitrate source
+        // already BELOW this bar is not "camera quality to protect" — it is a lower-quality source
+        // whose own (modest) quality we preserve via the ratio floor and output-codec efficiency.
+        // Applying the absolute floor to such a source clamps the target back up to the source
+        // bitrate and blocks all compression — this was the downloaded-video "same size / remuxed"
+        // bug. So the absolute floor binds only when the source is at or above it; otherwise the
+        // ratio floor governs. Camera sources (at/above the floor) are byte-identical to before.
+        val effectiveAbsoluteFloor = if (sourceVideoBitrate >= absoluteFloor) absoluteFloor else 0
+        return max(effectiveAbsoluteFloor, (sourceVideoBitrate * ratioFloor).toInt())
+            .coerceAtMost(sourceVideoBitrate)
     }
 
     /**

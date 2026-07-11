@@ -226,7 +226,13 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
     }
 
     companion object {
-        private const val PREFS_NAME = "smart_perceptual_profiles"
+        // v2: the pre-fix build applied a camera-class absolute bitrate floor to every source,
+        // which clamped downloaded/low-bitrate videos' perceptually-lossless target up to the source
+        // bitrate and stream-copied them. Any "prefer remux" latch or learned ratio stored under the
+        // old name was calibrated against that bug (and, for a homogeneous download batch, a couple
+        // of early failures could permanently latch a whole bucket to remux). Bumping the store name
+        // orphans that poisoned state so the corrected floor logic learns cleanly from verification.
+        private const val PREFS_NAME = "smart_perceptual_profiles_v2"
 
         // Cautious adaptation: small steps down after verified successes, larger steps up after
         // failures, so the engine converges toward safety rather than savings.

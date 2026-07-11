@@ -26,3 +26,6 @@ output-metadata.json
 ci-debug.keystore
 app/release/baselineProfiles/0/app-release.dm
 app/release/baselineProfiles/0/app-release.dm
+
+# Local device-validation captures (large logcat dumps, not source)
+validation/

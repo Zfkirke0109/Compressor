@@ -896,6 +896,19 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
             bitrate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull() ?: 0
             duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+            // Downloaded/social videos frequently omit an overall-bitrate tag. Rather than let the
+            // policy fall back to a camera-class assumption (which inflates the "source" bitrate and
+            // then blocks compression), derive the real average total bitrate from the actual file
+            // size and duration when the container hides it. This is the honest measured value.
+            if (bitrate <= 0 && size > 0L && duration > 0L) {
+                bitrate = (size * 8000.0 / duration.toDouble())
+                    .toLong().coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+                Log.i(
+                    "CompressorEncoderPlan",
+                    "measured source bitrate from size/duration for $name: ${bitrate} bps " +
+                        "(container exposed no overall bitrate)"
+                )
+            }
             fps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull()
                 ?: trackProbe.videoFrameRate
             if (fps <= 0f && trackProbe.videoFrameRate > 0f) fps = trackProbe.videoFrameRate

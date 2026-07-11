@@ -566,6 +566,79 @@ class BatchQualitySafetyTest {
     }
 
     @Test
+    fun downloadedLowBitrate1080pH264NowGetsRealSubSourceTarget() {
+        // The core downloaded-video bug: a 1080p H.264 web download at ~4 Mbps sits BELOW the
+        // 10 Mbps camera-class absolute floor, so the old floor clamped the perceptually-lossless
+        // target up to exactly the source bitrate -> predicted 0% savings -> silent remux for the
+        // whole batch. With the floor bound only to at/above-floor sources, an H.264->HEVC transcode
+        // now targets a real sub-source bitrate that verification can accept.
+        val download = VideoSourceInfo(
+            width = 1920,
+            height = 1080,
+            frameRate = 30f,
+            durationMs = 60_000,
+            totalBitrate = 4_000_000,
+            audioBitrate = 128_000,
+            videoMime = MimeTypes.VIDEO_H264,
+            audioMime = MimeTypes.AUDIO_AAC,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT709
+        )
+
+        val floor = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(download)
+        val target = BatchQualityBitratePolicy.calculateVideoBitrate(
+            source = download,
+            mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
+            outputMimeType = MimeTypes.VIDEO_H265
+        )
+
+        // Floor now reflects the ratio floor (0.55x), not the 10 Mbps camera absolute floor.
+        assertTrue("floor should drop below source for a sub-floor download", floor < download.videoBitrate)
+        // Target is a genuine sub-source bitrate (H.264->HEVC 0.90 default), not clamped to source.
+        assertTrue("target must be below source video bitrate", target < download.videoBitrate)
+        assertTrue("target must stay at or above the ratio floor", target >= floor)
+
+        // The pre-encode near-optimal gate must now let the encode proceed instead of preferring
+        // remux, so downloaded videos actually get compressed.
+        assertFalse(
+            BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
+                source = download,
+                outputMimeType = MimeTypes.VIDEO_H265,
+                sourceSizeBytes = 30_000_000L,
+                learnedTargetRatio = null,
+                expectedOvershootFactor = 1.0
+            )
+        )
+    }
+
+    @Test
+    fun cameraClassFloorsAreByteIdenticalAfterTheDownloadFix() {
+        // Regression guard: the floor change must ONLY affect sources below their absolute floor.
+        // Every camera source (at or above the floor) must produce the exact same floor as before.
+        // 1080p H.264 camera clip at 20 Mbps (>= 10 Mbps floor): floor = 20M*0.55 = 11M dominates.
+        val camera1080p = VideoSourceInfo(
+            width = 1920, height = 1080, frameRate = 30f, durationMs = 60_000,
+            totalBitrate = 20_000_000, audioBitrate = 256_000,
+            videoMime = MimeTypes.VIDEO_H264, colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+        )
+        val floor1080 = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(camera1080p)
+        // 20M - 256k = 19.744M video; ratio floor 0.55 -> 10.86M; abs floor 10M does not raise it.
+        assertEquals(10_859_200, floor1080)
+
+        // 4K60 HDR camera clip at ~120 Mbps: HDR-4K60 ratio floor 0.80 dominates the 48M abs floor.
+        val camera4k = VideoSourceInfo(
+            width = 3840, height = 2160, frameRate = 60f, durationMs = 60_000,
+            totalBitrate = 119_900_000, audioBitrate = 320_000,
+            videoMime = MimeTypes.VIDEO_H265,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084, colorStandard = MediaFormat.COLOR_STANDARD_BT2020
+        )
+        val floor4k = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(camera4k)
+        val video4k = camera4k.videoBitrate // 119.9M - 320k = 119.58M
+        assertEquals((video4k * 0.80).toInt(), floor4k)
+        assertTrue("4K HDR floor must stay >= 95 Mbps", floor4k >= 95_000_000)
+    }
+
+    @Test
     fun cbrCapabilityProbeFailsClosedWithoutCrashing() {
         // On a platform where the codec list is unavailable (or CQ/CBR unsupported), the probe
         // must return false — the experiment silently stays on the safe VBR path, never crashes.
