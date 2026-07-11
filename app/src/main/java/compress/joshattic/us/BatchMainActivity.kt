@@ -14,6 +14,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.*
@@ -255,6 +256,7 @@ private fun BatchCompressorScreen(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun BatchSettingsCard(
     state: BatchCompressorUiState,
@@ -463,15 +465,34 @@ private fun BatchSettingsCard(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { viewModel.requestShizukuPermission(context) }, enabled = !state.isCompressing) {
-                    Text("Authorize")
+            // Three action buttons with long labels do not fit one phone-width row (the last,
+            // "Test access", was squeezed/clipped). FlowRow wraps them cleanly at any width and font
+            // scale; heightIn keeps each a >=48dp touch target with a single un-clipped label line.
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = { viewModel.requestShizukuPermission(context) },
+                    enabled = !state.isCompressing,
+                    modifier = Modifier.heightIn(min = 48.dp)
+                ) {
+                    Text("Authorize", maxLines = 1)
                 }
-                OutlinedButton(onClick = onRequestOriginalMediaAccess, enabled = !state.isCompressing) {
-                    Text("Metadata access")
+                OutlinedButton(
+                    onClick = onRequestOriginalMediaAccess,
+                    enabled = !state.isCompressing,
+                    modifier = Modifier.heightIn(min = 48.dp)
+                ) {
+                    Text("Metadata access", maxLines = 1)
                 }
-                OutlinedButton(onClick = { viewModel.testReplacementAccess(context) }, enabled = !state.isCompressing) {
-                    Text("Test access")
+                OutlinedButton(
+                    onClick = { viewModel.testReplacementAccess(context) },
+                    enabled = !state.isCompressing,
+                    modifier = Modifier.heightIn(min = 48.dp)
+                ) {
+                    Text("Test access", maxLines = 1)
                 }
             }
         }
