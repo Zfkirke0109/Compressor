@@ -187,5 +187,109 @@ class ParseBatchLogcatTest(unittest.TestCase):
             self.assertIn(dropped, aggregate["structured_ignored_fields"])
 
 
+    # ---- v2 envelope (sequence / eventId / profile) ----
+    def _run(self, records):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            log = root / "logcat.txt"
+            out = root / "out"
+            log.write_text("\n".join(records), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), str(log), "--out", str(out)],
+                check=False, capture_output=True, text=True,
+            )
+            agg = None
+            jobs = []
+            if (out / "aggregate.json").exists():
+                agg = json.loads((out / "aggregate.json").read_text(encoding="utf-8"))
+            if (out / "jobs.jsonl").exists():
+                jobs = [json.loads(l) for l in (out / "jobs.jsonl").read_text(encoding="utf-8").splitlines()]
+            return result, agg, jobs
+
+    @staticmethod
+    def _v2(batch, etype, seq, event, jobid=None, profile="normal", **extra):
+        rec = {
+            "schemaVersion": 2, "batchId": batch, "type": etype, "eventType": etype,
+            "eventId": event, "sequence": seq, "timestampMs": 1000 + seq,
+            "androidUserId": 0 if profile == "normal" else 150, "profileKind": profile,
+        }
+        if jobid:
+            rec["jobId"] = jobid
+        rec.update(extra)
+        return "I CompressorDiag: " + json.dumps(rec)
+
+    def _v2_batch(self, batch, profile="normal", jobseq_start=1):
+        return [
+            self._v2(batch, "session_start", 0, "evt_" + "0" * 16, profile=profile, selectedCount=1),
+            self._v2(batch, "job", 1, "evt_" + "1" * 16, jobid="job_aaaaaaaaaaaa", profile=profile,
+                     id="job_aaaaaaaaaaaa", terminal="TRANSCODED_SMALLER", countsAsRealCompression=True,
+                     sourceSize=100, outputSize=70, savedBytes=30),
+            self._v2(batch, "session_summary", 2, "evt_" + "2" * 16, profile=profile, processed=1),
+        ]
+
+    def test_v2_happy_path_reports_profile_sequence_and_events(self):
+        result, agg, jobs = self._run(self._v2_batch("bv2", profile="normal"))
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(1, len(jobs))
+        self.assertEqual({"normal": 1}, agg["by_profile"])
+        self.assertEqual([2], agg["structured_schema_versions"])
+        self.assertEqual(3, agg["unique_structured_events"])
+        self.assertEqual(0, agg["first_sequence"])
+        self.assertEqual(2, agg["last_sequence"])
+        self.assertEqual({}, agg["missing_sequences"])
+
+    def test_v2_secondary_profile_is_reported(self):
+        _, agg, _ = self._run(self._v2_batch("bsec", profile="secondary_profile"))
+        self.assertEqual({"secondary_profile": 1}, agg["by_profile"])
+
+    def test_v2_reconnect_replay_is_deduped_but_raw_kept(self):
+        recs = self._v2_batch("brep")
+        # A reconnect can re-emit the same event with a different line prefix (timestamp/format),
+        # so it is NOT an exact-line duplicate; the (batchId,eventId) layer must still dedup it.
+        replayed = recs[:2] + ["07-11 09:00:00.000  " + recs[1]] + recs[2:]
+        result, agg, jobs = self._run(replayed)
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(1, len(jobs))               # deduped to a single job
+        self.assertGreaterEqual(agg["replay_event_count"], 1)
+
+    def test_v2_duplicate_sequence_different_event_is_integrity_error(self):
+        recs = self._v2_batch("bdup")
+        # A second event reusing sequence 1 with a different eventId.
+        recs.insert(2, self._v2("bdup", "job", 1, "evt_" + "9" * 16, jobid="job_bbbbbbbbbbbb",
+                                id="job_bbbbbbbbbbbb", terminal="EXPLICIT_REMUX",
+                                countsAsRealCompression=False, sourceSize=100, outputSize=100))
+        result, _, _ = self._run(recs)
+        self.assertEqual(2, result.returncode)
+        self.assertIn("duplicate sequence", result.stderr)
+
+    def test_v2_missing_sequence_in_summary_fails_closed(self):
+        recs = self._v2_batch("bgap")
+        recs[2] = self._v2("bgap", "session_summary", 3, "evt_" + "3" * 16, processed=1)  # skip seq 2
+        result, _, _ = self._run(recs)
+        self.assertEqual(2, result.returncode)
+        self.assertIn("missing event sequence", result.stderr)
+
+    def test_v2_malformed_event_id_fails_closed(self):
+        recs = self._v2_batch("bbad")
+        recs[1] = self._v2("bbad", "job", 1, "NOT_A_VALID_ID", jobid="job_aaaaaaaaaaaa",
+                           id="job_aaaaaaaaaaaa", terminal="TRANSCODED_SMALLER",
+                           countsAsRealCompression=True, sourceSize=100, outputSize=70)
+        result, _, _ = self._run(recs)
+        self.assertEqual(2, result.returncode)
+
+    def test_v2_session_cancelled_is_a_valid_terminal(self):
+        recs = [
+            self._v2("bcan", "session_start", 0, "evt_" + "0" * 16, selectedCount=3, profile="normal"),
+            self._v2("bcan", "job", 1, "evt_" + "1" * 16, jobid="job_aaaaaaaaaaaa",
+                     id="job_aaaaaaaaaaaa", terminal="TRANSCODED_SMALLER",
+                     countsAsRealCompression=True, sourceSize=100, outputSize=70),
+            self._v2("bcan", "session_cancelled", 2, "evt_" + "2" * 16, processed=1, reason="user_cancelled"),
+        ]
+        result, agg, jobs = self._run(recs)
+        self.assertEqual(0, result.returncode)   # cancelled early is not an error
+        self.assertEqual(1, len(jobs))
+        self.assertEqual({"session_cancelled": 1}, agg["session_terminal_types"])
+
+
 if __name__ == "__main__":
     unittest.main()

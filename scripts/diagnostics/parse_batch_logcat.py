@@ -17,8 +17,14 @@ import sys, os, re, json, csv, hashlib
 from collections import defaultdict, Counter
 
 DIAGNOSTIC_HASH_SALT = "galaxycompressor-diag-v1"
-STRUCTURED_JOB_FIELDS = {
-    "batchId", "type", "timestampMs", "id", "nameHash", "ext", "sourceMime",
+# Common v2 envelope on every structured record. v1 records simply lack the newer keys, so the
+# parser stays backward-compatible by treating them as optional.
+ENVELOPE_FIELDS = {
+    "schemaVersion", "batchId", "type", "eventType", "eventId", "sequence", "jobId",
+    "timestampMs", "androidUserId", "profileKind",
+}
+STRUCTURED_JOB_FIELDS = ENVELOPE_FIELDS | {
+    "id", "nameHash", "ext", "sourceMime",
     "w", "h", "fps", "durationMs", "sourceSize", "sourceTotalBitrate",
     "bitrateMeasuredFromSize", "hdr", "audioMime", "audioBitrate", "requestedMode",
     "effectiveMode", "plannedOutputMime", "plannedTargetRatio",
@@ -26,16 +32,19 @@ STRUCTURED_JOB_FIELDS = {
     "verified", "replacementSafe", "blockReason", "outputSize", "rawByteDelta",
     "savedBytes", "savedPct", "terminal", "countsAsRealCompression", "elapsedMs",
 }
-SESSION_START_FIELDS = {
-    "batchId", "type", "timestampMs", "schema", "appVersion", "buildType", "gitAppId",
+SESSION_START_FIELDS = ENVELOPE_FIELDS | {
+    "schema", "appVersion", "appVersionName", "appVersionCode", "buildCommit", "buildType",
+    "packageName", "processUid", "gitAppId",
     "deviceModel", "manufacturer", "androidRelease", "sdkInt", "mode", "selectedCount",
     "privacy",
 }
-SESSION_SUMMARY_FIELDS = {
-    "batchId", "type", "timestampMs", "processed", "failed", "skipped", "cancelled",
+SESSION_SUMMARY_FIELDS = ENVELOPE_FIELDS | {
+    "processed", "failed", "skipped", "cancelled",
     "realCompressions", "nonCompressions", "realCompressionInputBytes",
-    "realCompressionOutputBytes", "totalBytesSaved", "totalElapsedMs",
+    "realCompressionOutputBytes", "totalBytesSaved", "totalElapsedMs", "reason",
 }
+# session_cancelled / session_failed reuse the summary field set (plus reason).
+SESSION_TERMINAL_TYPES = {"session_summary", "session_cancelled", "session_failed"}
 
 def whitelisted(record, fields, ignored=None):
     # Copy ONLY explicitly permitted fields, so a future malformed record carrying displayName,
@@ -107,6 +116,16 @@ def main():
     structured_seen = False
     legacy_occurrences = Counter()
     seen_event_lines = set()
+    # v2 envelope integrity trackers (v1 records simply lack eventId/sequence).
+    session_terminals = defaultdict(list)          # batchId -> [session_summary|cancelled|failed recs]
+    event_ids_seen = set()                         # (batchId, eventId) for exact-event dedup
+    seq_owner = {}                                 # (batchId, sequence) -> eventId
+    sequences_by_batch = defaultdict(set)          # batchId -> {sequence,...}
+    duplicate_sequences = []                       # (batchId, sequence) seen with a different eventId
+    unique_structured_events = 0
+    malformed_event_ids = 0
+    replay_events = 0
+    profiles_by_batch = {}                         # batchId -> profileKind (from session_start)
 
     # Only the planning record starts with mode=. Ignore later encodeResult records on the same tag
     # or they overwrite the pending source/target fields before verification.
@@ -152,9 +171,10 @@ def main():
                     structured_errors.append(
                         f"line {line_number}: CompressorDiag record is not an object")
                     continue
-                record_type = rec.get("type")
+                # v2 emits eventType (and mirrors it as type); v1 emits only type.
+                record_type = rec.get("eventType") or rec.get("type")
                 batch_id = rec.get("batchId")
-                if record_type not in {"session_start", "job", "session_summary"}:
+                if record_type not in ({"session_start", "job"} | SESSION_TERMINAL_TYPES):
                     structured_errors.append(
                         f"line {line_number}: unknown CompressorDiag type {record_type!r}")
                     continue
@@ -170,7 +190,39 @@ def main():
                     structured_errors.append(
                         f"line {line_number}: CompressorDiag record is missing timestampMs")
                     continue
+
+                # --- v2 envelope integrity: eventId dedup + sequence tracking (v1 skips gracefully).
+                event_id = rec.get("eventId")
+                if event_id is not None:
+                    if not re.fullmatch(r"evt_[0-9a-f]{16}", str(event_id)):
+                        structured_errors.append(
+                            f"line {line_number}: malformed eventId {event_id!r}")
+                        malformed_event_ids += 1
+                        continue
+                    ekey = (str(batch_id), str(event_id))
+                    if ekey in event_ids_seen:
+                        # Same logical event replayed after a reconnect: dedup derived output,
+                        # raw log keeps the duplicate line.
+                        replay_events += 1
+                        continue
+                    event_ids_seen.add(ekey)
+                seq = rec.get("sequence")
+                if seq is not None:
+                    try:
+                        seq_int = int(seq)
+                        skey = (str(batch_id), seq_int)
+                        prev = seq_owner.get(skey)
+                        if prev is not None and prev != str(event_id):
+                            # Same sequence, different event: a monotonicity/threading integrity error.
+                            duplicate_sequences.append([str(batch_id), seq_int])
+                        seq_owner[skey] = str(event_id)
+                        sequences_by_batch[str(batch_id)].add(seq_int)
+                    except (ValueError, TypeError):
+                        structured_errors.append(
+                            f"line {line_number}: non-integer sequence {seq!r}")
+                unique_structured_events += 1
                 if record_type == "session_start":
+                    profiles_by_batch[str(batch_id)] = rec.get("profileKind")
                     if rec.get("selectedCount") is None:
                         structured_errors.append(
                             f"line {line_number}: session_start is missing selectedCount")
@@ -179,13 +231,15 @@ def main():
                     session_starts[batch_id].append(rec)
                     session_records.append(rec)
                     continue
-                if record_type == "session_summary":
-                    if rec.get("processed") is None:
+                if record_type in SESSION_TERMINAL_TYPES:
+                    if record_type == "session_summary" and rec.get("processed") is None:
                         structured_errors.append(
                             f"line {line_number}: session_summary is missing processed")
                         continue
                     rec = whitelisted(rec, SESSION_SUMMARY_FIELDS, structured_ignored)
-                    session_summaries[batch_id].append(rec)
+                    session_terminals[batch_id].append(rec)
+                    if record_type == "session_summary":
+                        session_summaries[batch_id].append(rec)
                     session_records.append(rec)
                     continue
                 required_job_fields = {
@@ -303,25 +357,41 @@ def main():
                     # redacted dataset.
                     pending_batch_notes.append(txt.rsplit(": ", 1)[-1].strip())
 
+    missing_sequences = {}
     if structured_seen:
-        batch_ids = set(session_starts) | set(session_summaries) | set(structured_job_keys)
+        batch_ids = set(session_starts) | set(session_terminals) | set(structured_job_keys)
         for batch_id in sorted(batch_ids):
             starts = session_starts.get(batch_id, [])
-            summaries = session_summaries.get(batch_id, [])
+            terminals = session_terminals.get(batch_id, [])
             if len(starts) != 1:
                 structured_errors.append(
                     f"batch {batch_id}: expected exactly one session_start, found {len(starts)}")
-            if len(summaries) != 1:
+            if len(terminals) != 1:
                 structured_errors.append(
-                    f"batch {batch_id}: expected exactly one session_summary, found {len(summaries)}")
-            if len(starts) == 1 and len(summaries) == 1:
+                    f"batch {batch_id}: expected exactly one session terminal "
+                    f"(summary/cancelled/failed), found {len(terminals)}")
+            terminal_type = terminals[0].get("type") if len(terminals) == 1 else None
+            # Only a clean session_summary must reconcile counts and be gap-free; a cancelled/failed
+            # session legitimately stops early, so partial counts and a truncated tail are expected.
+            if len(starts) == 1 and terminal_type == "session_summary":
                 selected = int(starts[0]["selectedCount"])
-                processed = int(summaries[0]["processed"])
+                processed = int(terminals[0]["processed"])
                 captured = len(structured_job_keys.get(batch_id, set()))
                 if selected != processed or processed != captured:
                     structured_errors.append(
                         f"batch {batch_id}: selected={selected}, processed={processed}, "
                         f"uniqueJobs={captured}")
+                seqs = sequences_by_batch.get(batch_id, set())
+                if seqs:
+                    gaps = sorted(set(range(min(seqs), max(seqs) + 1)) - seqs)
+                    if gaps:
+                        missing_sequences[batch_id] = gaps
+                        structured_errors.append(
+                            f"batch {batch_id}: missing event sequence numbers {gaps}")
+        # A duplicate sequence with different event ids is always an integrity failure.
+        for batch_id, seq in duplicate_sequences:
+            structured_errors.append(
+                f"batch {batch_id}: duplicate sequence {seq} with differing eventIds")
         if structured_errors:
             print("Structured diagnostics are incomplete or invalid:", file=sys.stderr)
             for error in structured_errors:
@@ -412,6 +482,22 @@ def main():
     agg["structured_ignored_field_count"] = int(sum(structured_ignored.values()))
     agg["structured_ignored_fields"] = dict(structured_ignored)
     agg["structured_parse_warnings"] = list(structured_errors)
+    # v2 envelope integrity + environment reporting.
+    all_seqs = sorted({s for seqs in sequences_by_batch.values() for s in seqs})
+    agg["by_profile"] = dict(Counter(
+        (profiles_by_batch.get(j.get("batchId")) or j.get("profileKind") or "unknown")
+        for j in rows))
+    agg["structured_schema_versions"] = sorted({
+        int(r.get("schemaVersion")) for r in session_records if r.get("schemaVersion") is not None})
+    agg["unique_structured_events"] = int(unique_structured_events)
+    agg["first_sequence"] = all_seqs[0] if all_seqs else None
+    agg["last_sequence"] = all_seqs[-1] if all_seqs else None
+    agg["missing_sequences"] = {b: g for b, g in missing_sequences.items()}
+    agg["duplicate_sequences"] = [list(x) for x in duplicate_sequences]
+    agg["malformed_event_id_count"] = int(malformed_event_ids)
+    agg["replay_event_count"] = int(replay_events)
+    agg["session_terminal_types"] = dict(Counter(
+        t.get("type") for terms in session_terminals.values() for t in terms))
     with open(os.path.join(outdir, "aggregate.json"), "w", encoding="utf-8") as f:
         json.dump(agg, f, indent=2)
 

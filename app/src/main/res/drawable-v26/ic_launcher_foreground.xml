@@ -1,18 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
-    android:viewportWidth="24"
-    android:viewportHeight="24"
-    android:tint="#FFFFFF">
-  <group android:scaleX="0.435"
-      android:scaleY="0.435"
-      android:translateX="6.78"
-      android:translateY="6.78">
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!--
+      The launcher glyph (galaxy + compress mark) is baked into
+      @mipmap/ic_launcher_bg, centred and mask-safe. This foreground layer is
+      intentionally transparent so the glyph is not drawn twice; the themed /
+      monochrome icon is supplied separately by @drawable/ic_launcher_monochrome.
+    -->
     <path
-        android:fillColor="@android:color/white"
-        android:pathData="M8,19h3v3h2v-3h3l-4,-4 -4,4zM16,4h-3L13,1h-2v3L8,4l4,4 4,-4zM4,9v2h16L20,9L4,9z"/>
-    <path
-        android:fillColor="@android:color/white"
-        android:pathData="M4,12h16v2H4z"/>
-  </group>
+        android:fillColor="#00000000"
+        android:pathData="M0,0h108v108h-108z" />
 </vector>

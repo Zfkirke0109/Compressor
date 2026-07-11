@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!--
+          Debug-only diagnostics self-test trigger. Merged into debug builds only (this manifest
+          lives in src/debug), so it is absent from release. Exported so `adb shell am broadcast`
+          can drive an environment self-test in the normal profile; the action only emits synthetic,
+          privacy-safe diagnostics.
+        -->
+        <receiver
+            android:name=".DiagnosticsSelfTestReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.github.zfkirke0109.galaxycompressor.DIAG_SELFTEST" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

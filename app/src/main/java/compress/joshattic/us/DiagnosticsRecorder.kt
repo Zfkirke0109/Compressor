@@ -1,13 +1,17 @@
 package compress.joshattic.us
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Process
 import android.util.Log
 import org.json.JSONObject
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import java.io.File
 
 /**
- * Structured, privacy-safe batch diagnostics.
+ * Structured, privacy-safe batch diagnostics (schema v2).
  *
  * Every record is emitted as one compact JSON line to the `CompressorDiag` logcat tag AND appended
  * to an on-device session file. Logcat is the canonical transport here because the app runs inside
@@ -16,38 +20,67 @@ import java.io.File
  * even for a Secure Folder run. When the files dir IS reachable (main-profile runs) the same records
  * also land in files/diagnostics/<batchId>/ for direct inspection.
  *
+ * Schema v2 envelope (on every record): schemaVersion, batchId, eventId, sequence, eventType (also
+ * mirrored as `type` for v1 readers), jobId, timestampMs, androidUserId, profileKind. `sequence` is a
+ * thread-safe monotonic counter per batch; `eventId` is a fresh unique token per logical event, so a
+ * reconnect replay of the same emitted line carries the same eventId (deduped downstream) while two
+ * genuinely different events never collide.
+ *
  * Privacy: NO video frames, NO source bytes, NO Secure Folder paths, NO raw display names or content
  * URIs ever enter a record. Sources are identified by a stable salted hash so every job can be
- * correlated across the before/after runs without exposing the private name.
+ * correlated across the before/after runs without exposing the private name. androidUserId is the
+ * app's own user id (public via Process.myUid()); profileKind is a truthful "normal"/"secondary_profile"
+ * classification — it never claims Secure Folder specifically because that cannot be proven from a
+ * public API.
  */
 class DiagnosticsRecorder private constructor(
     private val batchId: String,
-    private val sessionFile: File?
+    private val sessionFile: File?,
+    private val identity: SessionIdentity
 ) {
     private val outcomes = mutableListOf<BatchTerminalAccountingEntry>()
+    private val sequence = AtomicInteger(0)
 
     fun jobId(sourceKey: String): String = redactedJobId(sourceKey)
 
-    /** One record. [type] names the record; [fields] must already be privacy-safe. */
-    fun record(type: String, fields: Map<String, Any?>) {
+    /**
+     * One record. [type] names the event; [jobId] correlates per-item events (null for session
+     * events); [fields] must already be privacy-safe. The v2 envelope is added here so no caller can
+     * forget it, and the sequence/eventId are generated atomically per event.
+     */
+    fun record(type: String, jobId: String? = null, fields: Map<String, Any?>) {
         val obj = JSONObject()
+        obj.put("schemaVersion", SCHEMA_VERSION)
         obj.put("batchId", batchId)
+        obj.put("eventId", newEventId())
+        obj.put("sequence", sequence.getAndIncrement())
+        obj.put("eventType", type)
+        // Mirror the v1 field name so older parsers keep working during migration.
         obj.put("type", type)
+        obj.put("jobId", jobId ?: JSONObject.NULL)
         obj.put("timestampMs", System.currentTimeMillis())
+        obj.put("androidUserId", identity.androidUserId)
+        obj.put("profileKind", identity.profileKind)
         for ((k, v) in fields) obj.put(k, v ?: JSONObject.NULL)
         val line = obj.toString()
         Log.i(TAG, line)
         runCatching { sessionFile?.appendText(line + "\n") }
     }
 
-    fun sessionStart(mode: String, selectedCount: Int, appVersion: String, buildType: String) {
+    fun sessionStart(mode: String, selectedCount: Int) {
         record(
             "session_start",
-            mapOf(
+            fields = mapOf(
                 "schema" to SCHEMA_VERSION,
-                "appVersion" to appVersion,
-                "buildType" to buildType,
+                "packageName" to identity.packageName,
+                "appVersionName" to identity.appVersionName,
+                "appVersionCode" to identity.appVersionCode,
+                "buildCommit" to identity.buildCommit,
+                "buildType" to identity.buildType,
                 "gitAppId" to APP_ID,
+                "androidUserId" to identity.androidUserId,
+                "profileKind" to identity.profileKind,
+                "processUid" to identity.processUid,
                 "deviceModel" to Build.MODEL,
                 "manufacturer" to Build.MANUFACTURER,
                 "androidRelease" to Build.VERSION.RELEASE,
@@ -98,10 +131,12 @@ class DiagnosticsRecorder private constructor(
         } else {
             0.0
         }
+        val id = jobId(sourceKey)
         record(
             "job",
-            mapOf(
-                "id" to jobId(sourceKey),
+            jobId = id,
+            fields = mapOf(
+                "id" to id,
                 "nameHash" to redactedNameHash(displayNameForHashOnly),
                 "ext" to (displayNameForHashOnly.substringAfterLast('.', "none").lowercase()),
                 "sourceMime" to sourceMime,
@@ -137,7 +172,7 @@ class DiagnosticsRecorder private constructor(
         val summary = BatchTerminalAccounting.summarize(outcomes)
         record(
             "session_summary",
-            mapOf(
+            fields = mapOf(
                 "processed" to summary.processedCount,
                 "failed" to summary.failedCount,
                 "skipped" to summary.skippedCount,
@@ -152,9 +187,53 @@ class DiagnosticsRecorder private constructor(
         )
     }
 
+    /** Terminal record for a user-cancelled batch. Still one session terminal event. */
+    fun sessionCancelled(totalElapsedMs: Long, reason: String) {
+        val summary = BatchTerminalAccounting.summarize(outcomes)
+        record(
+            "session_cancelled",
+            fields = mapOf(
+                "processed" to summary.processedCount,
+                "cancelled" to summary.cancelledCount,
+                "realCompressions" to summary.realCompressionCount,
+                "totalBytesSaved" to summary.totalBytesSaved,
+                "totalElapsedMs" to totalElapsedMs,
+                "reason" to reason
+            )
+        )
+    }
+
+    /** Terminal record for a batch that aborted with an unrecovered error. */
+    fun sessionFailed(totalElapsedMs: Long, reason: String) {
+        val summary = BatchTerminalAccounting.summarize(outcomes)
+        record(
+            "session_failed",
+            fields = mapOf(
+                "processed" to summary.processedCount,
+                "failed" to summary.failedCount,
+                "realCompressions" to summary.realCompressionCount,
+                "totalElapsedMs" to totalElapsedMs,
+                "reason" to reason
+            )
+        )
+    }
+
+    private fun newEventId(): String = "evt_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16)
+
+    private data class SessionIdentity(
+        val packageName: String,
+        val appVersionName: String,
+        val appVersionCode: Long,
+        val buildCommit: String,
+        val buildType: String,
+        val androidUserId: Int,
+        val profileKind: String,
+        val processUid: Int
+    )
+
     companion object {
         const val TAG = "CompressorDiag"
-        const val SCHEMA_VERSION = 1
+        const val SCHEMA_VERSION = 2
         private const val APP_ID = "io.github.zfkirke0109.galaxycompressor"
         // Per-process random-free salt: a fixed app salt keeps hashes stable across the before/after
         // runs (so jobs correlate) while still not being a reversible identifier.
@@ -170,21 +249,88 @@ class DiagnosticsRecorder private constructor(
             return md.digest().joinToString("") { "%02x".format(it) }.substring(0, 12)
         }
 
+        // UID layout is userId * PER_USER_RANGE + appId; PER_USER_RANGE is 100000. Process.myUid()
+        // is public, so this yields the app's own Android user id (0 normal, >0 secondary profile
+        // such as Secure Folder) without any cross-user permission.
+        private const val PER_USER_RANGE = 100_000
+
+        private fun buildIdentity(context: Context): SessionIdentity {
+            val uid = Process.myUid()
+            val userId = uid / PER_USER_RANGE
+            val info = runCatching {
+                context.packageManager.getPackageInfo(context.packageName, 0)
+            }.getOrNull()
+            @Suppress("DEPRECATION")
+            val versionCode = info?.let {
+                if (Build.VERSION.SDK_INT >= 28) it.longVersionCode else it.versionCode.toLong()
+            } ?: -1L
+            val debuggable = context.applicationInfo.flags and
+                android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+            val buildCommit = runCatching { BuildConfig.GIT_COMMIT }.getOrDefault("unknown")
+            return SessionIdentity(
+                packageName = context.packageName,
+                appVersionName = info?.versionName ?: "unknown",
+                appVersionCode = versionCode,
+                buildCommit = buildCommit,
+                buildType = if (debuggable) "debug" else "release",
+                androidUserId = userId,
+                profileKind = if (userId == 0) "normal" else "secondary_profile",
+                processUid = uid
+            )
+        }
+
         fun start(
             context: Context,
             batchId: String,
             mode: String,
-            selectedCount: Int,
-            appVersion: String,
-            buildType: String
+            selectedCount: Int
         ): DiagnosticsRecorder {
             val file = runCatching {
                 val dir = File(context.filesDir, "diagnostics/$batchId").apply { mkdirs() }
                 File(dir, "session.jsonl")
             }.getOrNull()
-            return DiagnosticsRecorder(batchId, file).also {
-                it.sessionStart(mode, selectedCount, appVersion, buildType)
+            return DiagnosticsRecorder(batchId, file, buildIdentity(context)).also {
+                it.sessionStart(mode, selectedCount)
             }
+        }
+
+        /**
+         * Emit a self-contained, privacy-safe synthetic session (session_start + one synthetic job +
+         * session_summary) so the autonomous recorder can be validated in normal Android and Secure
+         * Folder WITHOUT running a real video batch. Touches no media, replaces no files, exposes no
+         * personal data. batchId carries a "selftest" marker and a caller token so repeated runs are
+         * distinguishable in the log buffer.
+         */
+        fun runSelfTest(context: Context, token: String): String {
+            val batchId = "selftest_$token"
+            val recorder = start(context, batchId, mode = "self_test", selectedCount = 1)
+            recorder.job(
+                sourceKey = "selftest://synthetic/$token",
+                displayNameForHashOnly = "selftest_synthetic.mp4",
+                sourceMime = "video/avc",
+                width = 1080, height = 1920, fps = 30f, durationMs = 5_000L,
+                sourceSize = 10_000_000L,
+                sourceTotalBitrate = 16_000_000,
+                bitrateWasMeasured = false,
+                hdr = false,
+                audioMime = "audio/mp4a-latm", audioBitrate = 128_000,
+                requestedMode = "Perceptually Lossless",
+                effectiveMode = "Perceptually Lossless",
+                plannedOutputMime = "video/hevc",
+                plannedTargetRatio = 0.85,
+                plannedTargetVideoBitrate = 13_600_000,
+                plannedDecisionReason = null,
+                wasStreamCopy = false,
+                verdict = "Perceptually Lossless Verified (self-test synthetic)",
+                verified = true,
+                replacementSafe = false,
+                blockReason = null,
+                outputSize = 7_000_000L,
+                terminal = BatchTerminalResult.TRANSCODED_SMALLER,
+                elapsedMs = 1_234L
+            )
+            recorder.sessionSummary(totalElapsedMs = 1_500L)
+            return batchId
         }
     }
 }

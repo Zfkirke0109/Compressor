@@ -1,10 +1,22 @@
 [CmdletBinding()]
 param(
     [string]$Serial,
+    # Which Android profile's structured session to bind to. Auto binds to the first new session from
+    # any user; Normal only binds to user 0; SecondaryProfile only binds to a nonzero user (Secure
+    # Folder is a nonzero user, but a nonzero user is not PROVEN to be Secure Folder from public APIs).
+    [ValidateSet("Auto", "Normal", "SecondaryProfile")]
+    [string]$Environment = "Auto",
     [switch]$RecoverCurrentSession,
     [int]$WaitForBatchMinutes = 0,
     [int]$MaxOfflineMinutes = 0,
     [int]$IdleMinutes = 0,
+    # After legacy (non-structured) Compressor activity is first observed, wait at most this long for a
+    # structured session_start before declaring the installed build incompatible. 0 disables the guard.
+    # It never interrupts a genuinely active structured session -- it only applies while still unbound.
+    [int]$SessionDetectionTimeoutSeconds = 180,
+    # If the installed build is incompatible (legacy-only), capture human-readable tags and finish by
+    # inactivity instead of stopping. Explicitly marked non-authoritative / partial in the manifest.
+    [switch]$AllowLegacyFallback,
     [switch]$NoParse,
     [switch]$IncludeHumanReadableTags,
     [switch]$ClearLogcat,
@@ -23,6 +35,43 @@ function Try-ReadDiagnostic([string]$Line) {
     if ($index -lt 0) { return $null }
     $json = $Line.Substring($index + $marker.Length).Trim()
     try { return $json | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+}
+
+# True when a raw logcat line is legacy (human-readable) Compressor output, NOT a structured
+# CompressorDiag record. Used to detect that Compressor is running but the installed build predates
+# the structured-diagnostics integration, so we can warn instead of waiting silently forever.
+function Test-LegacyCompressorLine([string]$Line) {
+    if ([string]::IsNullOrEmpty($Line)) { return $false }
+    if ($Line.IndexOf("CompressorDiag:", [System.StringComparison]::Ordinal) -ge 0) { return $false }
+    foreach ($tag in @(
+            "CompressorBatch:",
+            "CompressorEncoderPlan:",
+            "CompressorLearning:",
+            "CompressorVerification:",
+            "CompressorCodecCaps:")) {
+        if ($Line.IndexOf($tag, [System.StringComparison]::Ordinal) -ge 0) { return $true }
+    }
+    return $false
+}
+
+# Whether a session_start diagnostic is eligible for the requested -Environment. Auto accepts any
+# session. Normal requires the reported Android user 0. SecondaryProfile requires a nonzero user. A
+# session_start that does not report androidUserId (an older structured build) cannot be confirmed as
+# a specific profile, so it only qualifies under Auto -- it is skipped for Normal/SecondaryProfile.
+function Test-SessionMatchesEnvironment($Diagnostic, [string]$Environment) {
+    if ($Environment -eq "Auto") { return $true }
+    $hasUser = $false
+    $userId = -1
+    if ($null -ne $Diagnostic -and ($Diagnostic.PSObject.Properties.Name -contains "androidUserId")) {
+        $raw = $Diagnostic.androidUserId
+        if ($null -ne $raw -and "$raw" -match '^\d+$') { $hasUser = $true; $userId = [int]$raw }
+    }
+    if (-not $hasUser) { return $false }
+    switch ($Environment) {
+        "Normal" { return ($userId -eq 0) }
+        "SecondaryProfile" { return ($userId -ne 0) }
+        default { return $true }
+    }
 }
 
 function Find-NewestUnfinishedSession([object[]]$Records) {
@@ -85,6 +134,12 @@ $targetDeviceIdentity = $null
 $initialBufferSnapshotTaken = $false
 $readyAnnounced = $false
 $preexistingBatchIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+$legacyActivitySeenAt = $null
+$sessionDetectionDeadline = $null
+$legacyActivityDetected = $false
+$sessionDetectionTimedOut = $false
+$legacyFallbackActive = $false
+$waitingAnnounced = $false
 
 function Write-CaptureLog([string]$Message) {
     $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
@@ -187,7 +242,18 @@ function Start-LogcatProcess([string]$DeviceSerial) {
             "*:S"
         )
     } else {
-        @("CompressorDiag:V", "*:S")
+        # Privacy mode still SUBSCRIBES to legacy tags so an old, structured-diagnostics-free build
+        # can be detected (and warned about) instead of causing a silent wait. Legacy lines are used
+        # only for detection here; the write guard below keeps them out of the structured raw log.
+        @(
+            "CompressorDiag:V",
+            "CompressorBatch:V",
+            "CompressorEncoderPlan:V",
+            "CompressorLearning:V",
+            "CompressorVerification:V",
+            "CompressorCodecCaps:V",
+            "*:S"
+        )
     }
 
     $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
@@ -262,11 +328,16 @@ try {
         $stderrTask = $process.StandardError.ReadToEndAsync()
         $readTask = $process.StandardOutput.ReadLineAsync()
         if (-not $readyAnnounced) {
+            Write-CaptureLog "Target environment: $Environment"
             Write-CaptureLog "CAPTURE ARMED - start one Compressor batch now. You may close every AI app; capture keeps running."
             if (-not $IncludeHumanReadableTags) {
                 Write-CaptureLog "Privacy mode: structured CompressorDiag records only."
             }
             $readyAnnounced = $true
+        }
+        if (-not $waitingAnnounced -and $null -eq $activeBatchId) {
+            Write-CaptureLog "WAITING FOR STRUCTURED SESSION - listening for a CompressorDiag session_start."
+            $waitingAnnounced = $true
         }
 
         try {
@@ -276,6 +347,24 @@ try {
                     $stopReason = "wait_timeout"
                     break
                 }
+                # An old build that never emits a structured session_start must not hang the recorder
+                # forever. Once legacy Compressor activity has been seen, give the structured session a
+                # bounded grace period, then declare the build incompatible (or fall back).
+                if ($null -eq $activeBatchId -and $null -ne $sessionDetectionDeadline -and
+                    [DateTimeOffset]::UtcNow -ge $sessionDetectionDeadline) {
+                    $sessionDetectionTimedOut = $true
+                    if ($AllowLegacyFallback) {
+                        $legacyFallbackActive = $true
+                        $activeBatchId = "legacy-fallback"
+                        $lastRecordAt = [DateTimeOffset]::UtcNow
+                        Write-CaptureLog "INSTALLED BUILD MAY LACK STRUCTURED DIAGNOSTICS - falling back to legacy human-readable capture (non-authoritative)."
+                    } else {
+                        $stopReason = "incompatible_build"
+                        Write-CaptureLog "INCOMPATIBLE COMPRESSOR BUILD - STRUCTURED DIAGNOSTICS NOT DETECTED. Galaxy Compressor activity was seen, but this installed APK did not emit the required CompressorDiag session record. Install the corrected build (or re-run with -AllowLegacyFallback for a non-authoritative capture)."
+                        break
+                    }
+                }
+
                 if ($readTask.Wait(1000)) {
                     $line = $readTask.Result
                     if ($null -eq $line) { break }
@@ -287,23 +376,46 @@ try {
 
                     $diagnostic = Try-ReadDiagnostic $line
                     if ($null -eq $activeBatchId) {
-                        if ($null -eq $diagnostic -or $diagnostic.type -ne "session_start") { continue }
+                        # Not a structured record: if it is legacy Compressor output, start (once) the
+                        # bounded session-detection countdown so an old build is reported, not silently
+                        # awaited. Non-Compressor noise is ignored.
+                        if ($null -eq $diagnostic) {
+                            if ((Test-LegacyCompressorLine $line) -and $null -eq $legacyActivitySeenAt) {
+                                $legacyActivitySeenAt = [DateTimeOffset]::UtcNow
+                                $legacyActivityDetected = $true
+                                if ($SessionDetectionTimeoutSeconds -gt 0) {
+                                    $sessionDetectionDeadline = $legacyActivitySeenAt.AddSeconds($SessionDetectionTimeoutSeconds)
+                                }
+                                Write-CaptureLog "LEGACY COMPRESSOR ACTIVITY DETECTED - waiting up to ${SessionDetectionTimeoutSeconds}s for a structured session_start."
+                            }
+                            continue
+                        }
+                        if ($diagnostic.type -ne "session_start") { continue }
                         # The initial on-device buffer snapshot is the arrival boundary. This avoids
                         # assuming the PC and phone wall clocks are synchronized.
                         if ($preexistingBatchIds.Contains([string]$diagnostic.batchId)) { continue }
+                        if (-not (Test-SessionMatchesEnvironment $diagnostic $Environment)) {
+                            Write-CaptureLog "Ignoring session $($diagnostic.batchId) from androidUserId=$($diagnostic.androidUserId) (Environment=$Environment)."
+                            continue
+                        }
                         $activeBatchId = [string]$diagnostic.batchId
                         $sessionStart = $diagnostic
                         $lastRecordAt = [DateTimeOffset]::UtcNow
                         $writer.WriteLine($line)
-                        Write-CaptureLog "Capturing batch $activeBatchId ($($diagnostic.selectedCount) selected)."
+                        Write-CaptureLog "SESSION DETECTED - capturing batch $activeBatchId ($($diagnostic.selectedCount) selected, androidUserId=$($diagnostic.androidUserId))."
                         continue
                     }
 
                     if ($null -ne $diagnostic -and [string]$diagnostic.batchId -ne $activeBatchId) {
                         continue
                     }
-                    $writer.WriteLine($line)
-                    $lastRecordAt = [DateTimeOffset]::UtcNow
+                    # Privacy invariant: in structured mode the raw log holds ONLY structured records.
+                    # Legacy lines (subscribed for detection, or captured during -AllowLegacyFallback)
+                    # are written only when a human-readable capture was explicitly requested.
+                    if ($null -ne $diagnostic -or $IncludeHumanReadableTags -or $legacyFallbackActive) {
+                        $writer.WriteLine($line)
+                        $lastRecordAt = [DateTimeOffset]::UtcNow
+                    }
                     if ($null -ne $diagnostic -and $diagnostic.type -eq "job") {
                         $null = $jobIds.Add([string]$diagnostic.id)
                         Write-Host ("Captured item {0}: {1}" -f $jobIds.Count, $diagnostic.terminal)
@@ -315,8 +427,12 @@ try {
                     }
                 }
 
-                if ($IdleMinutes -gt 0 -and $null -ne $activeBatchId -and $jobIds.Count -gt 0 -and
-                    $null -ne $lastRecordAt -and [DateTimeOffset]::UtcNow -ge $lastRecordAt.AddMinutes($IdleMinutes)) {
+                # Idle completion is a fallback only: for -AllowLegacyFallback (no structured summary is
+                # ever coming) or for an explicit -IdleMinutes safety net on a bound structured session.
+                $idleWindow = if ($legacyFallbackActive -and $IdleMinutes -le 0) { 3 } else { $IdleMinutes }
+                if ($idleWindow -gt 0 -and $null -ne $activeBatchId -and
+                    ($legacyFallbackActive -or $jobIds.Count -gt 0) -and
+                    $null -ne $lastRecordAt -and [DateTimeOffset]::UtcNow -ge $lastRecordAt.AddMinutes($idleWindow)) {
                     $stopReason = "legacy_idle_timeout"
                     break
                 }
@@ -368,11 +484,21 @@ $complete = $reconciled -and $parseOk
 # Idle inference is a fallback only and can never certify completeness; the manifest says so.
 $completionSource = switch ($stopReason) {
     "session_summary" { "session_summary_record" }
-    "legacy_idle_timeout" { "idle_inference" }
+    "legacy_idle_timeout" { if ($legacyFallbackActive) { "legacy_idle_inference" } else { "idle_inference" } }
+    "incompatible_build" { "incompatible_build" }
     default { $stopReason }
 }
-$partial = (-not $complete) -and ($jobIds.Count -gt 0)
-$failureReason = if ($complete) { $null } elseif (-not $reconciled) { $stopReason } elseif (-not $parseOk) { "parser_failed" } else { $stopReason }
+$incompatibleBuild = $stopReason -eq "incompatible_build" -or $legacyFallbackActive
+$partial = (-not $complete) -and (($jobIds.Count -gt 0) -or $legacyFallbackActive)
+$failureReason = if ($complete) { $null } elseif ($stopReason -eq "incompatible_build") { "incompatible_installed_build_no_structured_diagnostics" } elseif (-not $reconciled) { $stopReason } elseif (-not $parseOk) { "parser_failed" } else { $stopReason }
+# Surface the privacy-safe build/profile identity the session reported, so the manifest records which
+# environment produced the data without any device-side query.
+$sessionProfileKind = if ($null -ne $sessionStart -and ($sessionStart.PSObject.Properties.Name -contains "profileKind")) { $sessionStart.profileKind } else { $null }
+$sessionAndroidUserId = if ($null -ne $sessionStart -and ($sessionStart.PSObject.Properties.Name -contains "androidUserId")) { $sessionStart.androidUserId } else { $null }
+$sessionPackageName = if ($null -ne $sessionStart -and ($sessionStart.PSObject.Properties.Name -contains "packageName")) { $sessionStart.packageName } else { $null }
+$sessionAppVersionName = if ($null -ne $sessionStart -and ($sessionStart.PSObject.Properties.Name -contains "appVersionName")) { $sessionStart.appVersionName } else { $null }
+$sessionAppVersionCode = if ($null -ne $sessionStart -and ($sessionStart.PSObject.Properties.Name -contains "appVersionCode")) { $sessionStart.appVersionCode } else { $null }
+$sessionBuildCommit = if ($null -ne $sessionStart -and ($sessionStart.PSObject.Properties.Name -contains "buildCommit")) { $sessionStart.buildCommit } else { $null }
 $parsedArtifacts = if (-not $NoParse -and $parserExitCode -eq 0) {
     [ordered]@{
         jobsFile = Join-Path $outputDir "jobs.jsonl"
@@ -386,12 +512,23 @@ $manifest = [ordered]@{
     captureEndedUtc = [DateTimeOffset]::UtcNow.ToString("o")
     deviceSerial = $lastDeviceSerial
     targetDeviceIdentity = $targetDeviceIdentity
+    environment = $Environment
     batchId = $activeBatchId
     stopReason = $stopReason
     completionSource = $completionSource
     complete = $complete
     partial = $partial
     reconciled = $reconciled
+    incompatibleBuild = $incompatibleBuild
+    legacyActivityDetected = $legacyActivityDetected
+    sessionDetectionTimedOut = $sessionDetectionTimedOut
+    legacyFallbackActive = $legacyFallbackActive
+    sessionProfileKind = $sessionProfileKind
+    sessionAndroidUserId = $sessionAndroidUserId
+    sessionPackageName = $sessionPackageName
+    sessionAppVersionName = $sessionAppVersionName
+    sessionAppVersionCode = $sessionAppVersionCode
+    sessionBuildCommit = $sessionBuildCommit
     failureReason = $failureReason
     selectedCount = $selectedCount
     processedCount = $processedCount

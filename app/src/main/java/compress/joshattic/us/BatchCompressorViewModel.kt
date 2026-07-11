@@ -546,19 +546,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 )
             }
 
+            // Package, version, build commit, Android user id, and profile kind are resolved inside
+            // start() from the context + BuildConfig so every record self-identifies its environment.
             val diagnostics = DiagnosticsRecorder.start(
                 context = context,
                 batchId = "batch_$batchStartedAt",
                 mode = quality.label,
-                selectedCount = _uiState.value.items.size,
-                appVersion = runCatching {
-                    context.packageManager.getPackageInfo(context.packageName, 0).versionName
-                }.getOrNull() ?: "unknown",
-                buildType = if (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
-                    "debug"
-                } else {
-                    "release"
-                }
+                selectedCount = _uiState.value.items.size
             )
             _uiState.value.items.filter { it.isAlreadyCompressed }.forEach { skippedItem ->
                 recordDiagnosticJob(
@@ -577,6 +571,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 )
             }
             var runCancelled = false
+            var runFailed = false
+            var sessionFailReason = "unknown"
 
             try {
                 _uiState.value.items.forEachIndexed { index, item ->
@@ -1003,6 +999,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             } catch (e: CancellationException) {
                 runCancelled = true
                 throw e
+            } catch (e: Throwable) {
+                runFailed = true
+                sessionFailReason = e.message ?: e.javaClass.simpleName
+                throw e
             } finally {
                 if (runCancelled) {
                     val cancelledItems = _uiState.value.items.filter { it.terminalResult == null }
@@ -1057,7 +1057,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         )
                     }
                 }
-                diagnostics.sessionSummary(System.currentTimeMillis() - batchStartedAt)
+                // Emit the honest session terminal record: cancelled batches get session_cancelled,
+                // a completed run gets session_summary. A hard-failure path is reported below.
+                val sessionElapsed = System.currentTimeMillis() - batchStartedAt
+                when {
+                    runCancelled -> diagnostics.sessionCancelled(sessionElapsed, reason = "user_cancelled")
+                    runFailed -> diagnostics.sessionFailed(sessionElapsed, reason = sessionFailReason)
+                    else -> diagnostics.sessionSummary(sessionElapsed)
+                }
                 activeTransformer = null
                 compressionJob = null
             }
