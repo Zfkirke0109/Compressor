@@ -16,12 +16,58 @@ private name) and technical fields.
 import sys, os, re, json, csv, hashlib
 from collections import defaultdict, Counter
 
+DIAGNOSTIC_HASH_SALT = "galaxycompressor-diag-v1"
+STRUCTURED_JOB_FIELDS = {
+    "batchId", "type", "timestampMs", "id", "nameHash", "ext", "sourceMime",
+    "w", "h", "fps", "durationMs", "sourceSize", "sourceTotalBitrate",
+    "bitrateMeasuredFromSize", "hdr", "audioMime", "audioBitrate", "requestedMode",
+    "effectiveMode", "plannedOutputMime", "plannedTargetRatio",
+    "plannedTargetVideoBitrate", "plannedDecisionReason", "wasStreamCopy", "verdict",
+    "verified", "replacementSafe", "blockReason", "outputSize", "rawByteDelta",
+    "savedBytes", "savedPct", "terminal", "countsAsRealCompression", "elapsedMs",
+}
+SESSION_START_FIELDS = {
+    "batchId", "type", "timestampMs", "schema", "appVersion", "buildType", "gitAppId",
+    "deviceModel", "manufacturer", "androidRelease", "sdkInt", "mode", "selectedCount",
+    "privacy",
+}
+SESSION_SUMMARY_FIELDS = {
+    "batchId", "type", "timestampMs", "processed", "failed", "skipped", "cancelled",
+    "realCompressions", "nonCompressions", "realCompressionInputBytes",
+    "realCompressionOutputBytes", "totalBytesSaved", "totalElapsedMs",
+}
+
+def whitelisted(record, fields, ignored=None):
+    # Copy ONLY explicitly permitted fields, so a future malformed record carrying displayName,
+    # sourceUri, or a path can never leak into a derived artifact. Disallowed keys are counted (not
+    # copied) so the run can report how much was dropped instead of silently discarding it.
+    if ignored is not None:
+        for key in record:
+            if key not in fields:
+                ignored[key] += 1
+    return {key: record[key] for key in fields if key in record}
+
+def stable_name_hash(name):
+    payload = (DIAGNOSTIC_HASH_SALT + (name or "")).encode("utf-8", "replace")
+    return hashlib.sha1(payload).hexdigest()[:12]
+
 def redact(name):
     if not name:
         return "unknown"
-    h = hashlib.sha1(name.encode("utf-8", "replace")).hexdigest()[:12]
+    h = stable_name_hash(name)
     ext = os.path.splitext(name)[1].lower().lstrip(".") or "none"
     return f"vid_{h}.{ext}"
+
+def redacted_id_from_diag(rec):
+    # Source-derived id is stable and keeps different selected URIs separate even when their
+    # display names are identical. It is already a salted hash; no raw URI is emitted.
+    return rec.get("id")
+
+def occurrence_id(base_id, occurrence):
+    if occurrence == 1:
+        return base_id
+    stem, dot, ext = base_id.rpartition(".")
+    return f"{stem}_{occurrence:02d}{dot}{ext}" if dot else f"{base_id}_{occurrence:02d}"
 
 # CompressorEncoderPlan: "mode=..; requestedCodec=..; resolvedOutputMime=..; source=WxH@Ffps; bitrate=..; audioBitrate=..; sourceCodec=..; hdr=..; colorTransfer=..; target=..p@..fps; targetVideoBitrate=..; learnedTargetRatio=..; targetAudioBitrate=..; privacy=.."
 def parse_kv(msg):
@@ -48,14 +94,26 @@ def main():
         outdir = sys.argv[sys.argv.index("--out") + 1]
     os.makedirs(outdir, exist_ok=True)
 
-    # jobs keyed by redacted name; a batch may re-run a name, keep the last plan/verify seen.
+    # Structured jobs are keyed by (batchId, jobId), so a Logcat Extreme export containing
+    # multiple complete batches cannot union or overwrite jobs that share a stable source id.
     jobs = defaultdict(lambda: {})
     order = []
+    session_records = []
+    session_starts = defaultdict(list)
+    session_summaries = defaultdict(list)
+    structured_job_keys = defaultdict(set)
+    structured_errors = []
+    structured_ignored = Counter()
+    structured_seen = False
+    legacy_occurrences = Counter()
+    seen_event_lines = set()
 
-    plan_re = re.compile(r"CompressorEncoderPlan\s*:\s*(.*)")
+    # Only the planning record starts with mode=. Ignore later encodeResult records on the same tag
+    # or they overwrite the pending source/target fields before verification.
+    plan_re = re.compile(r"CompressorEncoderPlan\s*:\s*(mode=.*)")
     learn_plan_re = re.compile(r"CompressorLearning\s*:\s*plan;\s*(.*)")
     learn_result_re = re.compile(r"CompressorLearning\s*:\s*result=(\w+);\s*(.*)")
-    verify_re = re.compile(r"CompressorVerification\s*:\s*(mode=.*file=.*)")
+    verify_re = re.compile(r"CompressorVerification\s*:\s*(mode=.*(?:file|job)=.*)")
     batch_re = re.compile(r"CompressorBatch\s*:\s*(.*)")
     diag_re = re.compile(r"CompressorDiag\s*:\s*(\{.*\})\s*$")
 
@@ -64,21 +122,116 @@ def main():
     # immediately precedes a verification is that item's plan. Maintain a pending plan.
     pending_plan = None
     pending_learn_plan = None
+    pending_learn_result = None
+    pending_batch_notes = []
 
     with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
+            # Wireless reconnects replay the same buffered log line. Ignore exact replays while
+            # retaining genuinely repeated processing of the same display name at a new timestamp.
+            event_line = line.rstrip("\r\n")
+            if event_line in seen_event_lines:
+                continue
+            seen_event_lines.add(event_line)
             m = diag_re.search(line)
+            if "CompressorDiag" in line and not m:
+                structured_seen = True
+                structured_errors.append(
+                    f"line {line_number}: malformed or truncated CompressorDiag JSON")
+                continue
             if m:
                 # Structured JSON record (present only on the corrected build).
+                structured_seen = True
                 try:
                     rec = json.loads(m.group(1))
-                except Exception:
+                except Exception as exc:
+                    structured_errors.append(
+                        f"line {line_number}: invalid CompressorDiag JSON ({exc})")
                     continue
-                name = rec.get("name") or rec.get("job") or "unknown"
-                rid = redact(name) if not str(name).startswith("vid_") else name
-                if rid not in jobs:
-                    order.append(rid)
-                jobs[rid].update({("diag_" + k): v for k, v in rec.items()})
+                if not isinstance(rec, dict):
+                    structured_errors.append(
+                        f"line {line_number}: CompressorDiag record is not an object")
+                    continue
+                record_type = rec.get("type")
+                batch_id = rec.get("batchId")
+                if record_type not in {"session_start", "job", "session_summary"}:
+                    structured_errors.append(
+                        f"line {line_number}: unknown CompressorDiag type {record_type!r}")
+                    continue
+                if not batch_id:
+                    structured_errors.append(
+                        f"line {line_number}: CompressorDiag record is missing batchId")
+                    continue
+                if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", str(batch_id)):
+                    structured_errors.append(
+                        f"line {line_number}: batchId is not a safe identifier")
+                    continue
+                if rec.get("timestampMs") is None:
+                    structured_errors.append(
+                        f"line {line_number}: CompressorDiag record is missing timestampMs")
+                    continue
+                if record_type == "session_start":
+                    if rec.get("selectedCount") is None:
+                        structured_errors.append(
+                            f"line {line_number}: session_start is missing selectedCount")
+                        continue
+                    rec = whitelisted(rec, SESSION_START_FIELDS, structured_ignored)
+                    session_starts[batch_id].append(rec)
+                    session_records.append(rec)
+                    continue
+                if record_type == "session_summary":
+                    if rec.get("processed") is None:
+                        structured_errors.append(
+                            f"line {line_number}: session_summary is missing processed")
+                        continue
+                    rec = whitelisted(rec, SESSION_SUMMARY_FIELDS, structured_ignored)
+                    session_summaries[batch_id].append(rec)
+                    session_records.append(rec)
+                    continue
+                required_job_fields = {
+                    "id", "terminal", "countsAsRealCompression", "sourceSize", "outputSize"
+                }
+                missing = sorted(k for k in required_job_fields if rec.get(k) is None)
+                if missing:
+                    structured_errors.append(
+                        f"line {line_number}: job is missing {', '.join(missing)}")
+                    continue
+                rid = redacted_id_from_diag(rec)
+                if not rid:
+                    structured_errors.append(
+                        f"line {line_number}: job id is empty")
+                    continue
+                if not re.fullmatch(r"job_[0-9a-f]{12}", str(rid)):
+                    structured_errors.append(
+                        f"line {line_number}: job id is not a salted redacted id")
+                    continue
+                rec = whitelisted(rec, STRUCTURED_JOB_FIELDS, structured_ignored)
+                key = (str(batch_id), str(rid))
+                if key in jobs and jobs[key].get("diagnostic"):
+                    structured_errors.append(
+                        f"line {line_number}: duplicate structured job {batch_id}/{rid}")
+                    continue
+                order.append(key)
+                structured_job_keys[batch_id].add(key)
+                j = jobs[key]
+                # The structured record is authoritative for terminal classification and uses the
+                # same salted display-name hash as legacy file= lines, so before/after jobs merge.
+                j.update(rec)
+                j["id"] = rid
+                j["diagnostic"] = True
+                j["plan_mode"] = rec.get("requestedMode")
+                j["verify_mode"] = rec.get("effectiveMode")
+                j["sourceCodec"] = rec.get("sourceMime")
+                j["sourceBitrate"] = rec.get("sourceTotalBitrate")
+                j["targetVideoBitrate"] = rec.get("plannedTargetVideoBitrate")
+                j["remuxReason"] = rec.get("plannedDecisionReason")
+                j["resolvedOutputMime"] = rec.get("plannedOutputMime")
+                j["learnedTargetRatio"] = rec.get("plannedTargetRatio")
+                j["audioBitrate"] = rec.get("audioBitrate")
+                j["hdr"] = rec.get("hdr")
+                j["replaceAllowed"] = rec.get("replacementSafe")
+                if rec.get("w") and rec.get("h"):
+                    j["source"] = f'{rec.get("w")}x{rec.get("h")}@{rec.get("fps")}fps'
                 continue
             m = plan_re.search(line)
             if m:
@@ -89,12 +242,15 @@ def main():
             m = verify_re.search(line)
             if m:
                 kv = parse_kv(m.group(1))
-                name = kv.get("file", "unknown")
-                rid = redact(name)
-                if rid not in jobs:
-                    order.append(rid)
-                j = jobs[rid]
+                name = kv.get("job") or kv.get("file", "unknown")
+                base_rid = name if str(name).startswith("job_") else redact(name)
+                legacy_occurrences[base_rid] += 1
+                rid = occurrence_id(base_rid, legacy_occurrences[base_rid])
+                key = ("legacy", rid)
+                order.append(key)
+                j = jobs[key]
                 j["id"] = rid
+                j["_legacyBaseId"] = base_rid
                 j["verdict"] = kv.get("verification")
                 j["playable"] = kv.get("playable")
                 j["replaceAllowed"] = kv.get("replaceAllowed")
@@ -114,42 +270,80 @@ def main():
                 if pending_learn_plan:
                     j["profileKey"] = pending_learn_plan.get("profileKey")
                     j["defaultRatio"] = num(pending_learn_plan.get("defaultRatio"))
+                    j["learnedRatio"] = num(pending_learn_plan.get("learnedRatio"))
                     j["floorRatio"] = num(pending_learn_plan.get("floorRatio"))
                     j["preferRemux_plan"] = pending_learn_plan.get("preferRemux")
                     j["remuxReason"] = pending_learn_plan.get("reason")
+                if pending_learn_result:
+                    j.update(pending_learn_result)
+                if pending_batch_notes:
+                    j["batch_notes"] = list(pending_batch_notes)
                 pending_plan = None
                 pending_learn_plan = None
+                pending_learn_result = None
+                pending_batch_notes = []
                 continue
             m = learn_result_re.search(line)
             if m:
-                # attach to most recent job in order
-                if order:
-                    j = jobs[order[-1]]
-                    kv = parse_kv(m.group(2))
-                    j["learn_result"] = m.group(1)
-                    j["sizeRatio"] = num(kv.get("sizeRatio"))
-                    j["nextRatio"] = num(kv.get("nextRatio"))
+                # Learning is logged before the item's terminal verification record, so keep it
+                # pending for that verification instead of attaching it to the previous job.
+                kv = parse_kv(m.group(2))
+                pending_learn_result = {
+                    "learn_result": m.group(1),
+                    "sizeRatio": num(kv.get("sizeRatio")),
+                    "nextRatio": num(kv.get("nextRatio")),
+                }
                 continue
             m = batch_re.search(line)
             if m:
                 txt = m.group(1)
                 fm = re.search(r"for (.+?):", txt) or re.search(r"for (.+?)\b", txt)
-                if fm and order:
-                    rid = redact(fm.group(1).strip())
-                    if rid in jobs:
-                        jobs[rid].setdefault("batch_notes", []).append(txt.strip())
+                if fm:
+                    # Keep the technical reason only; never copy the raw display name into the
+                    # redacted dataset.
+                    pending_batch_notes.append(txt.rsplit(": ", 1)[-1].strip())
+
+    if structured_seen:
+        batch_ids = set(session_starts) | set(session_summaries) | set(structured_job_keys)
+        for batch_id in sorted(batch_ids):
+            starts = session_starts.get(batch_id, [])
+            summaries = session_summaries.get(batch_id, [])
+            if len(starts) != 1:
+                structured_errors.append(
+                    f"batch {batch_id}: expected exactly one session_start, found {len(starts)}")
+            if len(summaries) != 1:
+                structured_errors.append(
+                    f"batch {batch_id}: expected exactly one session_summary, found {len(summaries)}")
+            if len(starts) == 1 and len(summaries) == 1:
+                selected = int(starts[0]["selectedCount"])
+                processed = int(summaries[0]["processed"])
+                captured = len(structured_job_keys.get(batch_id, set()))
+                if selected != processed or processed != captured:
+                    structured_errors.append(
+                        f"batch {batch_id}: selected={selected}, processed={processed}, "
+                        f"uniqueJobs={captured}")
+        if structured_errors:
+            print("Structured diagnostics are incomplete or invalid:", file=sys.stderr)
+            for error in structured_errors:
+                print(f"  - {error}", file=sys.stderr)
+            sys.exit(2)
 
     # Derive terminal classification from what we have.
     def terminal(j):
+        if j.get("diagnostic") and j.get("terminal"):
+            return j["terminal"]
         v = (j.get("verdict") or "").lower()
         mode = (j.get("verify_mode") or j.get("plan_mode") or "").lower()
         out = j.get("outputSize")
-        src = j.get("diag_sourceSize") or j.get("sourceSizeBytes")
+        src = j.get("sourceSize") or j.get("sourceSizeBytes")
         remuxish = "remux" in mode or "remux" in v
         if "verification failed" in v or (j.get("playable") == "failed"):
             return "OUTPUT_VALIDATION_FAILED"
         if "perceptually lossless verified" in v:
-            if src and out and out < src * 0.999:
+            size_ratio = j.get("sizeRatio")
+            if (size_ratio is not None and size_ratio <= (1.0 - 0.03)) or (
+                src and out and out <= src * (1.0 - 0.03)
+            ):
                 return "TRANSCODED_SMALLER"
             return "TRANSCODED_NOT_MEANINGFULLY_SMALLER"
         if remuxish and j.get("remuxReason") and "near optimal" in (j.get("remuxReason") or "").lower():
@@ -158,20 +352,40 @@ def main():
             return "UNEXPECTED_REMUX"
         return "UNCLASSIFIED"
 
+    # A corrected build also emits human-readable verification lines. Suppress only those legacy
+    # rows whose redacted job id exactly matches a structured record; retain unrelated legacy-only
+    # batches from a multi-session Logcat Extreme export.
+    structured_ids = {
+        jobs[key].get("id") for key in order if jobs[key].get("diagnostic")
+    }
     rows = []
-    for rid in order:
-        j = jobs[rid]
-        j["terminal"] = terminal(j)
+    for key in order:
+        j = jobs[key]
+        legacy_base_id = j.pop("_legacyBaseId", None)
+        if not j.get("diagnostic") and legacy_base_id in structured_ids:
+            continue
+        if not j.get("terminal"):
+            j["terminal"] = terminal(j)
+        if j.get("countsAsRealCompression") is None:
+            j["countsAsRealCompression"] = j["terminal"] in {
+                "TRANSCODED_SMALLER", "LOSSY_SMALLER"
+            }
+        if j.get("countsAsRealCompression") and j.get("savedBytes") is None:
+            size_ratio = j.get("sizeRatio")
+            output_size = j.get("outputSize")
+            if size_ratio and output_size and 0 < size_ratio < 1:
+                j["savedBytes"] = max(0, round(output_size / size_ratio) - round(output_size))
         rows.append(j)
 
     with open(os.path.join(outdir, "jobs.jsonl"), "w", encoding="utf-8") as f:
         for j in rows:
             f.write(json.dumps(j, ensure_ascii=False) + "\n")
 
-    cols = ["id", "plan_mode", "verify_mode", "source", "sourceCodec", "resolvedOutputMime",
+    cols = ["batchId", "id", "plan_mode", "verify_mode", "source", "sourceCodec", "resolvedOutputMime",
             "hdr", "sourceBitrate", "audioBitrate", "targetVideoBitrate", "defaultRatio",
-            "floorRatio", "learnedTargetRatio", "verdict", "playable", "replaceAllowed",
-            "outputSize", "sizeRatio", "remuxReason", "blockReason", "terminal"]
+            "learnedRatio", "floorRatio", "learnedTargetRatio", "verdict", "playable", "replaceAllowed",
+            "outputSize", "sizeRatio", "remuxReason", "blockReason", "terminal",
+            "countsAsRealCompression", "savedBytes", "rawByteDelta"]
     with open(os.path.join(outdir, "summary.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
         w.writeheader()
@@ -180,16 +394,24 @@ def main():
 
     agg = {
         "total_items": len(rows),
+        "by_batch": dict(Counter((j.get("batchId") or "legacy") for j in rows)),
         "by_terminal": dict(Counter(j["terminal"] for j in rows)),
         "by_verdict": dict(Counter((j.get("verdict") or "none") for j in rows)),
-        "by_source_codec": dict(Counter((j.get("sourceCodec") or "unknown") for j in rows)),
-        "by_plan_mode": dict(Counter((j.get("plan_mode") or "unknown") for j in rows)),
+        "by_source_codec": dict(Counter((j.get("sourceCodec") or j.get("sourceMime") or "unknown") for j in rows)),
+        "by_plan_mode": dict(Counter((j.get("plan_mode") or j.get("requestedMode") or "unknown") for j in rows)),
         "remux_reasons": dict(Counter((j.get("remuxReason") or "none") for j in rows)),
         "block_reasons": dict(Counter((j.get("blockReason") or "none") for j in rows)),
     }
     # simple headroom read: how many were routed to remux purely by the near-optimal gate
     agg["near_optimal_remux_count"] = sum(
         1 for j in rows if "near optimal" in (j.get("remuxReason") or "").lower())
+    agg["real_compression_count"] = sum(1 for j in rows if j.get("countsAsRealCompression") is True)
+    agg["real_compression_saved_bytes"] = sum(
+        int(j.get("savedBytes") or 0) for j in rows if j.get("countsAsRealCompression") is True)
+    agg["diagnostic_session_records"] = session_records
+    agg["structured_ignored_field_count"] = int(sum(structured_ignored.values()))
+    agg["structured_ignored_fields"] = dict(structured_ignored)
+    agg["structured_parse_warnings"] = list(structured_errors)
     with open(os.path.join(outdir, "aggregate.json"), "w", encoding="utf-8") as f:
         json.dump(agg, f, indent=2)
 

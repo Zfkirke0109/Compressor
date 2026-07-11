@@ -29,3 +29,7 @@ app/release/baselineProfiles/0/app-release.dm
 
 # Local device-validation captures (large logcat dumps, not source)
 validation/
+
+# Python bytecode from diagnostics scripts/tests
+__pycache__/
+*.pyc
