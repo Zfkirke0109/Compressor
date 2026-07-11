@@ -224,6 +224,35 @@ object BatchQualityBitratePolicy {
         }
     }
 
+    /**
+     * Perceptually Lossless must not manufacture a small bitrate delta by converting an already
+     * more-efficient source codec to a less-efficient output codec. On an S23, for example, AV1
+     * decode is available but hardware AV1 encode is not; Auto resolves to HEVC. Re-encoding that
+     * AV1 source to HEVC for a nominal ~5% saving is a quality regression, not a safe compression.
+     * Unknown codecs also fail closed because their relative efficiency cannot be proven.
+     */
+    fun shouldPreserveSourceCodecForPerceptualLossless(
+        sourceMimeType: String?,
+        outputMimeType: String?
+    ): Boolean {
+        val sourceTier = codecEfficiencyTier(sourceMimeType) ?: return true
+        val outputTier = codecEfficiencyTier(outputMimeType) ?: return true
+        val sameCodec = sourceMimeType.equals(outputMimeType, ignoreCase = true)
+        // An equal-tier codec swap (VP9/Dolby Vision -> HEVC) has no proven efficiency headroom
+        // and may discard codec-specific dynamic-range behavior. Only a strictly more efficient
+        // output codec justifies a Perceptually Lossless re-encode.
+        return !sameCodec && outputTier <= sourceTier
+    }
+
+    private fun codecEfficiencyTier(mimeType: String?): Int? = when (mimeType) {
+        MimeTypes.VIDEO_H264 -> 1
+        MimeTypes.VIDEO_H265,
+        MimeTypes.VIDEO_VP9,
+        MimeTypes.VIDEO_DOLBY_VISION -> 2
+        MimeTypes.VIDEO_AV1 -> 3
+        else -> null
+    }
+
     fun calculateVideoBitrate(
         source: VideoSourceInfo,
         mode: BatchQualityMode,
@@ -371,6 +400,9 @@ object BatchQualityBitratePolicy {
         learnedTargetRatio: Double? = null,
         expectedOvershootFactor: Double = 1.0
     ): Boolean {
+        if (shouldPreserveSourceCodecForPerceptualLossless(source.videoMime, outputMimeType)) {
+            return true
+        }
         if (sourceSizeBytes <= 0L) return false
         val predicted = predictedPerceptualLosslessBytes(
             source,
