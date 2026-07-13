@@ -8,6 +8,12 @@ on:
     paths:
       - 'tools/mt-localizer/**'
       - '.github/workflows/mt-localizer-build.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'tools/mt-localizer/**'
+      - '.github/workflows/mt-localizer-build.yml'
 
 permissions:
   contents: read
