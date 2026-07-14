@@ -7,55 +7,75 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
-import android.graphics.Color;
+import android.graphics.Bitmap;
+import android.graphics.ColorSpace;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
-import android.graphics.drawable.GradientDrawable;
+import android.hardware.HardwareBuffer;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.text.TextUtils;
-import android.util.DisplayMetrics;
-import android.util.TypedValue;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityWindowInfo;
-import android.widget.TextView;
+
+import com.google.mlkit.vision.common.InputImage;
+import com.google.mlkit.vision.text.Text;
+import com.google.mlkit.vision.text.TextRecognition;
+import com.google.mlkit.vision.text.TextRecognizer;
+import com.google.mlkit.vision.text.TextRecognizerOptions;
+import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions;
+import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions;
+import com.google.mlkit.vision.text.korean.KoreanTextRecognizerOptions;
 
 import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 
 public final class MtLocalizerService extends AccessibilityService {
     public static final String ACTION_REFRESH =
             "io.github.zfkirke0109.mtenglishoverlay.REFRESH";
 
     private static final String[] MT_PACKAGES = {"bin.mt.plus", "bin.mt.plus.canary"};
-    private static final int MAX_OVERLAYS = 70;
-    private static final int MAX_UNKNOWN = 500;
+    private static final int MAX_CANDIDATES = 90;
+    private static final long MIN_CAPTURE_INTERVAL_MS = 650L;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
-    private final ArrayList<View> overlayViews = new ArrayList<>();
-    private final Runnable refreshRunnable = this::refreshOverlays;
+    private final Runnable refreshRunnable = this::refreshVisualTranslation;
+    private final LinkedHashMap<String, OverlayItem> translatedItems = new LinkedHashMap<>();
 
     private WindowManager windowManager;
     private SharedPreferences prefs;
+    private BeautifulOverlayView overlayView;
+    private WindowManager.LayoutParams overlayParams;
+    private TranslationEngine translationEngine;
+    private TextRecognizer latinRecognizer;
+    private TextRecognizer chineseRecognizer;
+    private TextRecognizer japaneseRecognizer;
+    private TextRecognizer koreanRecognizer;
+    private boolean overlayAdded;
     private boolean receiverRegistered;
+    private boolean processing;
+    private long lastCaptureAt;
+    private long frameGeneration;
+    private long lastFingerprint;
+    private Bitmap currentBitmap;
 
     private final BroadcastReceiver refreshReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             if (!isEnabledByUser()) {
-                clearOverlays();
+                clearVisuals();
             } else {
-                scheduleRefresh(50L);
+                scheduleRefresh(80L);
             }
         }
     };
@@ -65,6 +85,14 @@ public final class MtLocalizerService extends AccessibilityService {
         super.onServiceConnected();
         windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
         prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+        overlayView = new BeautifulOverlayView(this);
+        translationEngine = new TranslationEngine(this, status -> {
+            if (overlayView != null) overlayView.setStatus(status);
+        });
+        latinRecognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+        chineseRecognizer = TextRecognition.getClient(new ChineseTextRecognizerOptions.Builder().build());
+        japaneseRecognizer = TextRecognition.getClient(new JapaneseTextRecognizerOptions.Builder().build());
+        koreanRecognizer = TextRecognition.getClient(new KoreanTextRecognizerOptions.Builder().build());
 
         AccessibilityServiceInfo info = getServiceInfo();
         info.packageNames = MT_PACKAGES;
@@ -73,7 +101,7 @@ public final class MtLocalizerService extends AccessibilityService {
                 | AccessibilityEvent.TYPE_VIEW_SCROLLED
                 | AccessibilityEvent.TYPE_WINDOWS_CHANGED;
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_VISUAL;
-        info.notificationTimeout = 250L;
+        info.notificationTimeout = 350L;
         info.flags |= AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS
                 | AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
                 | AccessibilityServiceInfo.FLAG_INCLUDE_NOT_IMPORTANT_VIEWS;
@@ -86,33 +114,47 @@ public final class MtLocalizerService extends AccessibilityService {
             registerReceiver(refreshReceiver, filter);
         }
         receiverRegistered = true;
-        scheduleRefresh(300L);
+        scheduleRefresh(500L);
     }
 
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
         if (event == null || !isEnabledByUser()) {
-            if (!isEnabledByUser()) clearOverlays();
+            if (!isEnabledByUser()) clearVisuals();
             return;
         }
         CharSequence packageName = event.getPackageName();
         if (packageName != null && !isTargetPackage(packageName.toString())) return;
 
-        long delay = event.getEventType() == AccessibilityEvent.TYPE_VIEW_SCROLLED
-                ? 120L
-                : 320L;
+        long delay;
+        switch (event.getEventType()) {
+            case AccessibilityEvent.TYPE_VIEW_SCROLLED:
+                delay = 260L;
+                break;
+            case AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED:
+            case AccessibilityEvent.TYPE_WINDOWS_CHANGED:
+                delay = 420L;
+                break;
+            default:
+                delay = 520L;
+        }
         scheduleRefresh(delay);
     }
 
     @Override
     public void onInterrupt() {
-        clearOverlays();
+        clearVisuals();
     }
 
     @Override
     public void onDestroy() {
         handler.removeCallbacksAndMessages(null);
-        clearOverlays();
+        clearVisuals();
+        if (translationEngine != null) translationEngine.close();
+        if (latinRecognizer != null) latinRecognizer.close();
+        if (chineseRecognizer != null) chineseRecognizer.close();
+        if (japaneseRecognizer != null) japaneseRecognizer.close();
+        if (koreanRecognizer != null) koreanRecognizer.close();
         if (receiverRegistered) {
             try {
                 unregisterReceiver(refreshReceiver);
@@ -128,186 +170,383 @@ public final class MtLocalizerService extends AccessibilityService {
         handler.postDelayed(refreshRunnable, delayMs);
     }
 
-    private void refreshOverlays() {
-        clearOverlays();
-        if (!isEnabledByUser() || windowManager == null) return;
-
-        LinkedHashMap<String, Candidate> unique = new LinkedHashMap<>();
-        List<AccessibilityWindowInfo> windows = getWindows();
-        if (windows != null && !windows.isEmpty()) {
-            for (AccessibilityWindowInfo window : windows) {
-                if (window == null) continue;
-                AccessibilityNodeInfo root = window.getRoot();
-                if (root != null) collectCandidates(root, unique, 0);
-                if (unique.size() >= MAX_OVERLAYS) break;
-            }
-        } else {
-            AccessibilityNodeInfo root = getRootInActiveWindow();
-            if (root != null) collectCandidates(root, unique, 0);
+    private void refreshVisualTranslation() {
+        if (!isEnabledByUser() || windowManager == null || processing) return;
+        TargetWindow target = findTargetWindow();
+        if (target == null) {
+            clearVisuals();
+            return;
         }
 
-        for (Candidate candidate : unique.values()) {
-            if (overlayViews.size() >= MAX_OVERLAYS) break;
-            addOverlay(candidate);
+        long elapsed = SystemClock.elapsedRealtime() - lastCaptureAt;
+        if (elapsed < MIN_CAPTURE_INTERVAL_MS) {
+            scheduleRefresh(MIN_CAPTURE_INTERVAL_MS - elapsed);
+            return;
+        }
+
+        ArrayList<Candidate> accessibilityCandidates = collectAccessibilityCandidates(target.root);
+        processing = true;
+        lastCaptureAt = SystemClock.elapsedRealtime();
+        if (overlayView != null) overlayView.setStatus("Reading screen…");
+
+        if (Build.VERSION.SDK_INT >= 34) {
+            takeScreenshotOfWindow(target.windowId, getMainExecutor(),
+                    new AccessibilityService.TakeScreenshotCallback() {
+                        @Override
+                        public void onSuccess(AccessibilityService.ScreenshotResult screenshot) {
+                            handleScreenshot(screenshot, accessibilityCandidates);
+                        }
+
+                        @Override
+                        public void onFailure(int errorCode) {
+                            processing = false;
+                            processCandidates(null, accessibilityCandidates);
+                            if (overlayView != null) overlayView.setStatus(null);
+                        }
+                    });
+        } else if (Build.VERSION.SDK_INT >= 30) {
+            if (overlayView != null) overlayView.setVisibility(View.INVISIBLE);
+            handler.postDelayed(() -> takeScreenshot(Display.DEFAULT_DISPLAY, getMainExecutor(),
+                    new AccessibilityService.TakeScreenshotCallback() {
+                        @Override
+                        public void onSuccess(AccessibilityService.ScreenshotResult screenshot) {
+                            if (overlayView != null) overlayView.setVisibility(View.VISIBLE);
+                            handleScreenshot(screenshot, accessibilityCandidates);
+                        }
+
+                        @Override
+                        public void onFailure(int errorCode) {
+                            if (overlayView != null) overlayView.setVisibility(View.VISIBLE);
+                            processing = false;
+                            processCandidates(null, accessibilityCandidates);
+                            if (overlayView != null) overlayView.setStatus(null);
+                        }
+                    }), 55L);
+        } else {
+            processing = false;
+            processCandidates(null, accessibilityCandidates);
         }
     }
 
-    private void collectCandidates(
+    private void handleScreenshot(
+            AccessibilityService.ScreenshotResult screenshot,
+            ArrayList<Candidate> accessibilityCandidates) {
+        Bitmap bitmap = null;
+        HardwareBuffer buffer = screenshot.getHardwareBuffer();
+        try {
+            ColorSpace colorSpace = screenshot.getColorSpace();
+            if (colorSpace == null) colorSpace = ColorSpace.get(ColorSpace.Named.SRGB);
+            Bitmap hardwareBitmap = Bitmap.wrapHardwareBuffer(buffer, colorSpace);
+            if (hardwareBitmap != null) {
+                bitmap = hardwareBitmap.copy(Bitmap.Config.ARGB_8888, false);
+            }
+        } catch (RuntimeException ignored) {
+        } finally {
+            try {
+                buffer.close();
+            } catch (Exception ignored) {
+            }
+        }
+
+        if (bitmap == null) {
+            processing = false;
+            processCandidates(null, accessibilityCandidates);
+            return;
+        }
+
+        long fingerprint = fingerprint(bitmap);
+        if (fingerprint == lastFingerprint && !translatedItems.isEmpty()) {
+            processing = false;
+            if (overlayView != null) overlayView.setStatus(null);
+            bitmap.recycle();
+            return;
+        }
+        lastFingerprint = fingerprint;
+        recognizeScreenshot(bitmap, accessibilityCandidates);
+    }
+
+    private void recognizeScreenshot(Bitmap bitmap, ArrayList<Candidate> accessibilityCandidates) {
+        InputImage image = InputImage.fromBitmap(bitmap, 0);
+        ArrayList<TextRecognizer> order = recognizerOrder(accessibilityCandidates);
+        runRecognizer(order, 0, image, bitmap, accessibilityCandidates);
+    }
+
+    private void runRecognizer(
+            List<TextRecognizer> recognizers,
+            int index,
+            InputImage image,
+            Bitmap bitmap,
+            ArrayList<Candidate> accessibilityCandidates) {
+        if (index >= recognizers.size()) {
+            processing = false;
+            processCandidates(bitmap, accessibilityCandidates);
+            return;
+        }
+
+        recognizers.get(index).process(image)
+                .addOnSuccessListener(result -> {
+                    ArrayList<Candidate> ocr = candidatesFromText(result);
+                    boolean useful = containsStrongForeignScript(ocr)
+                            || index == recognizers.size() - 1;
+                    if (useful) {
+                        mergeCandidates(accessibilityCandidates, ocr);
+                        processing = false;
+                        processCandidates(bitmap, accessibilityCandidates);
+                    } else {
+                        runRecognizer(recognizers, index + 1, image, bitmap, accessibilityCandidates);
+                    }
+                })
+                .addOnFailureListener(error ->
+                        runRecognizer(recognizers, index + 1, image, bitmap, accessibilityCandidates));
+    }
+
+    private ArrayList<TextRecognizer> recognizerOrder(List<Candidate> candidates) {
+        ArrayList<TextRecognizer> order = new ArrayList<>();
+        String joined = joinSources(candidates);
+        if (joined.matches(".*[\\p{IsHangul}].*")) {
+            order.add(koreanRecognizer);
+            order.add(chineseRecognizer);
+            order.add(japaneseRecognizer);
+        } else if (joined.matches(".*[\\p{IsHiragana}\\p{IsKatakana}].*")) {
+            order.add(japaneseRecognizer);
+            order.add(chineseRecognizer);
+            order.add(koreanRecognizer);
+        } else {
+            order.add(chineseRecognizer);
+            order.add(japaneseRecognizer);
+            order.add(koreanRecognizer);
+        }
+        order.add(latinRecognizer);
+        return order;
+    }
+
+    private void processCandidates(Bitmap bitmap, ArrayList<Candidate> candidates) {
+        long generation = ++frameGeneration;
+        translatedItems.clear();
+        replaceCurrentBitmap(bitmap);
+        ensureOverlay();
+        if (overlayView != null) overlayView.setFrame(currentBitmap, new ArrayList<>());
+
+        if (candidates == null || candidates.isEmpty()) {
+            if (overlayView != null) overlayView.setStatus(null);
+            return;
+        }
+
+        for (Candidate candidate : candidates) {
+            if (candidate == null || !isCandidateText(candidate.source)) continue;
+            translationEngine.translate(candidate.source, (source, english) -> {
+                if (generation != frameGeneration || TextUtils.isEmpty(english)) return;
+                OverlayItem item = new OverlayItem(candidate.bounds, source, english);
+                translatedItems.put(item.key(), item);
+                if (overlayView != null) {
+                    overlayView.setItems(new ArrayList<>(translatedItems.values()));
+                    overlayView.setStatus(null);
+                }
+            });
+        }
+    }
+
+    private ArrayList<Candidate> collectAccessibilityCandidates(AccessibilityNodeInfo root) {
+        LinkedHashMap<String, Candidate> output = new LinkedHashMap<>();
+        if (root != null) collectNode(root, output, 0);
+        return new ArrayList<>(output.values());
+    }
+
+    private void collectNode(
             AccessibilityNodeInfo node,
             Map<String, Candidate> output,
             int depth) {
-        if (node == null || depth > 60 || output.size() >= MAX_OVERLAYS) return;
-
+        if (node == null || depth > 60 || output.size() >= MAX_CANDIDATES) return;
         CharSequence packageName = node.getPackageName();
         if (packageName != null && isTargetPackage(packageName.toString()) && node.isVisibleToUser()) {
             String source = nodeText(node);
             if (isCandidateText(source) && !node.isPassword()) {
                 Rect bounds = new Rect();
                 node.getBoundsInScreen(bounds);
-                if (bounds.width() >= dp(18) && bounds.height() >= dp(12)) {
-                    String english = TranslationMemory.translate(source);
-                    if (english != null && !english.equals(source)) {
-                        String key = bounds.flattenToString() + "|" + source;
-                        output.put(key, new Candidate(bounds, source, english));
-                    } else {
-                        rememberUnknown(source);
-                    }
+                if (bounds.width() >= dp(16) && bounds.height() >= dp(10)) {
+                    Candidate candidate = new Candidate(bounds, source);
+                    output.put(candidate.key(), candidate);
                 }
             }
         }
-
-        int childCount = Math.min(node.getChildCount(), 200);
-        for (int i = 0; i < childCount && output.size() < MAX_OVERLAYS; i++) {
+        int childCount = Math.min(node.getChildCount(), 220);
+        for (int i = 0; i < childCount && output.size() < MAX_CANDIDATES; i++) {
             AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) collectCandidates(child, output, depth + 1);
+            if (child != null) collectNode(child, output, depth + 1);
         }
     }
 
-    private String nodeText(AccessibilityNodeInfo node) {
-        CharSequence text = node.getText();
-        if (text == null || text.toString().trim().isEmpty()) {
-            text = node.getContentDescription();
+    private ArrayList<Candidate> candidatesFromText(Text result) {
+        LinkedHashMap<String, Candidate> output = new LinkedHashMap<>();
+        if (result == null) return new ArrayList<>();
+        for (Text.TextBlock block : result.getTextBlocks()) {
+            for (Text.Line line : block.getLines()) {
+                Rect bounds = line.getBoundingBox();
+                String source = normalize(line.getText());
+                if (bounds == null || !isCandidateText(source)) continue;
+                if (bounds.width() < dp(14) || bounds.height() < dp(9)) continue;
+                Candidate candidate = new Candidate(bounds, source);
+                output.put(candidate.key(), candidate);
+                if (output.size() >= MAX_CANDIDATES) break;
+            }
+            if (output.size() >= MAX_CANDIDATES) break;
         }
-        return text == null ? "" : text.toString().trim();
+        return new ArrayList<>(output.values());
+    }
+
+    private void mergeCandidates(ArrayList<Candidate> base, List<Candidate> added) {
+        if (added == null) return;
+        for (Candidate candidate : added) {
+            if (base.size() >= MAX_CANDIDATES) break;
+            boolean duplicate = false;
+            for (Candidate existing : base) {
+                if (existing.source.equals(candidate.source) && overlapRatio(existing.bounds, candidate.bounds) > 0.55f) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) base.add(candidate);
+        }
+    }
+
+    private boolean containsStrongForeignScript(List<Candidate> candidates) {
+        for (Candidate candidate : candidates) {
+            if (TranslationMemory.containsForeignScript(candidate.source)) return true;
+        }
+        return false;
+    }
+
+    private String joinSources(List<Candidate> candidates) {
+        StringBuilder out = new StringBuilder();
+        if (candidates != null) {
+            for (Candidate candidate : candidates) out.append(candidate.source).append(' ');
+        }
+        return out.toString();
     }
 
     private boolean isCandidateText(String text) {
         if (text == null) return false;
-        String trimmed = text.trim();
-        if (trimmed.isEmpty() || trimmed.length() > 1600) return false;
-        if (!TranslationMemory.containsForeignScript(trimmed)) return false;
-
-        // Preserve code, hashes, file paths, URLs, and package/class identifiers.
+        String trimmed = normalize(text);
+        if (trimmed.isEmpty() || trimmed.length() > 1200) return false;
+        if (!trimmed.matches(".*[\\p{L}].*")) return false;
         if (trimmed.matches("^[A-Fa-f0-9]{16,}$")) return false;
         if (trimmed.startsWith("http://") || trimmed.startsWith("https://")) return false;
-        if (trimmed.matches("^[A-Za-z0-9_.$/:;<>\\[\\]()-]+$")) return false;
+        if (trimmed.matches("^[A-Za-z0-9_.$/:;<>\\[\\](){},=+*#@%-]+$")) return false;
         return true;
     }
 
-    private void addOverlay(Candidate candidate) {
-        Rect bounds = clampToScreen(candidate.bounds);
-        if (bounds.isEmpty()) return;
+    private TargetWindow findTargetWindow() {
+        List<AccessibilityWindowInfo> windows = getWindows();
+        if (windows != null) {
+            for (AccessibilityWindowInfo window : windows) {
+                if (window == null) continue;
+                AccessibilityNodeInfo root = window.getRoot();
+                if (root == null) continue;
+                CharSequence pkg = root.getPackageName();
+                if (pkg != null && isTargetPackage(pkg.toString())) {
+                    return new TargetWindow(window.getId(), root);
+                }
+            }
+        }
+        AccessibilityNodeInfo root = getRootInActiveWindow();
+        if (root != null && root.getPackageName() != null
+                && isTargetPackage(root.getPackageName().toString())) {
+            return new TargetWindow(root.getWindowId(), root);
+        }
+        return null;
+    }
 
-        TextView view = new TextView(this);
-        view.setText(candidate.english);
-        view.setTextColor(Color.WHITE);
-        view.setTextSize(TypedValue.COMPLEX_UNIT_SP, chooseTextSize(bounds));
-        view.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-        view.setPadding(dp(5), dp(2), dp(5), dp(2));
-        view.setIncludeFontPadding(false);
-        view.setMaxLines(Math.max(1, Math.min(12, bounds.height() / Math.max(dp(14), 1))));
-        view.setEllipsize(TextUtils.TruncateAt.END);
-
-        GradientDrawable background = new GradientDrawable();
-        background.setColor(Color.argb(238, 19, 23, 28));
-        background.setCornerRadius(dp(4));
-        background.setStroke(dp(1), Color.argb(220, 73, 146, 255));
-        view.setBackground(background);
-        view.setContentDescription("English translation: " + candidate.english);
-
-        WindowManager.LayoutParams params = new WindowManager.LayoutParams(
-                Math.max(bounds.width(), dp(64)),
-                Math.max(bounds.height(), dp(24)),
+    private void ensureOverlay() {
+        if (overlayAdded || overlayView == null || windowManager == null) return;
+        overlayParams = new WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
                 WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
                         | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN
                         | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
                 PixelFormat.TRANSLUCENT);
-        params.gravity = Gravity.TOP | Gravity.START;
-        params.x = bounds.left;
-        params.y = bounds.top;
-        params.setTitle("MT English: " + candidate.source);
+        overlayParams.gravity = Gravity.TOP | Gravity.START;
+        overlayParams.setTitle("MT English visual replacement");
         if (Build.VERSION.SDK_INT >= 28) {
-            params.layoutInDisplayCutoutMode =
+            overlayParams.layoutInDisplayCutoutMode =
                     WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
         }
-
         try {
-            windowManager.addView(view, params);
-            overlayViews.add(view);
+            windowManager.addView(overlayView, overlayParams);
+            overlayAdded = true;
         } catch (RuntimeException ignored) {
-            // Window may have disappeared between accessibility traversal and overlay creation.
         }
     }
 
-    private Rect clampToScreen(Rect original) {
-        DisplayMetrics metrics = getResources().getDisplayMetrics();
-        Rect out = new Rect(original);
-        out.left = Math.max(0, Math.min(out.left, metrics.widthPixels - 1));
-        out.top = Math.max(0, Math.min(out.top, metrics.heightPixels - 1));
-        out.right = Math.max(out.left + 1, Math.min(out.right, metrics.widthPixels));
-        out.bottom = Math.max(out.top + 1, Math.min(out.bottom, metrics.heightPixels));
-        return out;
-    }
-
-    private float chooseTextSize(Rect bounds) {
-        int heightDp = Math.round(bounds.height() / getResources().getDisplayMetrics().density);
-        if (heightDp <= 24) return 10f;
-        if (heightDp <= 36) return 12f;
-        if (heightDp <= 55) return 14f;
-        return 15f;
-    }
-
-    private void clearOverlays() {
-        if (windowManager == null) {
-            overlayViews.clear();
-            return;
-        }
-        for (View view : overlayViews) {
+    private void clearVisuals() {
+        frameGeneration++;
+        translatedItems.clear();
+        if (overlayAdded && windowManager != null && overlayView != null) {
             try {
-                windowManager.removeViewImmediate(view);
+                windowManager.removeViewImmediate(overlayView);
             } catch (RuntimeException ignored) {
             }
         }
-        overlayViews.clear();
+        overlayAdded = false;
+        recycleCurrentBitmap();
     }
 
-    private void rememberUnknown(String source) {
-        if (prefs == null || source == null) return;
-        String normalized = source.replaceAll("[\\t\\r\\n]+", " ")
+    private void replaceCurrentBitmap(Bitmap bitmap) {
+        Bitmap old = currentBitmap;
+        currentBitmap = bitmap;
+        if (old != null && old != bitmap && !old.isRecycled()) old.recycle();
+    }
+
+    private void recycleCurrentBitmap() {
+        if (currentBitmap != null && !currentBitmap.isRecycled()) currentBitmap.recycle();
+        currentBitmap = null;
+    }
+
+    private String nodeText(AccessibilityNodeInfo node) {
+        CharSequence text = node.getText();
+        if (text == null || text.toString().trim().isEmpty()) text = node.getContentDescription();
+        return text == null ? "" : normalize(text.toString());
+    }
+
+    private long fingerprint(Bitmap bitmap) {
+        if (bitmap == null || bitmap.isRecycled()) return 0L;
+        long hash = 1125899906842597L;
+        int cols = 13;
+        int rows = 23;
+        for (int y = 0; y < rows; y++) {
+            int py = Math.min(bitmap.getHeight() - 1, (y * bitmap.getHeight()) / rows);
+            for (int x = 0; x < cols; x++) {
+                int px = Math.min(bitmap.getWidth() - 1, (x * bitmap.getWidth()) / cols);
+                hash = 31L * hash + bitmap.getPixel(px, py);
+            }
+        }
+        return hash;
+    }
+
+    private float overlapRatio(Rect a, Rect b) {
+        Rect intersection = new Rect();
+        if (!intersection.setIntersect(a, b)) return 0f;
+        float smaller = Math.max(1f, Math.min(a.width() * a.height(), b.width() * b.height()));
+        return (intersection.width() * intersection.height()) / smaller;
+    }
+
+    private String normalize(String text) {
+        return text == null ? "" : text.replace('\u00A0', ' ')
+                .replaceAll("[\\t\\r\\n]+", " ")
                 .replaceAll("\\s{2,}", " ")
                 .trim();
-        if (normalized.length() < 2 || normalized.length() > 500) return;
-
-        Set<String> existing = prefs.getStringSet(MainActivity.PREF_UNKNOWN, Collections.emptySet());
-        HashSet<String> copy = new HashSet<>(existing);
-        if (copy.size() >= MAX_UNKNOWN || !copy.add(normalized)) return;
-        prefs.edit().putStringSet(MainActivity.PREF_UNKNOWN, copy).apply();
     }
 
     private boolean isEnabledByUser() {
-        if (prefs == null) {
-            prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
-        }
+        if (prefs == null) prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
         return prefs.getBoolean(MainActivity.PREF_ENABLED, true);
     }
 
     private boolean isTargetPackage(String packageName) {
         if (packageName == null) return false;
-        for (String target : MT_PACKAGES) {
-            if (target.equals(packageName)) return true;
-        }
+        for (String target : MT_PACKAGES) if (target.equals(packageName)) return true;
         return false;
     }
 
@@ -315,15 +554,27 @@ public final class MtLocalizerService extends AccessibilityService {
         return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
+    private static final class TargetWindow {
+        final int windowId;
+        final AccessibilityNodeInfo root;
+
+        TargetWindow(int windowId, AccessibilityNodeInfo root) {
+            this.windowId = windowId;
+            this.root = root;
+        }
+    }
+
     private static final class Candidate {
         final Rect bounds;
         final String source;
-        final String english;
 
-        Candidate(Rect bounds, String source, String english) {
+        Candidate(Rect bounds, String source) {
             this.bounds = new Rect(bounds);
             this.source = source;
-            this.english = english;
+        }
+
+        String key() {
+            return bounds.flattenToString() + "|" + source.toLowerCase(Locale.ROOT);
         }
     }
 }
