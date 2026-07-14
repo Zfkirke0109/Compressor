@@ -7,7 +7,7 @@ android {
     compileSdk 35
 
     defaultConfig {
-        applicationId 'io.github.zfkirke0109.mtenglishoverlay'
+        applicationId 'io.github.zfkirke0109.mtenglishvision'
         minSdk 26
         targetSdk 35
         versionCode 2
