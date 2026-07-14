@@ -4,8 +4,9 @@
     android:accessibilityFeedbackType="feedbackVisual"
     android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
     android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
     android:description="@string/service_description"
     android:isAccessibilityTool="true"
-    android:notificationTimeout="250"
+    android:notificationTimeout="350"
     android:packageNames="bin.mt.plus,bin.mt.plus.canary"
     android:settingsActivity="io.github.zfkirke0109.mtenglishoverlay.MainActivity" />
