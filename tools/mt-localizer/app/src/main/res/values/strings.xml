@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">MT English Overlay</string>
-    <string name="service_name">MT English Overlay Service</string>
-    <string name="service_description">Shows deterministic English overlays for non-English text exposed by MT Manager. No cloud AI is used.</string>
+    <string name="app_name">MT English Vision</string>
+    <string name="service_name">MT English Vision Service</string>
+    <string name="service_description">Translates MT Manager with on-device OCR, language detection, and seamless English visual replacement.</string>
 </resources>
