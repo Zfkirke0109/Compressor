@@ -20,7 +20,8 @@ class BatchTerminalClassifierTest {
         hardFailure: Boolean = false,
         nearOptimal: Boolean = false,
         unsupported: Boolean = false,
-        encoderFailed: Boolean = false
+        encoderFailed: Boolean = false,
+        evidencePreferred: Boolean = false
     ) = BatchTerminalInput(
         requestedMode = requested,
         effectiveMode = effective,
@@ -34,7 +35,8 @@ class BatchTerminalClassifierTest {
         hardFailure = hardFailure,
         preEncodeSourceAlreadyEfficient = nearOptimal,
         unsupportedContainer = unsupported,
-        encoderFailed = encoderFailed
+        encoderFailed = encoderFailed,
+        preEncodeEvidencePreferredRemux = evidencePreferred
     )
 
     @Test
@@ -66,6 +68,54 @@ class BatchTerminalClassifierTest {
         assertTrue(explicit.allowsOriginalReplacement)
         assertFalse(nearOptimal.allowsOriginalReplacement)
         assertFalse(fallback.allowsOriginalReplacement)
+    }
+
+    @Test
+    fun evidenceLatchedRemuxIsExpectedNotUnexpected() {
+        // The learning engine's measured remux-preference latch (repeated near-max-ratio
+        // failures) stream-copies up-front. That is an EXPECTED, evidence-driven outcome:
+        // batch_20260715_103237 measured 28 such items mislabeled UNEXPECTED_REMUX.
+        val latched = BatchTerminalClassifier.classify(
+            input(streamCopy = true, verified = true, effective = BatchQualityMode.REMUX_ONLY, evidencePreferred = true)
+        )
+        assertEquals(BatchTerminalResult.REMUX_PREFERRED_BY_EVIDENCE, latched)
+        assertFalse(latched.countsAsRealCompression)
+        assertFalse(latched.isFailure)
+
+        // Without the flag the same shape remains a verification-driven UNEXPECTED_REMUX.
+        val unflagged = BatchTerminalClassifier.classify(
+            input(streamCopy = true, verified = true, effective = BatchQualityMode.REMUX_ONLY)
+        )
+        assertEquals(BatchTerminalResult.UNEXPECTED_REMUX, unflagged)
+
+        // Precedence: an explicit Remux Only request stays EXPLICIT_REMUX; encoder failure
+        // stays UNEXPECTED_REMUX; source-efficiency inference outranks the latch flag.
+        assertEquals(
+            BatchTerminalResult.EXPLICIT_REMUX,
+            BatchTerminalClassifier.classify(
+                input(requested = BatchQualityMode.REMUX_ONLY, effective = BatchQualityMode.REMUX_ONLY, streamCopy = true, evidencePreferred = true)
+            )
+        )
+        assertEquals(
+            BatchTerminalResult.UNEXPECTED_REMUX,
+            BatchTerminalClassifier.classify(
+                input(streamCopy = true, verified = true, effective = BatchQualityMode.REMUX_ONLY, encoderFailed = true, evidencePreferred = true)
+            )
+        )
+        assertEquals(
+            BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED,
+            BatchTerminalClassifier.classify(
+                input(streamCopy = true, verified = true, effective = BatchQualityMode.REMUX_ONLY, nearOptimal = true, evidencePreferred = true)
+            )
+        )
+
+        // An UNVERIFIED evidence-latched copy must still fail closed, never look friendly.
+        assertEquals(
+            BatchTerminalResult.OUTPUT_VALIDATION_FAILED,
+            BatchTerminalClassifier.classify(
+                input(streamCopy = true, verified = false, replacementSafe = false, effective = BatchQualityMode.REMUX_ONLY, evidencePreferred = true)
+            )
+        )
     }
 
     @Test

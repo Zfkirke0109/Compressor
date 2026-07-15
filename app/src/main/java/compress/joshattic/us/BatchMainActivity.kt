@@ -756,6 +756,7 @@ private fun BatchVideoItem.shortStatusLabel(): String {
             BatchTerminalResult.LOSSY_SMALLER -> "Compressed"
             BatchTerminalResult.TRANSCODED_NOT_MEANINGFULLY_SMALLER -> "No size win"
             BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED -> "Already efficient"
+            BatchTerminalResult.REMUX_PREFERRED_BY_EVIDENCE -> "Kept (measured)"
             BatchTerminalResult.EXPLICIT_REMUX -> "Remuxed"
             BatchTerminalResult.UNEXPECTED_REMUX -> "Original kept"
             BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED -> "Skipped"

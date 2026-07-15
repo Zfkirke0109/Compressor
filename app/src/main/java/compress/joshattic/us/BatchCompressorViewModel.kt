@@ -221,6 +221,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val preferRemux: Boolean,
         val remuxReason: String?,
         val remuxWasSourceEfficient: Boolean,
+        // True when the remux preference came from the learning engine's measured latch
+        // (repeated near-max-ratio failures for this profile) rather than a source-efficiency
+        // inference — classified as REMUX_PREFERRED_BY_EVIDENCE, never UNEXPECTED_REMUX.
+        val remuxWasEvidencePreferred: Boolean = false,
         // Tier-1 experimental encoder-ceiling diagnostics (debug builds only): request CBR so the
         // QTI encoder cannot apply its VBR quality-boost overshoot. Judged by OutputVerifier only.
         val useCbrCeiling: Boolean = false,
@@ -628,6 +632,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     var diagnosticTargetVideoBitrate: Int? = null
                     var diagnosticDecisionReason: String? = null
                     var diagnosticSourceAlreadyEfficient = false
+                    var diagnosticEvidencePreferredRemux = false
                     var diagnosticEncoderFailed = false
                     // When a PL encode is attempted then discarded for a remux, preserve WHY (and the
                     // discarded encode's measured video bitrate) so the structured record stays honest
@@ -689,6 +694,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         )
                     }
                     diagnosticSourceAlreadyEfficient = perceptualPlan?.remuxWasSourceEfficient == true
+                    diagnosticEvidencePreferredRemux = perceptualPlan?.remuxWasEvidencePreferred == true
                     if (perceptualPlan?.skipReason != null) {
                         // Positive pixel evidence says compression would visibly degrade this
                         // clip: leave the original untouched and write nothing.
@@ -1046,6 +1052,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             sourceSize = item.originalSize,
                             outputSize = outputSize,
                             preEncodeSourceAlreadyEfficient = diagnosticSourceAlreadyEfficient,
+                            preEncodeEvidencePreferredRemux = diagnosticEvidencePreferredRemux,
                             encoderFailed = diagnosticEncoderFailed
                         )
                     )
@@ -1680,6 +1687,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             preferRemux = remuxReason != null,
             remuxReason = remuxReason,
             remuxWasSourceEfficient = (preserveSourceCodec || nearOptimal) && !profilePrefersRemux,
+            remuxWasEvidencePreferred = profilePrefersRemux,
             useCbrCeiling = useCbrCeiling,
             expectedOvershootFactor = expectedOvershootFactor,
             probeEligible = probeEligible,
@@ -1795,6 +1803,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             preferRemux = false,
             remuxReason = null,
             remuxWasSourceEfficient = false,
+            remuxWasEvidencePreferred = false,
             pixelProvenRatio = proven
         )
     }

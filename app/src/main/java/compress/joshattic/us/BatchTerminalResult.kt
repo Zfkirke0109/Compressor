@@ -39,6 +39,16 @@ enum class BatchTerminalResult(
     /** Source was already efficient for its resolution/codec; kept the exact stream copy. */
     ALREADY_HIGHLY_OPTIMIZED("Already efficient — kept original bytes", countsAsRealCompression = false),
 
+    /**
+     * The learning engine's measured evidence latched this device profile as remux-preferred
+     * (repeated verification/certification failures near the maximum safe ratio), so the exact
+     * stream copy was kept up-front. This is an EXPECTED, evidence-driven remux — distinct from
+     * [ALREADY_HIGHLY_OPTIMIZED] (a claim about the source) and from [UNEXPECTED_REMUX] (an
+     * encode that ran and could not be verified). Batch batch_20260715_103237 measured 28 such
+     * items misclassified as UNEXPECTED_REMUX before this terminal existed.
+     */
+    REMUX_PREFERRED_BY_EVIDENCE("Kept original — measured evidence prefers stream copy", countsAsRealCompression = false),
+
     /** User explicitly chose Remux Only: container repackage, never claimed as compression. */
     EXPLICIT_REMUX(
         "Remuxed (container only, not compressed)",
@@ -94,6 +104,12 @@ data class BatchTerminalInput(
     val hardFailure: Boolean = false,
     /** Set when a remux was chosen up-front because the source was already efficiently encoded. */
     val preEncodeSourceAlreadyEfficient: Boolean = false,
+    /**
+     * Set when a remux was chosen up-front by the learning engine's measured remux-preference
+     * latch (repeated near-max-ratio verification failures for this device profile) — an
+     * expected evidence-driven remux, never an unexpected fallback.
+     */
+    val preEncodeEvidencePreferredRemux: Boolean = false,
     /** Set when a remux/transcode failed because the container/codec is unsupported. */
     val unsupportedContainer: Boolean = false,
     /** Set when an encoder configuration/runtime error forced a fallback. */
@@ -149,6 +165,9 @@ object BatchTerminalClassifier {
             input.encoderFailed -> BatchTerminalResult.UNEXPECTED_REMUX
             input.requestedMode == BatchQualityMode.REMUX_ONLY -> BatchTerminalResult.EXPLICIT_REMUX
             input.preEncodeSourceAlreadyEfficient -> BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED
+            // The learning latch chose this stream copy up-front from measured class evidence:
+            // an expected outcome, not a verification-driven surprise.
+            input.preEncodeEvidencePreferredRemux -> BatchTerminalResult.REMUX_PREFERRED_BY_EVIDENCE
             // PL requested but ended as a stream copy without a clear near-optimal/encoder reason:
             // a verification-driven fallback.
             input.requestedMode == BatchQualityMode.PERCEPTUAL_LOSSLESS -> BatchTerminalResult.UNEXPECTED_REMUX
