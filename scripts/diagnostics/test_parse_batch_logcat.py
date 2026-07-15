@@ -243,6 +243,10 @@ class ParseBatchLogcatTest(unittest.TestCase):
                 probedRatios="0.70,0.80,0.90,0.95",
                 pixelProvenRatio=0.80,
                 probeDetail="windows passed at 0.80",
+                probeWindowScores="96.2/92.0/85.1;97.0/93.4/88.8",
+                certWindowScores="95.9/91.5/84.6;96.7/92.8/87.1",
+                thermalStart="nominal",
+                thermalEnd="light",
             ),
             self._v2("bf", "session_summary", 2, "evt_" + "c" * 16, processed=1),
         ]
@@ -261,6 +265,10 @@ class ParseBatchLogcatTest(unittest.TestCase):
         self.assertEqual("0.70,0.80,0.90,0.95", jobs[0]["probedRatios"])
         self.assertEqual(0.80, jobs[0]["pixelProvenRatio"])
         self.assertEqual("windows passed at 0.80", jobs[0]["probeDetail"])
+        self.assertEqual("96.2/92.0/85.1;97.0/93.4/88.8", jobs[0]["probeWindowScores"])
+        self.assertEqual("95.9/91.5/84.6;96.7/92.8/87.1", jobs[0]["certWindowScores"])
+        self.assertEqual("nominal", jobs[0]["thermalStart"])
+        self.assertEqual("light", jobs[0]["thermalEnd"])
         self.assertEqual(0, agg["structured_ignored_field_count"])
 
     def test_v2_happy_path_reports_profile_sequence_and_events(self):

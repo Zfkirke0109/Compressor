@@ -133,6 +133,13 @@ class DiagnosticsRecorder private constructor(
         probedRatios: String? = null,
         pixelProvenRatio: Double? = null,
         probeDetail: String? = null,
+        // Raw evidence behind the probe/certification decisions ("mean/p5/min;…" per window)
+        // and the job's thermal bracket — enough to recalibrate window thresholds and correlate
+        // throughput vs thermal state from a privacy-mode capture alone.
+        probeWindowScores: String? = null,
+        certWindowScores: String? = null,
+        thermalStart: String? = null,
+        thermalEnd: String? = null,
         discardedVideoBitrate: Int? = null
     ) {
         val accountingEntry = BatchTerminalAccountingEntry(terminal, sourceSize, outputSize)
@@ -175,6 +182,10 @@ class DiagnosticsRecorder private constructor(
                 "probedRatios" to probedRatios,
                 "pixelProvenRatio" to pixelProvenRatio,
                 "probeDetail" to probeDetail,
+                "probeWindowScores" to probeWindowScores,
+                "certWindowScores" to certWindowScores,
+                "thermalStart" to thermalStart,
+                "thermalEnd" to thermalEnd,
                 "outputSize" to outputSize,
                 "rawByteDelta" to rawByteDelta,
                 "savedBytes" to savedBytes,

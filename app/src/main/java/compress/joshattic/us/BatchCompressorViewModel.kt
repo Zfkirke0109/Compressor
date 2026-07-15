@@ -59,7 +59,12 @@ import kotlin.coroutines.resumeWithException
 // Encoder-undershoot tolerance applied to a pixel-proven ratio before it becomes the
 // verification bitrate floor: field capture batch_20260714_150649 measured deliveries as low
 // as ~0.94x of the request on this device class for near-floor targets.
-private const val PIXEL_PROVEN_UNDERSHOOT_TOLERANCE = 0.06
+// Measured on batch_20260715_084112 (n=11 discarded encodes): the QTI HEVC VBR encoder delivered
+// 0.86-0.93x of the requested bitrate (mean 0.887, sigma 0.019) on easy/high-bpp content — quality
+// saturation, not degradation. The old 0.06 tolerance sat INSIDE that range and discarded all 11
+// structurally-perfect encodes (7.8 wasted minutes). 0.15 covers the measured worst case with
+// margin; sampled pixel certification remains the real quality gate for every pixel-proven encode.
+private const val PIXEL_PROVEN_UNDERSHOOT_TOLERANCE = 0.15
 
 private enum class BatchQualityPreset(val label: String, val targetRatio: Float) {
     REMUX_ONLY("Remux Only", 1.0f),
@@ -239,7 +244,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // order) and the prober's decision detail. Answers "was a trial performed and what
         // exactly did it measure" without needing unstructured logcat tags.
         val probedRatios: List<Double> = emptyList(),
-        val probeDetail: String? = null
+        val probeDetail: String? = null,
+        // Compact per-window "mean/p5/min" scores of the last measured rung (pass or fail):
+        // the raw numbers behind the probe decision, for threshold calibration from captures.
+        val probeWindowScores: String? = null
     )
 
     private data class EncodeAttemptResult(
@@ -626,6 +634,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // even after verification is re-run on the remux.
                     var diagnosticFallbackReason: String? = null
                     var diagnosticDiscardedVideoBitrate: Int? = null
+                    // Compact per-window scores of the final output's sampled certification —
+                    // recorded pass OR fail so captures carry the real numbers behind verdicts.
+                    var diagnosticCertWindowScores: String? = null
                     val candidateFiles = linkedSetOf<File>()
                     var itemOutputAccepted = false
                     updateItem(index) {
@@ -697,7 +708,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             elapsedMs = System.currentTimeMillis() - itemStartedAt,
                             probedRatios = perceptualPlan.probedRatios,
                             pixelProvenRatio = perceptualPlan.pixelProvenRatio,
-                            probeDetail = perceptualPlan.probeDetail
+                            probeDetail = perceptualPlan.probeDetail,
+                            probeWindowScores = perceptualPlan.probeWindowScores
                         )
                         updateItem(index) {
                             it.copy(
@@ -833,6 +845,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             it.copy(message = "Certifying pixels: encoder undershot the bitrate floor, checking real quality…")
                         }
                         val recoveryScores = qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+                        diagnosticCertWindowScores = compactWindowScores(recoveryScores)
                         if (QualityProbePolicy.windowsPass(recoveryScores)) {
                             floorRecoveryCertScores = recoveryScores
                             val certifiedVideoBitrate = encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
@@ -876,6 +889,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         }
                         val certScores = floorRecoveryCertScores
                             ?: qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+                        diagnosticCertWindowScores = compactWindowScores(certScores)
                         val certOk = QualityProbePolicy.certificationPasses(
                             usedRatio = perceptualPlan.targetRatio,
                             defaultRatio = perceptualPlan.defaultRatio,
@@ -926,7 +940,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 discardedVideoBitrate = diagnosticDiscardedVideoBitrate,
                                 probedRatios = perceptualPlan.probedRatios,
                                 pixelProvenRatio = perceptualPlan.pixelProvenRatio,
-                                probeDetail = perceptualPlan.probeDetail
+                                probeDetail = perceptualPlan.probeDetail,
+                                probeWindowScores = perceptualPlan.probeWindowScores,
+                                certWindowScores = diagnosticCertWindowScores
                             )
                             updateItem(index) {
                                 it.copy(
@@ -1066,7 +1082,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         discardedVideoBitrate = diagnosticDiscardedVideoBitrate,
                         probedRatios = perceptualPlan?.probedRatios ?: emptyList(),
                         pixelProvenRatio = perceptualPlan?.pixelProvenRatio,
-                        probeDetail = perceptualPlan?.probeDetail
+                        probeDetail = perceptualPlan?.probeDetail,
+                        probeWindowScores = perceptualPlan?.probeWindowScores,
+                        certWindowScores = diagnosticCertWindowScores,
+                        thermalStart = metrics.thermalStart,
+                        thermalEnd = metrics.thermalEnd
                     )
 
                     if (terminal.isFailure) {
@@ -1691,6 +1711,25 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val bpp = BatchQualityBitratePolicy.sourceBitsPerPixelPerFrame(source)
         val candidates = QualityProbePolicy.candidateRatiosForSource(plan.defaultRatio, bpp)
         if (candidates.isEmpty()) return plan
+        // Decaying probe-skip latch: after repeated MEASURED safest-rung rejections for this
+        // profile class, a few ladders are skipped to save probe encodes/battery — then the
+        // next encounter re-probes so fresh pixels (never stale class history) keep the final
+        // say. The skip is recorded in the structured trace so captures can tell "skipped by
+        // recent measured evidence" apart from "never tried".
+        if (learningEngine.shouldSkipProbes(plan.profileKey)) {
+            val latched = learningEngine.noteProbeSkipped(plan.profileKey)
+            Log.i(
+                "CompressorProbe",
+                "probe skip; job=${diagnosticJobId(item)}; profile measured-rejected " +
+                    "${latched.consecutiveMeasuredProbeRejections}x consecutively; " +
+                    "skip ${latched.probeSkipsSinceLastProbe}/${SmartPerceptualProfileEngine.PROBE_SKIPS_BETWEEN_REPROBES} before forced re-probe"
+            )
+            return plan.copy(
+                probeDetail = "probes skipped: this profile class measured visible loss at every " +
+                    "candidate in ${latched.consecutiveMeasuredProbeRejections} consecutive recent ladders " +
+                    "(skip ${latched.probeSkipsSinceLastProbe}/${SmartPerceptualProfileEngine.PROBE_SKIPS_BETWEEN_REPROBES}, then re-probes)"
+            )
+        }
         val decision = qualityProber.runLadder(
             sourceUri = item.sourceUri,
             durationMs = item.durationMs,
@@ -1712,13 +1751,18 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             "probe result; job=${diagnosticJobId(item)}; probed=${decision.probedRatios}; " +
                 "proven=${decision.provenRatio ?: "none"}; detail=${decision.detail}"
         )
-        val probeTrace = plan.copy(probedRatios = decision.probedRatios, probeDetail = decision.detail)
+        val probeTrace = plan.copy(
+            probedRatios = decision.probedRatios,
+            probeDetail = decision.detail,
+            probeWindowScores = compactWindowScores(decision.windowScores)
+        )
         val proven = decision.provenRatio ?: run {
             // Measured rejection at the SAFEST candidate ratio is positive pixel evidence
             // that no allowed target can encode this clip transparently: skip the item
             // entirely (original untouched, no stream copy). Unmeasurable probes change
             // nothing — the conservative inference decision stands, honestly labeled.
             return if (decision.highestCandidateMeasuredRejected) {
+                learningEngine.recordMeasuredProbeRejection(plan.profileKey)
                 probeTrace.copy(
                     preferRemux = true,
                     skipReason = "On-device VMAF measured visible quality loss at every " +
@@ -1729,6 +1773,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 probeTrace
             }
         }
+        // A pixel-proven rung clears the probe-skip latch: fresh evidence supersedes history.
+        learningEngine.recordProbePass(plan.profileKey)
         // A proven ratio must still clear file-size measurement noise before overturning a
         // remux decision — a NOISE threshold, not a worthiness bar: verified 1-2% savings count.
         val predicted = BatchQualityBitratePolicy.predictedPerceptualLosslessBytes(
@@ -2137,7 +2183,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // happened and exactly what it measured, file by file.
         probedRatios: List<Double> = emptyList(),
         pixelProvenRatio: Double? = null,
-        probeDetail: String? = null
+        probeDetail: String? = null,
+        // Raw VMAF window scores ("mean/p5/min;…") from the probe ladder and the final-output
+        // certification, plus the thermal state bracket of the whole job — the fields needed to
+        // calibrate window thresholds and correlate throughput vs throttling from captures alone.
+        probeWindowScores: String? = null,
+        certWindowScores: String? = null,
+        thermalStart: String? = null,
+        thermalEnd: String? = null
     ) {
         diagnostics.job(
             // The recorder hashes both values before emission; raw URI/name never leave this call.
@@ -2173,12 +2226,22 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probedRatios = probedRatios.takeIf { it.isNotEmpty() }
                 ?.joinToString(",") { "%.2f".format(it) },
             pixelProvenRatio = pixelProvenRatio,
-            probeDetail = probeDetail
+            probeDetail = probeDetail,
+            probeWindowScores = probeWindowScores,
+            certWindowScores = certWindowScores,
+            thermalStart = thermalStart,
+            thermalEnd = thermalEnd
         )
     }
 
     private fun diagnosticJobId(item: BatchVideoItem): String =
         DiagnosticsRecorder.redactedJobId(item.sourceUri.toString())
+
+    // Compact "mean/p5/min" per window, ";"-joined — the capture-friendly form of VMAF window
+    // scores (e.g. "96.2/92.0/85.1;97.0/93.4/88.8"). Null when nothing was measured.
+    private fun compactWindowScores(scores: List<WindowScore>?): String? =
+        scores?.takeIf { it.isNotEmpty() }
+            ?.joinToString(";") { "%.1f/%.1f/%.1f".format(it.mean, it.p5, it.min) }
 
     private fun completionMessage(
         item: BatchVideoItem,

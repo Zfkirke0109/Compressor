@@ -25,6 +25,9 @@ import kotlin.coroutines.resumeWithException
 data class ProbeDecision(
     val provenRatio: Double?,
     val probedRatios: List<Double>,
+    // Window scores of the last MEASURED rung: the proven rung's scores on a pass, or the last
+    // measured (failing) rung's scores on a rejection — so captures carry the real numbers that
+    // justified the decision either way. Null only when nothing could be measured.
     val windowScores: List<WindowScore>?,
     val detail: String,
     // True when the HIGHEST candidate ratio (the codec default) was measured — not merely
@@ -75,12 +78,14 @@ class PerceptualQualityProber(private val context: Context) {
         val highestCandidate = candidateRatios.maxOrNull()
         var highestMeasuredRejected = false
         var highestFailedBelow: Double? = null
+        var lastMeasuredScores: List<WindowScore>? = null
         for (ratio in candidateRatios) {
             if (System.currentTimeMillis() - startedAt > TOTAL_BUDGET_MS) {
-                return ProbeDecision(null, probed, null, "probe budget exhausted", highestMeasuredRejected)
+                return ProbeDecision(null, probed, lastMeasuredScores, "probe budget exhausted", highestMeasuredRejected)
             }
             probed += ratio
             val scores = probeOneRatio(sourceUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows)
+            if (!scores.isNullOrEmpty()) lastMeasuredScores = scores
             if (QualityProbePolicy.windowsPass(scores)) {
                 Log.i(TAG, "ratio %.2f pixel-proven over ${windows.size} windows".format(ratio))
                 // One bounded bisection between this pass and the measured failure below it:
@@ -110,7 +115,7 @@ class PerceptualQualityProber(private val context: Context) {
             }
             Log.i(TAG, "ratio %.2f rejected by probe windows (measured=${!scores.isNullOrEmpty()})".format(ratio))
         }
-        return ProbeDecision(null, probed, null, "no candidate ratio passed", highestMeasuredRejected)
+        return ProbeDecision(null, probed, lastMeasuredScores, "no candidate ratio passed", highestMeasuredRejected)
     }
 
     /** Scores one candidate ratio across all windows; null = evidence unavailable/failed. */

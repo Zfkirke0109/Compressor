@@ -233,6 +233,71 @@ class SmartPerceptualProfileEngineTest {
     }
 
     @Test
+    fun probeSkipLatchIsDecayingAndEvidenceOnly() {
+        val e = engine()
+
+        // Fresh profile: never skip (no measured evidence).
+        assertFalse(e.shouldSkipProbes(key()))
+
+        // One measured rejection is not enough.
+        e.recordMeasuredProbeRejection(key())
+        assertFalse(e.shouldSkipProbes(key()))
+
+        // Two consecutive measured rejections arm the latch.
+        e.recordMeasuredProbeRejection(key())
+        assertTrue(e.shouldSkipProbes(key()))
+
+        // The skip budget is bounded: after PROBE_SKIPS_BETWEEN_REPROBES skips the next
+        // encounter MUST re-probe — the latch is never permanent.
+        repeat(SmartPerceptualProfileEngine.PROBE_SKIPS_BETWEEN_REPROBES) {
+            assertTrue(e.shouldSkipProbes(key()))
+            e.noteProbeSkipped(key())
+        }
+        assertFalse(e.shouldSkipProbes(key()))
+
+        // A renewed measured rejection restarts the skip cycle...
+        e.recordMeasuredProbeRejection(key())
+        assertTrue(e.shouldSkipProbes(key()))
+
+        // ...and a probe pass clears the latch entirely.
+        e.recordProbePass(key())
+        assertFalse(e.shouldSkipProbes(key()))
+
+        // A verified full encode also clears it.
+        e.recordMeasuredProbeRejection(key())
+        e.recordMeasuredProbeRejection(key())
+        assertTrue(e.shouldSkipProbes(key()))
+        e.recordVerifiedSuccess(key(), 0.95, 0.9, floorRatio = 0.80)
+        assertFalse(e.shouldSkipProbes(key()))
+    }
+
+    @Test
+    fun probeSkipLatchSurvivesRoundTripAndResistsTampering() {
+        // Encode/decode round-trips the latch fields.
+        val original = SmartPerceptualProfileEngine.LearnedEncodeProfile(
+            consecutiveMeasuredProbeRejections = 2,
+            probeSkipsSinceLastProbe = 1
+        )
+        assertEquals(original, SmartPerceptualProfileEngine.LearnedEncodeProfile.decode(original.encode()))
+
+        // Pre-latch stored profiles (missing fields) default to no-skip.
+        val legacy = SmartPerceptualProfileEngine.LearnedEncodeProfile.decode(
+            "success=1;failure=0;highFail=0;nextRatio=0.95;preferRemux=false;lastReason=;lastSizeRatio="
+        )
+        assertEquals(0, legacy!!.consecutiveMeasuredProbeRejections)
+        assertEquals(0, legacy.probeSkipsSinceLastProbe)
+
+        // Corrupt/hostile negative values clamp to 0 — a tampered store cannot manufacture skips.
+        val store = SmartPerceptualProfileEngine.InMemoryProfileStore()
+        store.write(
+            key().asKey(),
+            "success=0;failure=0;highFail=0;nextRatio=;preferRemux=false;lastReason=;lastSizeRatio=;probeRejects=-5;probeSkips=-9"
+        )
+        val tampered = SmartPerceptualProfileEngine(store)
+        assertFalse(tampered.shouldSkipProbes(key()))
+    }
+
+    @Test
     fun learningCannotBypassVerificationDecisions() {
         // The engine only produces a target ratio; feeding that ratio into the policy still
         // clamps to the safety floor, and OutputVerifier remains the only source of "verified".

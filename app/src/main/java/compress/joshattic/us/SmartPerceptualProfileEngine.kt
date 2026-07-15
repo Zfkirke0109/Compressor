@@ -92,7 +92,14 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         // Measured encoder overshoot (actual video bitrate / requested video bitrate) for this
         // profile, e.g. the S23 Ultra HEVC VBR path measured ~1.25 on 4K60 HDR. Used only to make
         // pre-encode size prediction honest; never to relax verification.
-        val measuredOvershootFactor: Double? = null
+        val measuredOvershootFactor: Double? = null,
+        // Decaying probe-skip latch. consecutiveMeasuredProbeRejections counts probe ladders whose
+        // SAFEST candidate was MEASURED (not merely unmeasurable) and rejected by the VMAF windows.
+        // probeSkipsSinceLastProbe counts ladders skipped under the latch since the last real probe.
+        // Together they implement "skip a few, then re-probe": measured class evidence may save
+        // probe encodes for a while, but never permanently denies a clip its trial.
+        val consecutiveMeasuredProbeRejections: Int = 0,
+        val probeSkipsSinceLastProbe: Int = 0
     ) {
         fun encode(): String = listOf(
             "success=$successCount",
@@ -102,7 +109,9 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             "preferRemux=$preferRemux",
             "lastReason=${lastFailureReason.orEmpty().replace(";", ",")}",
             "lastSizeRatio=${lastOutputToSourceRatio ?: ""}",
-            "overshoot=${measuredOvershootFactor ?: ""}"
+            "overshoot=${measuredOvershootFactor ?: ""}",
+            "probeRejects=$consecutiveMeasuredProbeRejections",
+            "probeSkips=$probeSkipsSinceLastProbe"
         ).joinToString(";")
 
         companion object {
@@ -121,7 +130,13 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
                         preferRemux = fields["preferRemux"]?.toBooleanStrictOrNull() ?: false,
                         lastFailureReason = fields["lastReason"]?.ifBlank { null },
                         lastOutputToSourceRatio = fields["lastSizeRatio"]?.toDoubleOrNull(),
-                        measuredOvershootFactor = fields["overshoot"]?.toDoubleOrNull()
+                        measuredOvershootFactor = fields["overshoot"]?.toDoubleOrNull(),
+                        // Missing on pre-latch stored profiles; negative/corrupt clamps to 0 so a
+                        // tampered store can never manufacture a probe-skip.
+                        consecutiveMeasuredProbeRejections =
+                            (fields["probeRejects"]?.toIntOrNull() ?: 0).coerceAtLeast(0),
+                        probeSkipsSinceLastProbe =
+                            (fields["probeSkips"]?.toIntOrNull() ?: 0).coerceAtLeast(0)
                     )
                 }.getOrNull()
             }
@@ -157,6 +172,55 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
     fun shouldPreferRemux(key: EncodeProfileKey): Boolean = profile(key).preferRemux
 
     /**
+     * Decaying probe-skip: true when this profile's probe ladders were MEASURED-rejected at the
+     * safest candidate ratio [MEASURED_PROBE_REJECTIONS_BEFORE_SKIP]+ consecutive times AND fewer
+     * than [PROBE_SKIPS_BETWEEN_REPROBES] ladders have been skipped since the last real probe.
+     * The caller must record each skip via [noteProbeSkipped]; once the skip budget is spent the
+     * next encounter re-probes (fresh evidence either renews or clears the latch). This is
+     * deliberately NOT permanent: measured class-level evidence may save battery for a while,
+     * but only fresh per-clip measurement is allowed to keep saying no.
+     */
+    fun shouldSkipProbes(key: EncodeProfileKey): Boolean {
+        val p = profile(key)
+        return p.consecutiveMeasuredProbeRejections >= MEASURED_PROBE_REJECTIONS_BEFORE_SKIP &&
+            p.probeSkipsSinceLastProbe < PROBE_SKIPS_BETWEEN_REPROBES
+    }
+
+    /** Records one ladder skipped under the [shouldSkipProbes] latch. */
+    fun noteProbeSkipped(key: EncodeProfileKey): LearnedEncodeProfile {
+        val current = profile(key)
+        val updated = current.copy(probeSkipsSinceLastProbe = current.probeSkipsSinceLastProbe + 1)
+        store.write(key.asKey(), updated.encode())
+        return updated
+    }
+
+    /**
+     * Records a probe ladder whose SAFEST candidate was measured and rejected by the VMAF
+     * windows — positive pixel evidence that this profile class currently cannot re-encode
+     * transparently. Resets the skip budget so the latch (if armed) starts a fresh cycle.
+     */
+    fun recordMeasuredProbeRejection(key: EncodeProfileKey): LearnedEncodeProfile {
+        val current = profile(key)
+        val updated = current.copy(
+            consecutiveMeasuredProbeRejections = current.consecutiveMeasuredProbeRejections + 1,
+            probeSkipsSinceLastProbe = 0
+        )
+        store.write(key.asKey(), updated.encode())
+        return updated
+    }
+
+    /** Records a probe ladder that pixel-proved some ratio: clears the probe-skip latch. */
+    fun recordProbePass(key: EncodeProfileKey): LearnedEncodeProfile {
+        val current = profile(key)
+        val updated = current.copy(
+            consecutiveMeasuredProbeRejections = 0,
+            probeSkipsSinceLastProbe = 0
+        )
+        store.write(key.asKey(), updated.encode())
+        return updated
+    }
+
+    /**
      * The expected encoder overshoot factor (actual/requested video bitrate) for this profile.
      * Defaults to [DEFAULT_OVERSHOOT_FACTOR] (no overshoot assumed) until measured; always clamped
      * to a sane range so a corrupt store cannot poison prediction.
@@ -189,7 +253,10 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             preferRemux = false,
             lastFailureReason = null,
             lastOutputToSourceRatio = outputToSourceBytesRatio,
-            measuredOvershootFactor = blendOvershoot(current.measuredOvershootFactor, measuredOvershootFactor)
+            measuredOvershootFactor = blendOvershoot(current.measuredOvershootFactor, measuredOvershootFactor),
+            // A verified full encode is the strongest possible pixel evidence for the class.
+            consecutiveMeasuredProbeRejections = 0,
+            probeSkipsSinceLastProbe = 0
         )
         store.write(key.asKey(), updated.encode())
         return updated
@@ -255,6 +322,14 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         const val FAILURE_STEP_UP = 0.05
         const val HIGH_RATIO_FAILURE_THRESHOLD = 0.93
         const val HIGH_RATIO_FAILURES_BEFORE_REMUX = 2
+
+        // Decaying probe-skip latch (batch_20260715_084112: 84/172 ladders measured-rejected in
+        // one run, median 4s each). Two consecutive measured safest-rung rejections arm the
+        // latch; up to three ladders are then skipped before the next encounter MUST re-probe.
+        // Skips save probe encodes/battery on classes that just measured hopeless, while the
+        // forced re-probe keeps the evidence fresh — a profile is never permanently denied trials.
+        const val MEASURED_PROBE_REJECTIONS_BEFORE_SKIP = 2
+        const val PROBE_SKIPS_BETWEEN_REPROBES = 3
 
         // Overshoot factors are ratios of measured/requested video bitrate. 1.0 = encoder honored
         // the request exactly; the S23 Ultra HEVC VBR path measured ~1.25 on 4K60 HDR sources.
