@@ -1,0 +1,203 @@
+package compress.joshattic.us.quality
+
+import android.content.Context
+import android.media.MediaCodecInfo
+import android.net.Uri
+import android.util.Log
+import androidx.media3.common.MediaItem
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.EditedMediaItemSequence
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+/** Result of one probe ladder run. */
+data class ProbeDecision(
+    val provenRatio: Double?,
+    val probedRatios: List<Double>,
+    val windowScores: List<WindowScore>?,
+    val detail: String,
+    // True when the HIGHEST candidate ratio (the codec default) was measured — not merely
+    // unmeasurable — and its windows fell below the acceptance thresholds. This is positive
+    // pixel evidence that no allowed ratio can encode the clip transparently, which justifies
+    // skipping the item entirely instead of writing a useless stream copy.
+    val highestCandidateMeasuredRejected: Boolean = false
+)
+
+/**
+ * Probe-based per-clip Perceptually Lossless targeting: encodes short clipped windows of the
+ * source at candidate bitrate ratios with the SAME hardware pipeline as real encodes (Media3
+ * Transformer, VBR, same output codec), scores each probe against the source windows with
+ * on-device VMAF (phone model), and returns the lowest ratio whose windows all pass
+ * [QualityProbePolicy] thresholds.
+ *
+ * SDR-only by contract (VMAF is not calibrated for PQ/HLG) and only for strictly more
+ * efficient output codecs — the callers enforce both. Every failure path returns "no
+ * evidence" and leaves the conservative gate decision unchanged.
+ */
+class PerceptualQualityProber(private val context: Context) {
+
+    companion object {
+        private const val TAG = "CompressorProbe"
+        private const val PROBE_EXPORT_TIMEOUT_MS = 60_000L
+        private const val TOTAL_BUDGET_MS = 150_000L
+    }
+
+    /**
+     * @param targetBitrateForRatio maps a candidate ratio to the exact video bitrate the real
+     *   encode would request (the caller supplies the policy computation so probe and encode
+     *   can never diverge).
+     */
+    suspend fun runLadder(
+        sourceUri: Uri,
+        durationMs: Long,
+        outputMime: String,
+        candidateRatios: List<Double>,
+        targetBitrateForRatio: (Double) -> Int,
+        audioBitrate: Int
+    ): ProbeDecision {
+        if (!VmafNative.isAvailable) return ProbeDecision(null, emptyList(), null, "vmaf unavailable")
+        val windows = QualityProbePolicy.probeWindows(durationMs * 1000L)
+        if (windows.isEmpty()) return ProbeDecision(null, emptyList(), null, "clip too short to probe")
+
+        val startedAt = System.currentTimeMillis()
+        val probed = mutableListOf<Double>()
+        val highestCandidate = candidateRatios.maxOrNull()
+        var highestMeasuredRejected = false
+        for (ratio in candidateRatios) {
+            if (System.currentTimeMillis() - startedAt > TOTAL_BUDGET_MS) {
+                return ProbeDecision(null, probed, null, "probe budget exhausted", highestMeasuredRejected)
+            }
+            probed += ratio
+            val scores = probeOneRatio(sourceUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows)
+            if (QualityProbePolicy.windowsPass(scores)) {
+                Log.i(TAG, "ratio %.2f pixel-proven over ${windows.size} windows".format(ratio))
+                return ProbeDecision(ratio, probed, scores, "windows passed at %.2f".format(ratio))
+            }
+            if (ratio == highestCandidate && !scores.isNullOrEmpty()) {
+                // Measured (not merely unmeasurable) rejection at the default ratio.
+                highestMeasuredRejected = true
+            }
+            Log.i(TAG, "ratio %.2f rejected by probe windows (measured=${!scores.isNullOrEmpty()})".format(ratio))
+        }
+        return ProbeDecision(null, probed, null, "no candidate ratio passed", highestMeasuredRejected)
+    }
+
+    /** Scores one candidate ratio across all windows; null = evidence unavailable/failed. */
+    private suspend fun probeOneRatio(
+        sourceUri: Uri,
+        outputMime: String,
+        ratio: Double,
+        videoBitrate: Int,
+        audioBitrate: Int,
+        windows: List<ScoreWindow>
+    ): List<WindowScore>? {
+        val collected = mutableListOf<WindowScore>()
+        for (window in windows) {
+            val probeFile = File.createTempFile("probe_${"%.2f".format(ratio)}_", ".mp4", context.cacheDir)
+            try {
+                val exported = withTimeoutOrNull(PROBE_EXPORT_TIMEOUT_MS) {
+                    exportClip(sourceUri, probeFile, outputMime, videoBitrate, audioBitrate, window)
+                } ?: return null
+                if (!exported) return null
+                val scores = withContext(Dispatchers.IO) {
+                    VmafPairScorer.score(
+                        context,
+                        ref = sourceUri,
+                        dist = Uri.fromFile(probeFile),
+                        // The probe file contains ONLY the window, starting at 0.
+                        windows = listOf(ScoreWindow(window.startUs, window.endUs, distStartUs = 0L))
+                    )
+                } ?: return null
+                collected += scores
+                // Early exit: one failing window already rejects this ratio.
+                if (!QualityProbePolicy.windowsPass(scores)) return collected
+            } finally {
+                runCatching { probeFile.delete() }
+            }
+        }
+        return collected
+    }
+
+    private suspend fun exportClip(
+        sourceUri: Uri,
+        outputFile: File,
+        outputMime: String,
+        videoBitrate: Int,
+        audioBitrate: Int,
+        window: ScoreWindow
+    ): Boolean = withContext(Dispatchers.Main) {
+        suspendCancellableCoroutine { continuation ->
+            val encoderFactory = DefaultEncoderFactory.Builder(context)
+                .setRequestedVideoEncoderSettings(
+                    VideoEncoderSettings.Builder()
+                        .setBitrate(videoBitrate)
+                        .setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                        .build()
+                )
+                .build()
+            val mediaItem = MediaItem.Builder()
+                .setUri(sourceUri)
+                .setClippingConfiguration(
+                    MediaItem.ClippingConfiguration.Builder()
+                        .setStartPositionMs(window.startUs / 1000)
+                        .setEndPositionMs(window.endUs / 1000)
+                        .build()
+                )
+                .build()
+            val edited = EditedMediaItem.Builder(mediaItem)
+                .setRemoveAudio(true) // probes judge video pixels only; audio is stream-copied in PL
+                .build()
+            val transformer = Transformer.Builder(context)
+                .setVideoMimeType(outputMime)
+                .setEncoderFactory(encoderFactory)
+                .addListener(object : Transformer.Listener {
+                    override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                        if (continuation.isActive) continuation.resume(outputFile.length() > 0L)
+                    }
+
+                    override fun onError(
+                        composition: Composition,
+                        exportResult: ExportResult,
+                        exportException: ExportException
+                    ) {
+                        runCatching { outputFile.delete() }
+                        if (continuation.isActive) continuation.resume(false)
+                    }
+                })
+                .build()
+            continuation.invokeOnCancellation {
+                transformer.cancel()
+                runCatching { outputFile.delete() }
+            }
+            try {
+                transformer.start(
+                    Composition.Builder(listOf(EditedMediaItemSequence(edited))).build(),
+                    outputFile.absolutePath
+                )
+            } catch (t: Throwable) {
+                if (continuation.isActive) continuation.resumeWithException(t)
+            }
+        }
+    }
+
+    /** Sampled pixel certification of a completed full encode against its source. */
+    suspend fun certify(sourceUri: Uri, outputFile: File, durationMs: Long): List<WindowScore>? {
+        if (!VmafNative.isAvailable) return null
+        val windows = QualityProbePolicy.probeWindows(durationMs * 1000L)
+        if (windows.isEmpty()) return null
+        return withContext(Dispatchers.IO) {
+            VmafPairScorer.score(context, sourceUri, Uri.fromFile(outputFile), windows)
+        }
+    }
+}

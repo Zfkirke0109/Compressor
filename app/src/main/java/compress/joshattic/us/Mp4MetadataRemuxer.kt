@@ -4,10 +4,12 @@ import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.concurrent.CancellationException
 
 data class Mp4MetadataRemuxResult(
     val outputFile: File,
@@ -67,7 +69,7 @@ object Mp4MetadataRemuxer {
                 trackMap[inputTrack] = outputTrack
             }
 
-            applyMuxerMetadata(muxer, snapshot)
+            applyMuxerMetadata(muxer, snapshot, snapshot.rotationDegrees)
 
             muxer.start()
             muxerStarted = true
@@ -124,6 +126,7 @@ object Mp4MetadataRemuxer {
             runCatching { muxer?.release() }
             runCatching { extractor.release() }
             runCatching { outputFile.delete() }
+            if (e is CancellationException) throw e
 
             val message = if (e.message?.contains(REMUX_ONLY_UNSUPPORTED_MESSAGE) == true) {
                 REMUX_ONLY_UNSUPPORTED_MESSAGE
@@ -137,7 +140,8 @@ object Mp4MetadataRemuxer {
     fun remuxWithSourceMetadata(
         context: Context,
         encodedFile: File,
-        snapshot: VideoMetadataSnapshot
+        snapshot: VideoMetadataSnapshot,
+        cancellationCheck: () -> Unit = {}
     ): Mp4MetadataRemuxResult {
         if (!encodedFile.exists() || encodedFile.length() <= 0L) {
             return Mp4MetadataRemuxResult(
@@ -148,17 +152,21 @@ object Mp4MetadataRemuxer {
             )
         }
 
-        val needsLocation = snapshot.hasLocation
-        val needsRotation = snapshot.rotationDegrees != null
-
-        if (!needsLocation && !needsRotation) {
+        // Transformer owns the encoded file's display orientation. In particular, Media3 normally
+        // landscape-encodes portrait video and adds a compensating rotation hint. Never remux only
+        // to copy the source's raw hint onto a transcode: doing so can overwrite Transformer's 90°
+        // hint with source 0° and leave a sideways file. With no location to add, keep the encoded
+        // file byte-for-byte as Transformer produced it.
+        if (!snapshot.hasLocation) {
             return Mp4MetadataRemuxResult(
                 encodedFile,
                 didRemux = false,
                 locationWritten = false,
-                message = "metadata remux skipped: no source location/rotation exposed"
+                message = "metadata remux skipped: encoded orientation retained; no source location to write"
             )
         }
+
+        val encodedRotation = orientationHintForTranscodedRemux(readRotationDegrees(encodedFile))
 
         val parent = encodedFile.parentFile ?: context.cacheDir
         val tempFile = File(parent, encodedFile.nameWithoutExtension + "_remux.mp4")
@@ -205,7 +213,10 @@ object Mp4MetadataRemuxer {
                 )
             }
 
-            applyMuxerMetadata(muxer, snapshot)
+            // Preserve the encoded output's own orientation while adding source location. Missing
+            // or invalid encoded rotation stays absent; the verifier then fails closed rather than
+            // guessing from source metadata.
+            applyMuxerMetadata(muxer, snapshot, encodedRotation)
             val wroteLocation = snapshot.hasLocation
 
             muxer.start()
@@ -217,6 +228,7 @@ object Mp4MetadataRemuxer {
             val bufferInfo = MediaCodec.BufferInfo()
 
             while (true) {
+                cancellationCheck()
                 val inputTrackIndex = extractor.sampleTrackIndex
                 if (inputTrackIndex < 0) break
 
@@ -273,6 +285,7 @@ object Mp4MetadataRemuxer {
             runCatching { muxer?.release() }
             runCatching { extractor.release() }
             runCatching { tempFile.delete() }
+            if (e is CancellationException) throw e
 
             Mp4MetadataRemuxResult(
                 encodedFile,
@@ -304,12 +317,27 @@ object Mp4MetadataRemuxer {
         }.getOrDefault(false)
     }
 
-    private fun applyMuxerMetadata(muxer: MediaMuxer, snapshot: VideoMetadataSnapshot) {
-        snapshot.rotationDegrees?.let { rotation ->
-            if (rotation == 0 || rotation == 90 || rotation == 180 || rotation == 270) {
-                muxer.setOrientationHint(rotation)
-            }
+    private fun readRotationDegrees(file: File): Int? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(file.absolutePath)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull()
+        } catch (_: Exception) {
+            null
+        } finally {
+            runCatching { retriever.release() }
         }
+    }
+
+    internal fun orientationHintForTranscodedRemux(encodedRotationDegrees: Int?): Int? =
+        encodedRotationDegrees?.takeIf { it == 0 || it == 90 || it == 180 || it == 270 }
+
+    private fun applyMuxerMetadata(
+        muxer: MediaMuxer,
+        snapshot: VideoMetadataSnapshot,
+        orientationDegrees: Int?
+    ) {
+        orientationDegrees?.let { muxer.setOrientationHint(it) }
 
         if (snapshot.hasLocation) {
             val lat = snapshot.latitude!!

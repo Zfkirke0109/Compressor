@@ -1,6 +1,7 @@
 package compress.joshattic.us
 
 import android.content.Context
+import android.media.MediaCodecInfo
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
@@ -30,8 +31,14 @@ object OutputVerifier {
         val colorRange: Int?,
         val audioChannelCount: Int?,
         val audioSampleRate: Int?,
-        val videoFrameRate: Float = 0f
+        val videoFrameRate: Float = 0f,
+        val hdrStaticInfoDigest: String? = null,
+        val hdr10PlusInfoDigest: String? = null,
+        val videoProfile: Int? = null
     ) {
+        val hdrMetadataPresent: Boolean
+            get() = hdrStaticInfoDigest != null || hdr10PlusInfoDigest != null
+
         val hdrLabel: String
             get() = when (colorTransfer) {
                 MediaFormat.COLOR_TRANSFER_ST2084 -> "HDR PQ"
@@ -54,7 +61,14 @@ object OutputVerifier {
         val outputSize: Long,
         val privacyMode: MetadataPrivacyMode,
         // Video frame count of the source when the platform exposes it (API 28+); 0 = unknown.
-        val sourceFrameCount: Int = 0
+        val sourceFrameCount: Int = 0,
+        // When a PL encode's target was justified by on-device pixel probes, the bitrate floor
+        // the verifier enforces is the pixel-proven one (with encoder-undershoot tolerance
+        // already applied by the caller), not the class-level inference floor. Sampled pixel
+        // certification of the final output remains mandatory for such encodes (enforced in
+        // the batch pipeline); this field only stops the structural floor from rejecting an
+        // encode the pixels already justified. Null = classic behavior, byte-identical.
+        val pixelProvenVideoBitrateFloor: Int? = null
     )
 
     fun verify(
@@ -62,7 +76,8 @@ object OutputVerifier {
         source: BatchVideoItem,
         outputFile: File,
         modeLabel: String,
-        privacyMode: MetadataPrivacyMode
+        privacyMode: MetadataPrivacyMode,
+        pixelProvenVideoBitrateFloor: Int? = null
     ): OutputVerificationReport {
         val rawOutputProbe = readFileProbe(outputFile)
         val sourceTracks = probeTracks(context, source.sourceUri)
@@ -109,7 +124,8 @@ object OutputVerifier {
                 sourceSize = source.originalSize,
                 outputSize = outputFile.length(),
                 privacyMode = privacyMode,
-                sourceFrameCount = readSourceFrameCount(context, source.sourceUri)
+                sourceFrameCount = readSourceFrameCount(context, source.sourceUri),
+                pixelProvenVideoBitrateFloor = pixelProvenVideoBitrateFloor
             )
         )
     }
@@ -147,18 +163,17 @@ object OutputVerifier {
             input.sourceTrackProbe.audioSampleRate,
             input.outputTrackProbe.audioSampleRate
         )
-        val hdrMatches = colorMatches(
-            input.sourceTrackProbe.colorTransfer,
-            input.outputTrackProbe.colorTransfer
+        val colorComparison = compareColorTransition(
+            input.mode,
+            input.sourceTrackProbe,
+            input.outputTrackProbe
         )
-        val standardMatches = colorMatches(
-            input.sourceTrackProbe.colorStandard,
-            input.outputTrackProbe.colorStandard
-        )
-        val rangeMatches = colorMatches(
-            input.sourceTrackProbe.colorRange,
-            input.outputTrackProbe.colorRange
-        )
+        val hdrMatches = colorComparison.transferMatches &&
+            colorComparison.hdrMetadataMatches &&
+            colorComparison.bitDepthMatches &&
+            colorComparison.profileMatches
+        val standardMatches = colorComparison.standardMatches
+        val rangeMatches = colorComparison.rangeMatches
         // Duration parity closes the truncated-output hole: a 5-second output of a 60-second
         // source must never pass Perceptually Lossless or Remux verification, no matter how good
         // its per-field metadata looks (a truncated file is also "strictly smaller", so without
@@ -175,8 +190,14 @@ object OutputVerifier {
             abs(input.outputFileProbe.frameCount - input.sourceFrameCount) <=
             maxOf(2, (input.sourceFrameCount * 0.01).toInt())
 
-        val rotationMatches = input.sourceMetadata.rotationDegrees == null ||
-            input.outputFileProbe.rotationDegrees == input.sourceMetadata.rotationDegrees
+        val rotationMatches = sameDisplayOrientation(
+            mode = input.mode,
+            sourceWidth = input.source.width,
+            sourceHeight = input.source.height,
+            displayDimensionsMatch = videoMatches,
+            sourceRotationDegrees = input.sourceMetadata.rotationDegrees,
+            outputRotationDegrees = input.outputFileProbe.rotationDegrees
+        )
         val locationMatches = when {
             input.privacyMode.removeLocation -> true
             !input.sourceMetadata.hasLocation -> true
@@ -231,7 +252,15 @@ object OutputVerifier {
         }
         val videoBitrateMeasured = input.outputTrackProbe.videoBitrate <= 0 && effectiveOutputVideoBitrate > 0
 
-        val minPerceptualVideoBitrate = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(input.source)
+        // Codec-aware floor: the output track's codec decides how many bits perceptual quality needs.
+        // For a same-codec stream copy this is byte-identical; for a cross-codec PL encode (H.264 ->
+        // HEVC) it lowers the source-codec-calibrated absolute floor so an efficient valid output is
+        // not falsely rejected. The ratio floor still guards perceptual quality.
+        val minPerceptualVideoBitrate = input.pixelProvenVideoBitrateFloor
+            ?: BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(
+                input.source,
+                input.outputTrackProbe.videoCodec
+            )
         val bitratePass = when (input.mode) {
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> effectiveOutputVideoBitrate > 0 && effectiveOutputVideoBitrate >= minPerceptualVideoBitrate
             BatchQualityMode.REMUX_ONLY -> effectiveOutputVideoBitrate <= 0 || sourceVideoBitrate <= 0 || effectiveOutputVideoBitrate >= (sourceVideoBitrate * 0.98).toInt()
@@ -273,7 +302,9 @@ object OutputVerifier {
                     input.outputTrackProbe.audioChannelCount != null &&
                     input.outputTrackProbe.audioSampleRate != null
                 )) &&
-            (!input.source.isHdr || (
+            (!(input.source.isHdr ||
+                (input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && colorComparison.sourceHasHdrRisk)
+                ) || (
                 input.outputTrackProbe.colorTransfer != null &&
                     input.outputTrackProbe.colorStandard != null &&
                     input.outputTrackProbe.colorRange != null
@@ -336,6 +367,7 @@ object OutputVerifier {
             !frameCountMatches -> "output video frame count differs from the source"
             input.mode == BatchQualityMode.REMUX_ONLY && !criticalFieldsComplete -> "stream-copy verification was incomplete"
             input.mode == BatchQualityMode.REMUX_ONLY && !videoMatches -> "remux output changed resolution"
+            input.mode == BatchQualityMode.REMUX_ONLY && !rotationMatches -> "remux output changed display orientation"
             input.mode == BatchQualityMode.REMUX_ONLY && fpsComparison != VerificationTransitionStatus.MATCH -> "remux output changed FPS"
             input.mode == BatchQualityMode.REMUX_ONLY && !videoCodecMatches -> "remux output changed video codec"
             input.mode == BatchQualityMode.REMUX_ONLY && !audioCodecMatches -> "remux output changed audio codec"
@@ -343,6 +375,7 @@ object OutputVerifier {
             input.mode == BatchQualityMode.REMUX_ONLY && !(hdrMatches && standardMatches && rangeMatches) -> "remux output changed HDR/color metadata"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !criticalFieldsComplete -> "perceptually lossless verification is unverified because critical fields were not exposed"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !videoMatches -> "perceptually lossless output changed resolution"
+            input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !rotationMatches -> "perceptually lossless output changed display orientation"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && fpsComparison != VerificationTransitionStatus.MATCH -> "perceptually lossless output changed FPS"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !bitratePass -> "perceptually lossless output bitrate fell below the verified safety threshold"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !audioBitratePass -> "perceptually lossless output audio bitrate fell below the verified safety threshold"
@@ -377,7 +410,12 @@ object OutputVerifier {
             audioCodec = "${codecLabel(input.sourceTrackProbe.audioCodec)} -> ${codecLabel(input.outputTrackProbe.audioCodec)} ${statusSuffix(audioCodecMatches)}",
             audioDetails = "${sampleRateLabel(input.sourceTrackProbe.audioSampleRate)}/${channelLabel(input.sourceTrackProbe.audioChannelCount)} -> ${sampleRateLabel(input.outputTrackProbe.audioSampleRate)}/${channelLabel(input.outputTrackProbe.audioChannelCount)} ${statusSuffix(audioShapeMatches)}",
             audioBitrate = "${bitrateLabel(input.sourceTrackProbe.audioBitrate)} -> ${bitrateLabel(effectiveOutputAudioBitrate)}${if (audioLooksStreamCopied) " (stream copied)" else ""} ${statusSuffix(audioBitratePass)}",
-            hdr = "${input.sourceTrackProbe.hdrLabel} -> ${input.outputTrackProbe.hdrLabel} ${statusSuffix(hdrMatches)}",
+            hdr = "${input.sourceTrackProbe.hdrLabel} -> ${input.outputTrackProbe.hdrLabel}" +
+                if (colorComparison.basis == ColorMatchBasis.MEDIA3_ASSUMED_SDR) {
+                    " (Media3 assumed SDR default) ${statusSuffix(hdrMatches)}"
+                } else {
+                    " ${statusSuffix(hdrMatches)}"
+                },
             colorStandard = "${colorStandardLabel(input.sourceTrackProbe.colorStandard)} -> ${colorStandardLabel(input.outputTrackProbe.colorStandard)} ${statusSuffix(standardMatches)}",
             colorRange = "${colorRangeLabel(input.sourceTrackProbe.colorRange)} -> ${colorRangeLabel(input.outputTrackProbe.colorRange)} ${statusSuffix(rangeMatches)}",
             mediaStoreDate = dateVerificationLabel(
@@ -495,6 +533,9 @@ object OutputVerifier {
         var audioChannels: Int? = null
         var audioSampleRate: Int? = null
         var videoFrameRate = 0f
+        var hdrStaticInfoDigest: String? = null
+        var hdr10PlusInfoDigest: String? = null
+        var videoProfile: Int? = null
 
         for (i in 0 until extractor.trackCount) {
             val format = extractor.getTrackFormat(i)
@@ -506,6 +547,11 @@ object OutputVerifier {
                     colorTransfer = format.intOrNull(MediaFormat.KEY_COLOR_TRANSFER) ?: colorTransfer
                     colorStandard = format.intOrNull(MediaFormat.KEY_COLOR_STANDARD) ?: colorStandard
                     colorRange = format.intOrNull(MediaFormat.KEY_COLOR_RANGE) ?: colorRange
+                    videoProfile = format.intOrNull(MediaFormat.KEY_PROFILE) ?: videoProfile
+                    hdrStaticInfoDigest =
+                        format.byteBufferDigest(MediaFormat.KEY_HDR_STATIC_INFO) ?: hdrStaticInfoDigest
+                    hdr10PlusInfoDigest =
+                        format.byteBufferDigest(MediaFormat.KEY_HDR10_PLUS_INFO) ?: hdr10PlusInfoDigest
                     if (videoFrameRate <= 0f) videoFrameRate = format.frameRateOrZero()
                 }
                 mime?.startsWith("audio/") == true -> {
@@ -527,15 +573,49 @@ object OutputVerifier {
             colorRange = colorRange,
             audioChannelCount = audioChannels,
             audioSampleRate = audioSampleRate,
-            videoFrameRate = videoFrameRate
+            videoFrameRate = videoFrameRate,
+            hdrStaticInfoDigest = hdrStaticInfoDigest,
+            hdr10PlusInfoDigest = hdr10PlusInfoDigest,
+            videoProfile = videoProfile
         )
     }
 
-    // Treat missing/invalid dimensions as a failed match so replacement never proceeds on unverified geometry.
+    // Both probes normalize 90/270-degree rotation before reaching this check, so an exact ordered
+    // pair is display-space parity. Keep this strict: no tolerance, scaling, cropping, or raw edge
+    // transposition is accepted here.
     internal fun sameDimensions(sourceWidth: Int, sourceHeight: Int, outputWidth: Int, outputHeight: Int): Boolean {
         if (sourceWidth <= 0 || sourceHeight <= 0 || outputWidth <= 0 || outputHeight <= 0) return false
         return sourceWidth == outputWidth && sourceHeight == outputHeight
     }
+
+    /**
+     * Media3 landscape-encodes portrait video by default and writes a compensating 90/270-degree
+     * orientation hint. Raw rotation equality is therefore not required for a real portrait
+     * transcode, but the display-normalized dimensions must match exactly. Stream copies remain
+     * strict because a remux must preserve the original orientation metadata unchanged.
+     */
+    internal fun sameDisplayOrientation(
+        mode: BatchQualityMode,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        displayDimensionsMatch: Boolean,
+        sourceRotationDegrees: Int?,
+        outputRotationDegrees: Int?
+    ): Boolean {
+        if (!displayDimensionsMatch) return false
+        val sourceRotation = sourceRotationDegrees ?: 0
+        val outputRotation = outputRotationDegrees ?: 0
+        if (sourceRotation !in VALID_ROTATIONS || outputRotation !in VALID_ROTATIONS) return false
+        if (sourceRotation == outputRotation) return true
+        if (mode != BatchQualityMode.PERCEPTUAL_LOSSLESS || sourceHeight <= sourceWidth) return false
+
+        // The only non-exact representation accepted is Media3's default for a coded portrait
+        // source: landscape-coded output with a compensating quarter-turn hint. Never accept 0/180
+        // as an alternative output hint, or an arbitrary quarter-turn delta from a rotated source.
+        return sourceRotation == 0 && (outputRotation == 90 || outputRotation == 270)
+    }
+
+    private val VALID_ROTATIONS = setOf(0, 90, 180, 270)
 
     private fun codecsMatch(left: String?, right: String?): Boolean {
         if (left == null && right == null) return true
@@ -543,10 +623,152 @@ object OutputVerifier {
         return left.equals(right, ignoreCase = true)
     }
 
-    private fun colorMatches(left: Int?, right: Int?): Boolean {
-        if (left == null && right == null) return true
-        if (left == null || right == null) return false
-        return left == right
+    internal enum class ColorMatchBasis {
+        EXACT,
+        BOTH_NOT_EXPOSED,
+        MEDIA3_ASSUMED_SDR,
+        MISMATCH
+    }
+
+    internal data class ColorTransitionComparison(
+        val transferMatches: Boolean,
+        val standardMatches: Boolean,
+        val rangeMatches: Boolean,
+        val hdrMetadataMatches: Boolean,
+        val bitDepthMatches: Boolean,
+        val profileMatches: Boolean,
+        val sourceHasHdrRisk: Boolean,
+        val basis: ColorMatchBasis
+    ) {
+        val matches: Boolean
+            get() = transferMatches && standardMatches && rangeMatches && hdrMetadataMatches &&
+                bitDepthMatches && profileMatches
+    }
+
+    /**
+     * Media3 normalizes absent/invalid input color metadata to its canonical SDR BT.709 limited
+     * representation before encoding. Accept that specific, asymmetric transition only for a
+     * Perceptually Lossless source with no HDR, wide-color, non-default-range, static-HDR, or
+     * high-bit-depth profile evidence. An absent source field is never a general wildcard, and a
+     * remux remains exact because a stream copy must not rewrite container color metadata.
+     */
+    internal fun compareColorTransition(
+        mode: BatchQualityMode,
+        source: TrackProbe,
+        output: TrackProbe
+    ): ColorTransitionComparison {
+        val sourceHasHdrRisk = source.hasHdrOrNonDefaultColorRisk()
+        val allowMedia3SdrDefault = mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !sourceHasHdrRisk
+        val transfer = compareColorField(
+            source.colorTransfer,
+            output.colorTransfer,
+            MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
+            allowMedia3SdrDefault
+        )
+        val standard = compareColorField(
+            source.colorStandard,
+            output.colorStandard,
+            MediaFormat.COLOR_STANDARD_BT709,
+            allowMedia3SdrDefault
+        )
+        val range = compareColorField(
+            source.colorRange,
+            output.colorRange,
+            MediaFormat.COLOR_RANGE_LIMITED,
+            allowMedia3SdrDefault
+        )
+        val staticHdrMatches = source.hdrStaticInfoDigest == output.hdrStaticInfoDigest
+        // KEY_HDR10_PLUS_INFO does not prove that all per-frame dynamic metadata survived a
+        // transcode. A stream copy can compare the exposed payload; a real encode fails closed.
+        val hdr10PlusMatches = if (mode == BatchQualityMode.REMUX_ONLY) {
+            source.hdr10PlusInfoDigest == output.hdr10PlusInfoDigest
+        } else {
+            source.hdr10PlusInfoDigest == null && output.hdr10PlusInfoDigest == null
+        }
+        val hdrMetadataMatches = staticHdrMatches && hdr10PlusMatches
+        val sourceRequiresTenBit = source.requiresTenBitOutput()
+        val bitDepthMatches = !sourceRequiresTenBit ||
+            profileSupportsTenBit(output.videoCodec, output.videoProfile)
+        val profileMatches = mode != BatchQualityMode.REMUX_ONLY ||
+            source.videoProfile == output.videoProfile
+        val bases = listOf(transfer.second, standard.second, range.second)
+        val basis = when {
+            !hdrMetadataMatches || !bitDepthMatches || !profileMatches ||
+                bases.any { it == ColorMatchBasis.MISMATCH } -> ColorMatchBasis.MISMATCH
+            bases.any { it == ColorMatchBasis.MEDIA3_ASSUMED_SDR } -> ColorMatchBasis.MEDIA3_ASSUMED_SDR
+            bases.all { it == ColorMatchBasis.BOTH_NOT_EXPOSED } -> ColorMatchBasis.BOTH_NOT_EXPOSED
+            else -> ColorMatchBasis.EXACT
+        }
+        return ColorTransitionComparison(
+            transferMatches = transfer.first,
+            standardMatches = standard.first,
+            rangeMatches = range.first,
+            hdrMetadataMatches = hdrMetadataMatches,
+            bitDepthMatches = bitDepthMatches,
+            profileMatches = profileMatches,
+            sourceHasHdrRisk = sourceHasHdrRisk,
+            basis = basis
+        )
+    }
+
+    private fun compareColorField(
+        source: Int?,
+        output: Int?,
+        media3SdrDefault: Int,
+        allowMedia3SdrDefault: Boolean
+    ): Pair<Boolean, ColorMatchBasis> = when {
+        source != null && source == output -> true to ColorMatchBasis.EXACT
+        source == null && output == null -> true to ColorMatchBasis.BOTH_NOT_EXPOSED
+        source == null && output == media3SdrDefault && allowMedia3SdrDefault ->
+            true to ColorMatchBasis.MEDIA3_ASSUMED_SDR
+        else -> false to ColorMatchBasis.MISMATCH
+    }
+
+    private fun TrackProbe.hasHdrOrNonDefaultColorRisk(): Boolean {
+        if (hdrMetadataPresent || videoCodec == MimeTypes.VIDEO_DOLBY_VISION) return true
+        if (colorTransfer != null && colorTransfer != MediaFormat.COLOR_TRANSFER_SDR_VIDEO) return true
+        if (colorStandard != null && colorStandard != MediaFormat.COLOR_STANDARD_BT709) return true
+        if (colorRange != null && colorRange != MediaFormat.COLOR_RANGE_LIMITED) return true
+        return profileSupportsTenBit(videoCodec, videoProfile)
+    }
+
+    private fun TrackProbe.requiresTenBitOutput(): Boolean =
+        videoCodec == MimeTypes.VIDEO_DOLBY_VISION ||
+            colorTransfer == MediaFormat.COLOR_TRANSFER_ST2084 ||
+            colorTransfer == MediaFormat.COLOR_TRANSFER_HLG ||
+            colorStandard == MediaFormat.COLOR_STANDARD_BT2020 ||
+            hdrMetadataPresent ||
+            profileSupportsTenBit(videoCodec, videoProfile)
+
+    private fun profileSupportsTenBit(mime: String?, profile: Int?): Boolean {
+        if (mime == MimeTypes.VIDEO_DOLBY_VISION) return true
+        if (profile == null) return false
+        return when (mime) {
+            MimeTypes.VIDEO_H264 -> profile in setOf(
+                MediaCodecInfo.CodecProfileLevel.AVCProfileHigh10,
+                MediaCodecInfo.CodecProfileLevel.AVCProfileHigh422,
+                MediaCodecInfo.CodecProfileLevel.AVCProfileHigh444
+            )
+            MimeTypes.VIDEO_H265 -> profile in setOf(
+                MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10,
+                MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10,
+                MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10Plus
+            )
+            MimeTypes.VIDEO_VP9 -> profile in setOf(
+                MediaCodecInfo.CodecProfileLevel.VP9Profile2,
+                MediaCodecInfo.CodecProfileLevel.VP9Profile2HDR,
+                MediaCodecInfo.CodecProfileLevel.VP9Profile2HDR10Plus,
+                MediaCodecInfo.CodecProfileLevel.VP9Profile3,
+                MediaCodecInfo.CodecProfileLevel.VP9Profile3HDR,
+                MediaCodecInfo.CodecProfileLevel.VP9Profile3HDR10Plus
+            )
+            MimeTypes.VIDEO_AV1 -> profile in setOf(
+                MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10,
+                MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10HDR10,
+                MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10HDR10Plus
+            )
+            else -> false
+        }
     }
 
     private fun optionalExactMatch(left: Int?, right: Int?): Boolean {
@@ -620,6 +842,18 @@ object OutputVerifier {
 
     private fun MediaFormat.intOrNull(key: String): Int? {
         return if (containsKey(key)) runCatching { getInteger(key) }.getOrNull() else null
+    }
+
+    private fun MediaFormat.byteBufferDigest(key: String): String? {
+        if (!containsKey(key)) return null
+        return runCatching {
+            val copy = getByteBuffer(key)?.duplicate() ?: return@runCatching null
+            val bytes = ByteArray(copy.remaining())
+            copy.get(bytes)
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest(bytes)
+                .joinToString("") { "%02x".format(it) }
+        }.getOrNull()
     }
 
     // KEY_FRAME_RATE may be stored as an int or a float depending on the container/framework path.

@@ -14,6 +14,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.*
@@ -255,6 +256,7 @@ private fun BatchCompressorScreen(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun BatchSettingsCard(
     state: BatchCompressorUiState,
@@ -463,15 +465,34 @@ private fun BatchSettingsCard(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { viewModel.requestShizukuPermission(context) }, enabled = !state.isCompressing) {
-                    Text("Authorize")
+            // Three action buttons with long labels do not fit one phone-width row (the last,
+            // "Test access", was squeezed/clipped). FlowRow wraps them cleanly at any width and font
+            // scale; heightIn keeps each a >=48dp touch target with a single un-clipped label line.
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                OutlinedButton(
+                    onClick = { viewModel.requestShizukuPermission(context) },
+                    enabled = !state.isCompressing,
+                    modifier = Modifier.heightIn(min = 48.dp)
+                ) {
+                    Text("Authorize", maxLines = 1)
                 }
-                OutlinedButton(onClick = onRequestOriginalMediaAccess, enabled = !state.isCompressing) {
-                    Text("Metadata access")
+                OutlinedButton(
+                    onClick = onRequestOriginalMediaAccess,
+                    enabled = !state.isCompressing,
+                    modifier = Modifier.heightIn(min = 48.dp)
+                ) {
+                    Text("Metadata access", maxLines = 1)
                 }
-                OutlinedButton(onClick = { viewModel.testReplacementAccess(context) }, enabled = !state.isCompressing) {
-                    Text("Test access")
+                OutlinedButton(
+                    onClick = { viewModel.testReplacementAccess(context) },
+                    enabled = !state.isCompressing,
+                    modifier = Modifier.heightIn(min = 48.dp)
+                ) {
+                    Text("Test access", maxLines = 1)
                 }
             }
         }
@@ -505,7 +526,9 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text("Batch summary", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            Text("Videos: ${state.items.size} • Done: ${state.doneCount} • Failed: ${state.failedCount}")
+            Text("Videos: ${state.items.size} • Outputs ready: ${state.doneCount}")
+            Text("Real compressions: ${state.realCompressionCount} • Remuxed/kept/no size win: ${state.nonCompressionCount}")
+            Text("Failed: ${state.failedCount} • Skipped: ${state.skippedCount} • Cancelled: ${state.cancelledCount}")
             Text("Original: ${state.formattedTotalOriginal}")
             Text("Mode: ${state.qualityPreset} • Codec: ${state.codecOption} • FPS: ${state.frameRateOption}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Metadata: ${MetadataPrivacyMode.fromLabel(state.metadataPrivacyMode).summary}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -527,7 +550,9 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
                     )
                 }
             }
-            if (state.totalOutputBytes > 0) Text("Outputs: ${state.formattedTotalOutput} • Saved: ${state.formattedTotalSaved}")
+            if (state.totalOutputBytes > 0) {
+                Text("Outputs: ${state.formattedTotalOutput} • Saved by real compression: ${state.formattedTotalSaved}")
+            }
         }
     }
 }
@@ -677,6 +702,15 @@ private fun BatchItemCard(
                 )
             }
 
+            item.terminalResult?.let { terminal ->
+                Text(
+                    "Outcome: ${terminal.label}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (terminal.isFailure) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+
             item.verificationReport?.let { report ->
                 HorizontalDivider()
                 Text("Verification", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
@@ -716,6 +750,23 @@ private fun BatchItemCard(
 }
 
 private fun BatchVideoItem.shortStatusLabel(): String {
+    terminalResult?.let { terminal ->
+        return when (terminal) {
+            BatchTerminalResult.TRANSCODED_SMALLER,
+            BatchTerminalResult.LOSSY_SMALLER -> "Compressed"
+            BatchTerminalResult.TRANSCODED_NOT_MEANINGFULLY_SMALLER -> "No size win"
+            BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED -> "Already efficient"
+            BatchTerminalResult.EXPLICIT_REMUX -> "Remuxed"
+            BatchTerminalResult.UNEXPECTED_REMUX -> "Original kept"
+            BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED -> "Skipped"
+            BatchTerminalResult.SKIPPED_WOULD_DEGRADE -> "Skipped (quality)"
+            BatchTerminalResult.CANCELLED -> "Cancelled"
+            BatchTerminalResult.OUTPUT_VALIDATION_FAILED,
+            BatchTerminalResult.ENCODER_FAILURE,
+            BatchTerminalResult.UNSUPPORTED_CONTAINER,
+            BatchTerminalResult.FAILED -> "Failed"
+        }
+    }
     return when {
         status == BatchItemStatus.Skipped || isAlreadyCompressed -> "Skipped"
         status == BatchItemStatus.Compressing -> "${progressPercent}%"
@@ -723,6 +774,7 @@ private fun BatchVideoItem.shortStatusLabel(): String {
         status == BatchItemStatus.Replaced -> "Replaced"
         status == BatchItemStatus.SavedCopy -> "Saved"
         status == BatchItemStatus.Failed -> "Failed"
+        status == BatchItemStatus.Cancelled -> "Cancelled"
         else -> "Ready"
     }
 }
@@ -736,6 +788,7 @@ private fun BatchVideoItem.preservationSummary(): String {
         BatchItemStatus.Done -> "copy ready"
         BatchItemStatus.Skipped -> "skipped"
         BatchItemStatus.Failed -> "failed"
+        BatchItemStatus.Cancelled -> "cancelled"
         BatchItemStatus.Compressing -> "compressing"
         else -> "ready"
     }
@@ -747,10 +800,18 @@ private fun BatchVideoItem.beforeAfterSummary(): String {
     val savedBytes = (originalSize - outputSize).coerceAtLeast(0L)
     val savedPercent = if (originalSize > 0L) ((savedBytes * 100.0) / originalSize).toInt() else 0
     val similarSize = originalSize > 0L && kotlin.math.abs(outputSize - originalSize).toDouble() / originalSize.toDouble() < 0.03
-    if (outputMode == "Remux Only" && similarSize) {
-        return "Before/after: ${formatCardBytes(originalSize)} -> ${formatCardBytes(outputSize)} • size similar"
+    if (terminalResult?.countsAsRealCompression == true) {
+        return "Before/after: ${formatCardBytes(originalSize)} → ${formatCardBytes(outputSize)} • saved ${formatCardBytes(savedBytes)} ($savedPercent%)"
     }
-    return "Before/after: ${formatCardBytes(originalSize)} → ${formatCardBytes(outputSize)} • saved ${formatCardBytes(savedBytes)} ($savedPercent%)"
+    val rawDelta = outputSize - originalSize
+    val deltaLabel = when {
+        similarSize -> "size similar"
+        rawDelta < 0L -> "container/file delta ${formatCardBytes(-rawDelta)} smaller (not compression savings)"
+        rawDelta > 0L -> "${formatCardBytes(rawDelta)} larger"
+        else -> "same size"
+    }
+    val outcome = terminalResult?.label ?: "not classified as a real compression"
+    return "Before/after: ${formatCardBytes(originalSize)} → ${formatCardBytes(outputSize)} • $deltaLabel • $outcome"
 }
 
 private fun formatCardBytes(bytes: Long): String {
@@ -805,5 +866,5 @@ private fun shareCompressedOutputs(context: Context, state: BatchCompressorUiSta
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
     }
-    context.startActivity(Intent.createChooser(intent, "Share compressed video${if (outputUris.size == 1) "" else "s"}"))
+    context.startActivity(Intent.createChooser(intent, "Share video output${if (outputUris.size == 1) "" else "s"}"))
 }

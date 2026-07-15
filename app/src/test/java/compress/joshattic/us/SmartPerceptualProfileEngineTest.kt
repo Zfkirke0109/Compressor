@@ -64,25 +64,33 @@ class SmartPerceptualProfileEngineTest {
     }
 
     @Test
-    fun verifiedSuccessStoresProfileAndStepsDownCautiously() {
+    fun verifiedSuccessStoresProfileWithoutSteppingTheTargetDown() {
+        // 2026-07-14 VMAF evidence: structural verification is perceptually blind, so a pass may
+        // never lower the next target (the old -0.02 step walked f030dffc553d down to 0.60).
         val e = engine()
         val updated = e.recordVerifiedSuccess(key(), usedTargetRatio = 0.95, outputToSourceBytesRatio = 0.96, floorRatio = 0.80)
 
         assertEquals(1, updated.successCount)
-        assertEquals(0.93, updated.nextTargetRatio!!, 1e-9)
+        assertEquals(0.95, updated.nextTargetRatio!!, 1e-9)
         assertNull(updated.lastFailureReason)
-        assertEquals(0.93, e.recommendedTargetRatio(key(), defaultRatio = 0.95, floorRatio = 0.80), 1e-9)
+        assertEquals(0.95, e.recommendedTargetRatio(key(), defaultRatio = 0.95, floorRatio = 0.80), 1e-9)
     }
 
     @Test
-    fun repeatedSuccessesNeverStepBelowSafetyFloor() {
+    fun repeatedSuccessesNeverLowerTheTargetBelowTheDefault() {
         val e = engine()
         var ratio = 0.95
         repeat(30) {
             ratio = e.recordVerifiedSuccess(key(), ratio, 0.9, floorRatio = 0.80).nextTargetRatio!!
         }
-        assertEquals(0.80, ratio, 1e-9)
-        assertEquals(0.80, e.recommendedTargetRatio(key(), defaultRatio = 0.95, floorRatio = 0.80), 1e-9)
+        assertEquals(0.95, ratio, 1e-9)
+        assertEquals(0.95, e.recommendedTargetRatio(key(), defaultRatio = 0.95, floorRatio = 0.80), 1e-9)
+
+        // Even a hostile stored history below the default is clamped back up to the default.
+        val store = SmartPerceptualProfileEngine.InMemoryProfileStore()
+        store.write(key().asKey(), "success=9;failure=0;highFail=0;nextRatio=0.60;preferRemux=false;lastReason=;lastSizeRatio=")
+        val walkedDown = SmartPerceptualProfileEngine(store)
+        assertEquals(0.95, walkedDown.recommendedTargetRatio(key(), defaultRatio = 0.95, floorRatio = 0.80), 1e-9)
     }
 
     @Test
@@ -119,11 +127,11 @@ class SmartPerceptualProfileEngineTest {
             e.recommendedTargetRatio(key(), 0.95, 0.80) <=
                 BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO
         )
-        // …and a corrupt/hostile stored value can never drop below the floor.
+        // …and a corrupt/hostile stored value can never drop below max(floor, default).
         val store = SmartPerceptualProfileEngine.InMemoryProfileStore()
         store.write(key().asKey(), "success=1;failure=0;highFail=0;nextRatio=0.05;preferRemux=false;lastReason=;lastSizeRatio=")
         val tampered = SmartPerceptualProfileEngine(store)
-        assertEquals(0.90, tampered.recommendedTargetRatio(key(), 0.95, 0.90), 1e-9)
+        assertEquals(0.95, tampered.recommendedTargetRatio(key(), 0.95, 0.90), 1e-9)
     }
 
     @Test
@@ -147,8 +155,13 @@ class SmartPerceptualProfileEngineTest {
     @Test
     fun overshootFactorIsLearnedBlendedAndClamped() {
         val e = engine()
-        // No measurement yet: assume the encoder honors requests (factor 1.0).
-        assertEquals(1.0, e.expectedOvershootFactor(key()), 1e-9)
+        // No measurement yet: this is the near-ceiling S23 4K60 HDR HEVC->HEVC class, which is seeded
+        // with the documented ~1.25 QTI VBR overshoot so the FIRST encounter prefers an honest remux.
+        assertEquals(
+            SmartPerceptualProfileEngine.SEEDED_NEAR_CEILING_OVERSHOOT,
+            e.expectedOvershootFactor(key()),
+            1e-9
+        )
 
         // The real S23 Ultra measurement from the device run: 142.3 / 113.9 ≈ 1.249.
         e.recordFailure(key(), 0.95, "size grew", floorRatio = 0.80, measuredOvershootFactor = 1.249)
@@ -176,6 +189,47 @@ class SmartPerceptualProfileEngineTest {
         // A later attempt where measurement was unavailable must keep the learned factor.
         e.recordFailure(key(), 0.97, "unverified", floorRatio = 0.80, measuredOvershootFactor = null)
         assertEquals(1.25, e.expectedOvershootFactor(key()), 1e-9)
+    }
+
+    @Test
+    fun overshootSeedAppliesOnlyToNearCeilingHdrHevcClass() {
+        val e = engine()
+
+        fun keyFor(source: VideoSourceInfo, encoderMime: String) =
+            SmartPerceptualProfileEngine.profileKeyFor(source, encoderMime, "samsung", "SM-S918B", 34)
+
+        // Seeded: 4K60 HDR HEVC -> HEVC (the documented near-ceiling class).
+        assertEquals(
+            SmartPerceptualProfileEngine.SEEDED_NEAR_CEILING_OVERSHOOT,
+            e.expectedOvershootFactor(keyFor(hdr4k60Source(), MimeTypes.VIDEO_H265)),
+            1e-9
+        )
+
+        // NOT seeded: ordinary 1080p SDR H.264 -> HEVC (the case that SHOULD compress).
+        val sdr1080pH264 = VideoSourceInfo(
+            width = 1920, height = 1080, frameRate = 30f, durationMs = 60_000,
+            totalBitrate = 5_000_000, audioBitrate = 128_000,
+            videoMime = MimeTypes.VIDEO_H264, audioMime = MimeTypes.AUDIO_AAC,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+        )
+        assertEquals(1.0, e.expectedOvershootFactor(keyFor(sdr1080pH264, MimeTypes.VIDEO_H265)), 1e-9)
+
+        // NOT seeded: 4K60 SDR HEVC (no HDR) — high-res/fps but not the HDR near-ceiling class.
+        val sdr4k60Hevc = VideoSourceInfo(
+            width = 3840, height = 2160, frameRate = 60f, durationMs = 60_000,
+            totalBitrate = 60_000_000, audioBitrate = 256_000,
+            videoMime = MimeTypes.VIDEO_H265, colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+        )
+        assertEquals(1.0, e.expectedOvershootFactor(keyFor(sdr4k60Hevc, MimeTypes.VIDEO_H265)), 1e-9)
+
+        // NOT seeded: 1080p HDR HEVC — HDR but not high resolution.
+        val hdr1080pHevc = VideoSourceInfo(
+            width = 1920, height = 1080, frameRate = 30f, durationMs = 60_000,
+            totalBitrate = 30_000_000, audioBitrate = 256_000,
+            videoMime = MimeTypes.VIDEO_H265,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_HLG, colorStandard = MediaFormat.COLOR_STANDARD_BT2020
+        )
+        assertEquals(1.0, e.expectedOvershootFactor(keyFor(hdr1080pHevc, MimeTypes.VIDEO_H265)), 1e-9)
     }
 
     @Test

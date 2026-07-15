@@ -6,18 +6,54 @@ plugins {
 
 val stableDebugKeystore = rootProject.file("ci-debug.keystore")
 
+// Best-effort short git commit for build provenance in structured diagnostics. Never fails the
+// build (shallow CI checkouts or a missing git binary fall back to "unknown").
+val buildGitCommit: String = try {
+    val process = ProcessBuilder("git", "rev-parse", "--short", "HEAD")
+        .directory(rootProject.rootDir)
+        .redirectErrorStream(true)
+        .start()
+    val text = process.inputStream.bufferedReader().readText().trim()
+    process.waitFor()
+    if (process.exitValue() == 0 && text.isNotEmpty()) text else "unknown"
+} catch (_: Exception) {
+    "unknown"
+}
+
 android {
     namespace = "compress.joshattic.us"
     compileSdk = 36
+    ndkVersion = "27.2.12479018"
 
     defaultConfig {
         applicationId = "io.github.zfkirke0109.galaxycompressor"
         minSdk = 24
         targetSdk = 36
-        versionCode = 25
-        versionName = "1.6.0"
+        versionCode = 26
+        versionName = "1.6.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        buildConfigField("String", "GIT_COMMIT", "\"$buildGitCommit\"")
+
+        // On-device VMAF is arm64-only (libvmaf NEON build). Other ABIs simply run without
+        // pixel scoring: VmafNative.isAvailable is false and every caller falls back to the
+        // structural-only pipeline.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                arguments += "-DANDROID_STL=c++_static"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     signingConfigs {
@@ -52,6 +88,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     dependenciesInfo {
         includeInBundle = false

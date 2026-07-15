@@ -4,6 +4,7 @@ import android.media.MediaFormat
 import androidx.media3.common.MimeTypes
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -143,18 +144,21 @@ class BatchQualitySafetyTest {
 
     @Test
     fun nearOptimalSourcePrefersRemuxInsteadOfPointlessReencode() {
+        // High-bit-density SDR H.264 camera clip -> HEVC: the only class the 2026-07-14 VMAF
+        // evidence still allows a PL re-encode for.
         val source = VideoSourceInfo(
-            width = 3840,
-            height = 2160,
-            frameRate = 60f,
+            width = 1920,
+            height = 1080,
+            frameRate = 30f,
             durationMs = 60_000,
-            totalBitrate = 119_900_000,
-            audioBitrate = 320_000,
-            videoMime = MimeTypes.VIDEO_H265,
-            colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084,
-            colorStandard = MediaFormat.COLOR_STANDARD_BT2020
+            totalBitrate = 20_000_000,
+            audioBitrate = 256_000,
+            videoMime = MimeTypes.VIDEO_H264,
+            audioMime = MimeTypes.AUDIO_AAC,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT709
         )
-        val sourceBytes = 119_900_000L * 60L / 8L
+        val sourceBytes = 20_000_000L * 60L / 8L
 
         // A target ratio pushed to the maximum cannot save >= 3%, so remux is the honest choice.
         assertTrue(
@@ -176,6 +180,69 @@ class BatchQualitySafetyTest {
                 learnedTargetRatio = null
             )
         )
+    }
+
+    @Test
+    fun hdrSourceAlwaysPrefersRemuxForPerceptualLossless() {
+        // Zero HDR pairs exist in the pixel-validation evidence; a stream copy is the only output
+        // proven to preserve HDR/color exactly, so PL must never re-encode an HDR source.
+        val hdrH264 = VideoSourceInfo(
+            width = 3840,
+            height = 2160,
+            frameRate = 60f,
+            durationMs = 60_000,
+            totalBitrate = 120_000_000,
+            audioBitrate = 256_000,
+            videoMime = MimeTypes.VIDEO_H264,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT2020
+        )
+        assertTrue(
+            BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
+                source = hdrH264,
+                outputMimeType = MimeTypes.VIDEO_H265,
+                sourceSizeBytes = 900_000_000L,
+                learnedTargetRatio = null
+            )
+        )
+    }
+
+    @Test
+    fun lowBitDensitySourcePrefersRemuxForPerceptualLossless() {
+        // VMAF-calibrated transparency gate: every measured pair below ~0.08 bits/pixel/frame
+        // failed the perceptual thresholds (4K60 at bpp 0.018 scored 1%-low 60.7 even at ratio
+        // 0.90). Sources below the gate must keep the exact stream copy.
+        val starved4k60 = VideoSourceInfo(
+            width = 2160,
+            height = 3840,
+            frameRate = 60f,
+            durationMs = 88_816,
+            totalBitrate = 8_964_225,
+            audioBitrate = 128_040,
+            videoMime = MimeTypes.VIDEO_H264,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+        )
+        assertTrue(
+            BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
+                source = starved4k60,
+                outputMimeType = MimeTypes.VIDEO_H265,
+                sourceSizeBytes = 99_521_194L,
+                learnedTargetRatio = null
+            )
+        )
+        assertFalse(BatchQualityBitratePolicy.sourceSupportsTransparentPerceptualLossless(starved4k60))
+
+        // Unknown source bitrate fails closed: transparency headroom cannot be proven.
+        val unknownBitrate = starved4k60.copy(totalBitrate = 0)
+        assertFalse(BatchQualityBitratePolicy.sourceSupportsTransparentPerceptualLossless(unknownBitrate))
+
+        // A healthy-density camera clip passes the gate.
+        val healthy1080p = VideoSourceInfo(
+            width = 1920, height = 1080, frameRate = 30f, durationMs = 60_000,
+            totalBitrate = 20_000_000, audioBitrate = 256_000,
+            videoMime = MimeTypes.VIDEO_H264, colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+        )
+        assertTrue(BatchQualityBitratePolicy.sourceSupportsTransparentPerceptualLossless(healthy1080p))
     }
 
     @Test
@@ -267,9 +334,12 @@ class BatchQualitySafetyTest {
             colorStandard = MediaFormat.COLOR_STANDARD_BT2020,
             colorRange = MediaFormat.COLOR_RANGE_LIMITED,
             audioChannelCount = 2,
-            audioSampleRate = 48_000
+            audioSampleRate = 48_000,
+            // A real HDR HEVC output exposes its Main10 profile through the extractor, proving the
+            // 10-bit path survived. The bitrate stays hidden (no btrt), but bit depth must be proven.
+            videoProfile = android.media.MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
         )
-        // Real S23 Ultra Transformer+MediaMuxer output: same codec/shape/HDR, bitrates hidden.
+        // Real S23 Ultra Transformer+MediaMuxer output: same codec/shape/HDR/profile, bitrates hidden.
         val outputTracks = sourceTracks.copy(videoBitrate = 0, audioBitrate = 0, videoFrameRate = 59f)
         return OutputVerifier.VerificationInput(
             mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
@@ -347,7 +417,9 @@ class BatchQualitySafetyTest {
             colorStandard = MediaFormat.COLOR_STANDARD_BT2020,
             colorRange = MediaFormat.COLOR_RANGE_LIMITED,
             audioChannelCount = 2,
-            audioSampleRate = 48_000
+            audioSampleRate = 48_000,
+            // HLG source requires 10-bit; a stream copy carries the source's Main10 profile through.
+            videoProfile = android.media.MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
         )
         val outputTracks = sourceTracks.copy(videoBitrate = 0, audioBitrate = 0, videoFrameRate = 60f)
 
@@ -388,27 +460,28 @@ class BatchQualitySafetyTest {
 
     @Test
     fun overshootAwarePredictionPrefersRemuxWhenEncoderOvershoots() {
+        // SDR H.264 -> HEVC with healthy bit density: the class PL may still re-encode.
         val source = VideoSourceInfo(
-            width = 2160,
-            height = 3840,
-            frameRate = 60f,
+            width = 1920,
+            height = 1080,
+            frameRate = 30f,
             durationMs = 93_247,
-            totalBitrate = 120_202_307,
+            totalBitrate = 20_000_000,
             audioBitrate = 256_000,
-            videoMime = MimeTypes.VIDEO_H265,
-            colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084,
-            colorStandard = MediaFormat.COLOR_STANDARD_BT2020
+            videoMime = MimeTypes.VIDEO_H264,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT709
         )
-        val sourceBytes = 1_401_060_070L
+        val sourceBytes = 20_000_000L / 8L * 93L
 
-        // Without overshoot knowledge, the default 0.95 target predicts a useful saving.
+        // Without overshoot knowledge, the default 0.90 target predicts a useful saving.
         assertFalse(
             BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
                 source, MimeTypes.VIDEO_H265, sourceBytes, learnedTargetRatio = null
             )
         )
-        // With the measured S23 Ultra VBR overshoot (~1.25x), the same request predicts an output
-        // LARGER than the source, so the honest pre-encode decision is remux — no wasted encode.
+        // With a measured ~1.25x VBR overshoot, the same request predicts an output LARGER than
+        // the source, so the honest pre-encode decision is remux — no wasted encode.
         assertTrue(
             BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
                 source, MimeTypes.VIDEO_H265, sourceBytes,
@@ -467,6 +540,34 @@ class BatchQualitySafetyTest {
             outputFileProbe = input.outputFileProbe.copy(frameCount = 5_594)
         )
         assertTrue(OutputVerifier.verify(intact).verified)
+    }
+
+    @Test
+    fun tenBitHdrSourceFailsClosedWhenOutputIsNotProvenTenBit() {
+        val base = hdr4k60VerificationInput(
+            outputSize = 1_190_000_000L,
+            sourceSize = 1_401_060_070L,
+            outputDurationMs = 93_247L
+        )
+        // 8-bit Main output carrying copied PQ/BT2020 color tags: color labels must NOT substitute
+        // for bit-depth proof. This is the exact "10-bit verifies as 8-bit" degradation to reject.
+        val eightBit = base.copy(
+            outputTrackProbe = base.outputTrackProbe.copy(
+                videoProfile = android.media.MediaCodecInfo.CodecProfileLevel.HEVCProfileMain
+            )
+        )
+        val eightBitReport = OutputVerifier.verify(eightBit)
+        assertFalse(eightBitReport.verified)
+        assertFalse(eightBitReport.replacementSafe)
+        assertTrue(eightBitReport.replacementBlockReason.orEmpty().contains("HDR/color"))
+
+        // Unknown output bit depth (profile not exposed) for a proven-10-bit source fails closed too.
+        val unknownDepth = base.copy(
+            outputTrackProbe = base.outputTrackProbe.copy(videoProfile = null)
+        )
+        val unknownReport = OutputVerifier.verify(unknownDepth)
+        assertFalse(unknownReport.verified)
+        assertFalse(unknownReport.replacementSafe)
     }
 
     @Test
@@ -541,7 +642,7 @@ class BatchQualitySafetyTest {
             colorStandard = MediaFormat.COLOR_STANDARD_BT709
         )
 
-        assertEquals(0.68, BatchQualityBitratePolicy.perceptualLosslessRatioFloor(source), 1e-9)
+        assertEquals(0.85, BatchQualityBitratePolicy.perceptualLosslessRatioFloor(source), 1e-9)
 
         val target = BatchQualityBitratePolicy.calculateVideoBitrate(
             source = source,
@@ -551,8 +652,9 @@ class BatchQualitySafetyTest {
         // Default HEVC->HEVC ratio 0.95 of ~33.9 Mbps video — no longer clamped up to source.
         assertTrue(target < source.videoBitrate)
 
-        // And the pre-encode gate now predicts a real saving instead of preferring remux.
-        assertFalse(
+        // Same-codec PL re-encodes now prefer the exact stream copy (2026-07-14 VMAF evidence:
+        // HEVC->HEVC at ratio 0.95 scored 1%-low 79.8 despite a 97.1 mean).
+        assertTrue(
             BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
                 source, MimeTypes.VIDEO_H265, 51_540_072L,
                 learnedTargetRatio = null,
@@ -560,9 +662,146 @@ class BatchQualitySafetyTest {
             )
         )
 
-        // True 4K (landscape or portrait) keeps its 4K floors.
+        // True 4K (landscape or portrait) keeps 4K-class floors.
         val portrait4k = source.copy(width = 2160, height = 3840, totalBitrate = 120_202_307)
-        assertEquals(0.74, BatchQualityBitratePolicy.perceptualLosslessRatioFloor(portrait4k), 1e-9)
+        assertEquals(0.85, BatchQualityBitratePolicy.perceptualLosslessRatioFloor(portrait4k), 1e-9)
+    }
+
+    @Test
+    fun downloadedLowBitrate1080pH264PrefersRemuxAfterVmafEvidence() {
+        // History: the pre-fix build silently remuxed low-bitrate downloads because a camera-class
+        // absolute floor clamped their target up to the source bitrate; the "downloaded-video fix"
+        // then allowed real sub-source targets. The 2026-07-14 VMAF suite measured exactly those
+        // encodes and DISPROVED them: 1080p at bpp 0.050 / ratio 0.82 scored 1%-low 78.7, and every
+        // low-density pair failed. A ~4 Mbps 1080p30 download sits at bpp ~0.062 — below the 0.08
+        // transparency gate — so the honest PL action is again the exact stream copy, this time as
+        // an explicit, evidence-based decision rather than a floor accident.
+        val download = VideoSourceInfo(
+            width = 1920,
+            height = 1080,
+            frameRate = 30f,
+            durationMs = 60_000,
+            totalBitrate = 4_000_000,
+            audioBitrate = 128_000,
+            videoMime = MimeTypes.VIDEO_H264,
+            audioMime = MimeTypes.AUDIO_AAC,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT709
+        )
+
+        assertFalse(BatchQualityBitratePolicy.sourceSupportsTransparentPerceptualLossless(download))
+        assertTrue(
+            BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
+                source = download,
+                outputMimeType = MimeTypes.VIDEO_H265,
+                sourceSizeBytes = 30_000_000L,
+                learnedTargetRatio = null,
+                expectedOvershootFactor = 1.0
+            )
+        )
+
+        // The bitrate math itself stays sane for callers that still compute it: the raised 0.85
+        // ratio floor governs (the 10 Mbps camera absolute floor does not bind below itself).
+        val floor = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(download)
+        val target = BatchQualityBitratePolicy.calculateVideoBitrate(
+            source = download,
+            mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
+            outputMimeType = MimeTypes.VIDEO_H265
+        )
+        assertEquals((download.videoBitrate * 0.85).toInt(), floor)
+        assertTrue("target must be below source video bitrate", target < download.videoBitrate)
+        assertTrue("target must stay at or above the ratio floor", target >= floor)
+    }
+
+    @Test
+    fun cameraClassFloorsFollowTheRaisedSdrRatioFloor() {
+        // After the 2026-07-14 VMAF evidence the SDR ratio floor is 0.85; camera-class sources'
+        // floors are governed by it whenever it exceeds the absolute floor.
+        // 1080p H.264 camera clip at 20 Mbps: floor = 19.744M * 0.85 = 16.78M dominates the 10M abs.
+        val camera1080p = VideoSourceInfo(
+            width = 1920, height = 1080, frameRate = 30f, durationMs = 60_000,
+            totalBitrate = 20_000_000, audioBitrate = 256_000,
+            videoMime = MimeTypes.VIDEO_H264, colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+        )
+        val floor1080 = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(camera1080p)
+        assertEquals((camera1080p.videoBitrate * 0.85).toInt(), floor1080)
+
+        // 4K60 HDR camera clip at ~120 Mbps: HDR-4K60 ratio floor 0.80 dominates the 48M abs floor.
+        val camera4k = VideoSourceInfo(
+            width = 3840, height = 2160, frameRate = 60f, durationMs = 60_000,
+            totalBitrate = 119_900_000, audioBitrate = 320_000,
+            videoMime = MimeTypes.VIDEO_H265,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084, colorStandard = MediaFormat.COLOR_STANDARD_BT2020
+        )
+        val floor4k = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(camera4k)
+        val video4k = camera4k.videoBitrate // 119.9M - 320k = 119.58M
+        assertEquals((video4k * 0.80).toInt(), floor4k)
+        assertTrue("4K HDR floor must stay >= 95 Mbps", floor4k >= 95_000_000)
+    }
+
+    @Test
+    fun crossCodecFloorScaleOnlyRelaxesTheAbsoluteFloorNeverTheRatioFloor() {
+        // A 720p H.264 clip at ~8 Mbps: the cross-codec scale (0.65) still lowers the 6 Mbps
+        // absolute-floor COMPONENT for an HEVC output, but with the evidence-raised 0.85 ratio
+        // floor the ratio floor dominates both floors — the perceptual guard is never scaled.
+        val h264_720p = VideoSourceInfo(
+            width = 1280, height = 720, frameRate = 30f, durationMs = 81_000,
+            totalBitrate = 8_168_020, audioBitrate = 168_505,
+            videoMime = MimeTypes.VIDEO_H264, audioMime = MimeTypes.AUDIO_AAC,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+        )
+        val legacyFloor = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(h264_720p)
+        val hevcFloor = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(h264_720p, MimeTypes.VIDEO_H265)
+
+        assertEquals((h264_720p.videoBitrate * 0.85).toInt(), legacyFloor)
+        assertEquals(legacyFloor, hevcFloor)
+        assertEquals(0.65, BatchQualityBitratePolicy.crossCodecAbsoluteFloorScale(h264_720p, MimeTypes.VIDEO_H265), 1e-9)
+    }
+
+    @Test
+    fun crossCodecFloorIsByteIdenticalForSameCodecAndForLegacyCallers() {
+        // Same-codec (HEVC -> HEVC) and the legacy 1-arg call must never change: the scale is 1.0.
+        val hevc1080p = VideoSourceInfo(
+            width = 1920, height = 1080, frameRate = 30f, durationMs = 60_000,
+            totalBitrate = 20_000_000, audioBitrate = 256_000,
+            videoMime = MimeTypes.VIDEO_H265, colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+        )
+        val legacy = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(hevc1080p)
+        val sameCodec = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(hevc1080p, MimeTypes.VIDEO_H265)
+        assertEquals(legacy, sameCodec)
+    }
+
+    @Test
+    fun crossCodecFloorNeverScalesHdrSources() {
+        // Belt-and-suspenders: even a (contrived) HDR source being sent to a more-efficient codec must
+        // keep its full absolute floor — HDR floors are never relaxed by the codec-efficiency scale.
+        val hdr4kH264 = VideoSourceInfo(
+            width = 3840, height = 2160, frameRate = 30f, durationMs = 60_000,
+            totalBitrate = 80_000_000, audioBitrate = 256_000,
+            videoMime = MimeTypes.VIDEO_H264,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_ST2084, colorStandard = MediaFormat.COLOR_STANDARD_BT2020
+        )
+        val legacy = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(hdr4kH264)
+        val toHevc = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(hdr4kH264, MimeTypes.VIDEO_H265)
+        assertEquals(legacy, toHevc)
+        assertEquals(1.0, BatchQualityBitratePolicy.crossCodecAbsoluteFloorScale(hdr4kH264, MimeTypes.VIDEO_H265), 1e-9)
+    }
+
+    @Test
+    fun crossCodecAbsoluteFloorScaleOnlyRelaxesForStrictlyMoreEfficientSdrOutput() {
+        fun sdr(mime: String) = VideoSourceInfo(
+            width = 1920, height = 1080, frameRate = 30f,
+            videoMime = mime, colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+        )
+        // H.264 -> HEVC/VP9: one tier of headroom -> 0.65.
+        assertEquals(0.65, BatchQualityBitratePolicy.crossCodecAbsoluteFloorScale(sdr(MimeTypes.VIDEO_H264), MimeTypes.VIDEO_H265), 1e-9)
+        // H.264 -> AV1: two tiers -> 0.50.
+        assertEquals(0.50, BatchQualityBitratePolicy.crossCodecAbsoluteFloorScale(sdr(MimeTypes.VIDEO_H264), MimeTypes.VIDEO_AV1), 1e-9)
+        // Same codec, less-efficient output, unknown codec, and null output all stay 1.0.
+        assertEquals(1.0, BatchQualityBitratePolicy.crossCodecAbsoluteFloorScale(sdr(MimeTypes.VIDEO_H265), MimeTypes.VIDEO_H265), 1e-9)
+        assertEquals(1.0, BatchQualityBitratePolicy.crossCodecAbsoluteFloorScale(sdr(MimeTypes.VIDEO_H265), MimeTypes.VIDEO_H264), 1e-9)
+        assertEquals(1.0, BatchQualityBitratePolicy.crossCodecAbsoluteFloorScale(sdr("video/unknown"), MimeTypes.VIDEO_H265), 1e-9)
+        assertEquals(1.0, BatchQualityBitratePolicy.crossCodecAbsoluteFloorScale(sdr(MimeTypes.VIDEO_H264), null), 1e-9)
     }
 
     @Test
@@ -658,6 +897,335 @@ class BatchQualitySafetyTest {
     }
 
     @Test
+    fun perceptualLosslessNeverDowngradesAnEfficientSourceCodecForNominalSavings() {
+        assertTrue(
+            BatchQualityBitratePolicy.shouldPreserveSourceCodecForPerceptualLossless(
+                MimeTypes.VIDEO_AV1,
+                MimeTypes.VIDEO_H265
+            )
+        )
+        assertTrue(
+            BatchQualityBitratePolicy.shouldPreserveSourceCodecForPerceptualLossless(
+                MimeTypes.VIDEO_H265,
+                MimeTypes.VIDEO_H264
+            )
+        )
+        assertTrue(
+            BatchQualityBitratePolicy.shouldPreserveSourceCodecForPerceptualLossless(
+                null,
+                MimeTypes.VIDEO_H265
+            )
+        )
+        assertFalse(
+            BatchQualityBitratePolicy.shouldPreserveSourceCodecForPerceptualLossless(
+                MimeTypes.VIDEO_H264,
+                MimeTypes.VIDEO_H265
+            )
+        )
+        // Same-codec re-encode is preserved (remuxed) since the 2026-07-14 VMAF evidence:
+        // HEVC->HEVC at ratio 0.95 failed the 1%-low threshold (79.8 vs 90).
+        assertTrue(
+            BatchQualityBitratePolicy.shouldPreserveSourceCodecForPerceptualLossless(
+                MimeTypes.VIDEO_H265,
+                MimeTypes.VIDEO_H265
+            )
+        )
+        assertTrue(
+            BatchQualityBitratePolicy.shouldPreserveSourceCodecForPerceptualLossless(
+                MimeTypes.VIDEO_VP9,
+                MimeTypes.VIDEO_H265
+            )
+        )
+        assertTrue(
+            BatchQualityBitratePolicy.shouldPreserveSourceCodecForPerceptualLossless(
+                MimeTypes.VIDEO_DOLBY_VISION,
+                MimeTypes.VIDEO_H265
+            )
+        )
+    }
+
+    @Test
+    fun portraitTransformerRotationPreservesDisplayGeometryWithoutWeakeningResolution() {
+        // The probes normalize each file's own rotation before comparing dimensions. Raw coded
+        // transposition never passes the dimension gate by itself.
+        assertTrue(OutputVerifier.sameDimensions(2160, 3840, 2160, 3840))
+        assertFalse(OutputVerifier.sameDimensions(2160, 3840, 3840, 2160))
+        assertFalse(OutputVerifier.sameDimensions(2160, 3840, 3840, 2161))
+        assertFalse(OutputVerifier.sameDimensions(2160, 3840, 1920, 1080))
+        assertFalse(OutputVerifier.sameDimensions(2160, 3840, 0, 2160))
+
+        // Media3's valid portrait representation may change the raw rotation hint by a quarter
+        // turn once normalized display dimensions match exactly.
+        assertTrue(
+            OutputVerifier.sameDisplayOrientation(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS,
+                2160,
+                3840,
+                displayDimensionsMatch = true,
+                sourceRotationDegrees = 0,
+                outputRotationDegrees = 90
+            )
+        )
+        // Remuxes must retain raw orientation, and transcodes never accept 180°, landscape
+        // quarter-turns, or mismatched display geometry. An absent hint is canonical zero.
+        assertFalse(
+            OutputVerifier.sameDisplayOrientation(
+                BatchQualityMode.REMUX_ONLY, 2160, 3840, true, 0, 90
+            )
+        )
+        assertFalse(
+            OutputVerifier.sameDisplayOrientation(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS, 2160, 3840, true, 0, 180
+            )
+        )
+        assertFalse(
+            OutputVerifier.sameDisplayOrientation(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS, 3840, 2160, true, 0, 90
+            )
+        )
+        assertFalse(
+            OutputVerifier.sameDisplayOrientation(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS, 2160, 3840, false, 0, 90
+            )
+        )
+        assertTrue(
+            OutputVerifier.sameDisplayOrientation(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS, 2160, 3840, true, 0, null
+            )
+        )
+        assertFalse(
+            OutputVerifier.sameDisplayOrientation(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS, 2160, 3840, true, null, 180
+            )
+        )
+        assertFalse(
+            OutputVerifier.sameDisplayOrientation(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS, 2160, 3840, true, null, 45
+            )
+        )
+        // A rotated source (raw 90/270) is only preserved by an exactly-equal output hint. The
+        // portrait compensation exception is for coded-portrait sources (raw 0) ONLY: a 90->0 change
+        // plays sideways and 90->180 plays upside down, so both must fail even though the normalized
+        // display dimensions match. Equal hints (90->90, 270->270) always pass.
+        assertFalse(
+            OutputVerifier.sameDisplayOrientation(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS, 2160, 3840, true, 90, 0
+            )
+        )
+        assertFalse(
+            OutputVerifier.sameDisplayOrientation(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS, 2160, 3840, true, 90, 180
+            )
+        )
+        assertTrue(
+            OutputVerifier.sameDisplayOrientation(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS, 2160, 3840, true, 90, 90
+            )
+        )
+        assertTrue(
+            OutputVerifier.sameDisplayOrientation(
+                BatchQualityMode.REMUX_ONLY, 2160, 3840, true, 270, 270
+            )
+        )
+    }
+
+    @Test
+    fun metadataRemuxKeepsEncodedOrientationInsteadOfGuessingFromSource() {
+        assertEquals(90, Mp4MetadataRemuxer.orientationHintForTranscodedRemux(90))
+        assertEquals(270, Mp4MetadataRemuxer.orientationHintForTranscodedRemux(270))
+        assertNull(Mp4MetadataRemuxer.orientationHintForTranscodedRemux(null))
+        assertNull(Mp4MetadataRemuxer.orientationHintForTranscodedRemux(45))
+    }
+
+    @Test
+    fun baselinePortraitTranscodeVerifiesWithMedia3CompensatingRotation() {
+        val sourceTracks = OutputVerifier.TrackProbe(
+            videoCodec = MimeTypes.VIDEO_H264,
+            audioCodec = MimeTypes.AUDIO_AAC,
+            videoBitrate = 62_011_000,
+            audioBitrate = 142_728,
+            colorTransfer = null,
+            colorStandard = null,
+            colorRange = null,
+            audioChannelCount = 2,
+            audioSampleRate = 44_100,
+            videoFrameRate = 60f
+        )
+        val outputTracks = sourceTracks.copy(
+            videoCodec = MimeTypes.VIDEO_H265,
+            videoBitrate = 0,
+            audioBitrate = 0,
+            colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
+            colorStandard = MediaFormat.COLOR_STANDARD_BT709,
+            colorRange = MediaFormat.COLOR_RANGE_LIMITED
+        )
+        val report = OutputVerifier.verify(
+            OutputVerifier.VerificationInput(
+                mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
+                source = VideoSourceInfo(
+                    width = 2160,
+                    height = 3840,
+                    frameRate = 60f,
+                    durationMs = 88_817,
+                    totalBitrate = 62_089_257,
+                    audioBitrate = 142_728,
+                    videoMime = MimeTypes.VIDEO_H264,
+                    audioMime = MimeTypes.AUDIO_AAC,
+                    rotationDegrees = 0,
+                    audioChannelCount = 2,
+                    audioSampleRate = 44_100
+                ),
+                // FileProbe dimensions are already display-normalized from coded 3840x2160 + 90°.
+                outputFileProbe = OutputVerifier.FileProbe(2160, 3840, 60f, 88_863, 90, 5_323),
+                sourceTrackProbe = sourceTracks,
+                outputTrackProbe = outputTracks,
+                sourceMetadata = VideoMetadataSnapshot(rawDateTag = "tag", rotationDegrees = 0),
+                outputMetadata = VideoMetadataSnapshot(rawDateTag = "tag", rotationDegrees = 90),
+                sourceSize = 689_308_985L,
+                outputSize = 607_807_388L,
+                privacyMode = MetadataPrivacyMode.PRESERVE_ALL,
+                sourceFrameCount = 5_323
+            )
+        )
+
+        assertEquals("Perceptually Lossless Verified", report.verdict)
+        assertTrue(report.verified)
+        assertTrue(report.replacementSafe)
+        assertTrue(report.video.endsWith("ok"))
+        assertTrue(report.rotation.endsWith("ok"))
+        assertTrue(report.hdr.contains("Media3 assumed SDR default"))
+    }
+
+    @Test
+    fun media3AssumedSdrTransitionIsNarrowAndHdrSafe() {
+        fun probe(
+            transfer: Int? = null,
+            standard: Int? = null,
+            range: Int? = null,
+            hdrStaticDigest: String? = null,
+            hdr10PlusDigest: String? = null,
+            profile: Int? = null,
+            mime: String = MimeTypes.VIDEO_H264
+        ) = OutputVerifier.TrackProbe(
+            videoCodec = mime,
+            audioCodec = null,
+            videoBitrate = 1_000_000,
+            audioBitrate = 0,
+            colorTransfer = transfer,
+            colorStandard = standard,
+            colorRange = range,
+            audioChannelCount = null,
+            audioSampleRate = null,
+            hdrStaticInfoDigest = hdrStaticDigest,
+            hdr10PlusInfoDigest = hdr10PlusDigest,
+            videoProfile = profile
+        )
+
+        val absent = probe()
+        val canonicalSdr = probe(
+            transfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
+            standard = MediaFormat.COLOR_STANDARD_BT709,
+            range = MediaFormat.COLOR_RANGE_LIMITED
+        )
+        val assumed = OutputVerifier.compareColorTransition(
+            BatchQualityMode.PERCEPTUAL_LOSSLESS,
+            absent,
+            canonicalSdr
+        )
+        assertTrue(assumed.matches)
+        assertEquals(OutputVerifier.ColorMatchBasis.MEDIA3_ASSUMED_SDR, assumed.basis)
+
+        // A stream copy may not rewrite absent metadata, and an absent field is never a wildcard.
+        assertFalse(
+            OutputVerifier.compareColorTransition(
+                BatchQualityMode.REMUX_ONLY,
+                absent,
+                canonicalSdr
+            ).matches
+        )
+        assertFalse(
+            OutputVerifier.compareColorTransition(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS,
+                absent,
+                canonicalSdr.copy(colorRange = MediaFormat.COLOR_RANGE_FULL)
+            ).matches
+        )
+        assertFalse(
+            OutputVerifier.compareColorTransition(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS,
+                absent,
+                canonicalSdr.copy(
+                    colorTransfer = MediaFormat.COLOR_TRANSFER_HLG,
+                    colorStandard = MediaFormat.COLOR_STANDARD_BT2020
+                )
+            ).matches
+        )
+
+        // Static HDR metadata or a 10-bit-capable source profile disables the assumed-SDR path.
+        assertFalse(
+            OutputVerifier.compareColorTransition(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS,
+                absent.copy(hdrStaticInfoDigest = "static-a"),
+                canonicalSdr
+            ).matches
+        )
+        assertFalse(
+            OutputVerifier.compareColorTransition(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS,
+                absent.copy(
+                    videoCodec = MimeTypes.VIDEO_H265,
+                    videoProfile = android.media.MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
+                ),
+                canonicalSdr.copy(videoCodec = MimeTypes.VIDEO_H265)
+            ).matches
+        )
+
+        val hdr = probe(
+            transfer = MediaFormat.COLOR_TRANSFER_ST2084,
+            standard = MediaFormat.COLOR_STANDARD_BT2020,
+            range = MediaFormat.COLOR_RANGE_LIMITED,
+            hdrStaticDigest = "static-a",
+            profile = android.media.MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10,
+            mime = MimeTypes.VIDEO_H265
+        )
+        assertTrue(
+            OutputVerifier.compareColorTransition(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS,
+                hdr,
+                hdr
+            ).matches
+        )
+        assertFalse(
+            OutputVerifier.compareColorTransition(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS,
+                hdr,
+                canonicalSdr.copy(videoCodec = MimeTypes.VIDEO_H265)
+            ).matches
+        )
+        assertFalse(
+            OutputVerifier.compareColorTransition(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS,
+                hdr,
+                hdr.copy(hdrStaticInfoDigest = "static-b")
+            ).matches
+        )
+        assertFalse(
+            OutputVerifier.compareColorTransition(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS,
+                hdr.copy(hdr10PlusInfoDigest = "dynamic-a"),
+                hdr.copy(hdr10PlusInfoDigest = "dynamic-a")
+            ).matches
+        )
+        assertFalse(
+            OutputVerifier.compareColorTransition(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS,
+                hdr,
+                hdr.copy(videoProfile = android.media.MediaCodecInfo.CodecProfileLevel.HEVCProfileMain)
+            ).matches
+        )
+    }
+
+    @Test
     fun perceptuallyLosslessFailsVerificationOnHdrAndBitrateLoss() {
         val report = OutputVerifier.verify(
             OutputVerifier.VerificationInput(
@@ -749,7 +1317,8 @@ class BatchQualitySafetyTest {
                     MediaFormat.COLOR_STANDARD_BT2020,
                     MediaFormat.COLOR_RANGE_LIMITED,
                     2,
-                    48_000
+                    48_000,
+                    videoProfile = android.media.MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
                 ),
                 outputTrackProbe = OutputVerifier.TrackProbe(
                     MimeTypes.VIDEO_H265,
@@ -760,7 +1329,8 @@ class BatchQualitySafetyTest {
                     MediaFormat.COLOR_STANDARD_BT2020,
                     MediaFormat.COLOR_RANGE_LIMITED,
                     2,
-                    48_000
+                    48_000,
+                    videoProfile = android.media.MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
                 ),
                 sourceMetadata = VideoMetadataSnapshot(
                     rawDateTag = "2026-07-08T00:00:00Z",
