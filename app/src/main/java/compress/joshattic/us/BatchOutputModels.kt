@@ -109,7 +109,12 @@ data class OutputVerificationReport(
     val replacementBlockReason: String? = null,
     val criticalFieldsComplete: Boolean = false,
     val verified: Boolean = false,
-    val durationParity: String = ""
+    val durationParity: String = "",
+    // True only when a Perceptually Lossless output failed SOLELY on the inferred video
+    // bitrate floor — every structural, color, audio, timing, and metadata check passed.
+    // That one case may be re-judged by sampled pixel certification (measured pixels
+    // outrank the inferred floor); any other failure combination is terminal.
+    val failedOnlyOnVideoBitrateFloor: Boolean = false
 ) {
     val summaryLines: List<String>
         get() = listOf(

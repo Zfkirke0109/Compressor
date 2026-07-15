@@ -105,9 +105,25 @@ object BatchQualityBitratePolicy {
     // action is an exact stream copy.
     const val PERCEPTUAL_LOSSLESS_MIN_SOURCE_BITS_PER_PIXEL = 0.08
 
-    // Minimum predicted savings before a Perceptually Lossless re-encode is worth attempting.
-    // Below this, the safe bitrate is so close to the source that Remux Only is the honest choice.
-    const val MIN_PERCEPTUAL_LOSSLESS_PREDICTED_SAVINGS = 0.03
+    // Minimum savings for a Perceptually Lossless result to count as a genuine reduction.
+    // This is a NOISE threshold, not a worthiness bar: a verified 1-2% smaller file is a
+    // successful compression. It only has to exceed filesystem/container/measurement noise,
+    // so it requires BOTH a relative and a small absolute margin (see meetsMinimumUsefulSavings).
+    const val MIN_PERCEPTUAL_LOSSLESS_PREDICTED_SAVINGS = 0.005
+    const val MIN_PERCEPTUAL_LOSSLESS_SAVINGS_BYTES = 262_144L
+
+    /**
+     * True when shrinking [sourceSizeBytes] to [candidateSizeBytes] clears measurement noise:
+     * at least [MIN_PERCEPTUAL_LOSSLESS_PREDICTED_SAVINGS] of the source AND
+     * [MIN_PERCEPTUAL_LOSSLESS_SAVINGS_BYTES] absolute. Unknown source size fails open
+     * (the post-encode smaller-than-source check still gates acceptance).
+     */
+    fun meetsMinimumUsefulSavings(sourceSizeBytes: Long, candidateSizeBytes: Long): Boolean {
+        if (sourceSizeBytes <= 0L) return true
+        val saved = sourceSizeBytes - candidateSizeBytes
+        return saved >= MIN_PERCEPTUAL_LOSSLESS_SAVINGS_BYTES &&
+            saved.toDouble() / sourceSizeBytes >= MIN_PERCEPTUAL_LOSSLESS_PREDICTED_SAVINGS
+    }
 
     // Perceptually Lossless targets may never exceed this fraction of the source video bitrate;
     // above it the re-encode cannot meaningfully shrink the file and remux should win instead.
@@ -260,6 +276,26 @@ object BatchQualityBitratePolicy {
         val outputTier = codecEfficiencyTier(outputMimeType) ?: return true
         val sameCodec = sourceMimeType.equals(outputMimeType, ignoreCase = true)
         return sameCodec || outputTier <= sourceTier
+    }
+
+    /**
+     * The strictly-unprobeable subset of [shouldPreserveSourceCodecForPerceptualLossless]:
+     * converting to a LESS efficient codec (or an unknown one — fail closed) manufactures a
+     * fake bitrate delta that no pixel probe can justify, so these never earn trial encodes.
+     *
+     * A SAME-codec re-encode is deliberately NOT a downgrade: it stays remux-preferred by
+     * inference (the 2026-07-14 suite disproved blind same-codec cuts), but it may earn probe
+     * encodes — a healthy-bpp source whose probe windows and post-encode certification both
+     * pass has per-clip pixel evidence that outranks the class-level inference.
+     */
+    fun isCodecDowngradeForPerceptualLossless(
+        sourceMimeType: String?,
+        outputMimeType: String?
+    ): Boolean {
+        val sourceTier = codecEfficiencyTier(sourceMimeType) ?: return true
+        val outputTier = codecEfficiencyTier(outputMimeType) ?: return true
+        val sameCodec = sourceMimeType.equals(outputMimeType, ignoreCase = true)
+        return !sameCodec && outputTier <= sourceTier
     }
 
     private fun codecEfficiencyTier(mimeType: String?): Int? = when (mimeType) {

@@ -74,6 +74,7 @@ class PerceptualQualityProber(private val context: Context) {
         val probed = mutableListOf<Double>()
         val highestCandidate = candidateRatios.maxOrNull()
         var highestMeasuredRejected = false
+        var highestFailedBelow: Double? = null
         for (ratio in candidateRatios) {
             if (System.currentTimeMillis() - startedAt > TOTAL_BUDGET_MS) {
                 return ProbeDecision(null, probed, null, "probe budget exhausted", highestMeasuredRejected)
@@ -82,11 +83,30 @@ class PerceptualQualityProber(private val context: Context) {
             val scores = probeOneRatio(sourceUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows)
             if (QualityProbePolicy.windowsPass(scores)) {
                 Log.i(TAG, "ratio %.2f pixel-proven over ${windows.size} windows".format(ratio))
+                // One bounded bisection between this pass and the measured failure below it:
+                // an extra probe encode may reclaim up to half the rung gap in real savings.
+                // The passing result above is ALWAYS kept as the fallback — a failed or
+                // unmeasurable refinement changes nothing.
+                val refined = QualityProbePolicy.refinementCandidate(ratio, highestFailedBelow)
+                if (refined != null && System.currentTimeMillis() - startedAt <= TOTAL_BUDGET_MS) {
+                    probed += refined
+                    val refinedScores = probeOneRatio(
+                        sourceUri, outputMime, refined, targetBitrateForRatio(refined), audioBitrate, windows
+                    )
+                    if (QualityProbePolicy.windowsPass(refinedScores)) {
+                        Log.i(TAG, "refinement %.2f pixel-proven (bisection below %.2f)".format(refined, ratio))
+                        return ProbeDecision(refined, probed, refinedScores, "windows passed at %.2f (refined)".format(refined))
+                    }
+                    Log.i(TAG, "refinement %.2f rejected; keeping proven %.2f".format(refined, ratio))
+                }
                 return ProbeDecision(ratio, probed, scores, "windows passed at %.2f".format(ratio))
             }
-            if (ratio == highestCandidate && !scores.isNullOrEmpty()) {
-                // Measured (not merely unmeasurable) rejection at the default ratio.
-                highestMeasuredRejected = true
+            if (!scores.isNullOrEmpty()) {
+                highestFailedBelow = ratio
+                if (ratio == highestCandidate) {
+                    // Measured (not merely unmeasurable) rejection at the safest candidate.
+                    highestMeasuredRejected = true
+                }
             }
             Log.i(TAG, "ratio %.2f rejected by probe windows (measured=${!scores.isNullOrEmpty()})".format(ratio))
         }
