@@ -29,7 +29,8 @@ STRUCTURED_JOB_FIELDS = ENVELOPE_FIELDS | {
     "bitrateMeasuredFromSize", "hdr", "audioMime", "audioBitrate", "requestedMode",
     "effectiveMode", "plannedOutputMime", "plannedTargetRatio",
     "plannedTargetVideoBitrate", "plannedDecisionReason", "wasStreamCopy", "verdict",
-    "verified", "replacementSafe", "blockReason", "outputSize", "rawByteDelta",
+    "verified", "replacementSafe", "blockReason", "fallbackReason", "discardedVideoBitrate",
+    "outputSize", "rawByteDelta",
     "savedBytes", "savedPct", "terminal", "countsAsRealCompression", "elapsedMs",
 }
 SESSION_START_FIELDS = ENVELOPE_FIELDS | {
@@ -454,7 +455,8 @@ def main():
     cols = ["batchId", "id", "plan_mode", "verify_mode", "source", "sourceCodec", "resolvedOutputMime",
             "hdr", "sourceBitrate", "audioBitrate", "targetVideoBitrate", "defaultRatio",
             "learnedRatio", "floorRatio", "learnedTargetRatio", "verdict", "playable", "replaceAllowed",
-            "outputSize", "sizeRatio", "remuxReason", "blockReason", "terminal",
+            "outputSize", "sizeRatio", "remuxReason", "blockReason", "fallbackReason",
+            "discardedVideoBitrate", "terminal",
             "countsAsRealCompression", "savedBytes", "rawByteDelta"]
     with open(os.path.join(outdir, "summary.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
@@ -471,6 +473,8 @@ def main():
         "by_plan_mode": dict(Counter((j.get("plan_mode") or j.get("requestedMode") or "unknown") for j in rows)),
         "remux_reasons": dict(Counter((j.get("remuxReason") or "none") for j in rows)),
         "block_reasons": dict(Counter((j.get("blockReason") or "none") for j in rows)),
+        # Why a Perceptually Lossless encode was discarded for a remux (survives privacy-mode capture).
+        "fallback_reasons": dict(Counter((j.get("fallbackReason") or "none") for j in rows)),
     }
     # simple headroom read: how many were routed to remux purely by the near-optimal gate
     agg["near_optimal_remux_count"] = sum(

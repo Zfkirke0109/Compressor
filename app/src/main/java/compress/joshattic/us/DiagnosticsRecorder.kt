@@ -120,7 +120,13 @@ class DiagnosticsRecorder private constructor(
         blockReason: String?,
         outputSize: Long,
         terminal: BatchTerminalResult,
-        elapsedMs: Long
+        elapsedMs: Long,
+        // When a Perceptually Lossless encode was attempted and then discarded in favour of a remux,
+        // these preserve WHY in the structured record itself — the per-field verification block reason
+        // and the discarded encode's measured video bitrate. Without them the remux re-verification
+        // overwrites verdict/blockReason and an UNEXPECTED_REMUX is opaque in a privacy-mode capture.
+        fallbackReason: String? = null,
+        discardedVideoBitrate: Int? = null
     ) {
         val accountingEntry = BatchTerminalAccountingEntry(terminal, sourceSize, outputSize)
         outcomes += accountingEntry
@@ -157,6 +163,8 @@ class DiagnosticsRecorder private constructor(
                 "verified" to verified,
                 "replacementSafe" to replacementSafe,
                 "blockReason" to blockReason,
+                "fallbackReason" to fallbackReason,
+                "discardedVideoBitrate" to discardedVideoBitrate,
                 "outputSize" to outputSize,
                 "rawByteDelta" to rawByteDelta,
                 "savedBytes" to savedBytes,

@@ -61,7 +61,14 @@ object OutputVerifier {
         val outputSize: Long,
         val privacyMode: MetadataPrivacyMode,
         // Video frame count of the source when the platform exposes it (API 28+); 0 = unknown.
-        val sourceFrameCount: Int = 0
+        val sourceFrameCount: Int = 0,
+        // When a PL encode's target was justified by on-device pixel probes, the bitrate floor
+        // the verifier enforces is the pixel-proven one (with encoder-undershoot tolerance
+        // already applied by the caller), not the class-level inference floor. Sampled pixel
+        // certification of the final output remains mandatory for such encodes (enforced in
+        // the batch pipeline); this field only stops the structural floor from rejecting an
+        // encode the pixels already justified. Null = classic behavior, byte-identical.
+        val pixelProvenVideoBitrateFloor: Int? = null
     )
 
     fun verify(
@@ -69,7 +76,8 @@ object OutputVerifier {
         source: BatchVideoItem,
         outputFile: File,
         modeLabel: String,
-        privacyMode: MetadataPrivacyMode
+        privacyMode: MetadataPrivacyMode,
+        pixelProvenVideoBitrateFloor: Int? = null
     ): OutputVerificationReport {
         val rawOutputProbe = readFileProbe(outputFile)
         val sourceTracks = probeTracks(context, source.sourceUri)
@@ -116,7 +124,8 @@ object OutputVerifier {
                 sourceSize = source.originalSize,
                 outputSize = outputFile.length(),
                 privacyMode = privacyMode,
-                sourceFrameCount = readSourceFrameCount(context, source.sourceUri)
+                sourceFrameCount = readSourceFrameCount(context, source.sourceUri),
+                pixelProvenVideoBitrateFloor = pixelProvenVideoBitrateFloor
             )
         )
     }
@@ -243,7 +252,15 @@ object OutputVerifier {
         }
         val videoBitrateMeasured = input.outputTrackProbe.videoBitrate <= 0 && effectiveOutputVideoBitrate > 0
 
-        val minPerceptualVideoBitrate = BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(input.source)
+        // Codec-aware floor: the output track's codec decides how many bits perceptual quality needs.
+        // For a same-codec stream copy this is byte-identical; for a cross-codec PL encode (H.264 ->
+        // HEVC) it lowers the source-codec-calibrated absolute floor so an efficient valid output is
+        // not falsely rejected. The ratio floor still guards perceptual quality.
+        val minPerceptualVideoBitrate = input.pixelProvenVideoBitrateFloor
+            ?: BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(
+                input.source,
+                input.outputTrackProbe.videoCodec
+            )
         val bitratePass = when (input.mode) {
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> effectiveOutputVideoBitrate > 0 && effectiveOutputVideoBitrate >= minPerceptualVideoBitrate
             BatchQualityMode.REMUX_ONLY -> effectiveOutputVideoBitrate <= 0 || sourceVideoBitrate <= 0 || effectiveOutputVideoBitrate >= (sourceVideoBitrate * 0.98).toInt()

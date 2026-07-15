@@ -759,6 +759,7 @@ private fun BatchVideoItem.shortStatusLabel(): String {
             BatchTerminalResult.EXPLICIT_REMUX -> "Remuxed"
             BatchTerminalResult.UNEXPECTED_REMUX -> "Original kept"
             BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED -> "Skipped"
+            BatchTerminalResult.SKIPPED_WOULD_DEGRADE -> "Skipped (quality)"
             BatchTerminalResult.CANCELLED -> "Cancelled"
             BatchTerminalResult.OUTPUT_VALIDATION_FAILED,
             BatchTerminalResult.ENCODER_FAILURE,

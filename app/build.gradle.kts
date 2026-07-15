@@ -23,6 +23,7 @@ val buildGitCommit: String = try {
 android {
     namespace = "compress.joshattic.us"
     compileSdk = 36
+    ndkVersion = "27.2.12479018"
 
     defaultConfig {
         applicationId = "io.github.zfkirke0109.galaxycompressor"
@@ -34,6 +35,25 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("String", "GIT_COMMIT", "\"$buildGitCommit\"")
+
+        // On-device VMAF is arm64-only (libvmaf NEON build). Other ABIs simply run without
+        // pixel scoring: VmafNative.isAvailable is false and every caller falls back to the
+        // structural-only pipeline.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                arguments += "-DANDROID_STL=c++_static"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     signingConfigs {

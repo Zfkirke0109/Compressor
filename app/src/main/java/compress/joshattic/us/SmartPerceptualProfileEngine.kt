@@ -3,6 +3,7 @@ package compress.joshattic.us
 import android.content.Context
 import android.content.SharedPreferences
 import android.media.MediaFormat
+import androidx.media3.common.MimeTypes
 
 /**
  * Local-only adaptive encoder calibration for Smart Perceptually Lossless.
@@ -15,8 +16,10 @@ import android.media.MediaFormat
  * Hard rules:
  *  - Everything stays on-device (SharedPreferences); nothing is uploaded and no network is used.
  *  - Only non-private technical values are stored (buckets, ratios, counts, failure reasons).
- *  - Recommendations are always clamped to [BatchQualityBitratePolicy.perceptualLosslessRatioFloor],
- *    so learning can never go below the HDR/120fps/high-bitrate safety floors.
+ *  - Recommendations are always clamped to at least max(safety floor, codec default ratio), so
+ *    learning can never go below the HDR/120fps/high-bitrate safety floors NOR below the
+ *    codec-appropriate default (structural-only feedback proved perceptually blind in the
+ *    2026-07-14 VMAF suite).
  *  - Learning only picks the target; [OutputVerifier] verification always decides truth, and a
  *    learned setting can never bypass or relax verification.
  */
@@ -130,15 +133,21 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
 
     /**
      * The target ratio to use for the next Perceptually Lossless encode of this profile, always
-     * clamped inside [floorRatio, PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO]. Returns [defaultRatio]
-     * (also clamped) when nothing was learned yet.
+     * clamped inside [max(floorRatio, defaultRatio), PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO].
+     * Returns [defaultRatio] (also clamped) when nothing was learned yet.
+     *
+     * The lower bound includes [defaultRatio] since the 2026-07-14 VMAF suite: structural
+     * verification cannot see perceptual damage, so structural-only "success" history may never
+     * buy a target below the codec-appropriate default. The proven failure was pair
+     * f030dffc553d, walked down to ratio 0.60 by structural passes -> VMAF mean 87.4 / 1%-low
+     * 76.7 while labeled "Perceptually Lossless Verified". Learning may still raise the target
+     * (after failures) or latch remux preference — both safety-direction moves.
      */
     fun recommendedTargetRatio(key: EncodeProfileKey, defaultRatio: Double, floorRatio: Double): Double {
         val learned = profile(key).nextTargetRatio ?: defaultRatio
-        return learned.coerceIn(
-            floorRatio.coerceAtMost(BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO),
-            BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO
-        )
+        val lowerBound = maxOf(floorRatio, defaultRatio)
+            .coerceAtMost(BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO)
+        return learned.coerceIn(lowerBound, BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO)
     }
 
     /**
@@ -153,12 +162,15 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
      * to a sane range so a corrupt store cannot poison prediction.
      */
     fun expectedOvershootFactor(key: EncodeProfileKey): Double =
-        (profile(key).measuredOvershootFactor ?: DEFAULT_OVERSHOOT_FACTOR)
+        (profile(key).measuredOvershootFactor ?: seededDefaultOvershoot(key))
             .coerceIn(MIN_OVERSHOOT_FACTOR, MAX_OVERSHOOT_FACTOR)
 
     /**
-     * Record a verification-passed Perceptually Lossless encode. The next recommendation steps
-     * down cautiously (never below [floorRatio]) so later videos with this profile may save more.
+     * Record a verification-passed Perceptually Lossless encode. Since the 2026-07-14 VMAF suite
+     * ([SUCCESS_STEP_DOWN] = 0.0) a structural pass no longer steps the next target DOWN: the
+     * verifier is structural-only and repeatedly rewarded encodes that VMAF later proved visibly
+     * degraded (f030dffc553d walked 0.90 -> 0.60 -> VMAF 87.4). Success still clears failure
+     * latches and records the measured overshoot.
      */
     fun recordVerifiedSuccess(
         key: EncodeProfileKey,
@@ -226,17 +238,20 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
     }
 
     companion object {
-        // v2: the pre-fix build applied a camera-class absolute bitrate floor to every source,
-        // which clamped downloaded/low-bitrate videos' perceptually-lossless target up to the source
-        // bitrate and stream-copied them. Any "prefer remux" latch or learned ratio stored under the
-        // old name was calibrated against that bug (and, for a homogeneous download batch, a couple
-        // of early failures could permanently latch a whole bucket to remux). Bumping the store name
-        // orphans that poisoned state so the corrected floor logic learns cleanly from verification.
-        private const val PREFS_NAME = "smart_perceptual_profiles_v2"
+        // v3: the 2026-07-14 VMAF suite (validation\vmaf_analysis\PIXEL_QUALITY_REPORT.md) proved
+        // that ratios learned from structural-only verification are perceptually unsafe (measured
+        // learned ratios 0.60-0.88 all failed the pixel thresholds). Any nextTargetRatio stored
+        // under the v2 name was calibrated against that blind feedback loop, so the store name is
+        // bumped to orphan the poisoned state. (v2 note, kept for history: the pre-fix build
+        // applied a camera-class absolute bitrate floor to every source, which clamped
+        // downloaded/low-bitrate videos' targets up to the source bitrate and stream-copied them;
+        // v2 orphaned state calibrated against that bug.)
+        private const val PREFS_NAME = "smart_perceptual_profiles_v3"
 
-        // Cautious adaptation: small steps down after verified successes, larger steps up after
-        // failures, so the engine converges toward safety rather than savings.
-        const val SUCCESS_STEP_DOWN = 0.02
+        // Adaptation is safety-only since the 2026-07-14 VMAF evidence: NO step-down after
+        // structural successes (the structural verifier cannot see perceptual damage, so success
+        // history must never buy a lower target), larger steps up after failures.
+        const val SUCCESS_STEP_DOWN = 0.0
         const val FAILURE_STEP_UP = 0.05
         const val HIGH_RATIO_FAILURE_THRESHOLD = 0.93
         const val HIGH_RATIO_FAILURES_BEFORE_REMUX = 2
@@ -246,6 +261,38 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         const val DEFAULT_OVERSHOOT_FACTOR = 1.0
         const val MIN_OVERSHOOT_FACTOR = 1.0
         const val MAX_OVERSHOOT_FACTOR = 2.0
+
+        // First-encounter (pre-measurement) overshoot seed for the near-ceiling S23-class HDR HEVC
+        // classes only. Documented device behavior: the QTI HEVC VBR encoder overshoots ~1.25x on
+        // high-resolution HDR footage that is already near the hardware efficiency ceiling. Set to
+        // 1.0 to disable the seed entirely (see [seededDefaultOvershoot] for the trade-off).
+        const val SEEDED_NEAR_CEILING_OVERSHOOT = 1.25
+
+        /**
+         * Overshoot factor to assume for a profile that has not yet measured its own encoder behavior.
+         * Most profiles get [DEFAULT_OVERSHOOT_FACTOR] (assume the encoder honors the request). The
+         * S23-class high-resolution HDR HEVC->HEVC classes get [SEEDED_NEAR_CEILING_OVERSHOOT] so the
+         * FIRST encounter's near-optimal gate predicts no useful saving and prefers an honest remux
+         * instead of burning a doomed encode that verification usually discards anyway.
+         *
+         * Intentional trade-off (revert by setting the seed to 1.0): a first clip of such a bucket that
+         * WOULD have compressed a few percent will also prefer remux. That is the skill-endorsed choice
+         * for near-ceiling Samsung HDR HEVC camera footage. This only biases the pre-encode encode-vs-
+         * remux decision; it never relaxes a bitrate floor or the verifier, and any real per-profile
+         * measurement immediately supersedes the seed.
+         */
+        internal fun seededDefaultOvershoot(key: EncodeProfileKey): Double {
+            val hevcToHevc = key.encoderMime.equals(MimeTypes.VIDEO_H265, ignoreCase = true) &&
+                key.sourceCodec.equals(MimeTypes.VIDEO_H265, ignoreCase = true)
+            val highResolution = key.resolutionBucket == "4k" || key.resolutionBucket == "8k"
+            val highFrameRate = key.fpsBucket == "60" || key.fpsBucket == "120"
+            val hdr = key.hdrBucket.startsWith("pq") || key.hdrBucket.startsWith("hlg")
+            return if (hevcToHevc && highResolution && highFrameRate && hdr) {
+                SEEDED_NEAR_CEILING_OVERSHOOT
+            } else {
+                DEFAULT_OVERSHOOT_FACTOR
+            }
+        }
 
         fun profileKeyFor(
             source: VideoSourceInfo,

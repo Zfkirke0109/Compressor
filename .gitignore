@@ -33,3 +33,12 @@ validation/
 # Python bytecode from diagnostics scripts/tests
 __pycache__/
 *.pyc
+
+# On-device VMAF toolchain: only the cross file and the xxd shim are source; the vmaf
+# source tree, downloaded wheels, and tarballs are reproducible from third_party docs.
+third_party/vmaf/
+third_party/pywheels/
+third_party/*.tar.gz
+
+# Native build intermediates (the prebuilt libvmaf.a under app/src/main/cpp/prebuilt IS committed)
+app/.cxx/

@@ -15,5 +15,14 @@
                 <action android:name="io.github.zfkirke0109.galaxycompressor.DIAG_SELFTEST" />
             </intent-filter>
         </receiver>
+
+        <!-- Debug-only native VMAF smoke test (synthetic frames through JNI; no user media). -->
+        <receiver
+            android:name="compress.joshattic.us.quality.VmafSelfTestReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.github.zfkirke0109.galaxycompressor.VMAF_SELFTEST" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

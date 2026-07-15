@@ -61,6 +61,14 @@ enum class BatchTerminalResult(
     /** Input was already a Compressor output; skipped by design. */
     SKIPPED_ALREADY_COMPRESSED("Skipped — already a Compressor output", countsAsRealCompression = false),
 
+    /**
+     * On-device pixel measurement (VMAF probe windows or output certification) proved that a
+     * Perceptually Lossless re-encode of this source would visibly lose quality, so the item
+     * was skipped entirely: the original stays untouched and no stream-copy is written (a remux
+     * of such a source saves nothing and costs full-file I/O).
+     */
+    SKIPPED_WOULD_DEGRADE("Skipped — compression would visibly lose quality", countsAsRealCompression = false),
+
     /** User cancelled the batch before this item finished. */
     CANCELLED("Cancelled", countsAsRealCompression = false),
 
@@ -178,13 +186,17 @@ object BatchTerminalAccounting {
 
     fun summarize(entries: List<BatchTerminalAccountingEntry>): BatchTerminalAccountingSummary {
         val real = entries.filter { it.terminal.countsAsRealCompression }
-        val skipped = entries.count { it.terminal == BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED }
+        val skipped = entries.count {
+            it.terminal == BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED ||
+                it.terminal == BatchTerminalResult.SKIPPED_WOULD_DEGRADE
+        }
         val cancelled = entries.count { it.terminal == BatchTerminalResult.CANCELLED }
         val failed = entries.count { it.terminal.isFailure }
         val nonCompression = entries.count {
             !it.terminal.countsAsRealCompression &&
                 !it.terminal.isFailure &&
                 it.terminal != BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED &&
+                it.terminal != BatchTerminalResult.SKIPPED_WOULD_DEGRADE &&
                 it.terminal != BatchTerminalResult.CANCELLED
         }
         return BatchTerminalAccountingSummary(

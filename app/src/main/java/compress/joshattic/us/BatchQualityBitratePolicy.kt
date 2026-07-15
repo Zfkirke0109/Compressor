@@ -94,6 +94,17 @@ data class BatchModeProfile(
 object BatchQualityBitratePolicy {
     const val PERCEPTUAL_LOSSLESS_SIZE_TOLERANCE = 0.03
 
+    // Minimum SOURCE video bit density (bits per pixel per frame) for a Perceptually Lossless
+    // re-encode to be plausibly transparent. Calibrated from the 2026-07-14 VMAF suite
+    // (validation\vmaf_analysis\PIXEL_QUALITY_REPORT.md): every measured pair with source bpp
+    // below ~0.08 failed the perceptual thresholds decisively regardless of target ratio
+    // (bpp 0.018 at ratio 0.90 -> VMAF 1%-low 60.7; bpp 0.029 at 0.86 -> 77.7; bpp 0.032 at
+    // 0.79 -> 30.2), and the single borderline pair sat exactly at bpp 0.079 (1%-low 89.1 vs
+    // the required 90). A source already compressed this hard has no headroom to survive a
+    // second hardware CBR generation; its remaining bits ARE its quality, so the honest PL
+    // action is an exact stream copy.
+    const val PERCEPTUAL_LOSSLESS_MIN_SOURCE_BITS_PER_PIXEL = 0.08
+
     // Minimum predicted savings before a Perceptually Lossless re-encode is worth attempting.
     // Below this, the safe bitrate is so close to the source that Remux Only is the honest choice.
     const val MIN_PERCEPTUAL_LOSSLESS_PREDICTED_SAVINGS = 0.03
@@ -106,10 +117,14 @@ object BatchQualityBitratePolicy {
     private const val HDR_4K60_RATIO_FLOOR = 0.80
     private const val HDR_4K_RATIO_FLOOR = 0.75
     private const val FPS120_RATIO_FLOOR = 0.88
-    private const val FPS60_4K_RATIO_FLOOR = 0.74
-    private const val FPS60_RATIO_FLOOR = 0.68
-    private const val UHD_RATIO_FLOOR = 0.62
-    private const val DEFAULT_RATIO_FLOOR = 0.55
+    // SDR floors below were raised from 0.74/0.68/0.62/0.55 after the 2026-07-14 VMAF suite
+    // (validation\vmaf_analysis\PIXEL_QUALITY_REPORT.md): every measured pair encoded at ratios
+    // 0.60-0.88 failed the perceptual thresholds (worst: ratio 0.79 at the old 0.55 floor scored
+    // VMAF mean 69.8 / 1%-low 30.2). No measured evidence supports any SDR ratio below 0.85.
+    private const val FPS60_4K_RATIO_FLOOR = 0.85
+    private const val FPS60_RATIO_FLOOR = 0.85
+    private const val UHD_RATIO_FLOOR = 0.85
+    private const val DEFAULT_RATIO_FLOOR = 0.85
 
     fun modeProfile(mode: BatchQualityMode): BatchModeProfile {
         return when (mode) {
@@ -230,6 +245,12 @@ object BatchQualityBitratePolicy {
      * decode is available but hardware AV1 encode is not; Auto resolves to HEVC. Re-encoding that
      * AV1 source to HEVC for a nominal ~5% saving is a quality regression, not a safe compression.
      * Unknown codecs also fail closed because their relative efficiency cannot be proven.
+     *
+     * Same-codec re-encodes are also preserved (remuxed) since the 2026-07-14 VMAF suite:
+     * pair 7611b521c24a (HEVC->HEVC at ratio 0.95, healthy 0.092 bits/pixel source) scored
+     * VMAF mean 97.1 but 1%-low 79.8 — transient frames are visibly hurt even by a 5% cut with
+     * no codec-efficiency headroom to pay for it. Only a strictly more efficient output codec
+     * (e.g. H.264 -> HEVC) justifies a Perceptually Lossless re-encode.
      */
     fun shouldPreserveSourceCodecForPerceptualLossless(
         sourceMimeType: String?,
@@ -238,10 +259,7 @@ object BatchQualityBitratePolicy {
         val sourceTier = codecEfficiencyTier(sourceMimeType) ?: return true
         val outputTier = codecEfficiencyTier(outputMimeType) ?: return true
         val sameCodec = sourceMimeType.equals(outputMimeType, ignoreCase = true)
-        // An equal-tier codec swap (VP9/Dolby Vision -> HEVC) has no proven efficiency headroom
-        // and may discard codec-specific dynamic-range behavior. Only a strictly more efficient
-        // output codec justifies a Perceptually Lossless re-encode.
-        return !sameCodec && outputTier <= sourceTier
+        return sameCodec || outputTier <= sourceTier
     }
 
     private fun codecEfficiencyTier(mimeType: String?): Int? = when (mimeType) {
@@ -259,7 +277,13 @@ object BatchQualityBitratePolicy {
         outputMimeType: String,
         outputFps: Int? = null,
         outputHeight: Int = source.height,
-        learnedTargetRatio: Double? = null
+        learnedTargetRatio: Double? = null,
+        // A per-clip ratio PROVEN by on-device pixel measurement (VMAF probe windows). Unlike a
+        // learned ratio, pixel evidence may target below the class-level safety floors — the
+        // floors encode "unproven is unsafe", and a probe replaces inference with measurement.
+        // Never below QualityProbePolicy.HARD_RATIO_FLOOR by construction at the call site, and
+        // the final output must still pass sampled pixel certification or it is discarded.
+        pixelProvenRatioFloor: Double? = null
     ): Int {
         val originalVideoBitrate = source.videoBitrate.takeIf { it > 0 } ?: fallbackOriginalBitrate(source)
         if (mode == BatchQualityMode.REMUX_ONLY) return originalVideoBitrate
@@ -276,12 +300,21 @@ object BatchQualityBitratePolicy {
         return when (mode) {
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> {
                 val defaultRatio = perceptualLosslessDefaultTargetRatio(source, outputMimeType)
+                val ratioFloor = pixelProvenRatioFloor ?: perceptualLosslessRatioFloor(source)
                 // A learned ratio can only move the target inside [safety floor, max ratio];
-                // verification remains the final gate regardless of what was learned.
+                // verification remains the final gate regardless of what was learned. A pixel-
+                // proven floor (probe evidence) replaces the class-level floor for this clip only.
                 val targetRatio = learnedTargetRatio
-                    ?.coerceIn(perceptualLosslessRatioFloor(source), PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO)
+                    ?.coerceIn(ratioFloor, PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO)
                     ?: defaultRatio
-                val floor = perceptualLosslessBitrateFloor(source)
+                // Output-codec-aware floor: a more efficient output codec (H.264 -> HEVC) legitimately
+                // needs fewer bits than the source-codec-calibrated absolute floor, so the floor must
+                // not clamp the target back up and block a valid cross-codec compression.
+                val floor = if (pixelProvenRatioFloor != null) {
+                    (originalVideoBitrate * pixelProvenRatioFloor).toInt()
+                } else {
+                    perceptualLosslessBitrateFloor(source, outputMimeType)
+                }
                 val target = (originalVideoBitrate * targetRatio).toInt()
                 target.coerceIn(floor.coerceAtMost(originalVideoBitrate), originalVideoBitrate)
             }
@@ -332,7 +365,7 @@ object BatchQualityBitratePolicy {
         }
     }
 
-    fun perceptualLosslessBitrateFloor(source: VideoSourceInfo): Int {
+    fun perceptualLosslessBitrateFloor(source: VideoSourceInfo, outputMimeType: String? = null): Int {
         val absoluteFloor = when {
             is8kClass(source) -> 100_000_000
             is4kClass(source) -> 48_000_000
@@ -352,9 +385,42 @@ object BatchQualityBitratePolicy {
         // bitrate and blocks all compression — this was the downloaded-video "same size / remuxed"
         // bug. So the absolute floor binds only when the source is at or above it; otherwise the
         // ratio floor governs. Camera sources (at/above the floor) are byte-identical to before.
-        val effectiveAbsoluteFloor = if (sourceVideoBitrate >= absoluteFloor) absoluteFloor else 0
+        //
+        // The absolute floor is expressed in the *source* codec's bit budget. When the output codec
+        // is strictly more efficient (H.264 -> HEVC/AV1), the same perceptual quality needs fewer
+        // output bits, so the source-codec floor over-constrains the encode and forces a wasted remux
+        // of a legitimately compressible clip. Scale only the absolute floor toward the output codec's
+        // efficiency; the ratio floor (the real perceptual guard) is never scaled, and HDR sources are
+        // never scaled. When [outputMimeType] is null (the legacy 1-arg call) the scale is 1.0, so
+        // every existing caller and camera-class floor stays byte-identical.
+        val absoluteFloorScale = crossCodecAbsoluteFloorScale(source, outputMimeType)
+        val effectiveAbsoluteFloor =
+            if (sourceVideoBitrate >= absoluteFloor) (absoluteFloor * absoluteFloorScale).toInt() else 0
         return max(effectiveAbsoluteFloor, (sourceVideoBitrate * ratioFloor).toInt())
             .coerceAtMost(sourceVideoBitrate)
+    }
+
+    /**
+     * Fraction to scale the *absolute* (camera-class) Perceptually Lossless bitrate floor by when the
+     * output codec is strictly more efficient than the source codec. HEVC needs materially fewer bits
+     * than H.264 for the same perceptual quality, so a source-codec-calibrated floor otherwise rejects
+     * a valid, efficient cross-codec encode and forces a wasted remux. Returns 1.0 (no change) for
+     * same-codec, unknown codecs, a less-efficient output, or ANY HDR source (whose stricter ratio
+     * floors and metadata risk make absolute-floor relief both moot and unsafe). The ratio floor is
+     * never affected — it remains the perceptual safety guard.
+     */
+    internal fun crossCodecAbsoluteFloorScale(source: VideoSourceInfo, outputMimeType: String?): Double {
+        if (source.isHdr) return 1.0
+        val sourceTier = codecEfficiencyTier(source.videoMime) ?: return 1.0
+        val outputTier = codecEfficiencyTier(outputMimeType) ?: return 1.0
+        if (outputTier <= sourceTier) return 1.0
+        // Conservative: one tier of efficiency headroom (H.264 -> HEVC/VP9, or HEVC -> AV1) still keeps
+        // ~65% of the source-codec bit budget as the floor; two tiers (H.264 -> AV1) keeps ~50%. These
+        // stay well above the theoretical efficiency gain so the floor still guards perceptual quality.
+        return when (outputTier - sourceTier) {
+            1 -> 0.65
+            else -> 0.50
+        }
     }
 
     /**
@@ -370,14 +436,16 @@ object BatchQualityBitratePolicy {
         source: VideoSourceInfo,
         outputMimeType: String,
         learnedTargetRatio: Double? = null,
-        expectedOvershootFactor: Double = 1.0
+        expectedOvershootFactor: Double = 1.0,
+        pixelProvenRatioFloor: Double? = null
     ): Long {
         val durationSec = (source.durationMs / 1000.0).coerceAtLeast(1.0)
         val videoBitrate = calculateVideoBitrate(
             source = source,
             mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
             outputMimeType = outputMimeType,
-            learnedTargetRatio = learnedTargetRatio
+            learnedTargetRatio = learnedTargetRatio,
+            pixelProvenRatioFloor = pixelProvenRatioFloor
         )
         val overshoot = if (expectedOvershootFactor.isFinite()) expectedOvershootFactor.coerceIn(1.0, 2.0) else 1.0
         // Perceptually Lossless transmuxes (stream-copies) audio when possible, so predicted audio
@@ -388,10 +456,36 @@ object BatchQualityBitratePolicy {
     }
 
     /**
+     * Measured source video bit density in bits per pixel per frame, or null when the source's
+     * real bitrate, dimensions, or frame rate are unknown. Deliberately uses only the MEASURED
+     * source bitrate — never [fallbackOriginalBitrate] — because a fabricated bitrate would
+     * fabricate transparency headroom.
+     */
+    fun sourceBitsPerPixelPerFrame(source: VideoSourceInfo): Double? {
+        val videoBitrate = source.videoBitrate.takeIf { it > 0 && source.totalBitrate > 0 } ?: return null
+        if (source.width <= 0 || source.height <= 0 || source.frameRate <= 0f) return null
+        return videoBitrate.toDouble() / (source.width.toDouble() * source.height * source.frameRate)
+    }
+
+    /**
+     * True when the source carries enough bit density for a Perceptually Lossless re-encode to be
+     * plausibly transparent ([PERCEPTUAL_LOSSLESS_MIN_SOURCE_BITS_PER_PIXEL]). Fails closed:
+     * an unknown bitrate/geometry/fps means transparency headroom cannot be proven, so PL must
+     * prefer the exact stream copy.
+     */
+    fun sourceSupportsTransparentPerceptualLossless(source: VideoSourceInfo): Boolean {
+        val bpp = sourceBitsPerPixelPerFrame(source) ?: return false
+        return bpp >= PERCEPTUAL_LOSSLESS_MIN_SOURCE_BITS_PER_PIXEL
+    }
+
+    /**
      * True when the safe Perceptually Lossless bitrate cannot shrink the file meaningfully
-     * (predicted savings below [MIN_PERCEPTUAL_LOSSLESS_PREDICTED_SAVINGS]). In that case the
-     * honest action is Remux Only: the source is already near optimal, so keep the exact
-     * stream copy instead of spending a re-encode that verification would likely discard.
+     * (predicted savings below [MIN_PERCEPTUAL_LOSSLESS_PREDICTED_SAVINGS]), or when the
+     * 2026-07-14 VMAF evidence shows a re-encode cannot be claimed perceptually lossless at all:
+     * an HDR source (zero HDR pairs have ever been pixel-validated, and HDR/color loss is the
+     * exact failure PL promises to prevent), or a source below the transparency bit-density gate.
+     * In every such case the honest action is Remux Only — the exact stream copy is the only
+     * output PROVEN lossless (remux control d1622031aefa: byte-identical elementary streams).
      */
     fun shouldPreferRemuxForPerceptualLossless(
         source: VideoSourceInfo,
@@ -403,6 +497,11 @@ object BatchQualityBitratePolicy {
         if (shouldPreserveSourceCodecForPerceptualLossless(source.videoMime, outputMimeType)) {
             return true
         }
+        // No HDR pair exists in the validation evidence; PL may not risk HDR/color loss on an
+        // unvalidated path. Stream-copy preserves HDR exactly.
+        if (source.isHdr) return true
+        // Already-starved sources (below the bpp gate) lose visibly in a second generation.
+        if (!sourceSupportsTransparentPerceptualLossless(source)) return true
         if (sourceSizeBytes <= 0L) return false
         val predicted = predictedPerceptualLosslessBytes(
             source,

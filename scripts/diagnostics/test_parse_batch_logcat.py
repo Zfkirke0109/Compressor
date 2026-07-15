@@ -227,6 +227,33 @@ class ParseBatchLogcatTest(unittest.TestCase):
             self._v2(batch, "session_summary", 2, "evt_" + "2" * 16, profile=profile, processed=1),
         ]
 
+    def test_fallback_reason_survives_capture_and_is_aggregated(self):
+        # An UNEXPECTED_REMUX job (PL encode attempted, then discarded for a remux) must keep its
+        # fallbackReason + discardedVideoBitrate in the structured artifacts — they are NOT dropped as
+        # ignored fields — so a privacy-mode capture can still explain WHY the encode was discarded.
+        records = [
+            self._v2("bf", "session_start", 0, "evt_" + "a" * 16, selectedCount=1),
+            self._v2(
+                "bf", "job", 1, "evt_" + "b" * 16, jobid="job_ffffffffffff",
+                id="job_ffffffffffff", terminal="UNEXPECTED_REMUX", countsAsRealCompression=False,
+                sourceSize=100, outputSize=100, wasStreamCopy=True,
+                verdict="Remux Verified", verified=True,
+                fallbackReason="perceptually lossless output bitrate fell below the verified safety threshold",
+                discardedVideoBitrate=3200000,
+            ),
+            self._v2("bf", "session_summary", 2, "evt_" + "c" * 16, processed=1),
+        ]
+        result, agg, jobs = self._run(records)
+        self.assertEqual(0, result.returncode)
+        self.assertEqual(1, len(jobs))
+        self.assertEqual(3200000, jobs[0]["discardedVideoBitrate"])
+        self.assertIn("fell below the verified safety threshold", jobs[0]["fallbackReason"])
+        self.assertIn(
+            "perceptually lossless output bitrate fell below the verified safety threshold",
+            agg["fallback_reasons"],
+        )
+        self.assertEqual(0, agg["structured_ignored_field_count"])
+
     def test_v2_happy_path_reports_profile_sequence_and_events(self):
         result, agg, jobs = self._run(self._v2_batch("bv2", profile="normal"))
         self.assertEqual(0, result.returncode)
