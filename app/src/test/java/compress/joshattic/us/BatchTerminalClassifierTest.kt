@@ -21,7 +21,8 @@ class BatchTerminalClassifierTest {
         nearOptimal: Boolean = false,
         unsupported: Boolean = false,
         encoderFailed: Boolean = false,
-        evidencePreferred: Boolean = false
+        evidencePreferred: Boolean = false,
+        retainedOriginal: Boolean = false
     ) = BatchTerminalInput(
         requestedMode = requested,
         effectiveMode = effective,
@@ -36,7 +37,8 @@ class BatchTerminalClassifierTest {
         preEncodeSourceAlreadyEfficient = nearOptimal,
         unsupportedContainer = unsupported,
         encoderFailed = encoderFailed,
-        preEncodeEvidencePreferredRemux = evidencePreferred
+        preEncodeEvidencePreferredRemux = evidencePreferred,
+        retainedOriginalNoOutput = retainedOriginal
     )
 
     @Test
@@ -116,6 +118,36 @@ class BatchTerminalClassifierTest {
                 input(streamCopy = true, verified = false, replacementSafe = false, effective = BatchQualityMode.REMUX_ONLY, evidencePreferred = true)
             )
         )
+    }
+
+    @Test
+    fun retainedOriginalIsKeepOriginalTerminalNeverCompression() {
+        // Keep-original fast path: no output written; source probed readable -> the same honest
+        // keep-original terminals apply, never a compression and never replacement-eligible.
+        val alreadyOptimal = BatchTerminalClassifier.classify(
+            input(retainedOriginal = true, verified = true, replacementSafe = false,
+                  streamCopy = false, nearOptimal = true, outputSize = 100_000_000)
+        )
+        assertEquals(BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED, alreadyOptimal)
+        assertFalse(alreadyOptimal.countsAsRealCompression)
+        assertFalse(alreadyOptimal.allowsOriginalReplacement)
+
+        val latched = BatchTerminalClassifier.classify(
+            input(retainedOriginal = true, verified = true, replacementSafe = false,
+                  streamCopy = false, evidencePreferred = true, outputSize = 100_000_000)
+        )
+        assertEquals(BatchTerminalResult.REMUX_PREFERRED_BY_EVIDENCE, latched)
+
+        // Source unreadable at retention time -> fail closed, never a friendly label.
+        val unreadable = BatchTerminalClassifier.classify(
+            input(retainedOriginal = true, verified = false, replacementSafe = false, streamCopy = false)
+        )
+        assertEquals(BatchTerminalResult.OUTPUT_VALIDATION_FAILED, unreadable)
+
+        // Savings accounting: a retained original saves exactly 0 bytes.
+        assertEquals(0L, BatchTerminalAccounting.savedBytes(
+            BatchTerminalAccountingEntry(alreadyOptimal, 100_000_000, 100_000_000)
+        ))
     }
 
     @Test

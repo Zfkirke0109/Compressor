@@ -248,6 +248,9 @@ class ParseBatchLogcatTest(unittest.TestCase):
                 thermalStart="nominal",
                 thermalEnd="light",
                 precedingCooldownMs=10000,
+                materializationMode="REUSED_SOURCE",
+                originalReuseBlockReason=None,
+                copyAvoidedBytes=889000000,
             ),
             self._v2("bf", "session_summary", 2, "evt_" + "c" * 16, processed=1),
         ]
@@ -271,6 +274,8 @@ class ParseBatchLogcatTest(unittest.TestCase):
         self.assertEqual("nominal", jobs[0]["thermalStart"])
         self.assertEqual("light", jobs[0]["thermalEnd"])
         self.assertEqual(10000, jobs[0]["precedingCooldownMs"])
+        self.assertEqual("REUSED_SOURCE", jobs[0]["materializationMode"])
+        self.assertEqual(889000000, jobs[0]["copyAvoidedBytes"])
         self.assertEqual(0, agg["structured_ignored_field_count"])
 
     def test_v2_happy_path_reports_profile_sequence_and_events(self):
