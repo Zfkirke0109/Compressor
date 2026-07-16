@@ -5,8 +5,10 @@ conversation history required. Status: **PR #23 validated on-device; ready for r
 throughput/intelligence workstreams queued.**
 
 ## Repo state
-- Branch: `fix/downloaded-video-pl-diagnostics`; HEAD **`f1e2fbb`** (pushed). PR **#23** OPEN,
-  MERGEABLE, base `main` (merge-base `16948e1` = merged PR #22).
+- Branch: `fix/downloaded-video-pl-diagnostics`; HEAD **`18d4b94`** (docs commit; last validated
+  SOURCE commit is `f1e2fbb`). PR **#23** OPEN, MERGEABLE, base `main` (merge-base `16948e1` =
+  merged PR #22). PR #23 is FROZEN — post-validation work continues on separate branches (see
+  `docs/post-pr23/IMPLEMENTATION_ROADMAP.md`).
 - Commit stack on top of `16948e1`:
   - `f10d968` bounded adaptive search (bpp-classed ladders, retreat rungs, bisection, same-codec
     probe-gating, noise-threshold savings, floor recovery)
