@@ -143,6 +143,11 @@ class DiagnosticsRecorder private constructor(
         // Inter-item handoff: thermal cooldown (ms) applied after the previous item, before this
         // one. 0 when the previous item ran no full encode or was skipped. Timing telemetry only.
         precedingCooldownMs: Long? = null,
+        // Keep-original fast path: REUSED_SOURCE (original surfaced, no copy) vs GENERATED_FILE;
+        // the guard that blocked reuse; and the bytes whose stream-copy was avoided.
+        materializationMode: String? = null,
+        originalReuseBlockReason: String? = null,
+        copyAvoidedBytes: Long? = null,
         discardedVideoBitrate: Int? = null
     ) {
         val accountingEntry = BatchTerminalAccountingEntry(terminal, sourceSize, outputSize)
@@ -190,6 +195,9 @@ class DiagnosticsRecorder private constructor(
                 "thermalStart" to thermalStart,
                 "thermalEnd" to thermalEnd,
                 "precedingCooldownMs" to precedingCooldownMs,
+                "materializationMode" to materializationMode,
+                "originalReuseBlockReason" to originalReuseBlockReason,
+                "copyAvoidedBytes" to copyAvoidedBytes,
                 "outputSize" to outputSize,
                 "rawByteDelta" to rawByteDelta,
                 "savedBytes" to savedBytes,

@@ -648,6 +648,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // even after verification is re-run on the remux.
                     var diagnosticFallbackReason: String? = null
                     var diagnosticDiscardedVideoBitrate: Int? = null
+                    // Why the keep-original fast path declined to reuse the source (enum name),
+                    // recorded on the full-remux record so captures show the guard that fired.
+                    var diagnosticReuseBlockReason: String? = null
                     // Compact per-window scores of the final output's sampled certification —
                     // recorded pass OR fail so captures carry the real numbers behind verdicts.
                     var diagnosticCertWindowScores: String? = null
@@ -742,6 +745,116 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     if (perceptualPlan?.preferRemux == true) {
                         effectiveQuality = BatchQualityPreset.REMUX_ONLY
                         preEncodeRemuxNote = perceptualPlan.remuxReason
+                    }
+                    // Keep-original remux FAST PATH (perf/remux-keep-original-fast-path): when the
+                    // pipeline has already DECIDED to keep the original bytes, and the audited
+                    // policy proves the copy would be a pure no-op (no privacy strip, compatible
+                    // container, readable source, user did not choose Remux Only), surface the
+                    // original directly — no copy written, no copy verified, original never opened
+                    // for write. Any guard failing falls through to the unchanged full remux.
+                    // Evidence: 40.3 min/172-file batch spent stream-copying keep-original items
+                    // (max 267 s to save 0 bytes) — docs/pr23/REMUX_ACCELERATION_INVESTIGATION.md.
+                    if (perceptualPlan?.preferRemux == true && quality != BatchQualityPreset.REMUX_ONLY) {
+                        val resolvedContainerMime = runCatching {
+                            context.contentResolver.getType(item.sourceUri)
+                        }.getOrNull()
+                        val sourceReadableNow = runCatching {
+                            context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { true } == true
+                        }.getOrDefault(false)
+                        val reuse = OriginalReusePolicy.evaluate(
+                            isKeepOriginalDecision = true,
+                            userRequestedRemuxOnly = false,
+                            privacyMode = privacyMode,
+                            resolvedContainerMime = resolvedContainerMime,
+                            sourceReadableNow = sourceReadableNow
+                        )
+                        if (reuse is OriginalReuseDecision.Eligible) {
+                            val retention = OriginalReusePolicy.retentionReport(
+                                sourcePlayable = sourceReadableNow,
+                                sourceSizeBytes = item.originalSize,
+                                containerMime = reuse.containerMime
+                            )
+                            val terminal = BatchTerminalClassifier.classify(
+                                BatchTerminalInput(
+                                    requestedMode = quality.toMode(),
+                                    effectiveMode = BatchQualityMode.REMUX_ONLY,
+                                    wasStreamCopy = false,
+                                    verified = retention.verified,
+                                    replacementSafe = false,
+                                    sourceSize = item.originalSize,
+                                    outputSize = item.originalSize,
+                                    preEncodeSourceAlreadyEfficient = perceptualPlan.remuxWasSourceEfficient,
+                                    preEncodeEvidencePreferredRemux = perceptualPlan.remuxWasEvidencePreferred,
+                                    retainedOriginalNoOutput = true
+                                )
+                            )
+                            Log.i(
+                                "CompressorBatch",
+                                "keep-original fast path; job=${diagnosticJobId(item)}; " +
+                                    "materialization=REUSED_SOURCE; copyAvoidedBytes=${item.originalSize}; " +
+                                    "container=$resolvedContainerMime; terminal=$terminal"
+                            )
+                            recordDiagnosticJob(
+                                diagnostics = diagnostics,
+                                item = item,
+                                requestedQuality = quality,
+                                effectiveQuality = BatchQualityPreset.REMUX_ONLY,
+                                resolvedMime = null,
+                                plannedTargetRatio = perceptualPlan.targetRatio,
+                                plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
+                                plannedDecisionReason = perceptualPlan.remuxReason,
+                                wasStreamCopy = false,
+                                verification = retention,
+                                outputSize = item.originalSize,
+                                terminal = terminal,
+                                elapsedMs = System.currentTimeMillis() - itemStartedAt,
+                                probedRatios = perceptualPlan.probedRatios,
+                                pixelProvenRatio = perceptualPlan.pixelProvenRatio,
+                                probeDetail = perceptualPlan.probeDetail,
+                                probeWindowScores = perceptualPlan.probeWindowScores,
+                                precedingCooldownMs = precedingHandoffCooldownMs,
+                                materializationMode = "REUSED_SOURCE",
+                                copyAvoidedBytes = item.originalSize
+                            )
+                            updateItem(index) {
+                                it.copy(
+                                    status = if (terminal.isFailure) BatchItemStatus.Failed else BatchItemStatus.Done,
+                                    progress = 1f,
+                                    currentOutputSize = item.originalSize,
+                                    outputUri = if (terminal.isFailure) null else item.sourceUri,
+                                    outputPath = null,
+                                    outputSize = if (terminal.isFailure) 0L else item.originalSize,
+                                    outputMode = BatchQualityPreset.REMUX_ONLY.label,
+                                    verificationReport = retention,
+                                    terminalResult = terminal,
+                                    metrics = BatchItemMetrics(
+                                        operationLabel = "Retained",
+                                        elapsedMs = System.currentTimeMillis() - itemStartedAt,
+                                        outputBytes = 0L,
+                                        savedBytes = 0L,
+                                        thermalStart = thermalWindow.thermalLabel,
+                                        thermalEnd = thermalWindow.thermalLabel,
+                                        batteryStart = thermalWindow.batteryPercent,
+                                        batteryEnd = thermalWindow.batteryPercent,
+                                        cooldownMs = 0L
+                                    ),
+                                    message = if (terminal.isFailure) {
+                                        "Original retention failed: source became unreadable — nothing was modified."
+                                    } else {
+                                        "Already optimal — original retained (no copy written)." +
+                                            (preEncodeRemuxNote?.let { note -> " $note" } ?: "")
+                                    }
+                                )
+                            }
+                            return@forEachIndexed
+                        } else if (reuse is OriginalReuseDecision.Blocked) {
+                            Log.i(
+                                "CompressorBatch",
+                                "keep-original fast path blocked; job=${diagnosticJobId(item)}; " +
+                                    "reason=${reuse.reason}; falling through to full remux"
+                            )
+                            diagnosticReuseBlockReason = reuse.reason.name
+                        }
                     }
                     diagnosticEffectiveQuality = effectiveQuality
                     logEncoderPlan(
@@ -1105,7 +1218,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         certWindowScores = diagnosticCertWindowScores,
                         thermalStart = metrics.thermalStart,
                         thermalEnd = metrics.thermalEnd,
-                        precedingCooldownMs = precedingHandoffCooldownMs
+                        precedingCooldownMs = precedingHandoffCooldownMs,
+                        materializationMode = "GENERATED_FILE",
+                        originalReuseBlockReason = diagnosticReuseBlockReason
                     )
 
                     if (terminal.isFailure) {
@@ -2226,7 +2341,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // Inter-item handoff telemetry: the thermal cooldown (ms) that was applied AFTER the
         // previous item and BEFORE this one started. 0 when the previous item ran no full encode
         // (the throughput optimization) or was skipped. Timing-only; no decision depends on it.
-        precedingCooldownMs: Long? = null
+        precedingCooldownMs: Long? = null,
+        // Materialization telemetry (keep-original fast path): REUSED_SOURCE when the original
+        // was surfaced with no copy written, GENERATED_FILE when a distinct output was produced.
+        // originalReuseBlockReason names the guard that forced a full remux; copyAvoidedBytes is
+        // the source size whose stream-copy was skipped.
+        materializationMode: String? = null,
+        originalReuseBlockReason: String? = null,
+        copyAvoidedBytes: Long? = null
     ) {
         diagnostics.job(
             // The recorder hashes both values before emission; raw URI/name never leave this call.
@@ -2267,7 +2389,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             certWindowScores = certWindowScores,
             thermalStart = thermalStart,
             thermalEnd = thermalEnd,
-            precedingCooldownMs = precedingCooldownMs
+            precedingCooldownMs = precedingCooldownMs,
+            materializationMode = materializationMode,
+            originalReuseBlockReason = originalReuseBlockReason,
+            copyAvoidedBytes = copyAvoidedBytes
         )
     }
 
