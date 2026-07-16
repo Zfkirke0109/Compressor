@@ -1,0 +1,173 @@
+sequence,jobId,sourceMime,w,h,fps,sourceSize,hdr,terminal,verdict,verified,plannedTargetRatio,pixelProvenRatio,probedRatios,probeDetail,probeWindowScores,certWindowScores,savedBytes,savedPct,elapsedMs,precedingCooldownMs,thermalStart,thermalEnd
+1,job_479022269a34,video/avc,852,480,25,17585377,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,95.4/84.0/83.8,,0,0,1824,0,,
+2,job_7291d4988411,video/avc,1280,720,24,45434067,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,,,,0,0,14585,0,normal,normal
+3,job_efbd4241216d,video/avc,1920,1080,30,117301659,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,89.3/74.5/74.1,,0,0,6249,0,,
+4,job_12f4f41e34d9,video/avc,480,854,30,90356958,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,90.4/81.3/80.7,,0,0,2094,0,,
+5,job_403d9e662d80,video/avc,1916,1080,24,1090160077,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,97.9/91.4/85.3;97.9/93.0/86.9;96.0/86.3/85.7,,0,0,30507,0,,
+6,job_6a0f98989283,video/avc,1280,720,25,189994760,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,85.9/76.5/76.2,,0,0,3037,0,,
+7,job_c15301378d30,video/avc,640,790,30,26509204,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,88.0/77.2/76.9,,0,0,2283,0,,
+8,job_f7e632f87b7e,video/avc,1280,720,24,296571105,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,89.4/73.1/72.4,,0,0,2805,0,,
+9,job_1d6959dfe250,video/avc,852,480,25,115387199,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,89.2/84.5/82.6,,0,0,1871,0,,
+10,job_0dd296c9aef2,video/avc,1920,1080,30,1771600203,False,TRANSCODED_SMALLER,Perceptually Lossless Verified,True,0.85,0.85,"0.70,0.80,0.90,0.85",windows passed at 0.85 (refined),97.1/91.6/91.4;97.0/92.4/91.9;97.4/92.6/92.4,97.2/93.4/93.1;97.5/94.0/93.7;97.7/93.1/93.0,466753079,0.26346411465160574,148918,0,normal,slightly warm
+11,job_a662b978cbf3,video/avc,930,1078,24,83911982,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 1/3, then re-probes)",,,0,0,10192,10000,slightly warm,slightly warm
+12,job_01b17b928e9c,video/avc,1080,1080,30,75477377,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,90.2/82.7/79.2,,0,0,3797,0,,
+13,job_3e0dc06b45fe,video/avc,1280,720,25,184580465,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,89.5/79.4/78.9,,0,0,3654,0,,
+14,job_7c1de5a28d82,video/avc,1280,720,24,100862910,False,UNEXPECTED_REMUX,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 1/3, then re-probes)",,93.3/91.1/88.6;95.1/92.3/90.0;92.9/88.3/88.1,0,0,39968,0,slightly warm,slightly warm
+15,job_b89013779738,video/avc,854,480,25,304250125,False,TRANSCODED_SMALLER,Perceptually Lossless Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 2/3, then re-probes)",,97.9/94.2/90.5;98.2/94.1/91.2;97.4/93.5/85.8,33354262,0.10962776761389992,128290,10000,slightly warm,slightly warm
+16,job_5ca677bd9ef6,video/avc,846,480,24,139398721,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,"0.90,0.95",no candidate ratio passed,,,0,0,34966,10000,slightly warm,slightly warm
+17,job_fba5121727da,video/avc,854,480,25,132850349,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,90.4/83.5/82.7,,0,0,2267,0,,
+18,job_6aac13eddf0c,video/avc,854,480,25,114160493,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,"0.90,0.95",no candidate ratio passed,,,0,0,26189,0,slightly warm,slightly warm
+19,job_3ec786f49af7,video/avc,852,480,25,172865517,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,90.3/81.6/81.5,,0,0,2628,0,,
+20,job_bb2e250b3ae2,video/avc,1280,720,30,193811741,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,81.1/76.0/74.5,,0,0,3655,0,,
+21,job_8f6f3f4d1a4d,video/avc,1280,720,30,248458087,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,90.6/77.9/77.3,,0,0,3937,0,,
+22,job_65b9339739a5,video/avc,854,480,25,120701203,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,91.1/78.3/77.5,,0,0,2431,0,,
+23,job_042dc1d3edf3,video/avc,1920,1080,30,323792162,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,65.6/63.3/63.0,,0,0,7302,0,,
+24,job_a0e6421a9c19,video/avc,272,480,24,13541670,False,UNEXPECTED_REMUX,Remux Verified,True,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,,,0,0,7058,0,slightly warm,slightly warm
+25,job_a0e03a846db5,video/avc,1920,1080,30,1150557591,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,92.4/80.9/80.1,,0,0,6579,0,,
+26,job_9b36f2745feb,video/avc,1920,1080,30,168808346,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 1/3, then re-probes)",,,0,0,11815,0,slightly warm,warm
+27,job_9dcdf56296e1,video/avc,1920,1080,30,139450148,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,,,,0,0,16033,0,warm,warm
+28,job_6fea43b8b145,video/avc,1920,1080,30,132313426,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,,,,0,0,19359,0,warm,warm
+29,job_2330065a5c71,video/avc,1920,1080,30,182441200,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,,,,0,0,20906,0,warm,warm
+30,job_b8c416498def,video/avc,1920,1080,30,264408190,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 2/3, then re-probes)",,,0,0,24920,0,warm,warm
+31,job_2b5016a7a117,video/avc,1920,1080,30,244393836,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,,,,0,0,28369,0,warm,warm
+32,job_d661b9669596,video/avc,1280,720,30,460670097,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 1/3, then re-probes)",,,0,0,57281,0,warm,warm
+33,job_3a4d4cee90ee,video/avc,1280,720,30,133896891,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,90.2/79.2/78.9,,0,0,5572,0,,
+34,job_d541cb43e753,video/avc,1080,1920,30,1882965381,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 3/3, then re-probes)",,,0,0,151601,0,warm,warm
+35,job_e07d28e8f5a5,video/avc,1920,1080,30,677522742,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,89.1/74.8/72.0,,0,0,8197,0,,
+36,job_7b9f61b93f58,video/avc,1080,1920,30,497065025,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,89.0/78.3/76.0,,0,0,10420,0,,
+37,job_33f5511f20f9,video/avc,1280,720,30,473750749,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,91.8/82.2/82.1,,0,0,5098,0,,
+38,job_be683df5cc76,video/avc,1280,720,24,531710729,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,89.6/81.9/81.7,,0,0,8446,0,,
+39,job_ac4e5afcca1b,video/avc,1280,720,24,384976210,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,89.0/75.9/75.5,,0,0,3843,0,,
+40,job_dcc090c27147,video/avc,1280,720,30,464713025,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,87.8/68.7/68.4,,0,0,4904,0,,
+41,job_c981474073bb,video/avc,1280,720,30,660727855,False,TRANSCODED_SMALLER,Perceptually Lossless Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 1/3, then re-probes)",,95.6/94.2/88.8;95.6/92.2/90.9;97.4/92.5/90.3,84297068,0.1275821313754057,136390,0,warm,warm
+42,job_3775d3fe16db,video/avc,1280,720,30,576348916,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,94.5/85.2/83.3,,0,0,8261,25000,,
+43,job_5b4c81d715ee,video/avc,1080,1920,30,676575611,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,87.9/72.7/72.5,,0,0,6590,0,,
+44,job_7635d29796b3,video/avc,1920,1080,30,531330737,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 1/3, then re-probes)",,,0,0,24932,0,warm,warm
+45,job_9aceff3f5ad5,video/avc,1080,1920,30,1008901321,False,UNEXPECTED_REMUX,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 2/3, then re-probes)",,95.3/88.5/88.0;93.7/83.8/83.3;94.2/92.3/92.1,0,0,251299,0,warm,warm
+46,job_749ac4fc73da,video/avc,1280,720,24,554929280,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 1/3, then re-probes)",,,0,0,111048,25000,warm,warm
+47,job_9cc46f714e87,video/avc,1280,720,30,403917606,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 2/3, then re-probes)",,,0,0,53291,0,warm,warm
+48,job_b57f765716a3,video/avc,1280,720,24,588079046,False,UNEXPECTED_REMUX,Remux Verified,True,0.9500000000000001,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 2/3, then re-probes)",,94.0/92.9/92.7;93.9/91.7/90.6;94.0/91.3/90.8,0,0,267378,0,warm,warm
+49,job_53bced08e1dc,video/avc,852,480,25,159180293,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,,,0,0,28315,25000,warm,warm
+50,job_5b7ad12702b8,video/avc,908,480,25,102432813,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,,,0,0,23241,0,warm,warm
+51,job_272626b88a53,video/avc,264,480,25,59551587,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,95.6/84.3/82.8,,0,0,2752,0,,
+52,job_9adc63f3ae64,video/avc,854,480,25,108988638,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,93.5/83.2/80.1,,0,0,1964,0,,
+53,job_306a9aa6164a,video/avc,1280,720,50,488480577,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,81.7/66.3/63.3,,0,0,5494,0,,
+54,job_108ed29b5819,video/avc,1280,720,30,276528471,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,88.7/74.9/74.5,,0,0,2855,0,,
+55,job_366385b94a59,video/avc,854,480,25,137428133,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,,,0,0,32555,0,warm,warm
+56,job_7f10484000d2,video/avc,1280,720,30,583918594,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,92.4/78.1/78.0,,0,0,3004,0,,
+57,job_795262d1852e,video/avc,1922,1080,30,343113293,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 3/3, then re-probes)",,,0,0,21811,0,warm,warm
+58,job_a75cda3e5c97,video/avc,854,480,25,218746308,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,,,0,0,69029,0,warm,warm
+59,job_d1b130bc8217,video/avc,852,480,25,165455757,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,,,0,0,40993,0,warm,warm
+60,job_41189f97648f,video/avc,852,480,25,121968232,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,,,0,0,25998,0,warm,warm
+61,job_5231d333ec0a,video/avc,852,480,25,187513883,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,,,0,0,33765,0,warm,warm
+62,job_06b27f887f60,video/avc,640,360,25,14807734,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,85.5/79.1/78.2,,0,0,1799,0,,
+63,job_17a103dc422e,video/avc,854,480,25,148399681,False,SKIPPED_WOULD_DEGRADE,,False,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,83.7/78.5/78.2,,0,0,2544,0,,
+64,job_75c70f5847b8,video/avc,854,480,25,93254571,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,,,0,0,24983,0,warm,warm
+65,job_0c3de8faa370,video/avc,854,480,25,330796956,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,,,0,0,59435,0,warm,warm
+66,job_94cb00a86d17,video/avc,852,480,25,101250651,False,SKIPPED_WOULD_DEGRADE,,False,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,86.4/77.3/77.2,,0,0,2299,0,,
+67,job_36f240ac015c,video/avc,854,480,25,99828886,False,SKIPPED_WOULD_DEGRADE,,False,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,89.1/79.2/79.1,,0,0,2331,0,,
+68,job_5a7f4c2735a6,video/avc,854,480,25,75950867,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,,,0,0,14538,0,warm,warm
+69,job_ab4149095e94,video/avc,854,480,25,123055624,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,,,0,0,25014,0,warm,warm
+70,job_a46f101f0d06,video/avc,854,480,25,125607737,False,SKIPPED_WOULD_DEGRADE,,False,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,95.6/85.5/81.6,,0,0,2201,0,,
+71,job_03b7b4fd1b09,video/avc,270,480,25,23032582,False,SKIPPED_WOULD_DEGRADE,Perceptually Lossless Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 1/3, then re-probes)",,87.9/82.3/81.4;88.9/86.4/85.7;92.0/90.2/89.4,0,0,23750,0,,
+72,job_57418e9956e5,video/avc,480,480,25,9148442,False,SKIPPED_WOULD_DEGRADE,,False,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,85.8/78.6/77.8,,0,0,1630,0,,
+73,job_147bf7bb4092,video/avc,854,480,25,200418633,False,SKIPPED_WOULD_DEGRADE,,False,0.9500000000000001,,"0.70,0.80,0.90,0.95",no candidate ratio passed,88.2/81.1/81.0,,0,0,4338,0,,
+74,job_76a833b61efd,video/avc,854,480,25,230312734,False,SKIPPED_WOULD_DEGRADE,,False,0.9500000000000001,,"0.70,0.80,0.90,0.95",no candidate ratio passed,93.8/86.0/85.7,,0,0,4063,0,,
+75,job_73e7aea750ab,video/avc,854,480,25,194031153,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,,,0,0,42659,0,warm,warm
+76,job_e94e5183c3c7,video/avc,360,480,25,113897823,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9500000000000001,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 2/3, then re-probes)",,,0,0,32562,0,warm,warm
+77,job_a344c1345a18,video/avc,854,480,25,142815887,False,SKIPPED_WOULD_DEGRADE,,False,0.9500000000000001,,"0.90,0.95",no candidate ratio passed,92.2/82.6/82.2,,0,0,2487,0,,
+78,job_c906bb6ad8cf,video/avc,854,480,30,97475196,False,UNEXPECTED_REMUX,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 1/3, then re-probes)",,92.9/91.4/90.8;93.5/90.8/90.6;93.8/91.1/90.4,0,0,54047,0,warm,warm
+79,job_926615713cbb,video/avc,852,480,25,889198971,False,UNEXPECTED_REMUX,Remux Verified,True,0.9500000000000001,,"0.70,0.80,0.90,0.95",no candidate ratio passed,,,0,0,112234,25000,warm,warm
+80,job_c272833b72da,video/avc,270,480,30,158702581,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,91.9/88.1/87.0,,0,0,2791,0,,
+81,job_c8efeffb2ee0,video/avc,854,480,25,189321003,False,SKIPPED_WOULD_DEGRADE,Perceptually Lossless Verified,True,0.9500000000000001,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 3/3, then re-probes)",,95.8/94.7/94.5;93.9/92.1/91.2;95.7/93.8/92.6,0,0,72181,0,,
+82,job_9e729b4fbd8a,video/avc,854,480,24,204740200,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,90.0/84.7/84.6,,0,0,4393,0,,
+83,job_2a04f105027e,video/avc,272,480,30,199600077,False,UNEXPECTED_REMUX,Remux Verified,True,0.9500000000000001,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 2/3, then re-probes)",,,0,0,53276,0,warm,warm
+84,job_6cff9cff0c31,video/avc,922,480,20,213128608,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,95.4/88.6/88.1,,0,0,3071,0,,
+85,job_4b5060dcc7ab,video/avc,270,480,30,80142602,False,SKIPPED_WOULD_DEGRADE,Perceptually Lossless Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 1/3, then re-probes)",,95.5/93.7/92.7;92.7/88.7/87.8;93.0/89.8/85.6,0,0,57443,0,,
+86,job_02163b7b5385,video/avc,854,480,30,165308847,False,SKIPPED_WOULD_DEGRADE,Perceptually Lossless Verified,True,0.97,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 3/3, then re-probes)",,95.6/93.7/92.8;98.2/94.0/92.2;95.5/94.5/91.0,0,0,79502,0,,
+87,job_a2c7d5afc27c,video/avc,854,480,60,331421630,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,91.0/82.0/81.1,,0,0,9412,0,,
+88,job_97f3cab96c60,video/avc,270,480,30,12772180,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,92.7/88.2/86.8,,0,0,3356,0,,
+89,job_2f49c44f945a,video/avc,854,480,30,167433695,False,SKIPPED_WOULD_DEGRADE,Perceptually Lossless Verified,True,0.9500000000000001,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 2/3, then re-probes)",,93.9/93.0/91.9;89.2/87.4/87.4;91.4/89.3/89.2,0,0,78112,0,,
+90,job_f99cb7dc5054,video/hevc,1440,2560,60,53591602,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,"0.75,0.85,0.95,0.97",no candidate ratio passed,,,0,0,4069,0,warm,warm
+91,job_6fb49135168a,video/hevc,2160,3840,60,40639878,True,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,,,,,0,0,506,0,warm,warm
+92,job_e67baf41e624,video/hevc,3840,2160,60,70329157,True,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,,,,,0,0,918,0,warm,warm
+93,job_f35f4514cd40,video/hevc,2560,1440,60,202427428,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,"0.75,0.85,0.95,0.97",no candidate ratio passed,,,0,0,5938,0,warm,warm
+94,job_7aa6e8718179,video/hevc,2560,1440,60,548522008,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,"0.75,0.85,0.95,0.97",no candidate ratio passed,,,0,0,8746,0,warm,warm
+95,job_2566f95870d2,video/hevc,1440,2560,60,51540072,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,"0.75,0.85,0.95,0.97",no candidate ratio passed,,,0,0,4004,0,warm,warm
+96,job_cef7b6a9c6e1,video/hevc,2160,3840,60,49491112,True,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,,,,,0,0,369,0,warm,warm
+97,job_7b02feda91b2,video/hevc,1080,1920,240,57717350,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,,,,,0,0,1124,0,warm,warm
+98,job_25d939087f71,video/avc,1080,1920,30,15740097,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,94.4/87.4/86.6,,0,0,10858,0,,
+99,job_df2605dfb1b7,video/hevc,1080,1920,30,32986029,True,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,,,,,0,0,599,0,warm,warm
+100,job_3b3536b136bb,video/hevc,4320,7680,30,98387999,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,"0.95,0.97",no candidate ratio passed,,,0,0,5411,0,warm,warm
+101,job_055f3183f78f,video/hevc,2160,3840,60,145764347,True,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,,,,,0,0,1028,0,warm,warm
+102,job_5fdb47ae675a,video/hevc,2160,3840,60,256720156,True,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,,,,,0,0,1704,0,warm,warm
+103,job_48f717f25718,video/avc,854,480,24,448526084,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,94.1/86.9/86.6,,0,0,3361,0,,
+104,job_a6149386feb6,video/avc,854,480,25,285200468,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,95.2/85.9/84.9,,0,0,3527,0,,
+105,job_669a01896c92,video/avc,854,480,30,298142964,False,REMUX_PREFERRED_BY_EVIDENCE,Remux Verified,True,0.97,,,"probes skipped: this profile class measured visible loss at every candidate in 3 consecutive recent ladders (skip 1/3, then re-probes)",,,0,0,44115,0,warm,warm
+106,job_a33d8a008d52,video/avc,854,480,25,255208887,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,95.7/90.2/88.3,,0,0,3259,0,,
+107,job_af4897eb0135,video/avc,270,480,50,85939217,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,84.5/78.0/77.6,,0,0,3044,0,,
+108,job_3c437245d641,video/avc,854,480,30,275565536,False,REMUX_PREFERRED_BY_EVIDENCE,Remux Verified,True,0.97,,,"probes skipped: this profile class measured visible loss at every candidate in 3 consecutive recent ladders (skip 2/3, then re-probes)",,,0,0,34612,0,warm,warm
+109,job_f18fea87c1d8,video/avc,1920,1080,25,227787374,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,92.0/78.7/77.9,,0,0,5010,0,,
+110,job_b9c27b302d5a,video/avc,720,1280,60,24654635,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,86.8/69.7/66.6,,0,0,4948,0,,
+111,job_7af196cdb81a,video/avc,1280,720,60,230382663,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,88.5/77.1/73.5,,0,0,5523,0,,
+112,job_235496b9afdb,video/avc,464,240,25,31826351,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.97,,"0.90,0.95",no candidate ratio passed,,,0,0,13416,0,warm,warm
+113,job_b92a72320927,video/avc,1920,1080,60,251555208,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,,,,0,0,25012,0,warm,warm
+114,job_b199db508570,video/avc,960,540,20,53206039,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,93.1/86.2/86.2,,0,0,7049,0,,
+115,job_0811e8b0e802,video/avc,1280,720,20,325671829,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.97,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 3/3, then re-probes)",,,0,0,25022,0,warm,warm
+116,job_20be07e7e8ab,video/avc,624,352,20,164328831,False,UNEXPECTED_REMUX,Remux Verified,True,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,,,0,0,19672,0,warm,warm
+117,job_8af97c415815,video/avc,1280,720,30,141563548,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 3/3, then re-probes)",,,0,0,13784,0,warm,warm
+118,job_29a195acdcee,video/avc,202,360,25,4893248,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.90,0.95",no candidate ratio passed,82.5/77.0/76.9,,0,0,2261,0,,
+119,job_f1a3322c5cfa,video/avc,1280,720,30,148518984,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,90.9/80.8/79.8,,0,0,8456,0,,
+120,job_6fae4bbfcbf2,video/avc,704,1280,30,166950496,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,98.8/96.4/86.8;89.8/76.0/75.6,,0,0,5957,0,,
+121,job_0a9c3d976cdb,video/avc,1280,720,30,175448035,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,,,,0,0,34702,0,warm,warm
+122,job_9f658245961a,video/avc,640,360,30,27862531,False,REMUX_PREFERRED_BY_EVIDENCE,Remux Verified,True,0.97,,,"probes skipped: this profile class measured visible loss at every candidate in 3 consecutive recent ladders (skip 3/3, then re-probes)",,,0,0,6709,0,warm,warm
+123,job_891b6a1b9673,video/avc,852,480,30,289869434,False,REMUX_PREFERRED_BY_EVIDENCE,Remux Verified,True,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,,,0,0,37651,0,warm,warm
+124,job_521fb7d5db06,video/avc,1280,720,30,107165138,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,90.0/77.9/77.3,,0,0,4844,0,,
+125,job_a5833f1abcd1,video/avc,1280,720,30,1854368,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 3 consecutive recent ladders (skip 1/3, then re-probes)",,,0,0,300,0,warm,warm
+126,job_8a3041e3a38a,video/avc,1920,1080,30,30704510,False,UNEXPECTED_REMUX,Remux Verified,True,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,,95.0/94.4/92.9;95.0/94.5/93.0;95.3/94.5/93.1,0,0,24616,0,warm,warm
+127,job_844babebca82,video/avc,1920,1080,30,30704510,False,UNEXPECTED_REMUX,Remux Verified,True,0.9500000000000001,,"0.70,0.80,0.90,0.95",no candidate ratio passed,,95.2/94.6/93.5;95.2/94.7/93.4;95.4/94.7/93.5,0,0,24188,25000,warm,warm
+128,job_6f82ffe0838b,video/hevc,1920,1080,30,31462182,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,"0.75,0.85,0.95,0.97",no candidate ratio passed,,,0,0,12705,25000,warm,warm
+129,job_ec299b1a0032,video/hevc,1920,1080,30,31462182,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,"0.75,0.85,0.95,0.97",no candidate ratio passed,,,0,0,13069,0,warm,warm
+130,job_e6ecde24503c,video/avc,1920,1080,30,30704510,False,SKIPPED_WOULD_DEGRADE,Perceptually Lossless Verified,True,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,,95.3/94.7/93.5;95.4/94.8/93.4;95.5/94.7/93.5,0,0,24314,0,,
+131,job_12146cda4b3c,video/avc,1360,768,10,30967302,False,TRANSCODED_SMALLER,Perceptually Lossless Verified,True,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,,97.8/94.3/94.3;99.3/93.5/93.5;98.2/93.9/93.9,3059251,0.09878971697308342,10152,0,warm,warm
+132,job_7c8cf4aa216f,video/avc,1080,1080,60,10727621,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,,,,0,0,1514,25000,warm,warm
+133,job_ece1952a0dbb,video/avc,360,640,30,12076728,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,94.9/91.7/89.3,,0,0,4725,0,,
+134,job_9e362d99cf3d,video/avc,720,1280,30,50489543,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 3 consecutive recent ladders (skip 2/3, then re-probes)",,,0,0,6120,0,warm,warm
+135,job_ce2b2c441b50,video/avc,1280,720,24,84293279,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.90,0.95",no candidate ratio passed,92.8/85.1/81.7,,0,0,2704,0,,
+136,job_5955c1c18ec5,video/avc,1280,720,24,33977301,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.90,0.95",no candidate ratio passed,93.5/79.5/76.5,,0,0,2834,0,,
+137,job_9baa69339f5e,video/avc,270,480,30,190670010,False,SKIPPED_WOULD_DEGRADE,Perceptually Lossless Verified,True,0.97,,,"probes skipped: this profile class measured visible loss at every candidate in 2 consecutive recent ladders (skip 3/3, then re-probes)",,94.4/93.6/93.6;95.7/94.6/93.1;95.6/93.2/93.1,0,0,115211,0,,
+138,job_3edb8d1cca83,video/avc,406,720,60,127027484,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,91.7/80.8/79.0,,0,0,3518,0,,
+139,job_da4ac1a47134,video/avc,640,480,25,56270258,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.90,0.95",no candidate ratio passed,82.9/76.5/75.9,,0,0,2202,0,,
+140,job_6809bd3d03db,video/avc,1280,720,30,42183359,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,94.7/84.2/82.2,,0,0,4726,0,,
+141,job_627651045c10,video/avc,638,480,30,19546071,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,89.2/72.5/71.7,,0,0,2120,0,,
+142,job_23a16a82ca4c,video/avc,1920,1080,30,31458599,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,22.7/16.9/12.9,,0,0,12717,0,,
+143,job_7492ae9e664e,video/avc,1920,1080,30,31458599,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,22.7/16.9/12.9,,0,0,12919,0,,
+144,job_45d5f1d090c8,video/hevc,1920,1080,30,31476687,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,"0.75,0.85,0.95,0.97",no candidate ratio passed,,,0,0,12882,0,warm,warm
+145,job_78e1990889a0,video/hevc,1920,1080,30,31476687,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,"0.75,0.85,0.95,0.97",no candidate ratio passed,,,0,0,13108,0,warm,warm
+146,job_930d1033488f,video/avc,1920,1080,30,20970904,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,22.6/17.0/12.6,,0,0,12753,0,,
+147,job_da0728a82dce,video/avc,1280,720,25,140026187,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.70,0.80,0.90,0.95",no candidate ratio passed,92.2/81.0/80.8,,0,0,6702,0,,
+148,job_9081f0d443b4,video/avc,852,480,25,86145059,False,REMUX_PREFERRED_BY_EVIDENCE,Remux Verified,True,0.97,,"0.90,0.95",no candidate ratio passed,,,0,0,16207,0,warm,warm
+149,job_274d8eaf20c9,video/avc,852,480,25,82002080,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.90,0.95",no candidate ratio passed,85.9/79.0/78.4,,0,0,2126,0,,
+150,job_b672b20ffdf4,video/avc,1280,720,30,694818860,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 3 consecutive recent ladders (skip 3/3, then re-probes)",,,0,0,84397,0,warm,warm
+151,job_97aefcf61588,video/hevc,720,1280,30,8080944,True,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,,,,,0,0,300,0,warm,warm
+152,job_18c66d9fd47c,video/hevc,720,1280,30,8080944,True,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,,,,,0,0,253,0,warm,warm
+153,job_041a72699777,video/hevc,720,1280,30,8080944,True,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.95,,,,,,0,0,359,0,warm,warm
+154,job_ab0875ddde5f,video/avc,480,1030,70,54885584,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,91.1/88.5/87.6,,0,0,5617,0,,
+155,job_159c0005bccf,video/avc,480,1030,38,31420153,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,17.6/0.0/0.0,,0,0,5028,0,,
+156,job_9c996a2c4f61,video/avc,1280,720,30,1854368,False,SKIPPED_WOULD_DEGRADE,,False,0.9,,"0.90,0.95",no candidate ratio passed,90.5/79.1/78.3,,0,0,3593,0,,
+157,job_f9e5cb1e4a38,video/avc,1280,720,30,1854368,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 4 consecutive recent ladders (skip 1/3, then re-probes)",,,0,0,299,0,warm,warm
+158,job_99eef88ae5db,video/avc,1920,1080,24,31455365,False,TRANSCODED_SMALLER,Perceptually Lossless Verified,True,0.65,0.65,"0.70,0.65",windows passed at 0.65 (refined),99.6/98.4/93.1;99.8/100.0/93.0;99.4/97.1/92.2,99.8/100.0/94.1;99.8/100.0/94.5;99.6/98.0/93.9,13661935,0.4343276576189785,26878,0,warm,warm
+159,job_07656e970432,video/av01,1920,818,30,31498218,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.93,,,,,,0,0,381,25000,warm,warm
+160,job_0c6baa77dd6b,video/avc,640,360,24,5241895,False,UNEXPECTED_REMUX,Remux Verified,True,0.9,,"0.70,0.80,0.90,0.95",no candidate ratio passed,,99.9/100.0/96.0;99.9/100.0/96.4;99.9/99.8/96.6,0,0,9771,0,warm,warm
+161,job_2891350edc57,video/avc,640,360,24,5241895,False,UNEXPECTED_REMUX,Remux Verified,True,0.9500000000000001,,"0.70,0.80,0.90,0.95",no candidate ratio passed,,99.9/100.0/96.1;99.9/100.0/96.6;99.9/99.9/96.6,0,0,10715,25000,warm,warm
+162,job_1fbc30cd7cee,video/avc,1280,720,24,10483296,False,TRANSCODED_SMALLER,Perceptually Lossless Verified,True,0.65,0.65,"0.70,0.65",windows passed at 0.65 (refined),99.5/97.6/92.8;99.7/100.0/92.1;99.3/96.6/92.5,99.8/100.0/94.5;99.8/100.0/94.6;99.6/97.5/94.9,4358955,0.4158000499079679,15566,25000,warm,warm
+163,job_195fc5e816d2,video/avc,1280,720,24,10483296,False,TRANSCODED_SMALLER,Perceptually Lossless Verified,True,0.65,0.65,"0.70,0.65",windows passed at 0.65 (refined),99.5/97.6/92.8;99.7/100.0/92.1;99.3/96.6/92.5,99.8/100.0/94.5;99.8/100.0/94.6;99.6/97.5/94.9,4358955,0.4158000499079679,15544,25000,warm,warm
+164,job_0cf8e09a7de3,video/avc,1920,1080,24,10485062,False,TRANSCODED_SMALLER,Perceptually Lossless Verified,True,0.65,0.65,"0.70,0.65",windows passed at 0.65 (refined),98.8/95.0/90.3;99.6/100.0/88.9;98.5/92.4/88.4,99.7/99.0/93.4;99.8/99.7/93.3;99.1/95.9/92.2,4264819,0.4067519104798808,24480,25000,warm,warm
+165,job_80b3052d4d01,video/avc,1920,1080,24,31455365,False,TRANSCODED_SMALLER,Perceptually Lossless Verified,True,0.65,0.65,"0.70,0.65",windows passed at 0.65 (refined),99.6/98.4/93.1;99.8/100.0/93.0;99.4/97.1/92.2,99.8/100.0/94.1;99.8/100.0/94.5;99.6/98.0/93.9,13661935,0.4343276576189785,26662,25000,warm,warm
+166,job_e3ac063861db,video/avc,1280,720,30,153856827,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.9,,,"probes skipped: this profile class measured visible loss at every candidate in 4 consecutive recent ladders (skip 2/3, then re-probes)",,,0,0,16537,25000,warm,warm
+167,job_2ca890dd1011,video/avc,640,360,30,32931759,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.90,0.95",no candidate ratio passed,84.3/76.5/76.3,,0,0,1702,0,,
+168,job_b8576ddf23a6,video/avc,640,360,30,32931759,False,REMUX_PREFERRED_BY_EVIDENCE,Remux Verified,True,0.97,,,"probes skipped: this profile class measured visible loss at every candidate in 3 consecutive recent ladders (skip 1/3, then re-probes)",,,0,0,8071,0,warm,warm
+169,job_5aa0f3f92d5a,video/avc,854,480,25,76813423,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.90,0.95",no candidate ratio passed,85.5/78.5/78.0,,0,0,1598,0,,
+170,job_013b61e0e926,video/avc,640,360,25,24308556,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.90,0.95",no candidate ratio passed,81.6/72.5/72.1,,0,0,1084,0,,
+171,job_04c0642111aa,video/avc,640,360,25,26399649,False,SKIPPED_WOULD_DEGRADE,,False,0.97,,"0.90,0.95",no candidate ratio passed,87.6/81.0/80.7,,0,0,1114,0,,
+172,job_744b5db4b24d,video/avc,640,360,25,33158611,False,ALREADY_HIGHLY_OPTIMIZED,Remux Verified,True,0.97,,,"probes skipped: this profile class measured visible loss at every candidate in 3 consecutive recent ladders (skip 1/3, then re-probes)",,,0,0,6006,0,warm,warm
