@@ -113,7 +113,14 @@ data class BatchTerminalInput(
     /** Set when a remux/transcode failed because the container/codec is unsupported. */
     val unsupportedContainer: Boolean = false,
     /** Set when an encoder configuration/runtime error forced a fallback. */
-    val encoderFailed: Boolean = false
+    val encoderFailed: Boolean = false,
+    /**
+     * Set when a keep-original decision retained the source directly with NO output written
+     * (the remux fast path): there is no copy to verify, so [verified] refers to the SOURCE
+     * being probed readable at retention time. Fails closed to OUTPUT_VALIDATION_FAILED when
+     * the source itself could not be read.
+     */
+    val retainedOriginalNoOutput: Boolean = false
 ) {
     /** Meaningful-savings threshold: at least this fraction smaller to call it a size win. */
     val meaningfullySmaller: Boolean
@@ -135,6 +142,16 @@ object BatchTerminalClassifier {
         if (input.skippedAlreadyCompressed) return BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED
         if (input.unsupportedContainer) return BatchTerminalResult.UNSUPPORTED_CONTAINER
         if (input.hardFailure) return BatchTerminalResult.FAILED
+
+        // Keep-original fast path: the source was retained directly, no copy written. The same
+        // keep-original terminals apply (never compression); an unreadable source fails closed.
+        if (input.retainedOriginalNoOutput) {
+            return when {
+                !input.verified -> BatchTerminalResult.OUTPUT_VALIDATION_FAILED
+                input.preEncodeEvidencePreferredRemux -> BatchTerminalResult.REMUX_PREFERRED_BY_EVIDENCE
+                else -> BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED
+            }
+        }
 
         // A real, verified encode that genuinely shrank the file is the only "real compression".
         if (!input.wasStreamCopy && input.verified) {
