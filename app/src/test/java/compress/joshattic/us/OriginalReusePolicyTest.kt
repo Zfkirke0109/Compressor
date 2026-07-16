@@ -107,21 +107,69 @@ class OriginalReusePolicyTest {
     }
 
     @Test
-    fun retentionReportIsHonestAndNeverReplacementSafe() {
-        val ok = OriginalReusePolicy.retentionReport(
-            sourcePlayable = true, sourceSizeBytes = 1_000_000L, containerMime = "video/mp4"
-        )
-        assertTrue(ok.verified)
-        // Nothing was written; replacement must remain a no-op forever.
-        assertFalse(ok.replacementSafe)
-        assertTrue(ok.verdict.contains("Original Retained"))
-        assertTrue(ok.fileSize.contains("0 bytes written"))
+    fun mimeNormalizationHandlesRealContentResolverShapes() {
+        // Parameterized, whitespace-padded, and case-varied MIME values normalize correctly...
+        for (ok in listOf(
+            "video/mp4; codecs=avc1", " VIDEO/MP4 ", "video/mp4;codecs=\"avc1.64001f, mp4a.40.2\"",
+            "Video/QuickTime", "video/3gpp; something=x"
+        )) {
+            assertTrue("mime '$ok' should be eligible", eval(mime = ok) is OriginalReuseDecision.Eligible)
+        }
+        // ...and the eligible decision carries the NORMALIZED mime, not the raw string.
+        val d = eval(mime = "video/mp4; codecs=avc1") as OriginalReuseDecision.Eligible
+        assertEquals("video/mp4", d.containerMime)
 
-        // Unreadable source -> verified=false -> classifier fails closed.
-        val bad = OriginalReusePolicy.retentionReport(
-            sourcePlayable = false, sourceSizeBytes = 1_000_000L, containerMime = "video/mp4"
+        // Null, blank, parameter-only, and octet-stream all fail closed.
+        for (bad in listOf(null, "", "   ", "; codecs=avc1", "application/octet-stream")) {
+            assertEquals(
+                "mime '$bad' must block reuse",
+                OriginalReuseBlockReason.CONTAINER_NORMALIZATION_REQUIRED,
+                blockedReason(eval(mime = bad))
+            )
+        }
+    }
+
+    @Test
+    fun retainedValidationIsTypedHonestAndDistinctFromOutputVerification() {
+        val ok = OriginalReusePolicy.retainedSourceValidation(
+            sourceReadable = true, sourceSizeBytes = 1_000_000L,
+            containerMime = "VIDEO/MP4; codecs=avc1", nowEpochMs = 1234L
         )
-        assertFalse(bad.verified)
-        assertFalse(bad.replacementSafe)
+        // It is its own type — the compiler already prevents passing it where an
+        // OutputVerificationReport is required; assert the semantic fields here.
+        assertTrue(ok.readableAtDecisionTime)
+        assertEquals(1_000_000L, ok.sizeBytes)
+        assertEquals("video/mp4", ok.containerMime)
+        assertEquals(1234L, ok.validatedAtEpochMs)
+        // Verdict vocabulary is retention-specific and explicitly NOT output-verified.
+        assertTrue(ok.verdict.contains("Original Retained"))
+        assertTrue(ok.verdict.contains("not output-verified"))
+        assertFalse(ok.verdict.contains("Perceptually Lossless"))
+        assertFalse(ok.verdict.contains("Remux Verified"))
+
+        val bad = OriginalReusePolicy.retainedSourceValidation(
+            sourceReadable = false, sourceSizeBytes = 1_000_000L,
+            containerMime = "video/mp4", nowEpochMs = 1234L
+        )
+        assertFalse(bad.readableAtDecisionTime)
+        assertTrue(bad.verdict.contains("Retention Failed"))
+    }
+
+    @Test
+    fun mixedRetainedAndGeneratedBatchTotalsAreDeterministicAndHonest() {
+        // A retained original (ALREADY_HIGHLY_OPTIMIZED via retainedOriginalNoOutput) never
+        // contributes savings; a real compression does. Totals are order-independent.
+        val retained = BatchTerminalAccountingEntry(
+            BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED, sourceBytes = 500L, outputBytes = 500L
+        )
+        val compressed = BatchTerminalAccountingEntry(
+            BatchTerminalResult.TRANSCODED_SMALLER, sourceBytes = 1000L, outputBytes = 600L
+        )
+        val a = BatchTerminalAccounting.summarize(listOf(retained, compressed, retained))
+        val b = BatchTerminalAccounting.summarize(listOf(compressed, retained, retained))
+        assertEquals(a, b)
+        assertEquals(1, a.realCompressionCount)
+        assertEquals(2, a.nonCompressionCount)
+        assertEquals(400L, a.totalBytesSaved) // only the real compression saves bytes
     }
 }
