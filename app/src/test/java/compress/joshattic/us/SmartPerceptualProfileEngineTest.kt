@@ -272,6 +272,40 @@ class SmartPerceptualProfileEngineTest {
     }
 
     @Test
+    fun knownWinnableClassIsNeverLatchSuppressed() {
+        // Evidence: batch_20260715_141019 measured 26 files latch-suppressed in three profile
+        // classes that ALSO verified compressions. A class proven to contain compressible
+        // content must keep probing every file, whatever the latch counters say.
+        val e = engine()
+
+        // Arm the latch with two measured rejections.
+        e.recordMeasuredProbeRejection(key())
+        e.recordMeasuredProbeRejection(key())
+        assertTrue(e.shouldSkipProbes(key()))
+
+        // A verified compression in this class flips everCompressed and exempts it forever.
+        e.recordVerifiedSuccess(key(), usedTargetRatio = 0.65, outputToSourceBytesRatio = 0.6, floorRatio = 0.80)
+        assertTrue(e.profile(key()).everCompressed)
+        assertFalse(e.shouldSkipProbes(key()))
+
+        // Even a fresh burst of measured rejections cannot re-arm the skip for a winnable class.
+        e.recordMeasuredProbeRejection(key())
+        e.recordMeasuredProbeRejection(key())
+        e.recordMeasuredProbeRejection(key())
+        assertFalse(e.shouldSkipProbes(key()))
+
+        // The exemption round-trips through the store and defaults false on legacy profiles.
+        val decoded = SmartPerceptualProfileEngine.LearnedEncodeProfile.decode(
+            SmartPerceptualProfileEngine.LearnedEncodeProfile(everCompressed = true).encode()
+        )
+        assertTrue(decoded!!.everCompressed)
+        val legacy = SmartPerceptualProfileEngine.LearnedEncodeProfile.decode(
+            "success=1;failure=0;highFail=0;nextRatio=0.95;preferRemux=false;lastReason=;lastSizeRatio="
+        )
+        assertFalse(legacy!!.everCompressed)
+    }
+
+    @Test
     fun probeSkipLatchSurvivesRoundTripAndResistsTampering() {
         // Encode/decode round-trips the latch fields.
         val original = SmartPerceptualProfileEngine.LearnedEncodeProfile(

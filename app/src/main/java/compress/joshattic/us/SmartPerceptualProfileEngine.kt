@@ -99,7 +99,15 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         // Together they implement "skip a few, then re-probe": measured class evidence may save
         // probe encodes for a while, but never permanently denies a clip its trial.
         val consecutiveMeasuredProbeRejections: Int = 0,
-        val probeSkipsSinceLastProbe: Int = 0
+        val probeSkipsSinceLastProbe: Int = 0,
+        // True once this profile class has EVER produced a verified compression. Evidence
+        // (capture batch_20260715_141019): the probe-skip latch denied probes to 26 files in
+        // three classes that ALSO verified compressions — e.g. video/avc|720p|24|sdr|lt10m had
+        // 3 compressions (one at 42%) and 9 latch-suppressed files. Compressibility is content-
+        // dependent within a technical bucket, so a class PROVEN to contain compressible content
+        // must never have its per-file probes suppressed. This flag only ever ADDS probes; it
+        // never lowers a quality bar (OutputVerifier + certification remain the sole verdict).
+        val everCompressed: Boolean = false
     ) {
         fun encode(): String = listOf(
             "success=$successCount",
@@ -111,7 +119,8 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             "lastSizeRatio=${lastOutputToSourceRatio ?: ""}",
             "overshoot=${measuredOvershootFactor ?: ""}",
             "probeRejects=$consecutiveMeasuredProbeRejections",
-            "probeSkips=$probeSkipsSinceLastProbe"
+            "probeSkips=$probeSkipsSinceLastProbe",
+            "everCompressed=$everCompressed"
         ).joinToString(";")
 
         companion object {
@@ -136,7 +145,8 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
                         consecutiveMeasuredProbeRejections =
                             (fields["probeRejects"]?.toIntOrNull() ?: 0).coerceAtLeast(0),
                         probeSkipsSinceLastProbe =
-                            (fields["probeSkips"]?.toIntOrNull() ?: 0).coerceAtLeast(0)
+                            (fields["probeSkips"]?.toIntOrNull() ?: 0).coerceAtLeast(0),
+                        everCompressed = fields["everCompressed"]?.toBooleanStrictOrNull() ?: false
                     )
                 }.getOrNull()
             }
@@ -182,6 +192,10 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
      */
     fun shouldSkipProbes(key: EncodeProfileKey): Boolean {
         val p = profile(key)
+        // Known-winnable exemption: a class that has EVER verified a compression keeps probing
+        // every file — the latch's battery saving is only justified for classes with no proven
+        // compressible content. (Evidence: batch_20260715_141019, 26 denied-winnable probes.)
+        if (p.everCompressed) return false
         return p.consecutiveMeasuredProbeRejections >= MEASURED_PROBE_REJECTIONS_BEFORE_SKIP &&
             p.probeSkipsSinceLastProbe < PROBE_SKIPS_BETWEEN_REPROBES
     }
@@ -256,7 +270,9 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             measuredOvershootFactor = blendOvershoot(current.measuredOvershootFactor, measuredOvershootFactor),
             // A verified full encode is the strongest possible pixel evidence for the class.
             consecutiveMeasuredProbeRejections = 0,
-            probeSkipsSinceLastProbe = 0
+            probeSkipsSinceLastProbe = 0,
+            // This class has now PROVEN it can compress: never latch-suppress its probes again.
+            everCompressed = true
         )
         store.write(key.asKey(), updated.encode())
         return updated
