@@ -1,0 +1,27 @@
+{
+  "program": "post-pr23-improvements",
+  "updated": "2026-07-15",
+  "pr23": {"state": "OPEN-frozen", "head": "18d4b943cb40fa745ab0e72daa679aaefd30bc8f",
+           "last_validated_source_commit": "f1e2fbb", "merge": "awaiting explicit owner approval"},
+  "phase0": {
+    "status": "complete",
+    "baseline": {
+      "unit_and_apk": "BUILD SUCCESSFUL (testDebugUnitTest + assembleDebug, 1m21s incremental)",
+      "parser_tests": "12/12 OK",
+      "apk": {"package": "io.github.zfkirke0109.galaxycompressor", "versionCode": 26,
+              "versionName": "1.6.1", "size_bytes": 16669653,
+              "sha256": "7510dba8089b8ea8b090e020895e298bc9e7ce7efe1881d017a42f21d5b9542d",
+              "signing": "local AGP debug key (CI artifacts use repo ci-debug.keystore secret)",
+              "embedded_commit": "18d4b94"},
+      "ci": "PR #23 checks green at 18d4b94 head (Android CI + Build PR Debug APK passed at f1e2fbb; 18d4b94 is docs-only)",
+      "working_tree": "clean after removing a stray extracted AndroidManifest.xml (agent-created); extract_algorithm_evidence.py remains untracked by prior note"
+    }
+  },
+  "phase1": {"status": "in_progress", "branch": "perf/remux-keep-original-fast-path", "pr": null},
+  "phase2": {"status": "pending", "branch": "feat/deferred-remux"},
+  "phase3": {"status": "pending", "branch": "research/adaptive-batch-concurrency"},
+  "phase4": {"status": "pending", "branch": "feat/compression-advisor-shadow"},
+  "deferred": ["Secure Folder validation (owner decision, next cycle)",
+               "VMAF v1 model integration (docs/pr23/VMAF_V1_INTEGRATION_PLAN.md)",
+               "GitHub Releases update-check page (older backlog)"]
+}

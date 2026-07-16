@@ -25,6 +25,9 @@ import kotlin.coroutines.resumeWithException
 data class ProbeDecision(
     val provenRatio: Double?,
     val probedRatios: List<Double>,
+    // Window scores of the last MEASURED rung: the proven rung's scores on a pass, or the last
+    // measured (failing) rung's scores on a rejection — so captures carry the real numbers that
+    // justified the decision either way. Null only when nothing could be measured.
     val windowScores: List<WindowScore>?,
     val detail: String,
     // True when the HIGHEST candidate ratio (the codec default) was measured — not merely
@@ -74,23 +77,45 @@ class PerceptualQualityProber(private val context: Context) {
         val probed = mutableListOf<Double>()
         val highestCandidate = candidateRatios.maxOrNull()
         var highestMeasuredRejected = false
+        var highestFailedBelow: Double? = null
+        var lastMeasuredScores: List<WindowScore>? = null
         for (ratio in candidateRatios) {
             if (System.currentTimeMillis() - startedAt > TOTAL_BUDGET_MS) {
-                return ProbeDecision(null, probed, null, "probe budget exhausted", highestMeasuredRejected)
+                return ProbeDecision(null, probed, lastMeasuredScores, "probe budget exhausted", highestMeasuredRejected)
             }
             probed += ratio
             val scores = probeOneRatio(sourceUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows)
+            if (!scores.isNullOrEmpty()) lastMeasuredScores = scores
             if (QualityProbePolicy.windowsPass(scores)) {
                 Log.i(TAG, "ratio %.2f pixel-proven over ${windows.size} windows".format(ratio))
+                // One bounded bisection between this pass and the measured failure below it:
+                // an extra probe encode may reclaim up to half the rung gap in real savings.
+                // The passing result above is ALWAYS kept as the fallback — a failed or
+                // unmeasurable refinement changes nothing.
+                val refined = QualityProbePolicy.refinementCandidate(ratio, highestFailedBelow)
+                if (refined != null && System.currentTimeMillis() - startedAt <= TOTAL_BUDGET_MS) {
+                    probed += refined
+                    val refinedScores = probeOneRatio(
+                        sourceUri, outputMime, refined, targetBitrateForRatio(refined), audioBitrate, windows
+                    )
+                    if (QualityProbePolicy.windowsPass(refinedScores)) {
+                        Log.i(TAG, "refinement %.2f pixel-proven (bisection below %.2f)".format(refined, ratio))
+                        return ProbeDecision(refined, probed, refinedScores, "windows passed at %.2f (refined)".format(refined))
+                    }
+                    Log.i(TAG, "refinement %.2f rejected; keeping proven %.2f".format(refined, ratio))
+                }
                 return ProbeDecision(ratio, probed, scores, "windows passed at %.2f".format(ratio))
             }
-            if (ratio == highestCandidate && !scores.isNullOrEmpty()) {
-                // Measured (not merely unmeasurable) rejection at the default ratio.
-                highestMeasuredRejected = true
+            if (!scores.isNullOrEmpty()) {
+                highestFailedBelow = ratio
+                if (ratio == highestCandidate) {
+                    // Measured (not merely unmeasurable) rejection at the safest candidate.
+                    highestMeasuredRejected = true
+                }
             }
             Log.i(TAG, "ratio %.2f rejected by probe windows (measured=${!scores.isNullOrEmpty()})".format(ratio))
         }
-        return ProbeDecision(null, probed, null, "no candidate ratio passed", highestMeasuredRejected)
+        return ProbeDecision(null, probed, lastMeasuredScores, "no candidate ratio passed", highestMeasuredRejected)
     }
 
     /** Scores one candidate ratio across all windows; null = evidence unavailable/failed. */

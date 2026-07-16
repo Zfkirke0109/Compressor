@@ -24,12 +24,28 @@ object QualityProbePolicy {
     // 0.60 that survived even partially.
     const val HARD_RATIO_FLOOR = 0.60
 
-    // Probe fast path: sources this far below the transparency gate (0.08 bpp) failed
-    // unanimously in both the 2026-07-14 PC suite and the on-device probe reruns (21/21
-    // probe rejections in capture batch_1784095235729, worst measured bpp that ever came
-    // close was 0.079). Skipping the ladder for them saves minutes per batch with no
-    // evidence lost; they keep the conservative inference decision.
-    const val PROBE_MIN_SOURCE_BITS_PER_PIXEL = 0.05
+    // The safest rung the ladder may retreat to after the default ratio fails its windows.
+    // Above ~0.97 the video-bitrate saving disappears into container/measurement noise, so a
+    // "pass" there would not produce a genuinely smaller file on same-codec encodes (cross-
+    // codec encodes still gain from codec efficiency, which the bitrate policy accounts for).
+    const val SAFEST_RATIO_CEILING = 0.97
+
+    // Probe fast path: sources below this video bits-per-pixel never earn probe encodes.
+    // Measured basis: every pair below 0.05 bpp failed unanimously at ratios <= 0.90 (21/21
+    // rejections in capture batch_1784095235729 plus the 2026-07-14 PC suite). Between 0.03
+    // and 0.08 the ladder now retreats to safer-than-default rungs first (those were never
+    // measured before), so the hard cut-off moves down to 0.03: below that, even a 0.97-ratio
+    // pass would save less than file-size measurement noise on such starved sources.
+    const val PROBE_MIN_SOURCE_BITS_PER_PIXEL = 0.03
+
+    // Sources at or above this bpp carry plausible transparency headroom (the policy gate
+    // value in BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_MIN_SOURCE_BITS_PER_PIXEL);
+    // they earn the full downward ladder. Below it the ladder is safest-rungs-only.
+    const val PROBE_HEALTHY_SOURCE_BITS_PER_PIXEL = 0.08
+
+    // One bounded bisection refinement between the lowest passing rung and the rung below it
+    // is only worth an extra probe encode when the gap is at least this wide.
+    const val REFINEMENT_MIN_GAP = 0.06
 
     // Full-encode certification uses the same window thresholds; a certified sub-default
     // encode must PROVE its windows, an unmeasurable certification fails closed only when
@@ -44,6 +60,48 @@ object QualityProbePolicy {
             defaultRatio
         )
         return ladder.distinct().sorted()
+    }
+
+    /**
+     * Bpp-aware probe ladder, lowest (most savings) first. Healthy sources (bpp >=
+     * [PROBE_HEALTHY_SOURCE_BITS_PER_PIXEL]) get the full downward ladder PLUS one
+     * safer-than-default retreat rung, so a clip that fails at the default ratio can still
+     * earn a small verified saving instead of being abandoned. Starved-but-probeable sources
+     * (bpp in [PROBE_MIN_SOURCE_BITS_PER_PIXEL, healthy)) get safest-biased rungs only —
+     * the measured evidence says their low rungs always fail, so probing them wastes encodes.
+     * Sources below [PROBE_MIN_SOURCE_BITS_PER_PIXEL] get no ladder (empty list).
+     */
+    fun candidateRatiosForSource(defaultRatio: Double, sourceBitsPerPixel: Double?): List<Double> {
+        val bpp = sourceBitsPerPixel ?: return emptyList()
+        if (bpp < PROBE_MIN_SOURCE_BITS_PER_PIXEL) return emptyList()
+        // Rungs are rounded to 2 decimals: IEEE drift (0.90 + 0.05 = 0.9500000000000001)
+        // otherwise leaks into logs, structured records, and dedup comparisons.
+        fun rung(v: Double) = Math.round(v * 100.0) / 100.0
+        val retreatRung = rung((defaultRatio + 0.05).coerceAtMost(SAFEST_RATIO_CEILING))
+        if (bpp < PROBE_HEALTHY_SOURCE_BITS_PER_PIXEL) {
+            // First-ever measured rungs for this class: default plus the safest retreat.
+            return listOf(rung(defaultRatio), retreatRung).distinct().sorted()
+        }
+        val ladder = listOf(
+            rung((defaultRatio - 0.20).coerceAtLeast(HARD_RATIO_FLOOR)),
+            rung((defaultRatio - 0.10).coerceAtLeast(HARD_RATIO_FLOOR)),
+            rung(defaultRatio),
+            retreatRung
+        )
+        return ladder.distinct().sorted()
+    }
+
+    /**
+     * One bounded bisection refinement: when the lowest passing rung sits at least
+     * [REFINEMENT_MIN_GAP] above the rung that failed below it (or above the hard floor when
+     * nothing below was tried), the midpoint is worth one extra probe. Returns null when the
+     * gap is too narrow to matter. Never returns a value below [HARD_RATIO_FLOOR].
+     */
+    fun refinementCandidate(lowestPassingRatio: Double, highestFailedBelow: Double?): Double? {
+        val lowerBound = (highestFailedBelow ?: HARD_RATIO_FLOOR).coerceAtLeast(HARD_RATIO_FLOOR)
+        if (lowestPassingRatio - lowerBound < REFINEMENT_MIN_GAP) return null
+        val midpoint = (lowestPassingRatio + lowerBound) / 2.0
+        return (Math.round(midpoint * 100.0) / 100.0).coerceAtLeast(HARD_RATIO_FLOOR)
     }
 
     /** True when every window individually clears the acceptance thresholds. */

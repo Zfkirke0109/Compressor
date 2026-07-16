@@ -50,6 +50,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import compress.joshattic.us.quality.PerceptualQualityProber
 import compress.joshattic.us.quality.QualityProbePolicy
+import compress.joshattic.us.quality.WindowScore
 import compress.joshattic.us.quality.VmafNative
 import java.io.File
 import kotlin.coroutines.resume
@@ -58,7 +59,12 @@ import kotlin.coroutines.resumeWithException
 // Encoder-undershoot tolerance applied to a pixel-proven ratio before it becomes the
 // verification bitrate floor: field capture batch_20260714_150649 measured deliveries as low
 // as ~0.94x of the request on this device class for near-floor targets.
-private const val PIXEL_PROVEN_UNDERSHOOT_TOLERANCE = 0.06
+// Measured on batch_20260715_084112 (n=11 discarded encodes): the QTI HEVC VBR encoder delivered
+// 0.86-0.93x of the requested bitrate (mean 0.887, sigma 0.019) on easy/high-bpp content — quality
+// saturation, not degradation. The old 0.06 tolerance sat INSIDE that range and discarded all 11
+// structurally-perfect encodes (7.8 wasted minutes). 0.15 covers the measured worst case with
+// margin; sampled pixel certification remains the real quality gate for every pixel-proven encode.
+private const val PIXEL_PROVEN_UNDERSHOOT_TOLERANCE = 0.15
 
 private enum class BatchQualityPreset(val label: String, val targetRatio: Float) {
     REMUX_ONLY("Remux Only", 1.0f),
@@ -215,21 +221,37 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val preferRemux: Boolean,
         val remuxReason: String?,
         val remuxWasSourceEfficient: Boolean,
+        // True when the remux preference came from the learning engine's measured latch
+        // (repeated near-max-ratio failures for this profile) rather than a source-efficiency
+        // inference — classified as REMUX_PREFERRED_BY_EVIDENCE, never UNEXPECTED_REMUX.
+        val remuxWasEvidencePreferred: Boolean = false,
         // Tier-1 experimental encoder-ceiling diagnostics (debug builds only): request CBR so the
         // QTI encoder cannot apply its VBR quality-boost overshoot. Judged by OutputVerifier only.
         val useCbrCeiling: Boolean = false,
         val expectedOvershootFactor: Double = 1.0,
-        // Pixel-probe eligibility and outcome. Eligible = SDR + strictly-more-efficient output
-        // codec + no profile remux latch; VMAF is not calibrated for HDR, and same-codec encodes
-        // stay remux-preferred (disproven by the 2026-07-14 suite).
+        // Pixel-probe eligibility and outcome. Eligible = SDR + non-downgrade output codec;
+        // VMAF is not calibrated for HDR. Same-codec sources and remux-latched profiles stay
+        // remux-preferred by INFERENCE but may earn probes — per-clip pixel evidence (probe
+        // windows + post-encode certification) outranks class-level inference in both
+        // directions. Codec downgrades (e.g. AV1 -> HEVC) never probe: a fake bitrate delta
+        // cannot be pixel-justified.
         val probeEligible: Boolean = false,
         val defaultRatio: Double = targetRatio,
-        // Ratio proven by on-device VMAF probe windows for THIS clip, when below/at the target.
+        // Ratio proven by on-device VMAF probe windows for THIS clip. May sit ABOVE the
+        // learned/default target when only a safer retreat rung passed its windows.
         val pixelProvenRatio: Double? = null,
-        // Set when pixel measurement PROVED that no candidate ratio (including the default) can
-        // encode this clip transparently: the item is skipped entirely — original untouched,
-        // no stream-copy written. Inference-only remux decisions never set this.
-        val skipReason: String? = null
+        // Set when pixel measurement PROVED that no candidate ratio (including the safest)
+        // can encode this clip transparently: the item is skipped entirely — original
+        // untouched, no stream-copy written. Inference-only remux decisions never set this.
+        val skipReason: String? = null,
+        // Full probe trace for the structured diagnostics record: every ratio attempted (in
+        // order) and the prober's decision detail. Answers "was a trial performed and what
+        // exactly did it measure" without needing unstructured logcat tags.
+        val probedRatios: List<Double> = emptyList(),
+        val probeDetail: String? = null,
+        // Compact per-window "mean/p5/min" scores of the last measured rung (pass or fail):
+        // the raw numbers behind the probe decision, for threshold calibration from captures.
+        val probeWindowScores: String? = null
     )
 
     private data class EncodeAttemptResult(
@@ -514,6 +536,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
         compressionJob = viewModelScope.launch(Dispatchers.Main) {
             val batchStartedAt = System.currentTimeMillis()
+            // Post-item thermal cooldown that was applied BEFORE the current item started (i.e. the
+            // cooldown after the previous item). Carried across iterations so each item's structured
+            // record shows the handoff delay that preceded it. Timing telemetry only.
+            var precedingCooldownMs = 0L
             _uiState.update {
                 it.copy(
                     isCompressing = true,
@@ -603,6 +629,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
                     val thermalWindow = waitForThermalWindow(context, item.originalName)
                     val itemStartedAt = System.currentTimeMillis()
+                    // The cooldown applied after the PREVIOUS item (0 after a no-encode item or a
+                    // skip). Snapshot for this item's structured record, then clear so a following
+                    // early-returning item correctly reports 0.
+                    val precedingHandoffCooldownMs = precedingCooldownMs
+                    precedingCooldownMs = 0L
                     val plannedFps = outputFpsFor(item, frameRate, quality)
                     var diagnosticEffectiveQuality = quality
                     var diagnosticResolvedMime: String? = null
@@ -610,12 +641,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     var diagnosticTargetVideoBitrate: Int? = null
                     var diagnosticDecisionReason: String? = null
                     var diagnosticSourceAlreadyEfficient = false
+                    var diagnosticEvidencePreferredRemux = false
                     var diagnosticEncoderFailed = false
                     // When a PL encode is attempted then discarded for a remux, preserve WHY (and the
                     // discarded encode's measured video bitrate) so the structured record stays honest
                     // even after verification is re-run on the remux.
                     var diagnosticFallbackReason: String? = null
                     var diagnosticDiscardedVideoBitrate: Int? = null
+                    // Compact per-window scores of the final output's sampled certification —
+                    // recorded pass OR fail so captures carry the real numbers behind verdicts.
+                    var diagnosticCertWindowScores: String? = null
                     val candidateFiles = linkedSetOf<File>()
                     var itemOutputAccepted = false
                     updateItem(index) {
@@ -668,6 +703,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         )
                     }
                     diagnosticSourceAlreadyEfficient = perceptualPlan?.remuxWasSourceEfficient == true
+                    diagnosticEvidencePreferredRemux = perceptualPlan?.remuxWasEvidencePreferred == true
                     if (perceptualPlan?.skipReason != null) {
                         // Positive pixel evidence says compression would visibly degrade this
                         // clip: leave the original untouched and write nothing.
@@ -684,7 +720,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             verification = null,
                             outputSize = 0L,
                             terminal = BatchTerminalResult.SKIPPED_WOULD_DEGRADE,
-                            elapsedMs = System.currentTimeMillis() - itemStartedAt
+                            elapsedMs = System.currentTimeMillis() - itemStartedAt,
+                            probedRatios = perceptualPlan.probedRatios,
+                            pixelProvenRatio = perceptualPlan.pixelProvenRatio,
+                            probeDetail = perceptualPlan.probeDetail,
+                            probeWindowScores = perceptualPlan.probeWindowScores,
+                            precedingCooldownMs = precedingHandoffCooldownMs
                         )
                         updateItem(index) {
                             it.copy(
@@ -801,6 +842,54 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             else -> null
                         }
                     }
+                    // Floor recovery: when the ONLY verification failure is the inferred video
+                    // bitrate floor (structure, color, audio, timing, metadata all passed) and
+                    // the output is strictly smaller, sampled pixel certification gets the final
+                    // word — a VBR encoder undershooting its request on easy content is quality
+                    // saturation, not necessarily degradation, and only pixels can tell which.
+                    // A measured PASS re-verifies with the certified bitrate as the pixel-proven
+                    // floor, so OutputVerifier remains the sole source of the final verdict; a
+                    // failed or unmeasurable certification changes nothing and the encode falls
+                    // back exactly as before.
+                    var floorRecoveryCertScores: List<WindowScore>? = null
+                    if (effectiveQuality == BatchQualityPreset.ORIGINAL &&
+                        perceptualPlan != null && perceptualPlan.probeEligible &&
+                        verification.failedOnlyOnVideoBitrateFloor &&
+                        item.originalSize > 0L && outputSize in 1 until item.originalSize
+                    ) {
+                        updateItem(index) {
+                            it.copy(message = "Certifying pixels: encoder undershot the bitrate floor, checking real quality…")
+                        }
+                        val recoveryScores = qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+                        diagnosticCertWindowScores = compactWindowScores(recoveryScores)
+                        if (QualityProbePolicy.windowsPass(recoveryScores)) {
+                            floorRecoveryCertScores = recoveryScores
+                            val certifiedVideoBitrate = encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
+                                ?: if (item.durationMs > 0 && outputSize > 0) {
+                                    ((outputSize * 8000.0 / item.durationMs) - item.originalAudioBitrate.coerceAtLeast(0))
+                                        .toInt().coerceAtLeast(1)
+                                } else {
+                                    1
+                                }
+                            Log.i(
+                                "CompressorProbe",
+                                "floor recovery; job=${diagnosticJobId(item)}; sampled windows passed; " +
+                                    "re-verifying with pixel-certified floor $certifiedVideoBitrate"
+                            )
+                            verification = withContext(Dispatchers.IO) {
+                                OutputVerifier.verify(
+                                    context, item, outputFile, effectiveQuality.label, privacyMode,
+                                    pixelProvenVideoBitrateFloor = certifiedVideoBitrate
+                                )
+                            }
+                        } else {
+                            Log.i(
+                                "CompressorProbe",
+                                "floor recovery; job=${diagnosticJobId(item)}; certification " +
+                                    "${if (recoveryScores == null) "unavailable" else "failed"}; fallback proceeds"
+                            )
+                        }
+                    }
                     // Sampled pixel certification of the full output (SDR probe-eligible encodes
                     // only). Measured-bad always fails; unmeasurable fails only when the encode's
                     // target was below the codec default (pixel evidence was its sole justification).
@@ -814,7 +903,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         updateItem(index) {
                             it.copy(message = "Certifying pixels: sampled VMAF check of the final output…")
                         }
-                        val certScores = qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+                        val certScores = floorRecoveryCertScores
+                            ?: qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+                        diagnosticCertWindowScores = compactWindowScores(certScores)
                         val certOk = QualityProbePolicy.certificationPasses(
                             usedRatio = perceptualPlan.targetRatio,
                             defaultRatio = perceptualPlan.defaultRatio,
@@ -862,7 +953,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 terminal = BatchTerminalResult.SKIPPED_WOULD_DEGRADE,
                                 elapsedMs = System.currentTimeMillis() - itemStartedAt,
                                 fallbackReason = certReason,
-                                discardedVideoBitrate = diagnosticDiscardedVideoBitrate
+                                discardedVideoBitrate = diagnosticDiscardedVideoBitrate,
+                                probedRatios = perceptualPlan.probedRatios,
+                                pixelProvenRatio = perceptualPlan.pixelProvenRatio,
+                                probeDetail = perceptualPlan.probeDetail,
+                                probeWindowScores = perceptualPlan.probeWindowScores,
+                                certWindowScores = diagnosticCertWindowScores,
+                                precedingCooldownMs = precedingHandoffCooldownMs
                             )
                             updateItem(index) {
                                 it.copy(
@@ -966,6 +1063,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             sourceSize = item.originalSize,
                             outputSize = outputSize,
                             preEncodeSourceAlreadyEfficient = diagnosticSourceAlreadyEfficient,
+                            preEncodeEvidencePreferredRemux = diagnosticEvidencePreferredRemux,
                             encoderFailed = diagnosticEncoderFailed
                         )
                     )
@@ -999,7 +1097,15 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         terminal = terminal,
                         elapsedMs = metrics.elapsedMs,
                         fallbackReason = diagnosticFallbackReason,
-                        discardedVideoBitrate = diagnosticDiscardedVideoBitrate
+                        discardedVideoBitrate = diagnosticDiscardedVideoBitrate,
+                        probedRatios = perceptualPlan?.probedRatios ?: emptyList(),
+                        pixelProvenRatio = perceptualPlan?.pixelProvenRatio,
+                        probeDetail = perceptualPlan?.probeDetail,
+                        probeWindowScores = perceptualPlan?.probeWindowScores,
+                        certWindowScores = diagnosticCertWindowScores,
+                        thermalStart = metrics.thermalStart,
+                        thermalEnd = metrics.thermalEnd,
+                        precedingCooldownMs = precedingHandoffCooldownMs
                     )
 
                     if (terminal.isFailure) {
@@ -1079,16 +1185,27 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
                     if (index < _uiState.value.items.lastIndex) {
                         val cooldown = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
+                        // Apply the thermal cooldown ONLY after an item that actually ran a full
+                        // hardware encode (encodeAttempt != null). Stream-copy/remux and already-
+                        // optimized items generate no encoder heat, so cooling down after them is
+                        // pure idle time. Timing-only: no compression/verification/learning decision
+                        // is affected. Skipped items already return before this block.
+                        val ranFullEncode = encodeAttempt != null
+                        val appliedCooldownMs = ThermalBatchGovernor.postItemCooldownMs(ranFullEncode, cooldown)
+                        precedingCooldownMs = appliedCooldownMs
                         _uiState.update {
                             it.copy(
                                 thermalStatus = cooldown.summary,
-                                statusMessage = "Cooling down ${cooldown.postItemDelayMs / 1000}s before next video."
+                                statusMessage = if (appliedCooldownMs > 0L)
+                                    "Cooling down ${appliedCooldownMs / 1000}s before next video."
+                                else
+                                    "Preparing next video…"
                             )
                         }
                         updateItem(index) {
-                            it.copy(metrics = it.metrics?.copy(cooldownMs = cooldown.postItemDelayMs))
+                            it.copy(metrics = it.metrics?.copy(cooldownMs = appliedCooldownMs))
                         }
-                        if (cooldown.postItemDelayMs > 0L) delay(cooldown.postItemDelayMs)
+                        if (appliedCooldownMs > 0L) delay(appliedCooldownMs)
                     }
                     } catch (e: CancellationException) {
                         if (!itemOutputAccepted) candidateFiles.forEach { runCatching { it.delete() } }
@@ -1570,10 +1687,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 "Source is already near optimal; kept exact stream copy."
             else -> null
         }
-        // On-device pixel probes may refine or overturn the inference-based decision for
-        // SDR sources heading to a strictly more efficient codec (see refinePlanWithPixelProbes).
-        val probeEligible = !profilePrefersRemux && !preserveSourceCodec &&
-            !hdrPixelTransparencyUnvalidated && VmafNative.isAvailable
+        // On-device pixel probes may refine or overturn the inference-based decision for any
+        // SDR source whose output codec is not a downgrade (see refinePlanWithPixelProbes).
+        // Same-codec sources and remux-latched profiles deliberately REMAIN probe-eligible:
+        // inference picks the default outcome, but only measured pixels may make it final —
+        // a prior failure must never permanently deny a clip its trial encodes.
+        val codecDowngrade = BatchQualityBitratePolicy.isCodecDowngradeForPerceptualLossless(
+            source.videoMime,
+            outputMime
+        )
+        val probeEligible = !codecDowngrade && !source.isHdr && VmafNative.isAvailable
         Log.i(
             "CompressorLearning",
             "plan; profileKey=${profileKey.asKey()}; defaultRatio=$defaultRatio; learnedRatio=$targetRatio; " +
@@ -1587,6 +1710,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             preferRemux = remuxReason != null,
             remuxReason = remuxReason,
             remuxWasSourceEfficient = (preserveSourceCodec || nearOptimal) && !profilePrefersRemux,
+            remuxWasEvidencePreferred = profilePrefersRemux,
             useCbrCeiling = useCbrCeiling,
             expectedOvershootFactor = expectedOvershootFactor,
             probeEligible = probeEligible,
@@ -1609,17 +1733,34 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         plan: PerceptualLosslessPlan
     ): PerceptualLosslessPlan {
         if (!plan.probeEligible) return plan
-        // Profile-latched or codec/HDR remuxes never probe; those gates are not inference.
+        // HDR and codec-downgrade plans never probe; those gates are not inference.
         val source = item.toSourceInfo()
-        // Fast path: far-below-gate sources failed unanimously in every measurement to date;
-        // don't spend probe encodes re-proving it. The inference decision stands.
+        // Bpp-classed ladder: healthy sources get the full downward ladder plus one safer
+        // retreat rung; starved-but-probeable sources get safest-biased rungs only (their
+        // first-ever measured trials); far-below-gate sources get none — for them even a
+        // safest-rung pass would save less than measurement noise, so inference stands.
         val bpp = BatchQualityBitratePolicy.sourceBitsPerPixelPerFrame(source)
-        if (bpp == null || bpp < QualityProbePolicy.PROBE_MIN_SOURCE_BITS_PER_PIXEL) {
-            return plan
+        val candidates = QualityProbePolicy.candidateRatiosForSource(plan.defaultRatio, bpp)
+        if (candidates.isEmpty()) return plan
+        // Decaying probe-skip latch: after repeated MEASURED safest-rung rejections for this
+        // profile class, a few ladders are skipped to save probe encodes/battery — then the
+        // next encounter re-probes so fresh pixels (never stale class history) keep the final
+        // say. The skip is recorded in the structured trace so captures can tell "skipped by
+        // recent measured evidence" apart from "never tried".
+        if (learningEngine.shouldSkipProbes(plan.profileKey)) {
+            val latched = learningEngine.noteProbeSkipped(plan.profileKey)
+            Log.i(
+                "CompressorProbe",
+                "probe skip; job=${diagnosticJobId(item)}; profile measured-rejected " +
+                    "${latched.consecutiveMeasuredProbeRejections}x consecutively; " +
+                    "skip ${latched.probeSkipsSinceLastProbe}/${SmartPerceptualProfileEngine.PROBE_SKIPS_BETWEEN_REPROBES} before forced re-probe"
+            )
+            return plan.copy(
+                probeDetail = "probes skipped: this profile class measured visible loss at every " +
+                    "candidate in ${latched.consecutiveMeasuredProbeRejections} consecutive recent ladders " +
+                    "(skip ${latched.probeSkipsSinceLastProbe}/${SmartPerceptualProfileEngine.PROBE_SKIPS_BETWEEN_REPROBES}, then re-probes)"
+            )
         }
-        val allowBelowDefault = true
-        val candidates = QualityProbePolicy.candidateRatios(plan.defaultRatio, allowBelowDefault)
-            .filter { plan.preferRemux || it <= plan.targetRatio + 1e-9 }
         val decision = qualityProber.runLadder(
             sourceUri = item.sourceUri,
             durationMs = item.durationMs,
@@ -1641,21 +1782,32 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             "probe result; job=${diagnosticJobId(item)}; probed=${decision.probedRatios}; " +
                 "proven=${decision.provenRatio ?: "none"}; detail=${decision.detail}"
         )
+        val probeTrace = plan.copy(
+            probedRatios = decision.probedRatios,
+            probeDetail = decision.detail,
+            probeWindowScores = compactWindowScores(decision.windowScores)
+        )
         val proven = decision.provenRatio ?: run {
-            // Measured rejection at the default ratio is positive pixel evidence that NO
-            // allowed target can encode this clip transparently: skip the item entirely
-            // (original untouched, no stream copy). Unmeasurable probes change nothing.
+            // Measured rejection at the SAFEST candidate ratio is positive pixel evidence
+            // that no allowed target can encode this clip transparently: skip the item
+            // entirely (original untouched, no stream copy). Unmeasurable probes change
+            // nothing — the conservative inference decision stands, honestly labeled.
             return if (decision.highestCandidateMeasuredRejected) {
-                plan.copy(
+                learningEngine.recordMeasuredProbeRejection(plan.profileKey)
+                probeTrace.copy(
                     preferRemux = true,
                     skipReason = "On-device VMAF measured visible quality loss at every " +
-                        "candidate ratio; original left untouched."
+                        "candidate ratio (${decision.probedRatios.joinToString { "%.2f".format(it) }}); " +
+                        "original left untouched."
                 )
             } else {
-                plan
+                probeTrace
             }
         }
-        // A proven ratio must still predict a useful saving before overturning a remux decision.
+        // A pixel-proven rung clears the probe-skip latch: fresh evidence supersedes history.
+        learningEngine.recordProbePass(plan.profileKey)
+        // A proven ratio must still clear file-size measurement noise before overturning a
+        // remux decision — a NOISE threshold, not a worthiness bar: verified 1-2% savings count.
         val predicted = BatchQualityBitratePolicy.predictedPerceptualLosslessBytes(
             source = source,
             outputMimeType = outputMime,
@@ -1663,14 +1815,18 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             expectedOvershootFactor = plan.expectedOvershootFactor,
             pixelProvenRatioFloor = proven
         )
-        val savesEnough = item.originalSize <= 0L || predicted <
-            (item.originalSize * (1.0 - BatchQualityBitratePolicy.MIN_PERCEPTUAL_LOSSLESS_PREDICTED_SAVINGS)).toLong()
-        if (!savesEnough) return plan
-        return plan.copy(
+        if (!BatchQualityBitratePolicy.meetsMinimumUsefulSavings(item.originalSize, predicted)) {
+            return probeTrace
+        }
+        // Adopt the proven ratio in BOTH directions: below the learned target it buys more
+        // savings at proven quality; above it (a safer retreat rung) it converts a would-be
+        // remux/skip into a small verified reduction. Certification re-checks the full output.
+        return probeTrace.copy(
             targetRatio = proven,
             preferRemux = false,
             remuxReason = null,
             remuxWasSourceEfficient = false,
+            remuxWasEvidencePreferred = false,
             pixelProvenRatio = proven
         )
     }
@@ -2053,7 +2209,24 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         terminal: BatchTerminalResult,
         elapsedMs: Long,
         fallbackReason: String? = null,
-        discardedVideoBitrate: Int? = null
+        discardedVideoBitrate: Int? = null,
+        // Probe trace: every ratio the ladder attempted, the pixel-proven winner (if any),
+        // and the prober's decision detail — so a capture can prove whether a trial encode
+        // happened and exactly what it measured, file by file.
+        probedRatios: List<Double> = emptyList(),
+        pixelProvenRatio: Double? = null,
+        probeDetail: String? = null,
+        // Raw VMAF window scores ("mean/p5/min;…") from the probe ladder and the final-output
+        // certification, plus the thermal state bracket of the whole job — the fields needed to
+        // calibrate window thresholds and correlate throughput vs throttling from captures alone.
+        probeWindowScores: String? = null,
+        certWindowScores: String? = null,
+        thermalStart: String? = null,
+        thermalEnd: String? = null,
+        // Inter-item handoff telemetry: the thermal cooldown (ms) that was applied AFTER the
+        // previous item and BEFORE this one started. 0 when the previous item ran no full encode
+        // (the throughput optimization) or was skipped. Timing-only; no decision depends on it.
+        precedingCooldownMs: Long? = null
     ) {
         diagnostics.job(
             // The recorder hashes both values before emission; raw URI/name never leave this call.
@@ -2085,12 +2258,27 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             terminal = terminal,
             elapsedMs = elapsedMs,
             fallbackReason = fallbackReason,
-            discardedVideoBitrate = discardedVideoBitrate
+            discardedVideoBitrate = discardedVideoBitrate,
+            probedRatios = probedRatios.takeIf { it.isNotEmpty() }
+                ?.joinToString(",") { "%.2f".format(it) },
+            pixelProvenRatio = pixelProvenRatio,
+            probeDetail = probeDetail,
+            probeWindowScores = probeWindowScores,
+            certWindowScores = certWindowScores,
+            thermalStart = thermalStart,
+            thermalEnd = thermalEnd,
+            precedingCooldownMs = precedingCooldownMs
         )
     }
 
     private fun diagnosticJobId(item: BatchVideoItem): String =
         DiagnosticsRecorder.redactedJobId(item.sourceUri.toString())
+
+    // Compact "mean/p5/min" per window, ";"-joined — the capture-friendly form of VMAF window
+    // scores (e.g. "96.2/92.0/85.1;97.0/93.4/88.8"). Null when nothing was measured.
+    private fun compactWindowScores(scores: List<WindowScore>?): String? =
+        scores?.takeIf { it.isNotEmpty() }
+            ?.joinToString(";") { "%.1f/%.1f/%.1f".format(it.mean, it.p5, it.min) }
 
     private fun completionMessage(
         item: BatchVideoItem,

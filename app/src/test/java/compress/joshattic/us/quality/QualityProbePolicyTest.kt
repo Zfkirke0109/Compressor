@@ -92,4 +92,48 @@ class QualityProbePolicyTest {
         assertTrue(QualityProbePolicy.WINDOW_MIN_MIN > 80.0)
         assertNull(null) // keep junit4 import shape stable
     }
+
+    @Test
+    fun bppClassedLadderShapesMatchTheEvidence() {
+        // Healthy sources: full downward ladder PLUS one safer retreat rung above the default.
+        assertEquals(
+            listOf(0.70, 0.80, 0.90, 0.95),
+            QualityProbePolicy.candidateRatiosForSource(0.90, sourceBitsPerPixel = 0.15)
+        )
+        // The retreat rung is capped at the safest useful ceiling.
+        assertEquals(
+            listOf(0.75, 0.85, 0.95, 0.97),
+            QualityProbePolicy.candidateRatiosForSource(0.95, sourceBitsPerPixel = 0.20)
+        )
+        // Starved-but-probeable sources get safest-biased rungs only: their low rungs are
+        // already disproven, but the safer rungs have never been measured — these are their
+        // first-ever trial encodes instead of a prediction-only rejection.
+        assertEquals(
+            listOf(0.90, 0.95),
+            QualityProbePolicy.candidateRatiosForSource(0.90, sourceBitsPerPixel = 0.05)
+        )
+        // Below the noise line: no ladder; inference stands.
+        assertTrue(QualityProbePolicy.candidateRatiosForSource(0.90, sourceBitsPerPixel = 0.02).isEmpty())
+        assertTrue(QualityProbePolicy.candidateRatiosForSource(0.90, sourceBitsPerPixel = null).isEmpty())
+        // Ladder never drops below the hard floor.
+        assertTrue(
+            QualityProbePolicy.candidateRatiosForSource(0.70, sourceBitsPerPixel = 0.30)
+                .all { it >= QualityProbePolicy.HARD_RATIO_FLOOR }
+        )
+    }
+
+    @Test
+    fun refinementBisectsOnlyWhenTheGapIsWorthAnEncode() {
+        // Pass at 0.80 after failing 0.70: midpoint 0.75 is worth one probe.
+        assertEquals(0.75, QualityProbePolicy.refinementCandidate(0.80, 0.70)!!, 1e-9)
+        // Narrow gap: not worth an extra encode.
+        assertNull(QualityProbePolicy.refinementCandidate(0.75, 0.70))
+        // Nothing failed below: bisect toward the hard floor when the gap allows.
+        assertEquals(0.65, QualityProbePolicy.refinementCandidate(0.70, null)!!, 1e-9)
+        // Passing at the floor itself leaves nothing to refine.
+        assertNull(QualityProbePolicy.refinementCandidate(QualityProbePolicy.HARD_RATIO_FLOOR, null))
+        // The refinement may never dip below the hard floor.
+        val refined = QualityProbePolicy.refinementCandidate(0.90, null)
+        assertTrue(refined == null || refined >= QualityProbePolicy.HARD_RATIO_FLOOR)
+    }
 }

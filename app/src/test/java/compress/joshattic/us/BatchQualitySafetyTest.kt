@@ -160,8 +160,11 @@ class BatchQualitySafetyTest {
         )
         val sourceBytes = 20_000_000L * 60L / 8L
 
-        // A target ratio pushed to the maximum cannot save >= 3%, so remux is the honest choice.
-        assertTrue(
+        // 2026-07-15 contract change (user-directed): the minimum-savings bar is a NOISE
+        // threshold, not a worthiness bar. Even at the maximum target ratio this clip predicts
+        // ~3% savings — comfortably above measurement noise — so the encode PROCEEDS and
+        // probe/certification pixels decide the truth. Only sub-noise predictions still remux.
+        assertFalse(
             BatchQualityBitratePolicy.shouldPreferRemuxForPerceptualLossless(
                 source = source,
                 outputMimeType = MimeTypes.VIDEO_H265,
@@ -178,6 +181,51 @@ class BatchQualitySafetyTest {
                 outputMimeType = MimeTypes.VIDEO_H265,
                 sourceSizeBytes = sourceBytes,
                 learnedTargetRatio = null
+            )
+        )
+
+        // The noise threshold itself: savings must clear BOTH the relative and absolute bars.
+        assertTrue(BatchQualityBitratePolicy.meetsMinimumUsefulSavings(1_000_000_000L, 900_000_000L))
+        assertFalse(BatchQualityBitratePolicy.meetsMinimumUsefulSavings(1_000_000_000L, 999_000_000L)) // 0.1% < 0.5%
+        assertFalse(BatchQualityBitratePolicy.meetsMinimumUsefulSavings(10_000_000L, 9_900_000L)) // 100 KB < 256 KB
+        assertTrue(BatchQualityBitratePolicy.meetsMinimumUsefulSavings(100_000_000L, 99_000_000L)) // 1% and ~1 MB
+        assertTrue(BatchQualityBitratePolicy.meetsMinimumUsefulSavings(0L, 123L)) // unknown source fails open
+    }
+
+    @Test
+    fun codecDowngradeNeverProbesButSameCodecMay() {
+        // Tier downgrades manufacture a fake bitrate delta — never probeable, always preserved.
+        assertTrue(
+            BatchQualityBitratePolicy.isCodecDowngradeForPerceptualLossless(
+                MimeTypes.VIDEO_AV1, MimeTypes.VIDEO_H265
+            )
+        )
+        assertTrue(
+            BatchQualityBitratePolicy.isCodecDowngradeForPerceptualLossless(
+                MimeTypes.VIDEO_H265, MimeTypes.VIDEO_H264
+            )
+        )
+        // Unknown codecs fail closed.
+        assertTrue(BatchQualityBitratePolicy.isCodecDowngradeForPerceptualLossless(null, MimeTypes.VIDEO_H265))
+        assertTrue(BatchQualityBitratePolicy.isCodecDowngradeForPerceptualLossless(MimeTypes.VIDEO_H265, null))
+
+        // Same-codec is NOT a downgrade: it stays remux-preferred by inference (the blanket
+        // preserve gate still says true) but may earn probe encodes — per-clip pixel evidence
+        // can overturn the class-level inference.
+        assertFalse(
+            BatchQualityBitratePolicy.isCodecDowngradeForPerceptualLossless(
+                MimeTypes.VIDEO_H265, MimeTypes.VIDEO_H265
+            )
+        )
+        assertTrue(
+            BatchQualityBitratePolicy.shouldPreserveSourceCodecForPerceptualLossless(
+                MimeTypes.VIDEO_H265, MimeTypes.VIDEO_H265
+            )
+        )
+        // Strictly-more-efficient conversions remain fully probeable.
+        assertFalse(
+            BatchQualityBitratePolicy.isCodecDowngradeForPerceptualLossless(
+                MimeTypes.VIDEO_H264, MimeTypes.VIDEO_H265
             )
         )
     }

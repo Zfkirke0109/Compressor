@@ -126,6 +126,23 @@ class DiagnosticsRecorder private constructor(
         // and the discarded encode's measured video bitrate. Without them the remux re-verification
         // overwrites verdict/blockReason and an UNEXPECTED_REMUX is opaque in a privacy-mode capture.
         fallbackReason: String? = null,
+        // Probe-ladder trace (schema-additive): the exact ratios attempted ("0.70,0.80,0.90"),
+        // the pixel-proven winner, and the prober's decision detail. Together these prove
+        // whether a trial encode happened for this job and what it measured — the difference
+        // between "rejected by prediction" and "rejected by evidence" in every capture.
+        probedRatios: String? = null,
+        pixelProvenRatio: Double? = null,
+        probeDetail: String? = null,
+        // Raw evidence behind the probe/certification decisions ("mean/p5/min;…" per window)
+        // and the job's thermal bracket — enough to recalibrate window thresholds and correlate
+        // throughput vs thermal state from a privacy-mode capture alone.
+        probeWindowScores: String? = null,
+        certWindowScores: String? = null,
+        thermalStart: String? = null,
+        thermalEnd: String? = null,
+        // Inter-item handoff: thermal cooldown (ms) applied after the previous item, before this
+        // one. 0 when the previous item ran no full encode or was skipped. Timing telemetry only.
+        precedingCooldownMs: Long? = null,
         discardedVideoBitrate: Int? = null
     ) {
         val accountingEntry = BatchTerminalAccountingEntry(terminal, sourceSize, outputSize)
@@ -165,6 +182,14 @@ class DiagnosticsRecorder private constructor(
                 "blockReason" to blockReason,
                 "fallbackReason" to fallbackReason,
                 "discardedVideoBitrate" to discardedVideoBitrate,
+                "probedRatios" to probedRatios,
+                "pixelProvenRatio" to pixelProvenRatio,
+                "probeDetail" to probeDetail,
+                "probeWindowScores" to probeWindowScores,
+                "certWindowScores" to certWindowScores,
+                "thermalStart" to thermalStart,
+                "thermalEnd" to thermalEnd,
+                "precedingCooldownMs" to precedingCooldownMs,
                 "outputSize" to outputSize,
                 "rawByteDelta" to rawByteDelta,
                 "savedBytes" to savedBytes,

@@ -310,7 +310,11 @@ object OutputVerifier {
                     input.outputTrackProbe.colorRange != null
                 ))
 
-        val perceptuallyLosslessVerified = playable &&
+        // Everything except the video-bitrate floor, factored out so callers can see when the
+        // floor was the SOLE failure: that specific case may be re-judged by sampled pixel
+        // certification (measured pixels outrank the inferred floor), and a measured pass
+        // re-verifies here with a pixel-proven floor. Every other failure stays terminal.
+        val perceptuallyLosslessVerifiedExceptVideoBitrate = playable &&
             criticalFieldsComplete &&
             durationMatches &&
             frameCountMatches &&
@@ -322,11 +326,12 @@ object OutputVerifier {
             audioCodecMatches &&
             audioShapeMatches &&
             audioBitratePass &&
-            bitratePass &&
             rotationMatches &&
             locationMatches &&
             mediaStoreDateMatches &&
             mp4DateMatches
+
+        val perceptuallyLosslessVerified = perceptuallyLosslessVerifiedExceptVideoBitrate && bitratePass
 
         val remuxVerified = playable &&
             criticalFieldsComplete &&
@@ -439,6 +444,10 @@ object OutputVerifier {
                 BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance
                 else -> playable
             },
+            failedOnlyOnVideoBitrateFloor = input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS &&
+                !bitratePass &&
+                perceptuallyLosslessVerifiedExceptVideoBitrate &&
+                outputWithinTolerance,
             durationParity = "${input.source.durationMs}ms -> ${input.outputFileProbe.durationMs}ms ${statusSuffix(durationMatches)}" +
                 if (input.sourceFrameCount > 0 && input.outputFileProbe.frameCount > 0) {
                     "; frames ${input.sourceFrameCount} -> ${input.outputFileProbe.frameCount} ${statusSuffix(frameCountMatches)}"

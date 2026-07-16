@@ -1,0 +1,64 @@
+{
+ "capture": {
+  "path": "validation/captures/batch_20260715_193710",
+  "batch": "batch_1784169490348",
+  "build": "349aff7 (CI merge-ref of f1e2fbb)",
+  "selected": 172,
+  "processed": 172,
+  "captured": 172,
+  "profile": "normal(user0)",
+  "learning_store": "fresh (smart_perceptual_profiles_v3.xml deleted pre-run)",
+  "integrity": "authoritative",
+  "parserExitCode": 0
+ },
+ "terminals": {
+  "SKIPPED_WOULD_DEGRADE": 84,
+  "ALREADY_HIGHLY_OPTIMIZED": 61,
+  "TRANSCODED_SMALLER": 9,
+  "UNEXPECTED_REMUX": 12,
+  "REMUX_PREFERRED_BY_EVIDENCE": 6
+ },
+ "compression": {
+  "count": 9,
+  "total_saved_bytes": 627770259,
+  "median_pct": 40.7,
+  "weighted_pct": 21.9
+ },
+ "latch_034b23f": {
+  "suppressed_fresh": 35,
+  "suppressed_warm_141019": 77,
+  "probe_ladders_fresh": 118,
+  "probe_ladders_warm": 88,
+  "skipped_would_degrade_fresh": 84,
+  "skipped_warm": 43
+ },
+ "throughput_f1e2fbb": {
+  "total_cooldown_min": 6.3,
+  "nonzero_cooldown_records": 17,
+  "cooldown_preceded_by": {
+   "TRANSCODED_SMALLER": 9,
+   "UNEXPECTED_REMUX": 8
+  },
+  "gate_correct": "cooldown applied ONLY after full-encode terminals; zero after remux/skip"
+ },
+ "wall_min": {
+  "old_7e735c8": 42.6,
+  "warm_4f4909e": 95.4,
+  "fresh_349aff7": 81.3
+ },
+ "inter_item_min": {
+  "old_7e735c8": 7.6,
+  "warm_4f4909e": 28.9,
+  "fresh_349aff7": 18.5
+ },
+ "vs_old084": {
+  "improved": 9,
+  "regressed": 0
+ },
+ "remux_timing": {
+  "items": 79,
+  "total_min": 40.3,
+  "max_s": 267.4
+ },
+ "conclusion": "Both fixes work. Latch fix gave 30 more files their measured trial (88->118 ladders); they correctly failed (SKIPPED 43->84), so the high remux/skip rate is LARGELY GENUINE for this dataset, not a latch artifact. Throughput gate is exact (cooldown only after the 17 encode items). 9 improved / 0 regressed vs old build."
+}

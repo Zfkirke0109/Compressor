@@ -30,6 +30,8 @@ STRUCTURED_JOB_FIELDS = ENVELOPE_FIELDS | {
     "effectiveMode", "plannedOutputMime", "plannedTargetRatio",
     "plannedTargetVideoBitrate", "plannedDecisionReason", "wasStreamCopy", "verdict",
     "verified", "replacementSafe", "blockReason", "fallbackReason", "discardedVideoBitrate",
+    "probedRatios", "pixelProvenRatio", "probeDetail",
+    "probeWindowScores", "certWindowScores", "thermalStart", "thermalEnd", "precedingCooldownMs",
     "outputSize", "rawByteDelta",
     "savedBytes", "savedPct", "terminal", "countsAsRealCompression", "elapsedMs",
 }
@@ -456,7 +458,8 @@ def main():
             "hdr", "sourceBitrate", "audioBitrate", "targetVideoBitrate", "defaultRatio",
             "learnedRatio", "floorRatio", "learnedTargetRatio", "verdict", "playable", "replaceAllowed",
             "outputSize", "sizeRatio", "remuxReason", "blockReason", "fallbackReason",
-            "discardedVideoBitrate", "terminal",
+            "discardedVideoBitrate", "probedRatios", "pixelProvenRatio", "probeDetail",
+            "probeWindowScores", "certWindowScores", "thermalStart", "thermalEnd", "precedingCooldownMs", "terminal",
             "countsAsRealCompression", "savedBytes", "rawByteDelta"]
     with open(os.path.join(outdir, "summary.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")

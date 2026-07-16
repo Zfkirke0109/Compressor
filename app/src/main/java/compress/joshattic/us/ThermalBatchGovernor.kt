@@ -30,6 +30,22 @@ object ThermalBatchGovernor {
         return ThermalBatchMode.values().firstOrNull { it.label == label } ?: ThermalBatchMode.BALANCED
     }
 
+    /**
+     * The post-item thermal cooldown that should actually be applied, given whether the item that
+     * just finished ran a full hardware encode. The cooldown exists to let the encoder recover
+     * after sustained load; a pure stream-copy/remux or an up-front already-optimized decision runs
+     * NO encoder and generates no encoder heat, so cooling down after it protects nothing and only
+     * adds idle wall-clock. Measured on capture batch_20260715_141019: 116 no-encode items each
+     * waited ~10-30 s of cooldown for zero thermal benefit.
+     *
+     * This is a TIMING-ONLY gate: it never changes any compression, probe, verification, remux, or
+     * learning decision. When an encode DID run, the full governor cooldown (base + user + thermal
+     * + battery extras) is preserved exactly. The pre-item thermal slowdown and the severe-thermal
+     * pause remain independent and unchanged, so a genuinely hot device is still throttled/paused.
+     */
+    fun postItemCooldownMs(ranFullEncode: Boolean, snapshot: ThermalBatchSnapshot): Long =
+        if (ranFullEncode) snapshot.postItemDelayMs else 0L
+
     fun snapshot(context: Context, modeLabel: String, userCooldownSeconds: Int): ThermalBatchSnapshot {
         val mode = modeFromLabel(modeLabel)
         val thermalStatus = readThermalStatus(context)
