@@ -247,6 +247,7 @@ class ParseBatchLogcatTest(unittest.TestCase):
                 certWindowScores="95.9/91.5/84.6;96.7/92.8/87.1",
                 thermalStart="nominal",
                 thermalEnd="light",
+                precedingCooldownMs=10000,
             ),
             self._v2("bf", "session_summary", 2, "evt_" + "c" * 16, processed=1),
         ]
@@ -269,6 +270,7 @@ class ParseBatchLogcatTest(unittest.TestCase):
         self.assertEqual("95.9/91.5/84.6;96.7/92.8/87.1", jobs[0]["certWindowScores"])
         self.assertEqual("nominal", jobs[0]["thermalStart"])
         self.assertEqual("light", jobs[0]["thermalEnd"])
+        self.assertEqual(10000, jobs[0]["precedingCooldownMs"])
         self.assertEqual(0, agg["structured_ignored_field_count"])
 
     def test_v2_happy_path_reports_profile_sequence_and_events(self):

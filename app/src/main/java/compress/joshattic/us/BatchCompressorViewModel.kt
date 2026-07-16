@@ -536,6 +536,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
         compressionJob = viewModelScope.launch(Dispatchers.Main) {
             val batchStartedAt = System.currentTimeMillis()
+            // Post-item thermal cooldown that was applied BEFORE the current item started (i.e. the
+            // cooldown after the previous item). Carried across iterations so each item's structured
+            // record shows the handoff delay that preceded it. Timing telemetry only.
+            var precedingCooldownMs = 0L
             _uiState.update {
                 it.copy(
                     isCompressing = true,
@@ -625,6 +629,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
                     val thermalWindow = waitForThermalWindow(context, item.originalName)
                     val itemStartedAt = System.currentTimeMillis()
+                    // The cooldown applied after the PREVIOUS item (0 after a no-encode item or a
+                    // skip). Snapshot for this item's structured record, then clear so a following
+                    // early-returning item correctly reports 0.
+                    val precedingHandoffCooldownMs = precedingCooldownMs
+                    precedingCooldownMs = 0L
                     val plannedFps = outputFpsFor(item, frameRate, quality)
                     var diagnosticEffectiveQuality = quality
                     var diagnosticResolvedMime: String? = null
@@ -715,7 +724,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             probedRatios = perceptualPlan.probedRatios,
                             pixelProvenRatio = perceptualPlan.pixelProvenRatio,
                             probeDetail = perceptualPlan.probeDetail,
-                            probeWindowScores = perceptualPlan.probeWindowScores
+                            probeWindowScores = perceptualPlan.probeWindowScores,
+                            precedingCooldownMs = precedingHandoffCooldownMs
                         )
                         updateItem(index) {
                             it.copy(
@@ -948,7 +958,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 pixelProvenRatio = perceptualPlan.pixelProvenRatio,
                                 probeDetail = perceptualPlan.probeDetail,
                                 probeWindowScores = perceptualPlan.probeWindowScores,
-                                certWindowScores = diagnosticCertWindowScores
+                                certWindowScores = diagnosticCertWindowScores,
+                                precedingCooldownMs = precedingHandoffCooldownMs
                             )
                             updateItem(index) {
                                 it.copy(
@@ -1093,7 +1104,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         probeWindowScores = perceptualPlan?.probeWindowScores,
                         certWindowScores = diagnosticCertWindowScores,
                         thermalStart = metrics.thermalStart,
-                        thermalEnd = metrics.thermalEnd
+                        thermalEnd = metrics.thermalEnd,
+                        precedingCooldownMs = precedingHandoffCooldownMs
                     )
 
                     if (terminal.isFailure) {
@@ -1173,16 +1185,27 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
                     if (index < _uiState.value.items.lastIndex) {
                         val cooldown = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
+                        // Apply the thermal cooldown ONLY after an item that actually ran a full
+                        // hardware encode (encodeAttempt != null). Stream-copy/remux and already-
+                        // optimized items generate no encoder heat, so cooling down after them is
+                        // pure idle time. Timing-only: no compression/verification/learning decision
+                        // is affected. Skipped items already return before this block.
+                        val ranFullEncode = encodeAttempt != null
+                        val appliedCooldownMs = ThermalBatchGovernor.postItemCooldownMs(ranFullEncode, cooldown)
+                        precedingCooldownMs = appliedCooldownMs
                         _uiState.update {
                             it.copy(
                                 thermalStatus = cooldown.summary,
-                                statusMessage = "Cooling down ${cooldown.postItemDelayMs / 1000}s before next video."
+                                statusMessage = if (appliedCooldownMs > 0L)
+                                    "Cooling down ${appliedCooldownMs / 1000}s before next video."
+                                else
+                                    "Preparing next video…"
                             )
                         }
                         updateItem(index) {
-                            it.copy(metrics = it.metrics?.copy(cooldownMs = cooldown.postItemDelayMs))
+                            it.copy(metrics = it.metrics?.copy(cooldownMs = appliedCooldownMs))
                         }
-                        if (cooldown.postItemDelayMs > 0L) delay(cooldown.postItemDelayMs)
+                        if (appliedCooldownMs > 0L) delay(appliedCooldownMs)
                     }
                     } catch (e: CancellationException) {
                         if (!itemOutputAccepted) candidateFiles.forEach { runCatching { it.delete() } }
@@ -2199,7 +2222,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         probeWindowScores: String? = null,
         certWindowScores: String? = null,
         thermalStart: String? = null,
-        thermalEnd: String? = null
+        thermalEnd: String? = null,
+        // Inter-item handoff telemetry: the thermal cooldown (ms) that was applied AFTER the
+        // previous item and BEFORE this one started. 0 when the previous item ran no full encode
+        // (the throughput optimization) or was skipped. Timing-only; no decision depends on it.
+        precedingCooldownMs: Long? = null
     ) {
         diagnostics.job(
             // The recorder hashes both values before emission; raw URI/name never leave this call.
@@ -2239,7 +2266,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probeWindowScores = probeWindowScores,
             certWindowScores = certWindowScores,
             thermalStart = thermalStart,
-            thermalEnd = thermalEnd
+            thermalEnd = thermalEnd,
+            precedingCooldownMs = precedingCooldownMs
         )
     }
 

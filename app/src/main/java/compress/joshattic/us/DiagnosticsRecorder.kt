@@ -140,6 +140,9 @@ class DiagnosticsRecorder private constructor(
         certWindowScores: String? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
+        // Inter-item handoff: thermal cooldown (ms) applied after the previous item, before this
+        // one. 0 when the previous item ran no full encode or was skipped. Timing telemetry only.
+        precedingCooldownMs: Long? = null,
         discardedVideoBitrate: Int? = null
     ) {
         val accountingEntry = BatchTerminalAccountingEntry(terminal, sourceSize, outputSize)
@@ -186,6 +189,7 @@ class DiagnosticsRecorder private constructor(
                 "certWindowScores" to certWindowScores,
                 "thermalStart" to thermalStart,
                 "thermalEnd" to thermalEnd,
+                "precedingCooldownMs" to precedingCooldownMs,
                 "outputSize" to outputSize,
                 "rawByteDelta" to rawByteDelta,
                 "savedBytes" to savedBytes,
