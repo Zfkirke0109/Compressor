@@ -86,7 +86,26 @@ REUSED_SOURCE records × copyAvoidedBytes vs the 193710 per-item elapsedMs for t
    item type (in-memory state). Retained sources therefore need no durable-permission machinery
    beyond the batch's existing read grants; the read-open check at decision time is the guard.
 
+## MEASURED device benchmark (2026-07-16, S23 Ultra, build 2f4ae52 / CI e75d480)
+Matched per-jobId comparison, capture batch_20260716_071913 (fast path) vs batch_20260715_193710
+(pre-fast-path), 172/172 jobIds matched, 70 keep-original pairs:
+- keep-original elapsed: median **19.4 s -> 0.06 s** (p90 57.3 -> 8.2 s; max 151.6 -> 12.8 s)
+- **per-item median reduction 96.8%** — acceptance target (>=80%) MET; 50/63 pairs >= 80%
+- total on matched pairs: 29.6 -> 2.3 min (**27.3 min saved**); whole-batch wall ~32 min for 176
+  files (previous build: ~81 min for 172)
+- largest file: 1,883 MB retained in **0.01 s** (was 151.6 s); 93 REUSED_SOURCE overall,
+  **17.8 GB of copying avoided**, all savedBytes = 0
+- guards verified on device: Remux Only -> 0 reused (21/21 GENERATED_FILE); privacy strip ->
+  0 reused (blockReason PRIVACY_STRIP_REQUIRED fired); 3 reference sources SHA-256 byte-identical
+  pre/post, including after an abrupt mid-batch process kill
+- retained-items-never-compression asserted across both captures: PASS
+- documented gap: graceful in-app cancel (session_cancelled) not exercised this cycle (code path
+  untouched by the PR; abrupt-kill was the harsher source-safety test)
+Analysis script: validation/captures/batch_20260716_071913/matched_benchmark.py (local, not
+committed with captures). Full evidence in PR #24 comments.
+
 ## Status
-Implementation + audit fixes + unit tests complete; clean validation and device-validation
-package recorded in the PR conversation; device benchmark pending the next user-run batch (no
-Secure Folder this cycle).
+COMPLETE AND MERGED (PR #24 -> main, 2026-07-16). Implementation + audit fixes + unit tests +
+clean validation + device validation + measured benchmark all recorded above and in PR #24.
+Remaining follow-ups: graceful in-app cancel device check (fold into a future run); RUNTIME_
+EVALUATION.md committed alongside this update. Secure Folder validation still deferred by owner.

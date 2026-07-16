@@ -1,6 +1,6 @@
 {
   "program": "post-pr23-improvements",
-  "updated": "2026-07-15",
+  "updated": "2026-07-16",
   "pr23": {
     "state": "OPEN-frozen",
     "head": "18d4b943cb40fa745ab0e72daa679aaefd30bc8f",
@@ -26,23 +26,16 @@
     }
   },
   "phase1": {
-    "status": "implemented-awaiting-device-benchmark",
-    "branch": "perf/remux-keep-original-fast-path",
+    "status": "COMPLETE-MERGED",
     "pr": "https://github.com/Zfkirke0109/Compressor/pull/24",
-    "head": "a28a059",
-    "commits": [
-      "e62f0dd",
-      "228eeb6",
-      "79ab871",
-      "4f1826f",
-      "a28a059"
-    ],
-    "tests": "full unit suite green; parser 12/12; new policy/classifier/parser tests",
-    "benchmark": "device run pending (projection: eligible keep-original 15-247s -> 1-3s)"
+    "merged": "2026-07-16 (merge 0c3bfa3, after PR #23 merge 9c7994b)",
+    "device_benchmark": "MEASURED: keep-original median 19.4s->0.06s (96.8% reduction, target >=80% MET); 27.3 min saved on 70 matched pairs; 17.8GB copying avoided; sources byte-identical; guards verified on device",
+    "gap": "graceful in-app cancel not exercised (code path untouched); fold into future run"
   },
   "phase2": {
-    "status": "in_progress",
-    "branch": "feat/deferred-remux"
+    "status": "pending-owner-go",
+    "branch": "feat/deferred-remux",
+    "base": "main"
   },
   "phase3": {
     "status": "pending",
