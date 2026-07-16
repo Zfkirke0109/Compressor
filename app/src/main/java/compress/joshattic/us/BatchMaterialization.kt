@@ -19,10 +19,16 @@ import java.io.File
  * untouched original, never opened for write, with the audited reason it was safe to reuse).
  */
 sealed interface MaterializedOutput {
-    /** The untouched original is the result. No copy was written; nothing was verified as a copy. */
+    /**
+     * The untouched original is the result. No copy was written; NOTHING was verified as a copy —
+     * a [ReusedSource] carries only [RetainedSourceValidation] (source readability at decision
+     * time), never an [OutputVerificationReport]. The type system enforces that retained sources
+     * cannot masquerade as verified generated outputs.
+     */
     data class ReusedSource(
         val sourceUri: Uri,
-        val decision: OriginalReuseDecision.Eligible
+        val decision: OriginalReuseDecision.Eligible,
+        val validation: RetainedSourceValidation
     ) : MaterializedOutput
 
     /** A distinct output file was written and verified (real remux or encode). */
@@ -31,6 +37,29 @@ sealed interface MaterializedOutput {
         val file: File,
         val verification: OutputVerificationReport
     ) : MaterializedOutput
+}
+
+/**
+ * Honest record of what was ACTUALLY checked when a source was retained: that the source URI
+ * opened for read (and optionally probed playable) at decision time, its size, and its probed
+ * container MIME. Deliberately NOT an [OutputVerificationReport]: no copy exists, so no codec/
+ * duration/fps/HDR/metadata/track parity was measured, and none may be implied. Diagnostics
+ * derived from this type must say "Original Retained", never "Verified".
+ */
+data class RetainedSourceValidation(
+    val readableAtDecisionTime: Boolean,
+    val playableAtDecisionTime: Boolean,
+    val sizeBytes: Long,
+    val containerMime: String?,
+    val validatedAtEpochMs: Long
+) {
+    /** Diagnostic verdict string — distinct vocabulary from OutputVerifier verdicts. */
+    val verdict: String
+        get() = if (readableAtDecisionTime) {
+            "Original Retained (source readable; no copy written; not output-verified)"
+        } else {
+            "Original Retention Failed (source unreadable)"
+        }
 }
 
 /** Why a keep-original decision was allowed to reuse the source, or why it was blocked. */
@@ -73,6 +102,18 @@ object OriginalReusePolicy {
         "video/3gpp2"
     )
 
+    /**
+     * Normalizes a ContentResolver MIME for comparison: trims, strips parameters
+     * ("video/mp4; codecs=avc1" -> "video/mp4"), lowercases. Null/blank stays null so unknown
+     * values keep failing closed. Document-provider caveat: getType() may legitimately return
+     * null or application/octet-stream for playable files — those fail closed to the full remux
+     * path, which is SAFE (only slower); compatibility is never inferred from a filename extension.
+     */
+    fun normalizeMime(raw: String?): String? {
+        val cleaned = raw?.trim()?.substringBefore(';')?.trim()?.lowercase()
+        return cleaned?.takeIf { it.isNotEmpty() }
+    }
+
     fun evaluate(
         /** True only when the pipeline has ALREADY decided this item keeps its original bytes. */
         isKeepOriginalDecision: Boolean,
@@ -97,9 +138,8 @@ object OriginalReusePolicy {
             // The copy is the mechanism that strips metadata; reuse would silently skip the strip.
             return OriginalReuseDecision.Blocked(OriginalReuseBlockReason.PRIVACY_STRIP_REQUIRED)
         }
-        if (resolvedContainerMime == null ||
-            resolvedContainerMime.lowercase() !in COMPATIBLE_CONTAINER_MIMES
-        ) {
+        val normalizedMime = normalizeMime(resolvedContainerMime)
+        if (normalizedMime == null || normalizedMime !in COMPATIBLE_CONTAINER_MIMES) {
             // Unknown or non-MP4-family container: normalization may be the remux's real value.
             return OriginalReuseDecision.Blocked(OriginalReuseBlockReason.CONTAINER_NORMALIZATION_REQUIRED)
         }
@@ -109,46 +149,27 @@ object OriginalReusePolicy {
         if (distinctOutputRequired) {
             return OriginalReuseDecision.Blocked(OriginalReuseBlockReason.DISTINCT_OUTPUT_REQUIRED)
         }
-        return OriginalReuseDecision.Eligible(resolvedContainerMime)
+        return OriginalReuseDecision.Eligible(normalizedMime)
     }
 
     /**
-     * Honest verification report for a retained original. This is NOT a stream-copy verification
-     * (no copy exists); it records that the source itself was probed readable/playable at
-     * retention time. verified=false (source unreadable) fails closed to OUTPUT_VALIDATION_FAILED
-     * in the classifier. replacementSafe is ALWAYS false: there is nothing to replace, and the
-     * replacement flow must remain a no-op for reused sources.
+     * Builds the honest retained-source validation record. Deliberately NOT an
+     * OutputVerificationReport: no generated output exists, so nothing that OutputVerifier
+     * measures (codec/duration/fps/HDR/metadata/track parity) was measured, and none of those
+     * fields may be synthesized. An unreadable source (readableAtDecisionTime=false) fails
+     * closed to OUTPUT_VALIDATION_FAILED in the classifier.
      */
-    fun retentionReport(
-        sourcePlayable: Boolean,
+    fun retainedSourceValidation(
+        sourceReadable: Boolean,
         sourceSizeBytes: Long,
-        containerMime: String?
-    ): OutputVerificationReport = OutputVerificationReport(
-        verdict = if (sourcePlayable) {
-            "Original Retained (already optimal; no copy written)"
-        } else {
-            "Original Retention Failed (source unreadable)"
-        },
-        playability = if (sourcePlayable) "opens" else "failed",
-        video = "unchanged (original retained)",
-        fps = "unchanged (original retained)",
-        videoBitrate = "unchanged (original retained)",
-        videoCodec = "unchanged (original retained)",
-        audioCodec = "unchanged (original retained)",
-        audioDetails = "unchanged (original retained)",
-        audioBitrate = "unchanged (original retained)",
-        hdr = "unchanged (original retained)",
-        colorStandard = "unchanged (original retained)",
-        colorRange = "unchanged (original retained)",
-        mediaStoreDate = "unchanged (original retained)",
-        mp4Date = "unchanged (original retained)",
-        location = "unchanged (original retained)",
-        rotation = "unchanged (original retained)",
-        fileSize = "${formatFileSize(sourceSizeBytes)} (original retained, 0 bytes written)",
-        replacementSafe = false,
-        replacementBlockReason = "original retained — replacement is a no-op by design",
-        criticalFieldsComplete = sourcePlayable,
-        verified = sourcePlayable,
-        durationParity = "unchanged (original retained; container $containerMime)"
+        containerMime: String?,
+        nowEpochMs: Long
+    ): RetainedSourceValidation = RetainedSourceValidation(
+        readableAtDecisionTime = sourceReadable,
+        // The read-open check is our playability proxy at decision time; no frames are decoded.
+        playableAtDecisionTime = sourceReadable,
+        sizeBytes = sourceSizeBytes,
+        containerMime = normalizeMime(containerMime),
+        validatedAtEpochMs = nowEpochMs
     )
 }

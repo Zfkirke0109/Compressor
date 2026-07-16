@@ -769,17 +769,21 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             sourceReadableNow = sourceReadableNow
                         )
                         if (reuse is OriginalReuseDecision.Eligible) {
-                            val retention = OriginalReusePolicy.retentionReport(
-                                sourcePlayable = sourceReadableNow,
+                            // Honest typed validation: records ONLY what was actually checked
+                            // (read-open at decision time). Never an OutputVerificationReport —
+                            // no output exists and no output verification ran.
+                            val retention = OriginalReusePolicy.retainedSourceValidation(
+                                sourceReadable = sourceReadableNow,
                                 sourceSizeBytes = item.originalSize,
-                                containerMime = reuse.containerMime
+                                containerMime = reuse.containerMime,
+                                nowEpochMs = System.currentTimeMillis()
                             )
                             val terminal = BatchTerminalClassifier.classify(
                                 BatchTerminalInput(
                                     requestedMode = quality.toMode(),
                                     effectiveMode = BatchQualityMode.REMUX_ONLY,
                                     wasStreamCopy = false,
-                                    verified = retention.verified,
+                                    verified = retention.readableAtDecisionTime,
                                     replacementSafe = false,
                                     sourceSize = item.originalSize,
                                     outputSize = item.originalSize,
@@ -804,7 +808,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
                                 plannedDecisionReason = perceptualPlan.remuxReason,
                                 wasStreamCopy = false,
-                                verification = retention,
+                                verification = null,
+                                retainedValidation = retention,
                                 outputSize = item.originalSize,
                                 terminal = terminal,
                                 elapsedMs = System.currentTimeMillis() - itemStartedAt,
@@ -825,7 +830,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                     outputPath = null,
                                     outputSize = if (terminal.isFailure) 0L else item.originalSize,
                                     outputMode = BatchQualityPreset.REMUX_ONLY.label,
-                                    verificationReport = retention,
+                                    // No OutputVerificationReport exists for a retained source —
+                                    // the honest record is the typed RetainedSourceValidation in
+                                    // diagnostics; the item message carries the user-facing truth.
+                                    verificationReport = null,
                                     terminalResult = terminal,
                                     metrics = BatchItemMetrics(
                                         operationLabel = "Retained",
@@ -2348,8 +2356,15 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // the source size whose stream-copy was skipped.
         materializationMode: String? = null,
         originalReuseBlockReason: String? = null,
-        copyAvoidedBytes: Long? = null
+        copyAvoidedBytes: Long? = null,
+        // Typed retained-source validation (REUSED_SOURCE materialization only). Mutually
+        // exclusive with [verification]: a retained source has no output verification, and a
+        // generated output has no retention record. Verdict/verified derive from whichever exists.
+        retainedValidation: RetainedSourceValidation? = null
     ) {
+        require(verification == null || retainedValidation == null) {
+            "A job cannot carry both output verification and retained-source validation"
+        }
         diagnostics.job(
             // The recorder hashes both values before emission; raw URI/name never leave this call.
             sourceKey = item.sourceUri.toString(),
@@ -2372,10 +2387,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             plannedTargetVideoBitrate = plannedTargetVideoBitrate,
             plannedDecisionReason = plannedDecisionReason,
             wasStreamCopy = wasStreamCopy,
-            verdict = verification?.verdict,
-            verified = verification?.verified == true,
-            replacementSafe = verification?.replacementSafe == true,
-            blockReason = verification?.replacementBlockReason,
+            verdict = retainedValidation?.verdict ?: verification?.verdict,
+            // For a retained source, "verified" records ONLY that the source was readable at
+            // decision time — the verdict string makes the distinction explicit and machine-
+            // readable via materializationMode=REUSED_SOURCE.
+            verified = retainedValidation?.readableAtDecisionTime ?: (verification?.verified == true),
+            replacementSafe = if (retainedValidation != null) false else verification?.replacementSafe == true,
+            blockReason = if (retainedValidation != null) {
+                "original retained — replacement is a no-op by design"
+            } else {
+                verification?.replacementBlockReason
+            },
             outputSize = outputSize,
             terminal = terminal,
             elapsedMs = elapsedMs,
