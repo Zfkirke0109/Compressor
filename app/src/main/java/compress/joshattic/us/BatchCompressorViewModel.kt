@@ -205,6 +205,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     private var compressionJob: Job? = null
     private var activeTransformer: Transformer? = null
 
+    // Brackets a running batch with foreground protection + a CPU wake lock (see PERF-001). Holds
+    // application context only (via AndroidViewModel.getApplication), so it is safe as a field and
+    // reused across runs, which keeps its idempotency state coherent. Never starts work itself.
+    private val batchGuard: BatchExecutionGuard by lazy {
+        BatchExecutionGuard(AndroidBatchExecutionSink(getApplication()))
+    }
+
     // Local-only encode calibration; recommends Perceptually Lossless targets but never bypasses
     // verification. Stored in app SharedPreferences, nothing leaves the device.
     private val learningEngine by lazy {
@@ -539,11 +546,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         }
 
         compressionJob = viewModelScope.launch(Dispatchers.Main) {
-            // Raise process priority for the whole batch so a backgrounded / screen-off long run is
-            // not killed mid-encode. Started here while the app is foreground (the user just tapped
-            // Start), satisfying the Android 12+ background-start restriction. Best-effort: a start
-            // failure must never abort the batch, so swallow it.
-            runCatching { BatchForegroundService.start(context) }
+            // Bracket the whole batch with foreground protection + a CPU wake lock so a backgrounded
+            // / screen-off long run is not killed or CPU-suspended mid-encode. Entered here while the
+            // app is foreground (the user just tapped Start), satisfying the Android 12+ background-
+            // start restriction. The guard is idempotent and its effects are best-effort, so this can
+            // never abort the batch; the matching end() lives in the outermost finally.
+            batchGuard.begin()
             val batchStartedAt = System.currentTimeMillis()
             // Post-item thermal cooldown that was applied BEFORE the current item started (i.e. the
             // cooldown after the previous item). Carried across iterations so each item's structured
@@ -1502,10 +1510,18 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 }
                 activeTransformer = null
                 compressionJob = null
-                // The batch has fully finished (or was cancelled/failed); drop the priority boost.
-                runCatching { BatchForegroundService.stop(context) }
+                // The batch has fully finished (or was cancelled/failed); drop foreground protection
+                // and release the wake lock. Idempotent — safe to call even if begin() never fired.
+                batchGuard.end()
             }
         }
+    }
+
+    override fun onCleared() {
+        // Last-resort teardown: if the ViewModel is destroyed while a batch's finally has not yet
+        // run (process/config edge), still release foreground protection + wake lock. Idempotent.
+        batchGuard.end()
+        super.onCleared()
     }
 
     fun cancelCompression() {
