@@ -32,13 +32,22 @@ data class WindowPairingDiag(
     val distExtra: Int,
     val skewFirstUs: Long,
     val skewMaxAbsUs: Long,
-    val skewMeanAbsUs: Long
+    val skewMeanAbsUs: Long,
+    // Frames the aligner dropped to re-establish timestamp alignment before scoring
+    // (measured misalignment, e.g. the Transformer clip's off-by-one window start).
+    val refAlignDrops: Int = 0,
+    val distAlignDrops: Int = 0
 ) {
-    /** Compact capture form: "ref=50,dist=52,extra=0/2,skewMs=first/maxAbs/meanAbs". */
+    /**
+     * Compact capture form: "ref=50,dist=52,extra=0/2,skewMs=first/maxAbs/meanAbs,drop=a/b".
+     * Locale-pinned: a comma-decimal device locale must not corrupt the comma-separated field.
+     */
     fun compact(): String =
-        "ref=%d,dist=%d,extra=%d/%d,skewMs=%.1f/%.1f/%.1f".format(
+        "ref=%d,dist=%d,extra=%d/%d,skewMs=%.1f/%.1f/%.1f,drop=%d/%d".format(
+            java.util.Locale.US,
             refFrames, distFrames, refExtra, distExtra,
-            skewFirstUs / 1000.0, skewMaxAbsUs / 1000.0, skewMeanAbsUs / 1000.0
+            skewFirstUs / 1000.0, skewMaxAbsUs / 1000.0, skewMeanAbsUs / 1000.0,
+            refAlignDrops, distAlignDrops
         )
 }
 
@@ -138,26 +147,63 @@ object VmafPairScorer {
         var distEnded = false
         var refExtra = 0
         var distExtra = 0
+        // Frames are paired by TIMESTAMP, not blind decode order: the Transformer probe clip
+        // and the reference window reader can disagree by one frame about where the window
+        // starts (measured: constant 33.2 ms skew at 29.97 fps, capture batch_20260716_185345),
+        // and decode-order pairing then scores inter-frame motion as if it were encode quality.
+        // The aligner drops the earlier head (budgeted) until the heads agree within half a
+        // frame interval; unalignable windows FAIL — misalignment is never scored.
+        val aligner = PtsAligner()
         // Pairing telemetry accumulators (diagnostics only — no influence on scoring).
         var refSeen = 0
         var distSeen = 0
         var skewFirstUs = 0L
         var skewMaxAbsUs = 0L
         var skewAbsSumUs = 0L
+        var pendingRef: I420Frame? = null
+        var pendingDist: I420Frame? = null
         try {
             while (true) {
-                val r = if (!refEnded) refQueue.poll(QUEUE_POLL_TIMEOUT_S, TimeUnit.SECONDS) else END
-                val d = if (!distEnded) distQueue.poll(QUEUE_POLL_TIMEOUT_S, TimeUnit.SECONDS) else END
-                if (r == null || d == null) {
-                    error.compareAndSet(null, "frame queue timeout")
-                    break
+                if (pendingRef == null && !refEnded) {
+                    val r = refQueue.poll(QUEUE_POLL_TIMEOUT_S, TimeUnit.SECONDS)
+                    if (r == null) {
+                        error.compareAndSet(null, "frame queue timeout")
+                        break
+                    }
+                    if (r === END) {
+                        refEnded = true
+                    } else {
+                        refSeen++
+                        aligner.onRefFrame(r.ptsUs - window.startUs)
+                        pendingRef = r
+                    }
                 }
-                if (r === END) refEnded = true else refSeen++
-                if (d === END) distEnded = true else distSeen++
-                if (refEnded && distEnded) break
-                if (refEnded != distEnded) {
-                    // one stream has leftover frames; count them for the tolerance check
-                    if (refEnded) distExtra++ else refExtra++
+                if (pendingDist == null && !distEnded) {
+                    val d = distQueue.poll(QUEUE_POLL_TIMEOUT_S, TimeUnit.SECONDS)
+                    if (d == null) {
+                        error.compareAndSet(null, "frame queue timeout")
+                        break
+                    }
+                    if (d === END) {
+                        distEnded = true
+                    } else {
+                        distSeen++
+                        aligner.onDistFrame(d.ptsUs - window.distStartUs)
+                        pendingDist = d
+                    }
+                }
+                val r = pendingRef
+                val d = pendingDist
+                if (r == null && d == null) break // both streams fully consumed
+                if (r == null || d == null) {
+                    // One stream ended with the other still producing: trailing extras.
+                    if (r == null) {
+                        distExtra++
+                        pendingDist = null
+                    } else {
+                        refExtra++
+                        pendingRef = null
+                    }
                     if (refExtra + distExtra > FRAME_COUNT_TOLERANCE) {
                         error.compareAndSet(null, "frame count mismatch beyond tolerance")
                         break
@@ -168,17 +214,29 @@ object VmafPairScorer {
                     error.compareAndSet(null, "frame geometry drift")
                     break
                 }
-                val skewUs = (r.ptsUs - window.startUs) - (d.ptsUs - window.distStartUs)
-                if (fed == 0) skewFirstUs = skewUs
-                val absSkew = kotlin.math.abs(skewUs)
-                if (absSkew > skewMaxAbsUs) skewMaxAbsUs = absSkew
-                skewAbsSumUs += absSkew
-                val rc = VmafNative.readFrames(handle, r.data, d.data, width, height)
-                if (rc < 0) {
-                    error.compareAndSet(null, "vmaf read_frames error $rc")
-                    break
+                when (aligner.decide(r.ptsUs - window.startUs, d.ptsUs - window.distStartUs)) {
+                    PtsAligner.Action.PAIR -> {
+                        val skewUs = (r.ptsUs - window.startUs) - (d.ptsUs - window.distStartUs)
+                        if (fed == 0) skewFirstUs = skewUs
+                        val absSkew = kotlin.math.abs(skewUs)
+                        if (absSkew > skewMaxAbsUs) skewMaxAbsUs = absSkew
+                        skewAbsSumUs += absSkew
+                        val rc = VmafNative.readFrames(handle, r.data, d.data, width, height)
+                        if (rc < 0) {
+                            error.compareAndSet(null, "vmaf read_frames error $rc")
+                            break
+                        }
+                        fed++
+                        pendingRef = null
+                        pendingDist = null
+                    }
+                    PtsAligner.Action.DROP_REF -> pendingRef = null
+                    PtsAligner.Action.DROP_DIST -> pendingDist = null
+                    PtsAligner.Action.FAIL -> {
+                        error.compareAndSet(null, "frame pairing alignment failed beyond drop budget")
+                        break
+                    }
                 }
-                fed++
             }
         } catch (t: Throwable) {
             error.compareAndSet(null, "scorer failed: ${t.message}")
@@ -213,7 +271,9 @@ object VmafPairScorer {
             distExtra = distExtra,
             skewFirstUs = skewFirstUs,
             skewMaxAbsUs = skewMaxAbsUs,
-            skewMeanAbsUs = if (fed > 0) skewAbsSumUs / fed else 0L
+            skewMeanAbsUs = if (fed > 0) skewAbsSumUs / fed else 0L,
+            refAlignDrops = aligner.refDropped,
+            distAlignDrops = aligner.distDropped
         )
         val result = WindowScore(
             comparedFrames = perFrame.size,

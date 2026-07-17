@@ -21,7 +21,7 @@ class WindowPairingDiagTest {
             skewMaxAbsUs = 867_000L,
             skewMeanAbsUs = 115_200L
         )
-        assertEquals("ref=36,dist=38,extra=0/2,skewMs=0.0/867.0/115.2", diag.compact())
+        assertEquals("ref=36,dist=38,extra=0/2,skewMs=0.0/867.0/115.2,drop=0/0", diag.compact())
     }
 
     @Test
@@ -33,9 +33,23 @@ class WindowPairingDiagTest {
             distExtra = 0,
             skewFirstUs = -16_700L, // dist leads ref by one 60fps frame interval
             skewMaxAbsUs = 16_700L,
-            skewMeanAbsUs = 50L
+            skewMeanAbsUs = 50L,
+            refAlignDrops = 1,
+            distAlignDrops = 0
         )
-        assertEquals("ref=12,dist=12,extra=1/0,skewMs=-16.7/16.7/0.1", diag.compact())
+        assertEquals("ref=12,dist=12,extra=1/0,skewMs=-16.7/16.7/0.1,drop=1/0", diag.compact())
+    }
+
+    @Test
+    fun compactIsLocaleStableOnCommaDecimalDevices() {
+        val saved = java.util.Locale.getDefault()
+        try {
+            java.util.Locale.setDefault(java.util.Locale.GERMANY)
+            val diag = WindowPairingDiag(35, 34, 1, 0, 33_200L, 33_200L, 33_200L, 0, 1)
+            assertEquals("ref=35,dist=34,extra=1/0,skewMs=33.2/33.2/33.2,drop=0/1", diag.compact())
+        } finally {
+            java.util.Locale.setDefault(saved)
+        }
     }
 
     @Test
