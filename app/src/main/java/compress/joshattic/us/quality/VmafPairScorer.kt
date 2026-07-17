@@ -259,8 +259,11 @@ object VmafPairScorer {
                     PtsAligner.Action.DROP_REF -> pendingRef = null
                     PtsAligner.Action.DROP_DIST -> pendingDist = null
                     PtsAligner.Action.FAIL -> {
-                        misaligned = true
-                        error.compareAndSet(
+                        // Only classify the window as misaligned if the pairing verdict WINS
+                        // the error race: an earlier decoder failure means the frames we were
+                        // aligning are untrustworthy, and the honest classification for the
+                        // window is "evidence unavailable", not "frame loss measured".
+                        misaligned = error.compareAndSet(
                             null,
                             "frame pairing rejected: ${aligner.failureReason ?: "misaligned"}"
                         )
