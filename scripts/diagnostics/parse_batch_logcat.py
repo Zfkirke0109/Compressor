@@ -31,7 +31,7 @@ STRUCTURED_JOB_FIELDS = ENVELOPE_FIELDS | {
     "plannedTargetVideoBitrate", "plannedDecisionReason", "wasStreamCopy", "verdict",
     "verified", "replacementSafe", "blockReason", "fallbackReason", "discardedVideoBitrate",
     "probedRatios", "pixelProvenRatio", "probeDetail",
-    "probeWindowScores", "certWindowScores", "thermalStart", "thermalEnd", "precedingCooldownMs",
+    "probeWindowScores", "probePairDiag", "certWindowScores", "thermalStart", "thermalEnd", "precedingCooldownMs",
     "materializationMode", "originalReuseBlockReason", "copyAvoidedBytes",
     "outputSize", "rawByteDelta",
     "savedBytes", "savedPct", "terminal", "countsAsRealCompression", "elapsedMs",
@@ -460,7 +460,7 @@ def main():
             "learnedRatio", "floorRatio", "learnedTargetRatio", "verdict", "playable", "replaceAllowed",
             "outputSize", "sizeRatio", "remuxReason", "blockReason", "fallbackReason",
             "discardedVideoBitrate", "probedRatios", "pixelProvenRatio", "probeDetail",
-            "probeWindowScores", "certWindowScores", "thermalStart", "thermalEnd", "precedingCooldownMs",
+            "probeWindowScores", "probePairDiag", "certWindowScores", "thermalStart", "thermalEnd", "precedingCooldownMs",
             "materializationMode", "originalReuseBlockReason", "copyAvoidedBytes", "terminal",
             "countsAsRealCompression", "savedBytes", "rawByteDelta"]
     with open(os.path.join(outdir, "summary.csv"), "w", newline="", encoding="utf-8") as f:

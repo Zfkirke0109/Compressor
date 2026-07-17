@@ -13,8 +13,34 @@ data class WindowScore(
     val comparedFrames: Int,
     val mean: Double,
     val p5: Double,
-    val min: Double
+    val min: Double,
+    // Pairing diagnostics for the window (null on legacy/synthetic scores). Telemetry only:
+    // never consulted by any pass/fail decision.
+    val pairing: WindowPairingDiag? = null
 )
+
+/**
+ * Per-window frame-pairing diagnostics. Frames are paired in decode order; the skew of pair i
+ * is (refPts_i - windowStart) - (distPts_i - distStart) — 0 for a perfectly aligned pair. A
+ * large or drifting skew means the two streams' frames were compared out of time: the score
+ * measured misalignment, not quality. Recorded so captures can tell those apart.
+ */
+data class WindowPairingDiag(
+    val refFrames: Int,
+    val distFrames: Int,
+    val refExtra: Int,
+    val distExtra: Int,
+    val skewFirstUs: Long,
+    val skewMaxAbsUs: Long,
+    val skewMeanAbsUs: Long
+) {
+    /** Compact capture form: "ref=50,dist=52,extra=0/2,skewMs=first/maxAbs/meanAbs". */
+    fun compact(): String =
+        "ref=%d,dist=%d,extra=%d/%d,skewMs=%.1f/%.1f/%.1f".format(
+            refFrames, distFrames, refExtra, distExtra,
+            skewFirstUs / 1000.0, skewMaxAbsUs / 1000.0, skewMeanAbsUs / 1000.0
+        )
+}
 
 /** A comparison window in the REFERENCE file's timeline. */
 data class ScoreWindow(val startUs: Long, val endUs: Long, val distStartUs: Long = startUs)
@@ -112,6 +138,12 @@ object VmafPairScorer {
         var distEnded = false
         var refExtra = 0
         var distExtra = 0
+        // Pairing telemetry accumulators (diagnostics only — no influence on scoring).
+        var refSeen = 0
+        var distSeen = 0
+        var skewFirstUs = 0L
+        var skewMaxAbsUs = 0L
+        var skewAbsSumUs = 0L
         try {
             while (true) {
                 val r = if (!refEnded) refQueue.poll(QUEUE_POLL_TIMEOUT_S, TimeUnit.SECONDS) else END
@@ -120,8 +152,8 @@ object VmafPairScorer {
                     error.compareAndSet(null, "frame queue timeout")
                     break
                 }
-                if (r === END) refEnded = true
-                if (d === END) distEnded = true
+                if (r === END) refEnded = true else refSeen++
+                if (d === END) distEnded = true else distSeen++
                 if (refEnded && distEnded) break
                 if (refEnded != distEnded) {
                     // one stream has leftover frames; count them for the tolerance check
@@ -136,6 +168,11 @@ object VmafPairScorer {
                     error.compareAndSet(null, "frame geometry drift")
                     break
                 }
+                val skewUs = (r.ptsUs - window.startUs) - (d.ptsUs - window.distStartUs)
+                if (fed == 0) skewFirstUs = skewUs
+                val absSkew = kotlin.math.abs(skewUs)
+                if (absSkew > skewMaxAbsUs) skewMaxAbsUs = absSkew
+                skewAbsSumUs += absSkew
                 val rc = VmafNative.readFrames(handle, r.data, d.data, width, height)
                 if (rc < 0) {
                     error.compareAndSet(null, "vmaf read_frames error $rc")
@@ -169,16 +206,27 @@ object VmafPairScorer {
         }
         val sorted = perFrame.sortedArray()
         val p5Index = ((sorted.size - 1) * 0.05).toInt()
+        val pairing = WindowPairingDiag(
+            refFrames = refSeen,
+            distFrames = distSeen,
+            refExtra = refExtra,
+            distExtra = distExtra,
+            skewFirstUs = skewFirstUs,
+            skewMaxAbsUs = skewMaxAbsUs,
+            skewMeanAbsUs = if (fed > 0) skewAbsSumUs / fed else 0L
+        )
         val result = WindowScore(
             comparedFrames = perFrame.size,
             mean = perFrame.average(),
             p5 = sorted[p5Index],
-            min = sorted.first()
+            min = sorted.first(),
+            pairing = pairing
         )
         Log.i(
             TAG,
             "window [${window.startUs / 1000}ms..${window.endUs / 1000}ms] frames=${result.comparedFrames} " +
-                "mean=%.2f p5=%.2f min=%.2f".format(result.mean, result.p5, result.min)
+                "mean=%.2f p5=%.2f min=%.2f".format(result.mean, result.p5, result.min) +
+                " pairing[${pairing.compact()}]"
         )
         return result
     }
