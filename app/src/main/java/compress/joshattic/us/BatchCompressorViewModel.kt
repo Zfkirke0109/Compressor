@@ -539,6 +539,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         }
 
         compressionJob = viewModelScope.launch(Dispatchers.Main) {
+            // Raise process priority for the whole batch so a backgrounded / screen-off long run is
+            // not killed mid-encode. Started here while the app is foreground (the user just tapped
+            // Start), satisfying the Android 12+ background-start restriction. Best-effort: a start
+            // failure must never abort the batch, so swallow it.
+            runCatching { BatchForegroundService.start(context) }
             val batchStartedAt = System.currentTimeMillis()
             // Post-item thermal cooldown that was applied BEFORE the current item started (i.e. the
             // cooldown after the previous item). Carried across iterations so each item's structured
@@ -1497,6 +1502,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 }
                 activeTransformer = null
                 compressionJob = null
+                // The batch has fully finished (or was cancelled/failed); drop the priority boost.
+                runCatching { BatchForegroundService.stop(context) }
             }
         }
     }

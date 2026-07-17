@@ -5,6 +5,14 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
 
+    <!-- Keep a long batch alive when the app is backgrounded / screen-off. mediaProcessing is the
+         API 34+ type; dataSync covers API 29-33; POST_NOTIFICATIONS (33+) lets the ongoing
+         notification show (the service still elevates priority even if the user denies it). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -45,6 +53,12 @@
             android:exported="false"
             android:label="@string/app_name"
             android:theme="@style/Theme.Compressor" />
+
+        <!-- Priority boost for a running batch; performs no work itself. Not exported. -->
+        <service
+            android:name=".BatchForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProcessing|dataSync" />
 
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
