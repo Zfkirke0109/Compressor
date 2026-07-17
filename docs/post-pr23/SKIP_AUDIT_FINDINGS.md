@@ -75,8 +75,18 @@ encode certed at 92.7/84.0 and was discarded — plausibly a false cert failure,
 savings may be recoverable wherever UNEXPECTED_REMUX followed a healthy encode.
 
 Fix (same branch, PR #25): `PtsAligner` — timestamp-based pairing in VmafPairScorer with an
-adaptive half-frame-interval tolerance (floor 4 ms), budgeted drops to re-align (max 8), and
-fail-closed "no pixel evidence" when alignment is impossible. Bars unchanged; unmeasurable
-windows stay conservative (and unmeasurable probes never feed the class latch). Device
-validation next: 3-file rerun (jellyfish must score ~97+ and compress; screen recording gets
-honest scores), then the 176-file rerun (the 62 genuine skips must stay skips).
+adaptive half-frame-interval tolerance (floor 4 ms), LEADING-boundary-only budgeted drops
+(max 8), fail-closed on internal misalignment (lost-frame evidence) and on unalignable
+windows. Typed outcomes: MisalignmentRejected never certifies (not even structurally at the
+default ratio); Unavailable keeps legacy semantics; unmeasurable probes never feed the latch.
+Bars unchanged.
+
+DEVICE-VALIDATED 2026-07-16 (capture batch_20260716_191148, build c087071, fresh store):
+- jellyfish_gradient: skew 33.2 ms -> 0.2-0.8 ms (drop=0/1 leading repair per window);
+  probes 98.9/97.0/91.0 -> pixel-proven 0.65 (bisection), cert 99.3/98.7/94.0 ->
+  PL Verified, 11.8 MB saved (37.6%). Was a false skip.
+- jellyfish_slow: pixel-proven 0.65, cert 97.9/97.4/92.7 -> PL Verified, 7.9 MB saved
+  (37.8%). Was a false skip.
+- screen recording (VFR): skew 0.3 ms; honest 95.4/87.1/82.7 -> honest skip (p5 87.1 < 91),
+  matching the offline aligned prediction. No fabricated zeros; latch now learns from truth.
+Remaining gate before merge: 176-file no-regression rerun (62 genuine skips must stay skips).
