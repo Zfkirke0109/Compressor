@@ -47,6 +47,26 @@ class BatchForegroundService : Service() {
         return START_NOT_STICKY
     }
 
+    /**
+     * API 34+ foreground-service timeout (mediaProcessing/dataSync have a cumulative daily cap). The
+     * platform calls this when the cap is hit and REQUIRES a prompt clean stop or it crashes the app.
+     * We stop the service; the batch (owned by the ViewModel) keeps running without the priority
+     * boost, which is honest degradation rather than a false completion or a crash. Never called on
+     * pre-34 devices. A real batch finishes far inside the cap, so this is a safety backstop only.
+     */
+    override fun onTimeout(startId: Int) = handleTimeout()
+
+    // API 35+ delivers the timeout through the two-arg overload; the one-arg (API 34) is never
+    // called on 35+, so BOTH must be handled or a 35+ dataSync/mediaProcessing timeout would hit the
+    // no-op super and the system would kill the process with a fatal RemoteServiceException.
+    override fun onTimeout(startId: Int, fgsType: Int) = handleTimeout()
+
+    private fun handleTimeout() {
+        Log.w(TAG, "foreground-service timeout reached; stopping cleanly (batch continues unprotected)")
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) } // STOP_FOREGROUND_REMOVE is API 24 = minSdk
+        stopSelf()
+    }
+
     companion object {
         private const val TAG = "BatchFgs"
         private const val CHANNEL_ID = "batch_compression"
@@ -65,13 +85,20 @@ class BatchForegroundService : Service() {
         }
 
         /**
-         * The declared FGS type for the running platform. mediaProcessing is the semantically correct
-         * type but only exists on API 34+; API 29-33 use dataSync (a general long-running type valid
-         * there); below API 29 no type is passed. compileSdk (36) makes the 34+ constant available at
-         * compile time; it is only referenced when SDK_INT >= 34, so older devices never touch it.
+         * The declared FGS type for the running platform.
+         *  - API 35+ (Android 15, VANILLA_ICE_CREAM): mediaProcessing — the semantically correct type,
+         *    which (with its FOREGROUND_SERVICE_MEDIA_PROCESSING permission) FIRST EXISTS on API 35.
+         *    Requesting it on Android 14 would hit an unrecognized permission and the OS could throw
+         *    SecurityException, so it must NOT be used below 35.
+         *  - API 29-34: dataSync — a general long-running type valid there (its
+         *    FOREGROUND_SERVICE_DATA_SYNC permission is enforced from API 34 and is declared).
+         *  - below API 29: no type.
+         * compileSdk (36) makes both constants available at compile time; each is referenced only at or
+         * above its introducing API, so older devices never touch a constant they lack.
          */
+        @Suppress("InlinedApi") // guarded: the API-35 constant is only used at SDK_INT >= 35
         private fun foregroundServiceType(): Int = when {
-            Build.VERSION.SDK_INT >= 34 -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
+            Build.VERSION.SDK_INT >= 35 -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
             else -> 0
         }

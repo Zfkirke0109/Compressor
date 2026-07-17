@@ -97,4 +97,32 @@ class BatchExecutionGuardTest {
 
         assertEquals(listOf("release", "stop"), sink.events)
     }
+
+    @Test
+    fun concurrentBeginsFireStartExactlyOnce() {
+        // The AtomicBoolean/compareAndSet exists to serialize concurrent entry; prove it under a
+        // real race (many threads released simultaneously) rather than sequential calls only.
+        val starts = java.util.concurrent.atomic.AtomicInteger(0)
+        val acquires = java.util.concurrent.atomic.AtomicInteger(0)
+        val sink = object : BatchExecutionSink {
+            override fun startForegroundProtection() { starts.incrementAndGet() }
+            override fun stopForegroundProtection() {}
+            override fun acquireCpuWakeLock() { acquires.incrementAndGet() }
+            override fun releaseCpuWakeLock() {}
+        }
+        val guard = BatchExecutionGuard(sink)
+        val threadCount = 32
+        val barrier = java.util.concurrent.CyclicBarrier(threadCount)
+        val threads = (1..threadCount).map {
+            Thread {
+                barrier.await() // all threads race into begin() at once
+                guard.begin()
+            }.apply { start() }
+        }
+        threads.forEach { it.join(5_000) }
+
+        assertTrue(guard.isActive)
+        assertEquals(1, starts.get())   // exactly one foreground start despite 32 concurrent begins
+        assertEquals(1, acquires.get()) // exactly one wake-lock acquire
+    }
 }
