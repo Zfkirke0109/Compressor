@@ -36,11 +36,12 @@
     "branch": "feat/deferred-remux (not created)"
   },
   "metric_accuracy_workstream": {
-    "status": "IN-PROGRESS (offline audit complete, committed)",
-    "findings_doc": "docs/post-pr23/SKIP_AUDIT_FINDINGS.md",
-    "evidence": "validation/captures/analysis_skip_audit_20260716/ (local-only)",
-    "verdicts": "69 skips: 62 genuine (11.5GB), 1 genuine near-miss (recalibration = dead end), 3 proven device artifacts (jellyfish x2 false skips w/ real savings incl. at 0.80; VFR screen-recording score collapse poisoning class latch). NEG/v1 stricter -> gate upgrade parked (would reduce coverage).",
-    "next": "per-frame PTS-pair telemetry in VmafPairScorer probe path; diagnostic run on jellyfish pair + screen recording; evidence-gated pairing fix; bars never weakened; 176-file rerun (62 genuine skips must stay skips)"
+    "status": "MECHANISM FOUND + FIX IMPLEMENTED (PR #25, awaiting device validation + owner merge decision)",
+    "findings_doc": "docs/post-pr23/SKIP_AUDIT_FINDINGS.md (incl. evening addendum)",
+    "evidence": "validation/captures/analysis_skip_audit_20260716/ + capture batch_20260716_185345 (local-only)",
+    "verdicts": "69 skips: 62 genuine (11.5GB), 1 genuine near-miss, 3 proven device artifacts. Mechanism MEASURED on-device: constant one-frame skew (33.2ms @29.97fps) between Transformer probe clip and reference window reader; decode-order pairing scored inter-frame motion as quality. Cert path implicated too (false UNEXPECTED_REMUX possible).",
+    "fix": "PtsAligner: timestamp-based pairing, adaptive half-frame-interval tolerance (floor 4ms), budgeted drops (max 8), fail-closed when unalignable; unmeasurable probes never feed the class latch; bars unchanged",
+    "next": "device validation: 3-file rerun (jellyfish must score ~97+ and compress; screen recording honest scores), then 176-file rerun (62 genuine skips must stay skips); owner decides PR #25 merge"
   },
   "phase3": {
     "status": "pending",

@@ -135,7 +135,7 @@ class PerceptualQualityProber(private val context: Context) {
                     exportClip(sourceUri, probeFile, outputMime, videoBitrate, audioBitrate, window)
                 } ?: return null
                 if (!exported) return null
-                val scores = withContext(Dispatchers.IO) {
+                val outcome = withContext(Dispatchers.IO) {
                     VmafPairScorer.score(
                         context,
                         ref = sourceUri,
@@ -143,7 +143,19 @@ class PerceptualQualityProber(private val context: Context) {
                         // The probe file contains ONLY the window, starting at 0.
                         windows = listOf(ScoreWindow(window.startUs, window.endUs, distStartUs = 0L))
                     )
-                } ?: return null
+                }
+                val scores = when (outcome) {
+                    is PairScoreOutcome.Scored -> outcome.windows
+                    // Either way this rung has no pixel evidence: an unalignable PROBE clip
+                    // says the probe pipeline broke, not that the source degrades. Returning
+                    // null keeps the conservative gate decision AND never counts as a
+                    // measured rejection (no probe-skip latch feeding).
+                    PairScoreOutcome.MisalignmentRejected -> {
+                        Log.w(TAG, "probe window rejected: clip/source frames not time-alignable")
+                        return null
+                    }
+                    PairScoreOutcome.Unavailable -> return null
+                }
                 collected += scores
                 // Early exit: one failing window already rejects this ratio.
                 if (!QualityProbePolicy.windowsPass(scores)) return collected
@@ -216,11 +228,17 @@ class PerceptualQualityProber(private val context: Context) {
         }
     }
 
-    /** Sampled pixel certification of a completed full encode against its source. */
-    suspend fun certify(sourceUri: Uri, outputFile: File, durationMs: Long): List<WindowScore>? {
-        if (!VmafNative.isAvailable) return null
+    /**
+     * Sampled pixel certification of a completed full encode against its source.
+     * The tri-state outcome is load-bearing for the caller: [PairScoreOutcome.Unavailable]
+     * keeps the legacy structural fallback at the default ratio, while
+     * [PairScoreOutcome.MisalignmentRejected] is measured evidence the OUTPUT's frames are
+     * not temporally comparable to the source (frame loss/retiming) and must always fail.
+     */
+    suspend fun certify(sourceUri: Uri, outputFile: File, durationMs: Long): PairScoreOutcome {
+        if (!VmafNative.isAvailable) return PairScoreOutcome.Unavailable
         val windows = QualityProbePolicy.probeWindows(durationMs * 1000L)
-        if (windows.isEmpty()) return null
+        if (windows.isEmpty()) return PairScoreOutcome.Unavailable
         return withContext(Dispatchers.IO) {
             VmafPairScorer.score(context, sourceUri, Uri.fromFile(outputFile), windows)
         }

@@ -137,6 +137,10 @@ class DiagnosticsRecorder private constructor(
         // and the job's thermal bracket — enough to recalibrate window thresholds and correlate
         // throughput vs thermal state from a privacy-mode capture alone.
         probeWindowScores: String? = null,
+        // Per-window frame-pairing diagnostics of the same rung ("ref=N,dist=N,extra=a/b,
+        // skewMs=first/maxAbs/meanAbs;…"): whether the scored pairs were actually the same
+        // moments in time. Separates "measured real quality" from "scored misaligned frames".
+        probePairDiag: String? = null,
         certWindowScores: String? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
@@ -191,6 +195,7 @@ class DiagnosticsRecorder private constructor(
                 "pixelProvenRatio" to pixelProvenRatio,
                 "probeDetail" to probeDetail,
                 "probeWindowScores" to probeWindowScores,
+                "probePairDiag" to probePairDiag,
                 "certWindowScores" to certWindowScores,
                 "thermalStart" to thermalStart,
                 "thermalEnd" to thermalEnd,

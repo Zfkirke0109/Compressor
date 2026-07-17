@@ -52,6 +52,25 @@ class QualityProbePolicyTest {
     }
 
     @Test
+    fun measuredMisalignmentNeverCertifiesNotEvenStructurally() {
+        val passing = PairScoreOutcome.Scored(listOf(good(), good()))
+        val failing = PairScoreOutcome.Scored(listOf(good(), good().copy(min = 60.0)))
+
+        // Scored outcomes decide exactly like the legacy list path.
+        assertTrue(QualityProbePolicy.certificationOutcomePasses(0.90, 0.90, passing))
+        assertFalse(QualityProbePolicy.certificationOutcomePasses(0.90, 0.90, failing))
+
+        // Unavailable evidence keeps the legacy structural fallback semantics.
+        assertTrue(QualityProbePolicy.certificationOutcomePasses(0.90, 0.90, PairScoreOutcome.Unavailable))
+        assertFalse(QualityProbePolicy.certificationOutcomePasses(0.70, 0.90, PairScoreOutcome.Unavailable))
+
+        // Measured misalignment is evidence AGAINST the output (frame loss/retiming):
+        // it must fail even at the default ratio, where mere unavailability would pass.
+        assertFalse(QualityProbePolicy.certificationOutcomePasses(0.90, 0.90, PairScoreOutcome.MisalignmentRejected))
+        assertFalse(QualityProbePolicy.certificationOutcomePasses(0.70, 0.90, PairScoreOutcome.MisalignmentRejected))
+    }
+
+    @Test
     fun probeWindowsSampleAwayFromClipEdges() {
         // Too short to probe honestly.
         assertTrue(QualityProbePolicy.probeWindows(1_500_000L).isEmpty())

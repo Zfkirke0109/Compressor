@@ -48,6 +48,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import compress.joshattic.us.quality.PairScoreOutcome
 import compress.joshattic.us.quality.PerceptualQualityProber
 import compress.joshattic.us.quality.QualityProbePolicy
 import compress.joshattic.us.quality.WindowScore
@@ -251,7 +252,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val probeDetail: String? = null,
         // Compact per-window "mean/p5/min" scores of the last measured rung (pass or fail):
         // the raw numbers behind the probe decision, for threshold calibration from captures.
-        val probeWindowScores: String? = null
+        val probeWindowScores: String? = null,
+        // Per-window frame-pairing diagnostics of the same rung (counts + decode-order pts skew):
+        // distinguishes "windows measured real quality" from "windows scored misaligned frames".
+        val probePairDiag: String? = null
     )
 
     private data class EncodeAttemptResult(
@@ -728,6 +732,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             pixelProvenRatio = perceptualPlan.pixelProvenRatio,
                             probeDetail = perceptualPlan.probeDetail,
                             probeWindowScores = perceptualPlan.probeWindowScores,
+                            probePairDiag = perceptualPlan.probePairDiag,
                             precedingCooldownMs = precedingHandoffCooldownMs
                         )
                         updateItem(index) {
@@ -817,6 +822,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 pixelProvenRatio = perceptualPlan.pixelProvenRatio,
                                 probeDetail = perceptualPlan.probeDetail,
                                 probeWindowScores = perceptualPlan.probeWindowScores,
+                                probePairDiag = perceptualPlan.probePairDiag,
                                 precedingCooldownMs = precedingHandoffCooldownMs,
                                 materializationMode = "REUSED_SOURCE",
                                 copyAvoidedBytes = item.originalSize
@@ -981,7 +987,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         updateItem(index) {
                             it.copy(message = "Certifying pixels: encoder undershot the bitrate floor, checking real quality…")
                         }
-                        val recoveryScores = qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+                        val recoveryOutcome = qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+                        val recoveryScores = (recoveryOutcome as? PairScoreOutcome.Scored)?.windows
                         diagnosticCertWindowScores = compactWindowScores(recoveryScores)
                         if (QualityProbePolicy.windowsPass(recoveryScores)) {
                             floorRecoveryCertScores = recoveryScores
@@ -1004,10 +1011,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 )
                             }
                         } else {
+                            val cause = when (recoveryOutcome) {
+                                is PairScoreOutcome.Scored -> "failed"
+                                PairScoreOutcome.MisalignmentRejected -> "rejected (output frames not time-alignable)"
+                                PairScoreOutcome.Unavailable -> "unavailable"
+                            }
                             Log.i(
                                 "CompressorProbe",
-                                "floor recovery; job=${diagnosticJobId(item)}; certification " +
-                                    "${if (recoveryScores == null) "unavailable" else "failed"}; fallback proceeds"
+                                "floor recovery; job=${diagnosticJobId(item)}; certification $cause; fallback proceeds"
                             )
                         }
                     }
@@ -1024,25 +1035,30 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         updateItem(index) {
                             it.copy(message = "Certifying pixels: sampled VMAF check of the final output…")
                         }
-                        val certScores = floorRecoveryCertScores
+                        val certOutcome = floorRecoveryCertScores?.let { PairScoreOutcome.Scored(it) }
                             ?: qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+                        val certScores = (certOutcome as? PairScoreOutcome.Scored)?.windows
                         diagnosticCertWindowScores = compactWindowScores(certScores)
-                        val certOk = QualityProbePolicy.certificationPasses(
+                        val certOk = QualityProbePolicy.certificationOutcomePasses(
                             usedRatio = perceptualPlan.targetRatio,
                             defaultRatio = perceptualPlan.defaultRatio,
-                            scores = certScores
+                            outcome = certOutcome
                         )
                         Log.i(
                             "CompressorProbe",
                             "certification; job=${diagnosticJobId(item)}; usedRatio=${perceptualPlan.targetRatio}; " +
                                 "windows=${certScores?.size ?: 0}; pass=$certOk; " +
-                                "scores=${certScores?.joinToString { "%.1f/%.1f/%.1f".format(it.mean, it.p5, it.min) } ?: "unmeasured"}"
+                                "scores=${certScores?.joinToString { "%.1f/%.1f/%.1f".format(java.util.Locale.US, it.mean, it.p5, it.min) } ?: "unmeasured"}"
                         )
                         if (!certOk) {
-                            val certReason = if (certScores == null) {
-                                "pixel certification unavailable for a sub-default-ratio encode"
-                            } else {
-                                "pixel certification failed (sampled VMAF below thresholds)"
+                            val certReason = when {
+                                certOutcome is PairScoreOutcome.MisalignmentRejected ->
+                                    "pixel certification rejected: output frames could not be " +
+                                        "time-aligned with the source (frame loss or retiming)"
+                                certScores == null ->
+                                    "pixel certification unavailable for a sub-default-ratio encode"
+                                else ->
+                                    "pixel certification failed (sampled VMAF below thresholds)"
                             }
                             diagnosticFallbackReason = certReason
                             diagnosticDiscardedVideoBitrate = encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
@@ -1079,6 +1095,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 pixelProvenRatio = perceptualPlan.pixelProvenRatio,
                                 probeDetail = perceptualPlan.probeDetail,
                                 probeWindowScores = perceptualPlan.probeWindowScores,
+                                probePairDiag = perceptualPlan.probePairDiag,
                                 certWindowScores = diagnosticCertWindowScores,
                                 precedingCooldownMs = precedingHandoffCooldownMs
                             )
@@ -1223,6 +1240,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         pixelProvenRatio = perceptualPlan?.pixelProvenRatio,
                         probeDetail = perceptualPlan?.probeDetail,
                         probeWindowScores = perceptualPlan?.probeWindowScores,
+                        probePairDiag = perceptualPlan?.probePairDiag,
                         certWindowScores = diagnosticCertWindowScores,
                         thermalStart = metrics.thermalStart,
                         thermalEnd = metrics.thermalEnd,
@@ -1908,7 +1926,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val probeTrace = plan.copy(
             probedRatios = decision.probedRatios,
             probeDetail = decision.detail,
-            probeWindowScores = compactWindowScores(decision.windowScores)
+            probeWindowScores = compactWindowScores(decision.windowScores),
+            probePairDiag = compactPairingDiag(decision.windowScores)
         )
         val proven = decision.provenRatio ?: run {
             // Measured rejection at the SAFEST candidate ratio is positive pixel evidence
@@ -2343,6 +2362,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // certification, plus the thermal state bracket of the whole job — the fields needed to
         // calibrate window thresholds and correlate throughput vs throttling from captures alone.
         probeWindowScores: String? = null,
+        // Per-window frame-pairing diagnostics ("ref=N,dist=N,extra=a/b,skewMs=f/max/mean;…")
+        // of the same probe rung — separates measured quality from misaligned comparisons.
+        probePairDiag: String? = null,
         certWindowScores: String? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
@@ -2408,6 +2430,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             pixelProvenRatio = pixelProvenRatio,
             probeDetail = probeDetail,
             probeWindowScores = probeWindowScores,
+            probePairDiag = probePairDiag,
             certWindowScores = certWindowScores,
             thermalStart = thermalStart,
             thermalEnd = thermalEnd,
@@ -2423,9 +2446,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     // Compact "mean/p5/min" per window, ";"-joined — the capture-friendly form of VMAF window
     // scores (e.g. "96.2/92.0/85.1;97.0/93.4/88.8"). Null when nothing was measured.
+    // Locale-pinned so comma-decimal device locales cannot corrupt the capture format.
     private fun compactWindowScores(scores: List<WindowScore>?): String? =
         scores?.takeIf { it.isNotEmpty() }
-            ?.joinToString(";") { "%.1f/%.1f/%.1f".format(it.mean, it.p5, it.min) }
+            ?.joinToString(";") { "%.1f/%.1f/%.1f".format(java.util.Locale.US, it.mean, it.p5, it.min) }
+
+    // Compact per-window pairing diagnostics, ";"-joined (see WindowPairingDiag.compact()).
+    // Null when nothing was measured or the scores carry no pairing data.
+    private fun compactPairingDiag(scores: List<WindowScore>?): String? =
+        scores?.mapNotNull { it.pairing?.compact() }
+            ?.takeIf { it.isNotEmpty() }
+            ?.joinToString(";")
 
     private fun completionMessage(
         item: BatchVideoItem,

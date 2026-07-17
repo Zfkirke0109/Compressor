@@ -244,6 +244,7 @@ class ParseBatchLogcatTest(unittest.TestCase):
                 pixelProvenRatio=0.80,
                 probeDetail="windows passed at 0.80",
                 probeWindowScores="96.2/92.0/85.1;97.0/93.4/88.8",
+                probePairDiag="ref=36,dist=36,extra=0/0,skewMs=0.0/16.7/8.3,drop=0/0;ref=35,dist=34,extra=1/0,skewMs=33.2/33.2/33.2,drop=0/1",
                 certWindowScores="95.9/91.5/84.6;96.7/92.8/87.1",
                 thermalStart="nominal",
                 thermalEnd="light",
@@ -270,6 +271,12 @@ class ParseBatchLogcatTest(unittest.TestCase):
         self.assertEqual(0.80, jobs[0]["pixelProvenRatio"])
         self.assertEqual("windows passed at 0.80", jobs[0]["probeDetail"])
         self.assertEqual("96.2/92.0/85.1;97.0/93.4/88.8", jobs[0]["probeWindowScores"])
+        # Pairing diagnostics must survive too: they are what distinguishes "windows measured
+        # real quality" from "windows scored misaligned frames" in a skip forensics pass.
+        self.assertEqual(
+            "ref=36,dist=36,extra=0/0,skewMs=0.0/16.7/8.3,drop=0/0;ref=35,dist=34,extra=1/0,skewMs=33.2/33.2/33.2,drop=0/1",
+            jobs[0]["probePairDiag"],
+        )
         self.assertEqual("95.9/91.5/84.6;96.7/92.8/87.1", jobs[0]["certWindowScores"])
         self.assertEqual("nominal", jobs[0]["thermalStart"])
         self.assertEqual("light", jobs[0]["thermalEnd"])
