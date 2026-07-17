@@ -19,6 +19,17 @@ object QualityProbePolicy {
     const val WINDOW_MIN_MIN = 84.0
     const val MIN_COMPARED_FRAMES_PER_WINDOW = 12
 
+    /**
+     * True only when a source of these display dimensions can actually be pixel-scored by
+     * [VmafPairScorer] (its geometry is at or below the 1080p-class scoring cap). Above the cap the
+     * scorer returns Unavailable AFTER the probe clip has already been encoded — so probing such a
+     * source burns full-resolution encodes for zero pixel evidence and then falls back to structural
+     * verification anyway. Gating probe eligibility on this predicate skips that doomed work with no
+     * change to the eventual acceptance decision. Pure so it is unit-testable without a device.
+     */
+    fun isPixelScoreableGeometry(width: Int, height: Int): Boolean =
+        width > 0 && height > 0 && width.toLong() * height.toLong() <= VmafPairScorer.MAX_COMPARE_PIXELS
+
     // The probe ladder may never target below this ratio no matter what windows say:
     // sampled windows are evidence, not proof, and the measured suite has nothing below
     // 0.60 that survived even partially.

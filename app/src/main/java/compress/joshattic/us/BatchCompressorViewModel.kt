@@ -1837,7 +1837,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             source.videoMime,
             outputMime
         )
-        val probeEligible = !codecDowngrade && !source.isHdr && VmafNative.isAvailable
+        // Pixel scoring is capped at 1080p-class geometry (VmafPairScorer.MAX_COMPARE_PIXELS). A
+        // source above the cap would run the full probe ladder — encoding a real ~1.2 s clip per
+        // rung — only for VmafPairScorer.score to return Unavailable on the geometry check and
+        // discard it. Gate probe eligibility on scoreable geometry so >1080p sources skip the
+        // doomed encodes entirely; they already fall back to structural verification unchanged.
+        val pixelScoreable = QualityProbePolicy.isPixelScoreableGeometry(source.width, source.height)
+        val probeEligible = !codecDowngrade && !source.isHdr && VmafNative.isAvailable && pixelScoreable
         Log.i(
             "CompressorLearning",
             "plan; profileKey=${profileKey.asKey()}; defaultRatio=$defaultRatio; learnedRatio=$targetRatio; " +
