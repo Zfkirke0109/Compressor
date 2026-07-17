@@ -23,6 +23,24 @@ class QualityProbePolicyTest {
     }
 
     @Test
+    fun pixelScoreableGeometryGatesAtTheScoringCap() {
+        // At/below the 1080p-class cap: scoreable, so probe-eligible.
+        assertTrue(QualityProbePolicy.isPixelScoreableGeometry(1920, 1080))
+        assertTrue(QualityProbePolicy.isPixelScoreableGeometry(1080, 1920)) // portrait
+        assertTrue(QualityProbePolicy.isPixelScoreableGeometry(1280, 720))
+        // Above the cap: the scorer would return Unavailable after a wasted encode -> not scoreable.
+        assertFalse(QualityProbePolicy.isPixelScoreableGeometry(3840, 2160)) // 4K
+        assertFalse(QualityProbePolicy.isPixelScoreableGeometry(2560, 1440)) // 1440p
+        assertFalse(QualityProbePolicy.isPixelScoreableGeometry(7680, 4320)) // 8K
+        // Degenerate dimensions never scoreable.
+        assertFalse(QualityProbePolicy.isPixelScoreableGeometry(0, 0))
+        assertFalse(QualityProbePolicy.isPixelScoreableGeometry(-1, 1080))
+        // Exactly at the cap boundary (1920*1088) is scoreable; one pixel over is not.
+        assertTrue(QualityProbePolicy.isPixelScoreableGeometry(1920, 1088))
+        assertFalse(QualityProbePolicy.isPixelScoreableGeometry(1921, 1088))
+    }
+
+    @Test
     fun windowsPassRequiresEveryWindowAboveEveryThreshold() {
         assertTrue(QualityProbePolicy.windowsPass(listOf(good(), good(), good())))
         assertFalse(QualityProbePolicy.windowsPass(null))
