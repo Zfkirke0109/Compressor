@@ -2,10 +2,8 @@
   "program": "post-pr23-improvements",
   "updated": "2026-07-16",
   "pr23": {
-    "state": "OPEN-frozen",
-    "head": "18d4b943cb40fa745ab0e72daa679aaefd30bc8f",
-    "last_validated_source_commit": "f1e2fbb",
-    "merge": "awaiting explicit owner approval"
+    "state": "MERGED",
+    "merge": "9c7994b (2026-07-16); main fbfa675 contains PR23 + PR24 + docs"
   },
   "phase0": {
     "status": "complete",
@@ -33,9 +31,16 @@
     "gap": "graceful in-app cancel not exercised (code path untouched); fold into future run"
   },
   "phase2": {
-    "status": "pending-owner-go",
-    "branch": "feat/deferred-remux",
-    "base": "main"
+    "status": "PARKED-by-owner-delegated-decision",
+    "rationale": "2026-07-16: owner delegated prioritization to goals (max genuine coverage, actually PL, faster). Deferred remux compresses/verifies nothing; Phase 1 absorbed its motivation (0 deferrable items in dataset). Slim create-copies action remains the preferred variant if ever revived.",
+    "branch": "feat/deferred-remux (not created)"
+  },
+  "metric_accuracy_workstream": {
+    "status": "IN-PROGRESS (offline audit complete, committed)",
+    "findings_doc": "docs/post-pr23/SKIP_AUDIT_FINDINGS.md",
+    "evidence": "validation/captures/analysis_skip_audit_20260716/ (local-only)",
+    "verdicts": "69 skips: 62 genuine (11.5GB), 1 genuine near-miss (recalibration = dead end), 3 proven device artifacts (jellyfish x2 false skips w/ real savings incl. at 0.80; VFR screen-recording score collapse poisoning class latch). NEG/v1 stricter -> gate upgrade parked (would reduce coverage).",
+    "next": "per-frame PTS-pair telemetry in VmafPairScorer probe path; diagnostic run on jellyfish pair + screen recording; evidence-gated pairing fix; bars never weakened; 176-file rerun (62 genuine skips must stay skips)"
   },
   "phase3": {
     "status": "pending",
