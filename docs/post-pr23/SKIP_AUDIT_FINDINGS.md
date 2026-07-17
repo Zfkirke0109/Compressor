@@ -90,3 +90,32 @@ DEVICE-VALIDATED 2026-07-16 (capture batch_20260716_191148, build c087071, fresh
 - screen recording (VFR): skew 0.3 ms; honest 95.4/87.1/82.7 -> honest skip (p5 87.1 < 91),
   matching the offline aligned prediction. No fabricated zeros; latch now learns from truth.
 Remaining gate before merge: 176-file no-regression rerun (62 genuine skips must stay skips).
+
+## ADDENDUM 2026-07-17 — 176-file rerun PASSED + bug also caused FALSE COMPRESSIONS
+
+Capture batch_20260716_233032 (full 176-file corpus, final build 41af64e, fresh store; a first
+attempt batch_20260716_194104 was interrupted at 24/176 and is marked PARTIAL). Evidence +
+scripts in validation/captures/analysis_rerun_20260717/.
+
+Headline: total "savings" 627.8 MB (baseline batch_20260715_193710) -> 218.4 MB — because the
+fix REMOVED A FALSE COMPRESSION, not a real one. The entire delta is one file:
+
+**133776.mp4 (1080p30, 1.77 GB)** — baseline (buggy pairing) probed 97.1/91.6, certed 97.2/93.4
+-> "Perceptually Lossless Verified", 466.8 MB "saved". Fix build probed 51.7/27.6 (skew 11.3 ms)
+-> SKIPPED. OFFLINE GROUND TRUTH (pulled the file, PTS-synced libx265 at 0.85 AND 0.95x, clean
+30fps CFR): 20%/50% windows score mean 68/p5 26 and mean 71/p5 36 — genuine severe degradation
+far below the 91 bar; only the 80% window passes. Two independent methods (fix build + offline)
+agree it degrades; the lone dissenter is the old decode-order pairing. **The baseline's 466.8 MB
+was the app degrading a video and labeling it lossless — a truth-rule violation the fix closes.**
+
+=> The pairing bug cut BOTH ways: false SKIPS (jellyfish) AND false COMPRESSIONS (133776).
+This PR is a correctness/honesty fix, not merely coverage.
+
+Corrected honest comparison (common 172 set): baseline reported 627.8 MB (incl. 466.8 MB
+proven-degraded) -> honest 161.0 MB; fix build 192.6 MB, every one pixel-verified (+31.6 MB
+genuine, plus jellyfish/sintel copies -> 218.4 MB total). ZERO genuine compressions lost (every
+real baseline win reproduced byte-for-byte). 62 genuine skips stayed skips (4 relabeled to
+honest retained/remux, 0 saved). 3 jellyfish false-skips -> verified. Pairing health: 0
+misalignment fail-closed on healthy content, 72 clean leading-drop repairs. Known residual:
+aligner reduces skew to sub-frame (11.3 ms on 133776 vs ~0.5 ms on jellyfish), doesn't change
+any verdict here. Gate PASSED; recommend merge (owner decision).
