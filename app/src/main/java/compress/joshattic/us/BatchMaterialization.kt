@@ -173,3 +173,24 @@ object OriginalReusePolicy {
         validatedAtEpochMs = nowEpochMs
     )
 }
+
+/**
+ * Pure verdict for "did the in-place original overwrite actually land the intended bytes?"
+ *
+ * The destructive replace path truncates the original on open ("rwt") and streams the verified
+ * output onto it. Proving success requires the resulting on-disk size to EQUAL the intended
+ * output size — nothing weaker. In particular an unknown/unreported size (statSize <= 0) is NOT
+ * evidence of success: it means we could not confirm the write, so it must fail closed (and
+ * trigger rollback), never be accepted. Isolated here so the rule is unit-testable without a
+ * device/content resolver.
+ */
+object ReplacementSizeCheck {
+    /**
+     * @param writtenSizeBytes size read back from the source after the write (statSize), or a
+     *   non-positive sentinel when the provider did not report a size.
+     * @param expectedSizeBytes the intended output file length.
+     * @return true only when the write is positively confirmed byte-for-byte.
+     */
+    fun verified(writtenSizeBytes: Long, expectedSizeBytes: Long): Boolean =
+        expectedSizeBytes > 0L && writtenSizeBytes == expectedSizeBytes
+}

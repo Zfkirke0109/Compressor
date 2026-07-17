@@ -2606,15 +2606,47 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             ""
         }
 
+        // Stage a private rollback copy of the ORIGINAL bytes BEFORE the destructive open.
+        // openOutputStream(uri,"rwt") truncates the source to zero on open, so a failure during
+        // copyTo (ENOSPC, provider error, process death) would otherwise leave the user's only
+        // copy truncated with no way back. This is independent of backupBeforeReplace: that saves
+        // a gallery copy the user opted into and may have turned off; this recovery copy always
+        // exists for the duration of the write and is deleted the instant the write is confirmed.
+        val recoveryDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
+        val recoveryCopy = File(recoveryDir, "replace_recovery_${diagnosticJobId(item)}.mp4")
+        val recoveryStaged = runCatching {
+            if (recoveryCopy.exists()) recoveryCopy.delete()
+            context.contentResolver.openInputStream(item.sourceUri)?.use { input ->
+                recoveryCopy.outputStream().use { output -> input.copyTo(output) }
+            } != null && recoveryCopy.length() > 0L
+        }.getOrDefault(false)
+        if (!recoveryStaged) {
+            runCatching { recoveryCopy.delete() }
+            val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
+            return@withContext ReplacementResult(
+                false,
+                if (savedUri != null) {
+                    "Could not stage a rollback copy of the original, so it was left untouched. A safe compressed copy was saved instead."
+                } else {
+                    "Could not stage a rollback copy of the original; it was left untouched, and saving a safe copy also failed."
+                }
+            )
+        }
+
+        val expectedLength = outputFile.length()
         val directResult = runCatching {
             context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
                 outputFile.inputStream().use { input -> input.copyTo(out) }
+                // Best-effort durability so the size read-back reflects committed bytes.
+                runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
             } ?: error("Could not open original for writing")
             val verifiedSize = context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { it.statSize } ?: -1L
-            verifiedSize <= 0L || verifiedSize == outputFile.length()
+            // STRICT: only a positive, exactly-matching size proves success. Unknown size is not proof.
+            ReplacementSizeCheck.verified(verifiedSize, expectedLength)
         }
 
         if (directResult.getOrDefault(false)) {
+            runCatching { recoveryCopy.delete() }
             val replacedPath = resolveFilesystemPath(context, item.sourceUri)
             val metadataReport = VideoMetadataPreserver.restoreAfterReplacement(
                 context = context,
@@ -2628,40 +2660,76 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             )
         }
 
-        if (useShizukuFallback) {
-            if (!ShizukuSupport.hasPermission()) {
-                val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
-                return@withContext ReplacementResult(false, if (savedUri != null) "Android write failed and Shizuku is not authorized, so a safe copy was saved." else "Android write failed and Shizuku is not authorized; saving copy also failed.")
-            }
+        // The destructive write failed or could not be confirmed: the source may now be truncated.
+        // Restore the original bytes from the recovery copy before doing anything else, so the
+        // user's file is at least whole again. Track whether that restore is itself confirmed.
+        val sourceRestored = runCatching {
+            context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
+                recoveryCopy.inputStream().use { input -> input.copyTo(out) }
+                runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
+            } ?: error("Could not reopen original to restore it")
+            val restoredSize = context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { it.statSize } ?: -1L
+            ReplacementSizeCheck.verified(restoredSize, recoveryCopy.length())
+        }.getOrDefault(false)
+
+        // Shizuku writes the FULL verified output to the path, which also repairs a source that the
+        // direct write may have truncated — so success here is a clean replacement. All Shizuku
+        // sub-failures fall through to the single honest fallback below (which knows sourceRestored),
+        // so a failed direct write can never be reported without accounting for the original's state.
+        if (useShizukuFallback && ShizukuSupport.hasPermission()) {
             val targetPath = resolveFilesystemPath(context, item.sourceUri)
-            if (targetPath == null) {
-                val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
-                return@withContext ReplacementResult(false, if (savedUri != null) "Shizuku is authorized, but Android did not expose a filesystem path for this video; safe copy saved." else "Shizuku is authorized, but no filesystem path was available and saving copy failed.")
-            }
-            val copied = ShizukuSupport.copyFileWithShizuku(outputFile.absolutePath, targetPath)
-            if (copied) {
-                val metadataReport = VideoMetadataPreserver.restoreAfterReplacement(
-                    context = context,
-                    sourceUri = item.sourceUri,
-                    snapshot = item.metadataSnapshot.filteredForPrivacy(privacyMode),
-                    replacedFilePath = targetPath
-                )
-                return@withContext ReplacementResult(
-                    true,
-                    "${backupMessage}Original replaced with Shizuku path fallback. Replace only after verification passed. Original folder/path preserved. ${metadataReport.summary()}"
-                )
+            if (targetPath != null) {
+                val copied = ShizukuSupport.copyFileWithShizuku(outputFile.absolutePath, targetPath)
+                if (copied) {
+                    runCatching { recoveryCopy.delete() }
+                    val metadataReport = VideoMetadataPreserver.restoreAfterReplacement(
+                        context = context,
+                        sourceUri = item.sourceUri,
+                        snapshot = item.metadataSnapshot.filteredForPrivacy(privacyMode),
+                        replacedFilePath = targetPath
+                    )
+                    return@withContext ReplacementResult(
+                        true,
+                        "${backupMessage}Original replaced with Shizuku path fallback. Replace only after verification passed. Original folder/path preserved. ${metadataReport.summary()}"
+                    )
+                }
             }
         }
 
+        // Every replacement attempt failed. Report the TRUTH about the original's state and never
+        // claim it was "protected" when the destructive open may have truncated it.
         val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
-        ReplacementResult(
-            false,
-            if (savedUri != null) {
-                "Original was protected by Android storage, so a safe compressed copy was saved instead. Use the in-app file picker for writable replacement."
-            } else {
-                "Original was protected by Android storage and saving a fallback copy failed."
-            }
-        )
+        val result = if (sourceRestored) {
+            runCatching { recoveryCopy.delete() }
+            ReplacementResult(
+                false,
+                if (savedUri != null) {
+                    "In-place replacement failed, so the original was restored intact and left in place. A safe compressed copy was saved instead."
+                } else {
+                    "In-place replacement failed; the original was restored intact, but saving a safe copy also failed."
+                }
+            )
+        } else {
+            // Worst case: the source may be incomplete AND we could not restore it in place.
+            // Preserve the untouched original bytes we still hold in the recovery copy to the
+            // gallery so nothing is lost, then report honestly.
+            val originalPreserved = saveFileToGallery(
+                context, recoveryCopy, "ORIGINAL_${item.outputName(quality)}", item.metadataSnapshot, privacyMode
+            ) != null
+            runCatching { recoveryCopy.delete() }
+            ReplacementResult(
+                false,
+                when {
+                    originalPreserved && savedUri != null ->
+                        "In-place replacement failed and the original on disk may be incomplete. A copy of your original AND the compressed version were both saved to your gallery — please verify the file in its original folder."
+                    originalPreserved ->
+                        "In-place replacement failed and the original on disk may be incomplete. A copy of your untouched original was saved to your gallery — please recover it from there."
+                    else ->
+                        "In-place replacement failed and the original on disk may be incomplete; recovering it also failed. Do not delete the app cache; contact support."
+                }
+            )
+        }
+        result
     }
 
     private fun shouldBlockOriginalOverwrite(
