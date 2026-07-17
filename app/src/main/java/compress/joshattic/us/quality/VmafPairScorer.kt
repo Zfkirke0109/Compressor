@@ -55,6 +55,20 @@ data class WindowPairingDiag(
 data class ScoreWindow(val startUs: Long, val endUs: Long, val distStartUs: Long = startUs)
 
 /**
+ * Tri-state scoring result. The distinction between the two failure cases is load-bearing:
+ * [Unavailable] means evidence could not be produced (native lib missing, geometry mismatch,
+ * decoder failure) — legacy "no evidence" semantics, eligible for the structural default-ratio
+ * certification fallback. [MisalignmentRejected] is POSITIVE evidence that the two streams'
+ * frames are not temporally comparable (frame loss or retiming) — it must always fail closed
+ * and is NEVER eligible for any structural fallback.
+ */
+sealed interface PairScoreOutcome {
+    data class Scored(val windows: List<WindowScore>) : PairScoreOutcome
+    object Unavailable : PairScoreOutcome
+    object MisalignmentRejected : PairScoreOutcome
+}
+
+/**
  * Streams display-normalized frames of two files through libvmaf for a set of short windows
  * and returns per-window aggregate scores. Frames are paired in decode order after window
  * alignment; a frame-count mismatch beyond a small tolerance fails the window (fail-closed:
@@ -81,30 +95,41 @@ object VmafPairScorer {
     }
 
     /**
-     * Scores [windows]; returns null if pixel evidence could not be produced (native lib missing,
-     * geometry mismatch, decoder failure, frame-count mismatch). Never throws.
+     * Scores [windows]. [PairScoreOutcome.Unavailable] when pixel evidence could not be
+     * produced (native lib missing, geometry mismatch, decoder failure, frame-count mismatch);
+     * [PairScoreOutcome.MisalignmentRejected] when the streams were measurably NOT temporally
+     * comparable (fail closed — never scored, never structurally certifiable). Never throws.
      */
-    fun score(context: Context, ref: Uri, dist: Uri, windows: List<ScoreWindow>): List<WindowScore>? {
-        if (!VmafNative.isAvailable) return null
-        val refGeom = YuvFrameReader.displayGeometry(context, ref) ?: return null
-        val distGeom = YuvFrameReader.displayGeometry(context, dist) ?: return null
+    fun score(context: Context, ref: Uri, dist: Uri, windows: List<ScoreWindow>): PairScoreOutcome {
+        if (!VmafNative.isAvailable) return PairScoreOutcome.Unavailable
+        val refGeom = YuvFrameReader.displayGeometry(context, ref) ?: return PairScoreOutcome.Unavailable
+        val distGeom = YuvFrameReader.displayGeometry(context, dist) ?: return PairScoreOutcome.Unavailable
         if (refGeom.first != distGeom.first || refGeom.second != distGeom.second) {
             Log.w(TAG, "display geometry mismatch ${refGeom.first}x${refGeom.second} vs ${distGeom.first}x${distGeom.second}")
-            return null
+            return PairScoreOutcome.Unavailable
         }
         val width = refGeom.first
         val height = refGeom.second
         if (width * height > MAX_COMPARE_PIXELS) {
             Log.i(TAG, "geometry ${width}x$height above pixel-scoring cap; skipping")
-            return null
+            return PairScoreOutcome.Unavailable
         }
 
         val results = mutableListOf<WindowScore>()
         for (window in windows) {
-            val score = scoreWindow(context, ref, dist, window, width, height) ?: return null
-            results += score
+            when (val outcome = scoreWindow(context, ref, dist, window, width, height)) {
+                is WindowOutcome.Scored -> results += outcome.score
+                WindowOutcome.Unavailable -> return PairScoreOutcome.Unavailable
+                WindowOutcome.Misaligned -> return PairScoreOutcome.MisalignmentRejected
+            }
         }
-        return results
+        return PairScoreOutcome.Scored(results)
+    }
+
+    private sealed interface WindowOutcome {
+        data class Scored(val score: WindowScore) : WindowOutcome
+        object Unavailable : WindowOutcome
+        object Misaligned : WindowOutcome
     }
 
     private fun scoreWindow(
@@ -114,12 +139,12 @@ object VmafPairScorer {
         window: ScoreWindow,
         width: Int,
         height: Int
-    ): WindowScore? {
+    ): WindowOutcome {
         // Plain vmaf_v0.6.1 (no phone transform): every threshold in QualityProbePolicy was
         // calibrated against the PC harness's default-model scores, and mixing models would
         // silently loosen the bar (the phone transform maps scores upward).
         val handle = VmafNative.open(width, height, phoneModel = false, threads = 2)
-        if (handle == 0L) return null
+        if (handle == 0L) return WindowOutcome.Unavailable
         val refQueue = ArrayBlockingQueue<I420Frame>(QUEUE_CAPACITY)
         val distQueue = ArrayBlockingQueue<I420Frame>(QUEUE_CAPACITY)
         val error = AtomicReference<String?>(null)
@@ -162,6 +187,7 @@ object VmafPairScorer {
         var skewAbsSumUs = 0L
         var pendingRef: I420Frame? = null
         var pendingDist: I420Frame? = null
+        var misaligned = false
         try {
             while (true) {
                 if (pendingRef == null && !refEnded) {
@@ -233,7 +259,11 @@ object VmafPairScorer {
                     PtsAligner.Action.DROP_REF -> pendingRef = null
                     PtsAligner.Action.DROP_DIST -> pendingDist = null
                     PtsAligner.Action.FAIL -> {
-                        error.compareAndSet(null, "frame pairing alignment failed beyond drop budget")
+                        misaligned = true
+                        error.compareAndSet(
+                            null,
+                            "frame pairing rejected: ${aligner.failureReason ?: "misaligned"}"
+                        )
                         break
                     }
                 }
@@ -254,13 +284,14 @@ object VmafPairScorer {
         if (err != null || fed == 0) {
             Log.w(TAG, "window [${window.startUs}..${window.endUs}] failed: ${err ?: "no frames"}")
             VmafNative.close(handle)
-            return null
+            // Measured misalignment is positive evidence, not mere absence of evidence.
+            return if (misaligned) WindowOutcome.Misaligned else WindowOutcome.Unavailable
         }
         val perFrame = VmafNative.flush(handle)
         VmafNative.close(handle)
         if (perFrame == null || perFrame.isEmpty() || perFrame.any { it < 0 }) {
             Log.w(TAG, "vmaf flush failed for window")
-            return null
+            return WindowOutcome.Unavailable
         }
         val sorted = perFrame.sortedArray()
         val p5Index = ((sorted.size - 1) * 0.05).toInt()
@@ -285,9 +316,9 @@ object VmafPairScorer {
         Log.i(
             TAG,
             "window [${window.startUs / 1000}ms..${window.endUs / 1000}ms] frames=${result.comparedFrames} " +
-                "mean=%.2f p5=%.2f min=%.2f".format(result.mean, result.p5, result.min) +
+                "mean=%.2f p5=%.2f min=%.2f".format(java.util.Locale.US, result.mean, result.p5, result.min) +
                 " pairing[${pairing.compact()}]"
         )
-        return result
+        return WindowOutcome.Scored(result)
     }
 }

@@ -48,6 +48,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import compress.joshattic.us.quality.PairScoreOutcome
 import compress.joshattic.us.quality.PerceptualQualityProber
 import compress.joshattic.us.quality.QualityProbePolicy
 import compress.joshattic.us.quality.WindowScore
@@ -986,7 +987,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         updateItem(index) {
                             it.copy(message = "Certifying pixels: encoder undershot the bitrate floor, checking real quality…")
                         }
-                        val recoveryScores = qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+                        val recoveryOutcome = qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+                        val recoveryScores = (recoveryOutcome as? PairScoreOutcome.Scored)?.windows
                         diagnosticCertWindowScores = compactWindowScores(recoveryScores)
                         if (QualityProbePolicy.windowsPass(recoveryScores)) {
                             floorRecoveryCertScores = recoveryScores
@@ -1009,10 +1011,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 )
                             }
                         } else {
+                            val cause = when (recoveryOutcome) {
+                                is PairScoreOutcome.Scored -> "failed"
+                                PairScoreOutcome.MisalignmentRejected -> "rejected (output frames not time-alignable)"
+                                PairScoreOutcome.Unavailable -> "unavailable"
+                            }
                             Log.i(
                                 "CompressorProbe",
-                                "floor recovery; job=${diagnosticJobId(item)}; certification " +
-                                    "${if (recoveryScores == null) "unavailable" else "failed"}; fallback proceeds"
+                                "floor recovery; job=${diagnosticJobId(item)}; certification $cause; fallback proceeds"
                             )
                         }
                     }
@@ -1029,25 +1035,30 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         updateItem(index) {
                             it.copy(message = "Certifying pixels: sampled VMAF check of the final output…")
                         }
-                        val certScores = floorRecoveryCertScores
+                        val certOutcome = floorRecoveryCertScores?.let { PairScoreOutcome.Scored(it) }
                             ?: qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+                        val certScores = (certOutcome as? PairScoreOutcome.Scored)?.windows
                         diagnosticCertWindowScores = compactWindowScores(certScores)
-                        val certOk = QualityProbePolicy.certificationPasses(
+                        val certOk = QualityProbePolicy.certificationOutcomePasses(
                             usedRatio = perceptualPlan.targetRatio,
                             defaultRatio = perceptualPlan.defaultRatio,
-                            scores = certScores
+                            outcome = certOutcome
                         )
                         Log.i(
                             "CompressorProbe",
                             "certification; job=${diagnosticJobId(item)}; usedRatio=${perceptualPlan.targetRatio}; " +
                                 "windows=${certScores?.size ?: 0}; pass=$certOk; " +
-                                "scores=${certScores?.joinToString { "%.1f/%.1f/%.1f".format(it.mean, it.p5, it.min) } ?: "unmeasured"}"
+                                "scores=${certScores?.joinToString { "%.1f/%.1f/%.1f".format(java.util.Locale.US, it.mean, it.p5, it.min) } ?: "unmeasured"}"
                         )
                         if (!certOk) {
-                            val certReason = if (certScores == null) {
-                                "pixel certification unavailable for a sub-default-ratio encode"
-                            } else {
-                                "pixel certification failed (sampled VMAF below thresholds)"
+                            val certReason = when {
+                                certOutcome is PairScoreOutcome.MisalignmentRejected ->
+                                    "pixel certification rejected: output frames could not be " +
+                                        "time-aligned with the source (frame loss or retiming)"
+                                certScores == null ->
+                                    "pixel certification unavailable for a sub-default-ratio encode"
+                                else ->
+                                    "pixel certification failed (sampled VMAF below thresholds)"
                             }
                             diagnosticFallbackReason = certReason
                             diagnosticDiscardedVideoBitrate = encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }

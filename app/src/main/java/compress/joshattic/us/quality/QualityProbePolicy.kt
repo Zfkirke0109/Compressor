@@ -138,6 +138,19 @@ object QualityProbePolicy {
     }
 
     /**
+     * Certification verdict for a tri-state scoring outcome. Measured misalignment is
+     * POSITIVE evidence the output's frames are not temporally comparable to the source
+     * (frame loss or retiming) — it always fails, and is never eligible for the structural
+     * default-ratio fallback that covers merely-unavailable evidence.
+     */
+    fun certificationOutcomePasses(usedRatio: Double, defaultRatio: Double, outcome: PairScoreOutcome): Boolean =
+        when (outcome) {
+            is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
+            PairScoreOutcome.Unavailable -> certificationPasses(usedRatio, defaultRatio, null)
+            PairScoreOutcome.MisalignmentRejected -> false
+        }
+
+    /**
      * Probe windows for a clip of [durationUs]: up to three short windows away from the very
      * start/end (codec warm-up and tail padding are unrepresentative). Short clips get one
      * centered window. Returns an empty list when the clip is too short to sample honestly.

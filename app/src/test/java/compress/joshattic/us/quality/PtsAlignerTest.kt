@@ -102,14 +102,38 @@ class PtsAlignerTest {
     }
 
     @Test
-    fun retimedStreamExhaustsTheDropBudgetAndFails() {
+    fun retimedStreamFailsClosed() {
         // A CFR-ized/duplicated clip of VFR content: cadences never agree for long. The
         // aligner must give up (fail closed) instead of scoring a partially-fabricated set.
         val ref = cfr(30, 33_333L)
         val dist = cfr(60, 16_667L, offsetUs = 8_000L) // offset half-ish frames, double cadence
+        val (_, fail, _) = run(ref, dist)
+        assertEquals(PtsAligner.Action.FAIL, fail)
+    }
+
+    @Test
+    fun internalMissingFramesAreLostFrameEvidenceNotRepairable() {
+        // The dist stream drops frames 10-12 mid-window (genuine temporal degradation).
+        // Aligning around them would score the surviving pairs at ~100 and hide the loss:
+        // the aligner must fail closed at the first internal misalignment instead.
+        val ref = cfr(30, 33_333L)
+        val dist = ref.filterIndexed { i, _ -> i !in 10..12 }
+        val (pairs, fail, aligner) = run(ref, dist)
+        assertEquals(PtsAligner.Action.FAIL, fail)
+        assertEquals(10, pairs.size) // pairs 0-9 scored, then the gap is detected
+        assertEquals(0, aligner.refDropped + aligner.distDropped) // no internal "repair"
+    }
+
+    @Test
+    fun leadingOffsetRepairNeverHidesALaterInternalGap() {
+        // Both defects at once: one-frame leading offset AND an internal missing frame.
+        // The leading offset is repaired (one drop), the internal gap still fails closed.
+        val interval = 33_367L
+        val ref = cfr(30, interval, offsetUs = interval)
+        val dist = cfr(30, interval, offsetUs = 0L).filterIndexed { i, _ -> i != 15 }
         val (_, fail, aligner) = run(ref, dist)
         assertEquals(PtsAligner.Action.FAIL, fail)
-        assertTrue(aligner.refDropped + aligner.distDropped >= PtsAligner.MAX_ALIGNMENT_DROPS)
+        assertEquals(1, aligner.distDropped) // the legitimate leading repair
     }
 
     @Test
