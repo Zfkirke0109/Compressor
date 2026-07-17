@@ -60,3 +60,23 @@ skip population was audited offline before any code change.
 audit_runner.py, population_analysis.py, audit_results.json (pre-passthrough),
 audit_results_passthrough.json (jellyfish run), skip_population.json, matches.json,
 device_videos.txt — validation/captures/analysis_skip_audit_20260716/
+
+## ADDENDUM 2026-07-16 evening — device mechanism FOUND (PR #25 diagnostic run)
+
+Capture batch_20260716_185345 (3-file batch on the PR #25 telemetry build):
+jellyfish_gradient probed with `probePairDiag = ref=35,dist=34,extra=1/0,skewMs=33.2/33.2/33.2`
+— a CONSTANT one-frame-interval skew (33.2 ms at 29.97 fps) across the whole window with a
+one-frame count mismatch. The Transformer probe clip and the reference window reader disagree
+by exactly one frame about the window start; decode-order pairing then scores ref[i] against
+the re-encode of ref[i+1] for every pair. The probe measured inter-frame motion, not encode
+quality. Same mechanism explains the VFR screen recording's 17.6/0/0 (variable gaps up to
+350 ms → near-zero scores) and implicates CERTIFICATION (same scorer): the screen recording's
+encode certed at 92.7/84.0 and was discarded — plausibly a false cert failure, meaning real
+savings may be recoverable wherever UNEXPECTED_REMUX followed a healthy encode.
+
+Fix (same branch, PR #25): `PtsAligner` — timestamp-based pairing in VmafPairScorer with an
+adaptive half-frame-interval tolerance (floor 4 ms), budgeted drops to re-align (max 8), and
+fail-closed "no pixel evidence" when alignment is impossible. Bars unchanged; unmeasurable
+windows stay conservative (and unmeasurable probes never feed the class latch). Device
+validation next: 3-file rerun (jellyfish must score ~97+ and compress; screen recording gets
+honest scores), then the 176-file rerun (the 62 genuine skips must stay skips).
