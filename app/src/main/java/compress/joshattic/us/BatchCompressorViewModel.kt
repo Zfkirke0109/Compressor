@@ -2435,9 +2435,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     // Compact "mean/p5/min" per window, ";"-joined — the capture-friendly form of VMAF window
     // scores (e.g. "96.2/92.0/85.1;97.0/93.4/88.8"). Null when nothing was measured.
+    // Locale-pinned so comma-decimal device locales cannot corrupt the capture format.
     private fun compactWindowScores(scores: List<WindowScore>?): String? =
         scores?.takeIf { it.isNotEmpty() }
-            ?.joinToString(";") { "%.1f/%.1f/%.1f".format(it.mean, it.p5, it.min) }
+            ?.joinToString(";") { "%.1f/%.1f/%.1f".format(java.util.Locale.US, it.mean, it.p5, it.min) }
 
     // Compact per-window pairing diagnostics, ";"-joined (see WindowPairingDiag.compact()).
     // Null when nothing was measured or the scores carry no pairing data.
