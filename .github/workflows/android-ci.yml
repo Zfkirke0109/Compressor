@@ -33,8 +33,36 @@ jobs:
       - name: Make Gradle executable
         run: chmod +x ./gradlew
 
+      - name: Restore and validate shared signing key
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          EXPECTED_SIGNER_SHA256: ${{ secrets.EXPECTED_SIGNER_SHA256 }}
+        run: |
+          set -euo pipefail
+          for secret in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS EXPECTED_SIGNER_SHA256; do
+            test -n "${!secret}" || { echo "::error::Required secret $secret is not configured."; exit 1; }
+          done
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > ci-debug.keystore
+          chmod 600 ci-debug.keystore
+          keytool -list -keystore ci-debug.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          actual="$(keytool -exportcert -keystore ci-debug.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" | sha256sum | awk '{print toupper($1)}')"
+          expected="$(printf '%s' "$EXPECTED_SIGNER_SHA256" | tr -d '[:space:]:' | tr '[:lower:]' '[:upper:]')"
+          test "$actual" = "$expected" || { echo "::error::Signing certificate fingerprint mismatch."; exit 1; }
+
       - name: Build debug APK
+        env:
+          COMPRESSOR_DEBUG_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          COMPRESSOR_DEBUG_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          COMPRESSOR_DEBUG_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew :app:assembleDebug --stacktrace --console=plain > gradle-build.log 2>&1
+
+      - name: Remove signing material from runner
+        if: always()
+        shell: bash
+        run: rm -f ci-debug.keystore
 
       - name: Upload Gradle log
         if: always()

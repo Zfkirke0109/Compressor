@@ -43,20 +43,25 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Restore stable debug signing key
+      - name: Restore and validate shared signing key
         shell: bash
         env:
-          COMPRESSOR_DEBUG_KEYSTORE_BASE64: ${{ secrets.COMPRESSOR_DEBUG_KEYSTORE_BASE64 }}
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          EXPECTED_SIGNER_SHA256: ${{ secrets.EXPECTED_SIGNER_SHA256 }}
         run: |
-          if [ -n "$COMPRESSOR_DEBUG_KEYSTORE_BASE64" ]; then
-            echo "$COMPRESSOR_DEBUG_KEYSTORE_BASE64" | base64 --decode > ci-debug.keystore
-            chmod 600 ci-debug.keystore
-            echo "STABLE_DEBUG_SIGNING=true" >> "$GITHUB_ENV"
-            echo "Stable debug signing key restored."
-          else
-            echo "STABLE_DEBUG_SIGNING=false" >> "$GITHUB_ENV"
-            echo "No stable debug signing key secret found. Falling back to default debug signing."
-          fi
+          set -euo pipefail
+          for secret in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS EXPECTED_SIGNER_SHA256; do
+            test -n "${!secret}" || { echo "::error::Required secret $secret is not configured."; exit 1; }
+          done
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > ci-debug.keystore
+          chmod 600 ci-debug.keystore
+          keytool -list -keystore ci-debug.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null
+          actual="$(keytool -exportcert -keystore ci-debug.keystore -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" | sha256sum | awk '{print toupper($1)}')"
+          expected="$(printf '%s' "$EXPECTED_SIGNER_SHA256" | tr -d '[:space:]:' | tr '[:lower:]' '[:upper:]')"
+          test "$actual" = "$expected" || { echo "::error::Signing certificate fingerprint mismatch."; exit 1; }
+          echo "STABLE_DEBUG_SIGNING=true" >> "$GITHUB_ENV"
 
       # 1. FIND OR CREATE THE INITIAL COMMENT
       - name: Post "Building" Comment
@@ -100,9 +105,9 @@ jobs:
         id: build_apk
         shell: bash
         env:
-          COMPRESSOR_DEBUG_KEYSTORE_PASSWORD: ${{ secrets.COMPRESSOR_DEBUG_KEYSTORE_PASSWORD }}
-          COMPRESSOR_DEBUG_KEY_ALIAS: ${{ secrets.COMPRESSOR_DEBUG_KEY_ALIAS }}
-          COMPRESSOR_DEBUG_KEY_PASSWORD: ${{ secrets.COMPRESSOR_DEBUG_KEY_PASSWORD }}
+          COMPRESSOR_DEBUG_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          COMPRESSOR_DEBUG_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          COMPRESSOR_DEBUG_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           set -o pipefail
           ./gradlew assembleDebug --stacktrace | tee build.log
@@ -115,6 +120,11 @@ jobs:
           name: compressor-debug-pr-${{ env.PR_NUMBER }}
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 5
+
+      - name: Remove signing material from runner
+        if: always()
+        shell: bash
+        run: rm -f ci-debug.keystore
 
       # 4. READ LOGS (Truncate to last 100 lines to fit in comment)
       - name: Process Logs
