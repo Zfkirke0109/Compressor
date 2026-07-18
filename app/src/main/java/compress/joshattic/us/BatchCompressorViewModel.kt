@@ -1062,10 +1062,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             defaultRatio = perceptualPlan.defaultRatio,
                             outcome = certOutcome
                         )
-                        // Pixel proof requires BOTH a pass AND measured windows. certOk alone is not
-                        // enough: an Unavailable outcome at the default ratio also returns true via the
-                        // structural fallback, and that is explicitly NOT pixel evidence.
-                        pixelCertifiedThisRun = certOk && certScores != null
+                        // Pixel proof requires BOTH a pass AND measured windows — see
+                        // QualityProbePolicy.isPixelCertified (pure + unit-tested) for why certOk
+                        // alone is insufficient.
+                        pixelCertifiedThisRun = QualityProbePolicy.isPixelCertified(certOk, certOutcome)
                         Log.i(
                             "CompressorProbe",
                             "certification; job=${diagnosticJobId(item)}; usedRatio=${perceptualPlan.targetRatio}; " +

@@ -30,8 +30,12 @@ class BatchForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val notification = buildNotification(this)
         try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(NOTIFICATION_ID, notification, foregroundServiceType())
+            if (ForegroundServiceTypePolicy.requiresTypedStartForeground(Build.VERSION.SDK_INT)) {
+                startForeground(
+                    NOTIFICATION_ID,
+                    notification,
+                    ForegroundServiceTypePolicy.typeForSdk(Build.VERSION.SDK_INT)
+                )
             } else {
                 @Suppress("DEPRECATION")
                 startForeground(NOTIFICATION_ID, notification)
@@ -84,24 +88,9 @@ class BatchForegroundService : Service() {
             app.stopService(Intent(app, BatchForegroundService::class.java))
         }
 
-        /**
-         * The declared FGS type for the running platform.
-         *  - API 35+ (Android 15, VANILLA_ICE_CREAM): mediaProcessing — the semantically correct type,
-         *    which (with its FOREGROUND_SERVICE_MEDIA_PROCESSING permission) FIRST EXISTS on API 35.
-         *    Requesting it on Android 14 would hit an unrecognized permission and the OS could throw
-         *    SecurityException, so it must NOT be used below 35.
-         *  - API 29-34: dataSync — a general long-running type valid there (its
-         *    FOREGROUND_SERVICE_DATA_SYNC permission is enforced from API 34 and is declared).
-         *  - below API 29: no type.
-         * compileSdk (36) makes both constants available at compile time; each is referenced only at or
-         * above its introducing API, so older devices never touch a constant they lack.
-         */
-        @Suppress("InlinedApi") // guarded: the API-35 constant is only used at SDK_INT >= 35
-        private fun foregroundServiceType(): Int = when {
-            Build.VERSION.SDK_INT >= 35 -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            else -> 0
-        }
+        // The platform-level -> FGS-type decision lives in ForegroundServiceTypePolicy so it is pure
+        // and unit-testable (ForegroundServiceTypePolicyTest pins the API-35 boundary). Getting it
+        // wrong fails silently at startForeground on real devices rather than at build time.
 
         private fun buildNotification(context: Context): Notification {
             ensureChannel(context)

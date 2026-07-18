@@ -70,6 +70,31 @@ class QualityProbePolicyTest {
     }
 
     @Test
+    fun onlyMeasuredScoredWindowsCountAsPixelCertified() {
+        // Regression guard for QUAL-001's subtlety: "certification passed" is NOT "pixels proved it".
+        val scored = PairScoreOutcome.Scored(listOf(good(), good()))
+
+        // The only true case: a pass backed by real measured windows.
+        assertTrue(QualityProbePolicy.isPixelCertified(certificationPassed = true, outcome = scored))
+
+        // Unavailable passes acceptance at/above the default ratio via the STRUCTURAL fallback —
+        // honest acceptance, but never pixel evidence. This is the case that would otherwise wear
+        // the full perceptual label dishonestly.
+        assertFalse(
+            QualityProbePolicy.isPixelCertified(
+                certificationPassed = QualityProbePolicy.certificationOutcomePasses(0.90, 0.90, PairScoreOutcome.Unavailable),
+                outcome = PairScoreOutcome.Unavailable
+            )
+        )
+
+        // Measured misalignment is evidence AGAINST, never certification.
+        assertFalse(QualityProbePolicy.isPixelCertified(true, PairScoreOutcome.MisalignmentRejected))
+
+        // A failed certification is never pixel-certified, even with measured windows.
+        assertFalse(QualityProbePolicy.isPixelCertified(certificationPassed = false, outcome = scored))
+    }
+
+    @Test
     fun measuredMisalignmentNeverCertifiesNotEvenStructurally() {
         val passing = PairScoreOutcome.Scored(listOf(good(), good()))
         val failing = PairScoreOutcome.Scored(listOf(good(), good().copy(min = 60.0)))
