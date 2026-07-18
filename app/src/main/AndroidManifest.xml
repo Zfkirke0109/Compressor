@@ -5,9 +5,13 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" tools:node="remove" />
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
 
-    <!-- Keep a long batch alive when the app is backgrounded / screen-off. mediaProcessing is the
-         API 34+ type; dataSync covers API 29-33; POST_NOTIFICATIONS (33+) lets the ongoing
-         notification show (the service still elevates priority even if the user denies it). -->
+    <!-- Keep a long batch alive when the app is backgrounded / screen-off. mediaProcessing (and its
+         FOREGROUND_SERVICE_MEDIA_PROCESSING permission) FIRST EXISTS on API 35 (Android 15), so it is
+         only requested at runtime when SDK_INT >= 35; dataSync covers API 29-34. Do not lower that
+         threshold: on Android 14 the mediaProcessing permission does not exist and the OS can reject
+         the startForeground call, leaving a batch unprotected. POST_NOTIFICATIONS (33+) only affects
+         whether the ongoing notification is visible — the service still elevates process priority
+         even if the user denies it. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
