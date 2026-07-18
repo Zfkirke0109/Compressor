@@ -54,17 +54,28 @@ paths, no passwords. The signer SHA-256 below is a public certificate fingerprin
   `adb install -r`, run PL over a few files, background + screen-off, confirm: notification shows,
   batch survives + completes, service stops after. Then merge #29 (squash).
 
-## NEXT TASK (updated) — confirmed backlog, risk order, one focused PR each
-1. free-space (StatFs) precheck before expensive/destructive ops;
-2. scope `clearBatchCache()` to current-batch items (avoid deleting unsaved prior outputs);
-3. vmaf_jni dist-array release on the `ref==NULL` error branch;
-4. muxer empty-track early-return release path;
-5. instrumented SAF rollback test for SAFE-001 (injected ENOSPC / truncated write);
-6. evaluate temp-write + atomic same-volume rename to drop the recovery-copy I/O;
-7. remove dead `MainActivity`/`CompressorViewModel` + `recommendedBatchParallelism` ONLY after
+## SHIPPED since the first draft of this file (main = `ad18935`)
+#29 PERF-001 (device-validated) · #30 manifest comment · #31 QUAL-001 label honesty ·
+#32 regression guards (API-35 threshold + pixel-cert rule extracted to pure, tested policies;
+dumpsys gotcha recorded in the android-logcat-device-validation skill) ·
+**#33 free-space precheck** · **#34 cache-clear scoping**.
+**Every confirmed audit finding rated Medium or above is now shipped.** 152 unit tests, 0 failures.
+
+## NEXT TASK (updated) — remaining backlog, risk order
+1. **Instrumented SAF rollback test for SAFE-001** — the one gate SAFE-001 still lacks. The strict
+   size rule is unit-tested (`ReplacementSizeCheckTest`) but the actual mid-write rollback (inject
+   ENOSPC / a truncated stream, assert the original is restored and the message is honest) has never
+   been executed. Highest remaining value on the safety side.
+2. **Speed lever (SPEED_SCOPING.md)** — biggest user-visible win left: the probe-skip latch skips the
+   cheap probe but still runs a FULL encode it then discards (~9 min of the measured 12.8 min/batch
+   wasted-encode total). Requires care: do not let it deny a winnable class (the everCompressed
+   exemption exists for exactly that reason).
+3. vmaf_jni dist-array release on the `ref==NULL` error branch (Low, native-OOM only).
+4. Mp4MetadataRemuxer empty-track early-return release path (Low).
+5. Evaluate temp-write + atomic same-volume rename to drop SAFE-001's recovery-copy I/O.
+6. Remove dead `MainActivity`/`CompressorViewModel` + `recommendedBatchParallelism` ONLY after
    reference analysis.
-Also open: the speed lever from SPEED_SCOPING.md (probe-skip latch runs a full encode it then
-discards, ~9 min/batch) and the GitHub Releases update-check page.
+7. GitHub Releases update-check page (older backlog item, never started).
 
 ## (HISTORICAL — already implemented in #31) QUAL-001 design
 Branch `fix/verification-label-honesty` (already created off main). Goal: stop labeling a PL
