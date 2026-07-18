@@ -71,8 +71,33 @@ Adjust the `-s` tag filter to match whatever component is actually in question �
 - A crash could plausibly be either an app bug or a genuine hardware/OEM limitation (e.g., an HDR-related MediaCodec quirk) and you can't tell without more device-specific testing than you have available.
 - Fixing the root cause would require touching code covered by [[android-media3-perceptual-compression]]'s truth rules — hand off to that skill's constraints rather than patching around them.
 
+## Reading `dumpsys` state correctly (verification gotchas)
+
+Getting these wrong produces confident, wrong device claims — which is worse than no evidence.
+
+- **Wake locks: the live list is not the event log.** `adb shell dumpsys power` contains BOTH a
+  current-holders list and a recent-history section. Only entries shaped like
+  `PARTIAL_WAKE_LOCK 'your:tag' ACQ=-1m7s (uid=… pid=… lock=…)` mean *held right now*. Lines shaped
+  like `07-18 00:03:58 - 10784 (pkg) - ACQ your:tag (partial)` are **history** and remain there long
+  after release. A loose `dumpsys power | grep your:tag` therefore reports a false "still held".
+  Match on the `PARTIAL_WAKE_LOCK '<tag>'` form (or check for a matching `REL`) before claiming a
+  leak. Also confirm the uid is *your* app's — other apps hold generic tags like
+  `ForegroundService:WakeLock`.
+- **A foreground service's real state** is in `dumpsys activity services <pkg>`: look for
+  `isForeground=true`, `foregroundId=<your id>`, and `types=0x…` (e.g. `0x00002000` =
+  mediaProcessing, `0x1` = dataSync). The `types` value is the ground truth for whether your
+  platform-level → FGS-type mapping is actually correct on that device.
+- **`device offline` invalidates the reading, it does not mean "stopped".** Wireless ADB commonly
+  drops when the screen turns off and the debug port rotates. If a query returns nothing because the
+  transport died, do NOT report the service/lock as gone — reconnect (`adb mdns services`, then
+  connect to the NEW port) and re-query. The app process keeps running regardless of ADB.
+- The device's logcat ring buffer retains events recorded while ADB was disconnected, so
+  `adb logcat -d` after reconnecting can still prove what happened during a screen-off window.
+
 ## Anti-patterns
 
+- Don't report a device state from a grep whose match you haven't eyeballed — confirm the matched
+  line is the live-state form, not a history/echo line, before drawing a conclusion.
 - Don't diagnose a bug purely from a screenshot or description without asking to see the actual logcat output if it's available.
 - Don't treat every stack trace mentioning a Samsung/vendor class as the root cause — check whether it's just in the call chain incidentally.
 - Don't recommend a fix that touches encode/verification logic without cross-checking [[android-media3-perceptual-compression]] first.

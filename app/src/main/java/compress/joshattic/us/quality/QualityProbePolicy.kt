@@ -154,6 +154,19 @@ object QualityProbePolicy {
      * (frame loss or retiming) — it always fails, and is never eligible for the structural
      * default-ratio fallback that covers merely-unavailable evidence.
      */
+    /**
+     * True ONLY when sampled pixels actually certified this output.
+     *
+     * Deliberately NOT the same thing as "certification passed": [certificationOutcomePasses]
+     * returns true for [PairScoreOutcome.Unavailable] at or above the default ratio via the
+     * structural fallback, which is an honest ACCEPTANCE but is NOT pixel evidence. It is also not
+     * the same as probe eligibility — an eligible item whose certification produced no measured
+     * windows was still accepted structurally. Only a passing [PairScoreOutcome.Scored] means real
+     * measured windows backed the result, so only that may wear the full perceptual label (QUAL-001).
+     */
+    fun isPixelCertified(certificationPassed: Boolean, outcome: PairScoreOutcome): Boolean =
+        certificationPassed && outcome is PairScoreOutcome.Scored
+
     fun certificationOutcomePasses(usedRatio: Double, defaultRatio: Double, outcome: PairScoreOutcome): Boolean =
         when (outcome) {
             is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
