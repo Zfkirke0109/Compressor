@@ -564,7 +564,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val frameRate = frameRateFromLabel(_uiState.value.frameRateOption)
             val codec = codecFromLabel(_uiState.value.codecOption)
             val privacyMode = MetadataPrivacyMode.fromLabel(_uiState.value.metadataPrivacyMode)
-            clearBatchCache()
+            // Reclaim orphaned cache files, but keep anything the CURRENT results still reference:
+            // re-running while previous results are still on screen must not delete files that
+            // share/save are still offering. Those entries are replaced by this run's own outputs.
+            clearBatchCache(preservePaths = _uiState.value.items.mapNotNull { it.outputPath }.toSet())
 
             _uiState.update { state ->
                 state.copy(
@@ -2925,10 +2928,21 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         return File(outputDir, "${base}_${sourceToken}_$suffix.mp4")
     }
 
-    private fun clearBatchCache() {
+    /**
+     * Deletes cached batch outputs, optionally preserving files that the CURRENT ui state still
+     * points at. Starting a run used to wipe the whole directory, which could delete outputs the
+     * still-displayed previous results referenced — leaving share/save pointing at files that no
+     * longer exist. Passing the live outputPaths keeps those intact; genuine orphans (nothing in the
+     * UI can reach them) are still reclaimed. An explicit user "clear" passes nothing and wipes all.
+     */
+    private fun clearBatchCache(preservePaths: Set<String> = emptySet()) {
         runCatching {
             val dir = File(getApplication<Application>().cacheDir, "batch_compressed_videos")
-            if (dir.exists()) dir.listFiles()?.forEach { it.delete() }
+            if (!dir.exists()) return@runCatching
+            val files = dir.listFiles() ?: return@runCatching
+            files.forEach { file ->
+                if (BatchCacheRetention.isDeletable(file.absolutePath, preservePaths)) file.delete()
+            }
         }
     }
 }
