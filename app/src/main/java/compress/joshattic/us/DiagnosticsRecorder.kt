@@ -116,6 +116,11 @@ class DiagnosticsRecorder private constructor(
         wasStreamCopy: Boolean,
         verdict: String?,
         verified: Boolean,
+        // Whether sampled pixel scoring ACTUALLY measured and passed this output (QUAL-001). Keeps
+        // captures/analytics consistent with the user-facing wording: a structurally-verified output
+        // records verified=true but pixelCertified=false, so no analysis can mistake structural
+        // acceptance for perceptual proof.
+        pixelCertified: Boolean = false,
         replacementSafe: Boolean,
         blockReason: String?,
         outputSize: Long,
@@ -187,6 +192,7 @@ class DiagnosticsRecorder private constructor(
                 "wasStreamCopy" to wasStreamCopy,
                 "verdict" to verdict,
                 "verified" to verified,
+                "pixelCertified" to pixelCertified,
                 "replacementSafe" to replacementSafe,
                 "blockReason" to blockReason,
                 "fallbackReason" to fallbackReason,
