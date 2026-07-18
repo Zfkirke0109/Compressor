@@ -205,6 +205,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     private var compressionJob: Job? = null
     private var activeTransformer: Transformer? = null
 
+    // Brackets a running batch with foreground protection + a CPU wake lock (see PERF-001). Holds
+    // application context only (via AndroidViewModel.getApplication), so it is safe as a field and
+    // reused across runs, which keeps its idempotency state coherent. Never starts work itself.
+    private val batchGuard: BatchExecutionGuard by lazy {
+        BatchExecutionGuard(AndroidBatchExecutionSink(getApplication()))
+    }
+
     // Local-only encode calibration; recommends Perceptually Lossless targets but never bypasses
     // verification. Stored in app SharedPreferences, nothing leaves the device.
     private val learningEngine by lazy {
@@ -626,6 +633,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             var sessionFailReason = "unknown"
 
             try {
+                // Enter foreground protection + CPU wake lock as the FIRST action inside the try, so
+                // begin() and the end() in this try's finally are a symmetric bracket that no setup or
+                // encode throw can leak. The app is foreground here (the user just tapped Start), which
+                // satisfies the Android 12+ background-start restriction; the guard is idempotent and
+                // its effects are best-effort, so this can never abort the batch. Only cheap pre-try
+                // setup (cache clear, state init) runs before this — never an encode.
+                batchGuard.begin()
                 _uiState.value.items.forEachIndexed { index, item ->
                     if (item.isAlreadyCompressed) {
                         return@forEachIndexed
@@ -1434,6 +1448,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 sessionFailReason = e.message ?: e.javaClass.simpleName
                 throw e
             } finally {
+                // Release foreground protection + wake lock FIRST, before any other finally work, so a
+                // throw in the rest of this block cannot leak them. Idempotent — safe even if begin()
+                // never fired (e.g. a pre-try setup failure).
+                batchGuard.end()
                 if (runCancelled) {
                     val cancelledItems = _uiState.value.items.filter { it.terminalResult == null }
                     _uiState.update { state ->
@@ -1499,6 +1517,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 compressionJob = null
             }
         }
+    }
+
+    override fun onCleared() {
+        // Last-resort teardown: if the ViewModel is destroyed while a batch's finally has not yet
+        // run (process/config edge), still release foreground protection + wake lock. Idempotent.
+        batchGuard.end()
+        super.onCleared()
     }
 
     fun cancelCompression() {

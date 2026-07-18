@@ -1,5 +1,8 @@
 <resources>
     <string name="app_name">Galaxy Compressor</string>
+    <string name="batch_fgs_channel">Batch compression</string>
+    <string name="batch_fgs_title">Compressing videos</string>
+    <string name="batch_fgs_text">Batch running — keep it running for fastest, most reliable results.</string>
     <string name="title_compressor">Compressor</string>
     <string name="share">Share</string>
     <string name="saved">Saved</string>
