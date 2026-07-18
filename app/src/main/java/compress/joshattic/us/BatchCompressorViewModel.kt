@@ -2663,6 +2663,26 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // exists for the duration of the write and is deleted the instant the write is confirmed.
         val recoveryDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
         val recoveryCopy = File(recoveryDir, "replace_recovery_${diagnosticJobId(item)}.mp4")
+
+        // Free-space precheck. The recovery copy is a FULL copy of the original, so if the cache
+        // volume cannot hold it we must not begin the destructive truncate-then-write at all — an
+        // ENOSPC while staging is exactly how the user's only copy would be put at risk. Blocks only
+        // on positive evidence of insufficient space; an unmeasurable filesystem proceeds (the staged
+        // recovery + rollback remain the real backstop).
+        val cacheAvailable = StorageSpacePolicy.availableBytesFor(recoveryDir)
+        if (StorageSpacePolicy.blocks(item.originalSize, cacheAvailable)) {
+            val shortfall = StorageSpacePolicy.shortfallMessage(item.originalSize, cacheAvailable)
+            Log.w("CompressorBatch", "replace precheck; job=${diagnosticJobId(item)}; blocked: $shortfall")
+            val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
+            return@withContext ReplacementResult(
+                false,
+                if (savedUri != null) {
+                    "Not enough free space to protect the original ($shortfall), so it was left untouched. A safe compressed copy was saved instead."
+                } else {
+                    "Not enough free space to protect the original ($shortfall); it was left untouched, and saving a safe copy also failed."
+                }
+            )
+        }
         val recoveryStaged = runCatching {
             if (recoveryCopy.exists()) recoveryCopy.delete()
             context.contentResolver.openInputStream(item.sourceUri)?.use { input ->
