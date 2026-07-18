@@ -3,12 +3,21 @@
 Durable shared-reality record for the next Claude/Codex/human session. No secrets, no keystore
 paths, no passwords. The signer SHA-256 below is a public certificate fingerprint (already in CI).
 
-## Current integrated state
-- **origin/main = `54857cf`** = "ci: use shared Android signing keystore (#28)".
-- Merged & integrated: #22, #23, #24, #25 (PL pipeline + pairing fix), **#26 (SAFE-001)**,
-  **#27 (QUAL-002)**, **#28 (shared signing, CI-only)**.
-- **Open PRs:** **#29 PERF-001** (this session, ready pending device validation) and **#17**
-  (DRAFT, AV1 follow-up — PRESERVE, untouched).
+## Current integrated state (UPDATED 2026-07-18 — all of this session's work is MERGED)
+- **origin/main = `5d48e94`**. Merge order this session: #28 `54857cf` (signing, CI-only) ->
+  handoff `af9fa74` -> **#29 PERF-001 `f046c0e`** -> **#30 `bf15a61`** (manifest comment API 34->35)
+  -> **#31 QUAL-001 `5d48e94`**.
+- Merged & integrated: #22-#25 (PL pipeline + pairing fix), #26 (SAFE-001), #27 (QUAL-002),
+  #28 (signing), **#29 (PERF-001, device-validated)**, #30, **#31 (QUAL-001)**.
+- **Open PRs:** only **#17** (DRAFT, AV1 follow-up — PRESERVE, untouched). Nothing else pending.
+- **PERF-001 device evidence (S23 Ultra / Android 16, API 36):** FGS `isForeground=true`
+  `types=0x00002000` (mediaProcessing — confirms the API-35 threshold fix), `galaxycompressor:batch`
+  PARTIAL wake lock held, ongoing notification, **survived background + screen-off 10 min during a
+  real 182-video batch**, clean release at completion. Signer verified == expected shared identity.
+  Device migrated off the old pre-#28 debug key (uninstall+install, owner-authorized); learning store
+  backed up and restored (8329 B) -> future CI builds now update in place cleanly.
+- **QUAL-001 (#31) is DONE** — the design below was implemented as specified (keyed on
+  `certOk && certScores != null`, never on `probeEligible`). Kept for historical context only.
 - Preserved local branches: `feat/galaxy-app-icon`, `claude/add-android-workflow-skills`,
   `copilot/fix-pr-18-build-failure`, `feat/batch-foreground-service` (=#29),
   `fix/verification-label-honesty` (empty QUAL-001 starting branch off main, no commits yet).
@@ -45,7 +54,19 @@ paths, no passwords. The signer SHA-256 below is a public certificate fingerprin
   `adb install -r`, run PL over a few files, background + screen-off, confirm: notification shows,
   batch survives + completes, service stops after. Then merge #29 (squash).
 
-## NEXT TASK — QUAL-001 (execution-ready design)
+## NEXT TASK (updated) — confirmed backlog, risk order, one focused PR each
+1. free-space (StatFs) precheck before expensive/destructive ops;
+2. scope `clearBatchCache()` to current-batch items (avoid deleting unsaved prior outputs);
+3. vmaf_jni dist-array release on the `ref==NULL` error branch;
+4. muxer empty-track early-return release path;
+5. instrumented SAF rollback test for SAFE-001 (injected ENOSPC / truncated write);
+6. evaluate temp-write + atomic same-volume rename to drop the recovery-copy I/O;
+7. remove dead `MainActivity`/`CompressorViewModel` + `recommendedBatchParallelism` ONLY after
+   reference analysis.
+Also open: the speed lever from SPEED_SCOPING.md (probe-skip latch runs a full encode it then
+discards, ~9 min/batch) and the GitHub Releases update-check page.
+
+## (HISTORICAL — already implemented in #31) QUAL-001 design
 Branch `fix/verification-label-honesty` (already created off main). Goal: stop labeling a PL
 output "Perceptually Lossless Verified" (implying pixel proof) when pixel scoring did NOT actually
 certify it. `OutputVerifier.verify` (OutputVerifier.kt:396) sets that verdict on STRUCTURAL grounds
