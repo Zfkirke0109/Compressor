@@ -672,6 +672,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // Compact per-window scores of the final output's sampled certification —
                     // recorded pass OR fail so captures carry the real numbers behind verdicts.
                     var diagnosticCertWindowScores: String? = null
+                    // True ONLY once sampled VMAF has actually measured this output and passed. Stays
+                    // false when certification never ran (not probe-eligible) or returned no measured
+                    // evidence (Unavailable/misaligned) and the encode was accepted structurally.
+                    var pixelCertifiedThisRun = false
                     val candidateFiles = linkedSetOf<File>()
                     var itemOutputAccepted = false
                     updateItem(index) {
@@ -1058,6 +1062,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             defaultRatio = perceptualPlan.defaultRatio,
                             outcome = certOutcome
                         )
+                        // Pixel proof requires BOTH a pass AND measured windows. certOk alone is not
+                        // enough: an Unavailable outcome at the default ratio also returns true via the
+                        // structural fallback, and that is explicitly NOT pixel evidence.
+                        pixelCertifiedThisRun = certOk && certScores != null
                         Log.i(
                             "CompressorProbe",
                             "certification; job=${diagnosticJobId(item)}; usedRatio=${perceptualPlan.targetRatio}; " +
@@ -1203,6 +1211,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             )
                         }
                     }
+                    // QUAL-001 — label honesty. OutputVerifier decides "Perceptually Lossless Verified"
+                    // from STRUCTURAL checks alone, and it runs BEFORE pixel certification, so on its own
+                    // that wording would imply pixel proof even when no pixels were ever scored (source
+                    // above the VMAF geometry cap, VMAF unavailable, HDR/codec-downgrade, or a
+                    // certification that returned no measured evidence and was accepted structurally).
+                    // Record what was actually proven and qualify the wording when it was structural only.
+                    // Nothing here relaxes acceptance: a measured cert FAILURE already skipped this item.
+                    verification = verification.withCertificationBasis(pixelCertifiedThisRun)
                     logVerificationResult(item, effectiveQuality, verification, outputSize)
                     val thermalEnd = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
                     val terminal = BatchTerminalClassifier.classify(
@@ -2445,6 +2461,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // decision time — the verdict string makes the distinction explicit and machine-
             // readable via materializationMode=REUSED_SOURCE.
             verified = retainedValidation?.readableAtDecisionTime ?: (verification?.verified == true),
+            // Retained sources never encode, so they can never be pixel-certified.
+            pixelCertified = verification?.pixelCertified == true,
             replacementSafe = if (retainedValidation != null) false else verification?.replacementSafe == true,
             blockReason = if (retainedValidation != null) {
                 "original retained — replacement is a no-op by design"

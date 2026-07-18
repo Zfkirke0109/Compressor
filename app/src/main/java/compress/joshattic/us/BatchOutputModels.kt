@@ -114,7 +114,13 @@ data class OutputVerificationReport(
     // bitrate floor — every structural, color, audio, timing, and metadata check passed.
     // That one case may be re-judged by sampled pixel certification (measured pixels
     // outrank the inferred floor); any other failure combination is terminal.
-    val failedOnlyOnVideoBitrateFloor: Boolean = false
+    val failedOnlyOnVideoBitrateFloor: Boolean = false,
+    // True ONLY when sampled on-device VMAF actually measured this output against its source and
+    // those measured windows passed. It is NOT set by probe eligibility, and NOT set when
+    // certification was merely unavailable (decoder/geometry/alignment failure) and the encode was
+    // accepted structurally at the codec-default ratio. Defaults false so any path that does not
+    // explicitly prove pixels stays honest — the "Verified" wording is chosen from this flag.
+    val pixelCertified: Boolean = false
 ) {
     val summaryLines: List<String>
         get() = listOf(
@@ -136,6 +142,38 @@ data class OutputVerificationReport(
             "Rotation: $rotation",
             "Size: $fileSize"
         ) + (if (durationParity.isNotBlank()) listOf("Duration/frames: $durationParity") else emptyList())
+
+    /**
+     * Records whether sampled pixel scoring ACTUALLY certified this output, and qualifies the
+     * Perceptually Lossless success wording accordingly.
+     *
+     * Only the unqualified PL success verdict is ever rewritten: remux, lossy-mode, "Unverified" and
+     * failure verdicts pass through untouched. A verdict is never UPGRADED — passing
+     * [pixelCertified] = true cannot turn a structural/failed verdict into a pixel-certified one; it
+     * only preserves the existing full claim when pixels genuinely backed it. This keeps the strong
+     * wording reserved for outputs whose pixels were measured and passed.
+     */
+    fun withCertificationBasis(pixelCertified: Boolean): OutputVerificationReport {
+        if (verdict != PERCEPTUALLY_LOSSLESS_VERIFIED) return copy(pixelCertified = pixelCertified)
+        return copy(
+            pixelCertified = pixelCertified,
+            verdict = if (pixelCertified) PERCEPTUALLY_LOSSLESS_VERIFIED else PERCEPTUALLY_LOSSLESS_STRUCTURAL_ONLY
+        )
+    }
+
+    companion object {
+        /** Full claim: structural checks passed AND sampled pixels were measured and passed. */
+        const val PERCEPTUALLY_LOSSLESS_VERIFIED = "Perceptually Lossless Verified"
+
+        /**
+         * Structural checks passed but NO pixels were sampled (source above the VMAF scoring cap,
+         * VMAF unavailable on this device/ABI, or certification produced no measured evidence). The
+         * encode is still accepted under the existing rules — this wording just refuses to imply
+         * perceptual proof that was never obtained.
+         */
+        const val PERCEPTUALLY_LOSSLESS_STRUCTURAL_ONLY =
+            "Perceptually Lossless — structural checks only (pixels not sampled)"
+    }
 }
 
 data class BatchItemMetrics(

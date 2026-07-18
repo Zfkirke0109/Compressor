@@ -29,7 +29,7 @@ STRUCTURED_JOB_FIELDS = ENVELOPE_FIELDS | {
     "bitrateMeasuredFromSize", "hdr", "audioMime", "audioBitrate", "requestedMode",
     "effectiveMode", "plannedOutputMime", "plannedTargetRatio",
     "plannedTargetVideoBitrate", "plannedDecisionReason", "wasStreamCopy", "verdict",
-    "verified", "replacementSafe", "blockReason", "fallbackReason", "discardedVideoBitrate",
+    "verified", "pixelCertified", "replacementSafe", "blockReason", "fallbackReason", "discardedVideoBitrate",
     "probedRatios", "pixelProvenRatio", "probeDetail",
     "probeWindowScores", "probePairDiag", "certWindowScores", "thermalStart", "thermalEnd", "precedingCooldownMs",
     "materializationMode", "originalReuseBlockReason", "copyAvoidedBytes",
@@ -457,7 +457,7 @@ def main():
 
     cols = ["batchId", "id", "plan_mode", "verify_mode", "source", "sourceCodec", "resolvedOutputMime",
             "hdr", "sourceBitrate", "audioBitrate", "targetVideoBitrate", "defaultRatio",
-            "learnedRatio", "floorRatio", "learnedTargetRatio", "verdict", "playable", "replaceAllowed",
+            "learnedRatio", "floorRatio", "learnedTargetRatio", "verdict", "pixelCertified", "playable", "replaceAllowed",
             "outputSize", "sizeRatio", "remuxReason", "blockReason", "fallbackReason",
             "discardedVideoBitrate", "probedRatios", "pixelProvenRatio", "probeDetail",
             "probeWindowScores", "probePairDiag", "certWindowScores", "thermalStart", "thermalEnd", "precedingCooldownMs",

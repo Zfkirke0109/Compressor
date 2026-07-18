@@ -393,7 +393,11 @@ object OutputVerifier {
         val verdict = when (input.mode) {
             BatchQualityMode.REMUX_ONLY -> if (remuxVerified) "Remux Verified" else "Remux Verification Failed"
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> when {
-                perceptuallyLosslessVerified && outputWithinTolerance -> "Perceptually Lossless Verified"
+                // Structural verdict only — this runs BEFORE sampled pixel certification. The caller
+                // qualifies the wording via OutputVerificationReport.withCertificationBasis(...) once
+                // it knows whether pixels were actually measured (QUAL-001).
+                perceptuallyLosslessVerified && outputWithinTolerance ->
+                    OutputVerificationReport.PERCEPTUALLY_LOSSLESS_VERIFIED
                 !criticalFieldsComplete -> "Perceptually Lossless Unverified"
                 else -> "Perceptually Lossless Verification Failed"
             }
