@@ -29,6 +29,7 @@ scripts/prepare_dataset_v2.py   dataset hygiene + dedup -> model_rows_v2.csv
 scripts/run_study_v2.py         exhaustive grid + nested holdout + bootstrap
 scripts/build_corpus.py         build a bpp-diverse test corpus + offline VMAF labels
 scripts/test_build_corpus.py    unit tests for the corpus builder's pure logic
+scripts/build_smoke_notebook.py generate the Colab ffmpeg/libvmaf smoke test
 notebooks/Compressor_Optuna_V2.ipynb   Colab driver
 REVIEW_FINDINGS.md              why the v1 candidate was rejected
 NEXT_ROUND_INSTRUMENTATION.md   what to change before the next capture round
@@ -56,6 +57,23 @@ Needs `ffmpeg`/`ffprobe` (and libvmaf for `label`) on PATH — none are bundled.
 pure planning/accounting logic is covered by `test_build_corpus.py`; the
 ffmpeg-dependent paths are integration-only. See `NEXT_ROUND_INSTRUMENTATION.md`
 §5 for why the corpus, not the optimizer, is the lever.
+
+### Smoke-testing the ffmpeg paths
+
+Unit tests cannot reach the encode/VMAF paths. `build_smoke_notebook.py` emits a
+self-contained Colab notebook (both tools embedded as base64) that acquires an
+ffmpeg with libvmaf, generates synthetic masters, runs plan → build → label, and
+asserts the build path, the label path, and the `measure_quality` coupling:
+
+```
+python scripts/build_smoke_notebook.py --out Compressor_Corpus_SmokeTest.ipynb
+```
+
+Upload the result to Colab and Runtime → Run all. Re-run it after changing
+`build_corpus.py`. Its first real execution (2026-07-21) caught three bugs static
+review had missed — including one that recorded failed measurements as
+quality-negatives — so treat a green run as a release gate for this tool, not a
+formality.
 
 The study reads a capture bundle's `all_jobs_normalized.csv` (produced from
 device logcat by
