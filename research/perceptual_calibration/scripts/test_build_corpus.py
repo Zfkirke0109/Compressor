@@ -7,6 +7,7 @@ ffmpeg/ffprobe/libvmaf paths are integration-only and not exercised here.
 """
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -210,6 +211,67 @@ class TestArgParserPortability(unittest.TestCase):
             self.assertEqual(parser.parse_args(["label", "--out", "o"]).command, "label")
         finally:
             bc.__file__ = original
+
+
+class TestMeasurePairId(unittest.TestCase):
+    """Regression: measure_quality rejected every measurement because the report
+    filename stem did not equal --pair-id (status METRIC_FAILED), so VMAF never ran.
+    Caught by the Colab smoke test."""
+
+    PAIR_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")  # mirrors measure_quality
+
+    def test_pair_id_matches_harness_charset_and_length(self):
+        for idx in (1, 42, 9999):
+            for ratio in (0.9, 0.95, 0.97):
+                pid = bc.measure_pair_id(idx, ratio)
+                self.assertRegex(pid, self.PAIR_ID_RE)
+                self.assertLessEqual(len(pid), 64)
+
+    def test_report_stem_equals_pair_id(self):
+        pid = bc.measure_pair_id(7, 0.95)
+        self.assertEqual(Path(f"{pid}.json").stem, pid)
+
+    def test_pair_ids_are_unique_per_row_and_ratio(self):
+        ids = {bc.measure_pair_id(i, r) for i in range(1, 6) for r in (0.9, 0.95, 0.97)}
+        self.assertEqual(len(ids), 15)
+
+
+class TestSummarizeRatioResults(unittest.TestCase):
+    """Regression (safety): an unavailable/failed measurement must never become a
+    quality-negative. The old check used `"passed" in r`, which is true even when
+    passed is None, so clips with no VMAF at all were labeled compressible=0."""
+
+    def test_unavailable_measurements_stay_unlabeled(self):
+        per_ratio = [{"ratio": 0.95, "vmaf_mean": None, "passed": None}]
+        compressible, best, note = bc.summarize_ratio_results(per_ratio)
+        self.assertEqual(compressible, "", "unavailable VMAF must not be a negative")
+        self.assertIsNone(best)
+        self.assertTrue(note)
+
+    def test_encode_failures_stay_unlabeled(self):
+        compressible, best, note = bc.summarize_ratio_results([{"ratio": 0.95, "error": "encode_failed"}])
+        self.assertEqual(compressible, "")
+        self.assertTrue(note)
+
+    def test_empty_stays_unlabeled(self):
+        self.assertEqual(bc.summarize_ratio_results([])[0], "")
+
+    def test_real_negative_is_labeled_zero(self):
+        compressible, best, note = bc.summarize_ratio_results([{"ratio": 0.95, "passed": False}])
+        self.assertEqual(compressible, 0)
+        self.assertIsNone(best)
+        self.assertEqual(note, "")
+
+    def test_win_picks_most_aggressive_passing_ratio(self):
+        per_ratio = [{"ratio": 0.97, "passed": True}, {"ratio": 0.90, "passed": True},
+                     {"ratio": 0.95, "passed": False}]
+        compressible, best, _ = bc.summarize_ratio_results(per_ratio)
+        self.assertEqual(compressible, 1)
+        self.assertEqual(best, 0.90)
+
+    def test_mixed_none_and_false_is_a_real_negative(self):
+        per_ratio = [{"ratio": 0.97, "passed": None}, {"ratio": 0.90, "passed": False}]
+        self.assertEqual(bc.summarize_ratio_results(per_ratio)[0], 0)
 
 
 class TestManifestIO(unittest.TestCase):

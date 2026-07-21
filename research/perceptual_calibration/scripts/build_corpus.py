@@ -266,6 +266,33 @@ def find_metric(report: dict[str, Any], *names: str) -> float | None:
     return None
 
 
+def measure_pair_id(row_index: int, ratio: float) -> str:
+    """Short, charset-safe pair id for measure_quality.py.
+
+    measure_quality enforces PAIR_ID_RE (alnum start, [A-Za-z0-9._-], <=64 chars) AND
+    requires the report filename stem to equal the pair id exactly - so the report must
+    be written as '<pair_id>.json'. clip_ids are too long and contain '__', so they
+    cannot be used directly.
+    """
+    return f"c{row_index:04d}r{('%g' % ratio).replace('.', 'p')}"
+
+
+def summarize_ratio_results(per_ratio: list[dict[str, Any]]) -> tuple[Any, float | None, str]:
+    """Collapse per-ratio measurements into a label: (compressible, best_ratio, note).
+
+    `compressible` is 1/0 ONLY when at least one ratio produced a real verdict. If every
+    ratio failed to encode or produced no usable VMAF, the row stays UNLABELED ("") - an
+    unavailable or failed measurement must never become a quality-negative.
+    """
+    verdicts = [r for r in per_ratio if r.get("passed") is not None]
+    if not verdicts:
+        return "", None, "no ratio produced a usable VMAF verdict; left unlabeled (not a quality-negative)"
+    passing = [r["ratio"] for r in verdicts if r["passed"]]
+    if passing:
+        return 1, min(passing), ""
+    return 0, None, ""
+
+
 def label_from_metrics(vmaf_mean: float | None, vmaf_p5: float | None,
                        vmaf_min: float | None, size_ratio: float | None) -> bool | None:
     """Passes the production window floors AND actually smaller? True/False.
@@ -558,9 +585,11 @@ def cmd_label(args) -> int:
                 if not encode_clip(ffmpeg, enc, pl_out, (w, h)):
                     per_ratio.append({"ratio": ratio, "error": "encode_failed"})
                     continue
-                report_path = work / f"{row['clip_id']}_pl{ratio}.vmaf.json"
+                # measure_quality requires report stem == pair id exactly.
+                pair_id = measure_pair_id(i, ratio)
+                report_path = work / f"{pair_id}.json"
                 mres = _run([sys.executable, str(measure), "--source", str(clip),
-                             "--output", str(pl_out), "--pair-id", f"c{i}r{ratio}",
+                             "--output", str(pl_out), "--pair-id", pair_id,
                              "--ffmpeg", ffmpeg, "--report", str(report_path)], timeout=3600)
                 if not report_path.exists():
                     per_ratio.append({"ratio": ratio, "error": "measure_failed",
@@ -582,17 +611,24 @@ def cmd_label(args) -> int:
                 if not args.keep_work:
                     pl_out.unlink(missing_ok=True)
 
-        measured_any = any("passed" in r for r in per_ratio)
-        compressible = ("" if not measured_any else (1 if best_pass is not None else 0))
-        if not measured_any and not note:
-            note = "all ratios failed to encode or measure; left unlabeled (not a quality-negative)"
+        # A verdict only counts when a ratio actually produced one; encode/measure
+        # failures leave the row UNLABELED rather than marking it a quality-negative.
+        compressible, summary_ratio, summary_note = summarize_ratio_results(per_ratio)
+        if summary_note and not note:
+            note = summary_note
+        if best_pass is None:
+            best_pass = summary_ratio
+        chosen = next((r for r in per_ratio if r.get("ratio") == best_pass), None)
+        if chosen is None:
+            chosen = next((r for r in per_ratio if r.get("passed") is not None), None)
         row.update({
             "ratios_tested": json.dumps(per_ratio),
             "best_pass_ratio": best_pass if best_pass is not None else "",
             "pl_vmaf_mean": best_metrics["mean"] if best_metrics["mean"] is not None else "",
             "pl_vmaf_p5": best_metrics["p5"] if best_metrics["p5"] is not None else "",
             "pl_vmaf_min": best_metrics["min"] if best_metrics["min"] is not None else "",
-            "pl_output_bytes": "", "pl_size_ratio": "",
+            "pl_output_bytes": "",
+            "pl_size_ratio": (chosen or {}).get("size_ratio") or "",
             "pl_classification": best_class, "compressible": compressible, "label_note": note,
         })
         if i % 10 == 0 or i == len(rows):
