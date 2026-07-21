@@ -614,6 +614,27 @@ def find_report_status(report: dict[str, Any]) -> Any:
 
 
 # --------------------------------------------------------------------------------------
+def default_measure_quality_path() -> str:
+    """Best-effort path to the repo's VMAF harness.
+
+    Must never raise: this is evaluated while the parser is built, so a failure here
+    would break *every* subcommand (not just `label`) whenever the script is copied
+    out of its repo location - e.g. vendored into a Colab working dir. Prefers the
+    in-repo path, then a sibling copy, then a bare filename for --measure-quality to
+    override.
+    """
+    here = Path(__file__).resolve()
+    parents = here.parents
+    if len(parents) > 3:  # <repo>/research/perceptual_calibration/scripts/this.py
+        candidate = parents[3] / "scripts" / "diagnostics" / "measure_quality.py"
+        if candidate.exists():
+            return str(candidate)
+    sibling = here.parent / "measure_quality.py"
+    if sibling.exists():
+        return str(sibling)
+    return "measure_quality.py"
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
@@ -645,9 +666,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     sp_label = sub.add_parser("label", help="attach offline VMAF ground-truth labels")
     sp_label.add_argument("--out", required=True)
-    sp_label.add_argument("--measure-quality",
-                          default=str(Path(__file__).resolve().parents[3]
-                                      / "scripts" / "diagnostics" / "measure_quality.py"),
+    sp_label.add_argument("--measure-quality", default=default_measure_quality_path(),
                           help="path to scripts/diagnostics/measure_quality.py")
     sp_label.add_argument("--pl-ratios", default="", help="comma list; default 0.97,0.95,0.90")
     sp_label.add_argument("--relabel", action="store_true", help="re-label already-labeled clips")

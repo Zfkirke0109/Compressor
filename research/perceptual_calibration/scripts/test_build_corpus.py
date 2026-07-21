@@ -6,6 +6,7 @@ These cover the accounting/planning that determines corpus size and diversity; t
 ffmpeg/ffprobe/libvmaf paths are integration-only and not exercised here.
 """
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -169,6 +170,46 @@ class TestMetricsAndLabel(unittest.TestCase):
     def test_label_unlabeled_on_missing(self):
         self.assertIsNone(bc.label_from_metrics(None, 92.0, 85.0, 0.9))
         self.assertIsNone(bc.label_from_metrics(96.0, 92.0, 85.0, None))
+
+
+class TestArgParserPortability(unittest.TestCase):
+    """Regression: the parser must build wherever the script lives.
+
+    The --measure-quality default was computed as Path(__file__).parents[3], which
+    raises IndexError when the script is copied somewhere shallower (e.g. /content/
+    tools/ on Colab). Because the default is evaluated while the parser is built, that
+    broke EVERY subcommand, not just `label`. Caught by the Colab ffmpeg smoke test.
+    """
+
+    def test_default_measure_quality_never_raises(self):
+        self.assertIsInstance(bc.default_measure_quality_path(), str)
+
+    def test_parser_builds_and_parses_each_subcommand(self):
+        p = bc.build_arg_parser()
+        self.assertEqual(p.parse_args(["plan", "--masters", "m"]).command, "plan")
+        self.assertEqual(p.parse_args(["build", "--masters", "m", "--out", "o"]).command, "build")
+        self.assertEqual(p.parse_args(["label", "--out", "o"]).command, "label")
+
+    def test_survives_shallow_script_location(self):
+        """The exact Colab layout that crashed: /content/tools/build_corpus.py.
+
+        Simulated by patching __file__ rather than copying to a temp dir - system temp
+        dirs are deep enough that parents[3] resolves, which would make this test
+        vacuous on Windows/macOS. A shallow root has only ~3 parents, so the old
+        parents[3] lookup raises IndexError here on every platform.
+        """
+        shallow = os.path.join(os.path.sep, "content", "tools", "build_corpus.py")
+        original = bc.__file__
+        try:
+            bc.__file__ = shallow
+            self.assertLess(len(Path(shallow).resolve().parents), 4,
+                            "test setup must actually be shallow or it proves nothing")
+            self.assertIsInstance(bc.default_measure_quality_path(), str)
+            parser = bc.build_arg_parser()  # must not raise IndexError
+            self.assertEqual(parser.parse_args(["plan", "--masters", "m"]).command, "plan")
+            self.assertEqual(parser.parse_args(["label", "--out", "o"]).command, "label")
+        finally:
+            bc.__file__ = original
 
 
 class TestManifestIO(unittest.TestCase):
