@@ -27,10 +27,35 @@ study plus a plan for the data the *next* round actually needs.
 ```
 scripts/prepare_dataset_v2.py   dataset hygiene + dedup -> model_rows_v2.csv
 scripts/run_study_v2.py         exhaustive grid + nested holdout + bootstrap
+scripts/build_corpus.py         build a bpp-diverse test corpus + offline VMAF labels
+scripts/test_build_corpus.py    unit tests for the corpus builder's pure logic
 notebooks/Compressor_Optuna_V2.ipynb   Colab driver
 REVIEW_FINDINGS.md              why the v1 candidate was rejected
 NEXT_ROUND_INSTRUMENTATION.md   what to change before the next capture round
 ```
+
+## Building a test corpus
+
+`build_corpus.py` addresses the root cause the review surfaced: the existing
+captures can't identify the thresholds because they lack headroom diversity. It
+cuts short, non-overlapping segments from a set of master videos and re-encodes
+each across a bits-per-pixel ladder (emphasizing the disputed [0.03, 0.069) band)
+and codec mix, producing controlled SOURCE clips. Its `label` phase re-encodes
+each clip perceptually-lossless-style and scores it with the repo's authoritative
+VMAF harness ([`measure_quality.py`](../../scripts/diagnostics/measure_quality.py))
+to attach a ground-truth "compressible?" label — treating any encoder/measurement
+failure as *unlabeled*, never as a quality-negative.
+
+```
+python scripts/build_corpus.py plan  --masters <dir>              # dry-run size/spread estimate
+python scripts/build_corpus.py build --masters <dir> --out <dir>  # needs ffmpeg + ffprobe
+python scripts/build_corpus.py label --out <dir>                  # needs ffmpeg w/ libvmaf
+```
+
+Needs `ffmpeg`/`ffprobe` (and libvmaf for `label`) on PATH — none are bundled. The
+pure planning/accounting logic is covered by `test_build_corpus.py`; the
+ffmpeg-dependent paths are integration-only. See `NEXT_ROUND_INSTRUMENTATION.md`
+§5 for why the corpus, not the optimizer, is the lever.
 
 The study reads a capture bundle's `all_jobs_normalized.csv` (produced from
 device logcat by

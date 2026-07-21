@@ -119,6 +119,13 @@ and codec/content mix. Short segments also match the app's own probe/cert window
 
 ### The key trick: manufacture headroom
 
+`scripts/build_corpus.py` automates exactly this (see the README). Point it at a
+directory of masters and it cuts short non-overlapping segments, re-encodes each
+across a bpp ladder that emphasizes the [0.03, 0.069) band, and — in its `label`
+phase — attaches an offline VMAF ground-truth "compressible?" verdict per clip via
+the repo's `measure_quality.py`. Start with `build_corpus.py plan --masters <dir>`
+for a size/spread estimate before encoding.
+
 For calibration you need **known-compressible** and **known-incompressible**
 examples spanning the bpp axis — especially the [0.03, 0.069) band the review
 flagged as unmeasured. The most valuable clips are ones where you control the
