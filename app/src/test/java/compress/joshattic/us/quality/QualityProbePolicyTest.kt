@@ -70,6 +70,39 @@ class QualityProbePolicyTest {
     }
 
     @Test
+    fun worstWindowShortfallMeasuresTheBindingMargin() {
+        // Bars are 95.5 / 91.0 / 84.0. A passing set has a non-positive shortfall.
+        assertTrue(QualityProbePolicy.worstWindowShortfall(listOf(good(), good()))!! <= 0.0)
+        // Fails by 2.0 on the mean (worst of the three), others passing.
+        val nearMiss = WindowScore(30, mean = 93.5, p5 = 92.0, min = 88.0)
+        assertEquals(2.0, QualityProbePolicy.worstWindowShortfall(listOf(good(), nearMiss))!!, 1e-9)
+        // The WORST window across the set wins.
+        val badP5 = WindowScore(30, mean = 97.0, p5 = 80.0, min = 88.0) // p5 short by 11
+        assertEquals(11.0, QualityProbePolicy.worstWindowShortfall(listOf(nearMiss, badP5))!!, 1e-9)
+        assertNull(QualityProbePolicy.worstWindowShortfall(null))
+        assertNull(QualityProbePolicy.worstWindowShortfall(emptyList()))
+    }
+
+    @Test
+    fun upwardRefinementOnlyFiresForARealNearMissBelowTheCeiling() {
+        val nearMiss = listOf(WindowScore(30, mean = 93.5, p5 = 92.0, min = 88.0)) // short by 2.0
+        val farMiss = listOf(WindowScore(30, mean = 85.0, p5 = 92.0, min = 88.0))  // short by 10.5
+        val exactBoundary = listOf(WindowScore(30, mean = 93.0, p5 = 92.0, min = 88.0)) // short by 2.5
+
+        // Near-miss at 0.95 -> retry at the 0.97 ceiling.
+        assertEquals(0.97, QualityProbePolicy.upwardRefinementCandidate(0.95, nearMiss)!!, 1e-9)
+        // Exactly at the margin still qualifies; a hair past it does not.
+        assertEquals(0.97, QualityProbePolicy.upwardRefinementCandidate(0.95, exactBoundary)!!, 1e-9)
+        assertNull(QualityProbePolicy.upwardRefinementCandidate(0.95, farMiss))
+        // Already at/above the ceiling: nowhere higher to go.
+        assertNull(QualityProbePolicy.upwardRefinementCandidate(0.97, nearMiss))
+        // A rung that actually passed has nothing to refine.
+        assertNull(QualityProbePolicy.upwardRefinementCandidate(0.95, listOf(good())))
+        // No measured scores -> cannot judge a near-miss -> no extra probe.
+        assertNull(QualityProbePolicy.upwardRefinementCandidate(0.95, null))
+    }
+
+    @Test
     fun onlyMeasuredScoredWindowsCountAsPixelCertified() {
         // Regression guard for QUAL-001's subtlety: "certification passed" is NOT "pixels proved it".
         val scored = PairScoreOutcome.Scored(listOf(good(), good()))
