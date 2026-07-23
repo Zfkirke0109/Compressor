@@ -163,9 +163,14 @@ data class BatchCompressorUiState(
     val batchMetrics: BatchMetricsSummary? = null,
     val deviceProfile: String = DeviceCapabilityProfiles.current().name,
     val hasHardwareAv1Encoder: Boolean = false,
+    // Source URIs of items a just-finished Perceptually Lossless batch honestly kept at original
+    // size, but that High Quality could actually shrink (see HighQualityRetryPolicy). Drives the
+    // post-batch "shrink these with High Quality?" offer. Empty except right after a PL batch.
+    val highQualityRetryCandidates: List<Uri> = emptyList(),
     val statusMessage: String? = null,
     val errorMessage: String? = null
 ) {
+    val highQualityRetryCount: Int get() = highQualityRetryCandidates.size
     val doneCount: Int get() = items.count { it.status == BatchItemStatus.Done || it.status == BatchItemStatus.Replaced || it.status == BatchItemStatus.SavedCopy }
     val failedCount: Int get() = items.count { it.status == BatchItemStatus.Failed }
     val skippedCount: Int get() = items.count { it.status == BatchItemStatus.Skipped || it.isAlreadyCompressed }
@@ -488,6 +493,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 it.copy(
                     items = items,
                     isLoading = false,
+                    highQualityRetryCandidates = emptyList(),
                     deviceProfile = DeviceCapabilityProfiles.current().name,
                     hasHardwareAv1Encoder = hasEncoder(MimeTypes.VIDEO_AV1),
                     statusMessage = when {
@@ -537,6 +543,53 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         }
     }
 
+    /**
+     * Source URIs of items the just-finished batch honestly kept at original size but that High
+     * Quality could actually shrink — feeds the post-batch "shrink these with High Quality?" offer.
+     * Only populated when the batch ran in Perceptually Lossless; every other mode returns empty.
+     * Pure and cheap (no codec queries), so it is safe to call inline on the completion update.
+     */
+    private fun highQualityRetryCandidatesFor(state: BatchCompressorUiState): List<Uri> {
+        val wasPerceptualLossless = qualityFromLabel(state.qualityPreset) == BatchQualityPreset.ORIGINAL
+        if (!wasPerceptualLossless) return emptyList()
+        return state.items.filter { item ->
+            HighQualityRetryPolicy.isEligible(
+                batchWasPerceptualLossless = true,
+                terminal = item.terminalResult,
+                sourceVideoBitrate = item.toSourceInfo().videoBitrate,
+                sourceHeight = item.originalHeight
+            )
+        }.map { it.sourceUri }
+    }
+
+    /**
+     * Re-run only the kept-original videos from the last Perceptually Lossless batch in High
+     * Quality — the honest lossy lever that trades a little quality for a real size reduction.
+     * Reuses the existing pipeline: it narrows the batch to the offered sources, switches the mode
+     * to High Quality, and starts a fresh run (which resets and processes them). Originals are never
+     * touched here; only new output files are produced. A no-op while a batch is running.
+     */
+    fun retryUnshrunkAsHighQuality(context: Context) {
+        val current = _uiState.value
+        if (current.isCompressing || compressionJob?.isCompleted == false) return
+        val candidateUris = current.highQualityRetryCandidates.toSet()
+        if (candidateUris.isEmpty()) return
+        val subset = current.items.filter { it.sourceUri in candidateUris }
+        if (subset.isEmpty()) return
+        _uiState.update {
+            it.copy(
+                items = subset,
+                qualityPreset = BatchQualityPreset.HIGH.label,
+                selectedPreset = null,
+                highQualityRetryCandidates = emptyList(),
+                batchMetrics = null,
+                errorMessage = null,
+                statusMessage = "Re-running ${subset.size} video${if (subset.size == 1) "" else "s"} in High Quality…"
+            )
+        }
+        startCompression(context)
+    }
+
     fun startCompression(context: Context) {
         val current = _uiState.value
         if (current.items.isEmpty() || current.isCompressing || compressionJob?.isCompleted == false) return
@@ -556,6 +609,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     isCompressing = true,
                     errorMessage = null,
                     batchMetrics = null,
+                    highQualityRetryCandidates = emptyList(),
                     statusMessage = "Compressing with thermal-safe batch pacing."
                 )
             }
@@ -1449,6 +1503,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     it.copy(
                         isCompressing = false,
                         batchMetrics = metrics,
+                        highQualityRetryCandidates = highQualityRetryCandidatesFor(it),
                         statusMessage = "Finished ${it.doneCount} output${if (it.doneCount == 1) "" else "s"}. " +
                             "Real compressions: ${accounting.realCompressionCount}. " +
                             "Saved ${formatFileSize(accounting.totalBytesSaved)} by real compression.",
