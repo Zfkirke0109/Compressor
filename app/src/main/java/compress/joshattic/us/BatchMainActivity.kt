@@ -181,6 +181,14 @@ private fun BatchCompressorScreen(
                 state.batchMetrics?.let { metrics ->
                     item { BatchMetricsCard(metrics) }
                 }
+                if (!state.isCompressing && state.highQualityRetryCount > 0) {
+                    item {
+                        HighQualityRetryCard(
+                            count = state.highQualityRetryCount,
+                            onRetry = { viewModel.retryUnshrunkAsHighQuality(context) }
+                        )
+                    }
+                }
             }
 
             state.statusMessage?.let { message ->
@@ -251,6 +259,40 @@ private fun BatchCompressorScreen(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+            }
+        }
+    }
+}
+
+/**
+ * Post-batch offer shown after a Perceptually Lossless run that honestly kept some videos at
+ * original size. High Quality is the honest lossy lever that can actually shrink those; tapping
+ * re-runs only the offered videos in High Quality (see [BatchCompressorViewModel.retryUnshrunkAsHighQuality]).
+ */
+@Composable
+private fun HighQualityRetryCard(count: Int, onRetry: () -> Unit) {
+    val many = count != 1
+    OutlinedCard(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(
+                "Want the rest smaller?",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSecondaryContainer
+            )
+            Text(
+                "$count ${if (many) "videos were" else "video was"} kept at original quality — " +
+                    "Perceptually Lossless couldn't shrink ${if (many) "them" else "it"} without visible change. " +
+                    "High Quality can re-encode ${if (many) "them" else "it"} smaller at the same resolution and " +
+                    "frame rate, for a small quality trade.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSecondaryContainer
+            )
+            Button(onClick = onRetry, modifier = Modifier.fillMaxWidth()) {
+                Text("Shrink $count with High Quality")
             }
         }
     }
