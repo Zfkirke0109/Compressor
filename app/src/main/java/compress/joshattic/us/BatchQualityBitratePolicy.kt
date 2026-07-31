@@ -363,7 +363,11 @@ object BatchQualityBitratePolicy {
                     source.height >= 720 -> 2_500_000
                     else -> 1_000_000
                 }
-                (originalVideoBitrate * ratio).toInt().coerceIn(floor, originalVideoBitrate)
+                // Clamp the floor to at most the source bitrate before coerceIn: an already-
+                // below-floor source (e.g. a 1080p clip at 3 Mbps, floor 5 Mbps) would otherwise
+                // make min > max and throw. This resolves to "no shrink" (target = source).
+                (originalVideoBitrate * ratio).toInt()
+                    .coerceIn(floor.coerceAtMost(originalVideoBitrate), originalVideoBitrate)
             }
             BatchQualityMode.STORAGE_SAVER -> {
                 val ratio = 0.42f * fpsScale * heightScale
@@ -373,7 +377,10 @@ object BatchQualityBitratePolicy {
                     outputHeight >= 720 -> 1_800_000
                     else -> 900_000
                 }
-                (originalVideoBitrate * ratio).toInt().coerceIn(floor, originalVideoBitrate)
+                // Same guard as High Quality: clamp the floor to at most the source bitrate so an
+                // already-below-floor source resolves to "no shrink" instead of throwing on coerceIn.
+                (originalVideoBitrate * ratio).toInt()
+                    .coerceIn(floor.coerceAtMost(originalVideoBitrate), originalVideoBitrate)
             }
             BatchQualityMode.REMUX_ONLY -> originalVideoBitrate
         }
