@@ -30,6 +30,20 @@ object HighQualityRetryPolicy {
     // the file would not get meaningfully smaller. 0.15 keeps the offer to clearly worthwhile wins.
     const val MIN_HEADROOM_FRACTION = 0.15
 
+    // Large-file escape hatch. A modest RELATIVE reduction on a big file is still a big win, and
+    // the 0.15 bar alone silently dropped those. Measured on the 2026-07-31 S23 batch: a 471.9 MB
+    // 4K clip (13.49 Mbps video, floor-clamped target 12 Mbps = 89.0% of source) fell just under
+    // the relative bar at 11.0% predicted, yet really saved 50.7 MB. So an offer also qualifies
+    // when the PREDICTED absolute saving is substantial and the relative cut is still non-trivial.
+    //
+    // These are OFFER-POLICY knobs only: they decide which already-kept files we SUGGEST re-running
+    // in High Quality. They do not move any bitrate floor, ratio, or encode target — a file that is
+    // offered still encodes under exactly the same quality policy as before.
+    const val MIN_ABSOLUTE_SAVING_BYTES = 25L * 1024L * 1024L
+    // Floor for the absolute path: never trade real quality + minutes of encoding for a trivial
+    // relative cut just because the source file happens to be huge.
+    const val MIN_HEADROOM_FRACTION_FOR_LARGE_FILES = 0.10
+
     /**
      * High Quality's target video bitrate for a same-resolution, same-FPS retry, in bits/sec.
      * Mirrors the encoder's HIGH_QUALITY branch but GUARDS the floor against exceeding the source
@@ -51,15 +65,36 @@ object HighQualityRetryPolicy {
     }
 
     /**
-     * True when High Quality would actually make this source meaningfully smaller — its target
-     * video bitrate clears the [MIN_HEADROOM_FRACTION] margin below the source. Unknown source
-     * bitrate fails closed (no honest estimate is possible).
+     * The fraction of the source video bitrate High Quality would cut for a same-resolution,
+     * same-FPS retry: 0.0 when the floor has eaten the entire saving (target == source), up to
+     * ~0.28 for healthy sources. Returns 0.0 when the source bitrate is unknown.
      */
-    fun highQualityWouldShrink(sourceVideoBitrate: Int, sourceHeight: Int): Boolean {
-        if (sourceVideoBitrate <= 0) return false
+    fun predictedSavingFraction(sourceVideoBitrate: Int, sourceHeight: Int): Double {
+        if (sourceVideoBitrate <= 0) return 0.0
         val target = highQualityTargetVideoBitrate(sourceVideoBitrate, sourceHeight)
-        if (target <= 0) return false
-        return target <= sourceVideoBitrate * (1.0 - MIN_HEADROOM_FRACTION)
+        if (target <= 0) return 0.0
+        return (1.0 - target.toDouble() / sourceVideoBitrate.toDouble()).coerceIn(0.0, 1.0)
+    }
+
+    /**
+     * True when High Quality would actually make this source meaningfully smaller. Qualifies two
+     * ways: a clearly worthwhile RELATIVE cut ([MIN_HEADROOM_FRACTION]), or a still-non-trivial cut
+     * ([MIN_HEADROOM_FRACTION_FOR_LARGE_FILES]) that yields a substantial ABSOLUTE saving
+     * ([MIN_ABSOLUTE_SAVING_BYTES]) because the file is large.
+     *
+     * Note both paths key off the same predicted fraction, so a source whose floor leaves NO
+     * headroom (fraction 0.0 — exactly the case that produces bigger-than-source output) can never
+     * qualify through either path, no matter how large the file is. Unknown source bitrate or size
+     * fails closed: without an honest estimate we do not promise a shrink.
+     */
+    fun highQualityWouldShrink(sourceVideoBitrate: Int, sourceHeight: Int, sourceSizeBytes: Long): Boolean {
+        val fraction = predictedSavingFraction(sourceVideoBitrate, sourceHeight)
+        if (fraction <= 0.0) return false
+        if (fraction >= MIN_HEADROOM_FRACTION) return true
+        if (sourceSizeBytes <= 0L) return false
+        val predictedSaving = sourceSizeBytes * fraction
+        return fraction >= MIN_HEADROOM_FRACTION_FOR_LARGE_FILES &&
+            predictedSaving >= MIN_ABSOLUTE_SAVING_BYTES
     }
 
     /**
@@ -91,9 +126,10 @@ object HighQualityRetryPolicy {
         batchWasPerceptualLossless: Boolean,
         terminal: BatchTerminalResult?,
         sourceVideoBitrate: Int,
-        sourceHeight: Int
+        sourceHeight: Int,
+        sourceSizeBytes: Long
     ): Boolean =
         batchWasPerceptualLossless &&
             terminalIsRetryCandidate(terminal) &&
-            highQualityWouldShrink(sourceVideoBitrate, sourceHeight)
+            highQualityWouldShrink(sourceVideoBitrate, sourceHeight, sourceSizeBytes)
 }

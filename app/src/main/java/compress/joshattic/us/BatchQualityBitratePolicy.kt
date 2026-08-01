@@ -307,6 +307,72 @@ object BatchQualityBitratePolicy {
         else -> null
     }
 
+    /**
+     * True when a LOSSY mode's computed target video bitrate cannot beat the source at all, so the
+     * encode is arithmetically incapable of producing a smaller file and is pure wasted work.
+     *
+     * This happens when a source already sits at or below its resolution's bitrate floor: the floor
+     * clamps the target back up to the source bitrate, the encode runs at full cost, and the output
+     * comes out the same size or LARGER — it is then correctly discarded and the original kept.
+     * Measured on the 2026-07-31 S23 batch: 11 such clips burned 7.9 minutes to produce 25 MB of
+     * bigger-than-source output, every one of them a below-floor source.
+     *
+     * Honest-skip semantics only. It reports "this mode cannot reduce this source", which is the
+     * same verdict the pipeline reaches AFTER the encode — it just reaches it without spending the
+     * encode. Deliberately narrow so it can never suppress work the user actually wanted:
+     *  - Perceptually Lossless / Remux Only are excluded outright (they have their own probe and
+     *    stream-copy paths; only the explicitly-lossy modes are considered here).
+     *  - An unknown source bitrate FAILS OPEN (returns false) — with no honest estimate, the encode
+     *    still runs and the real measured result decides.
+     *  - A REQUESTED TRANSFORM IS NEVER DENIED. An FPS cap or a resolution reduction is something
+     *    the user asked for in its own right (a Storage Saver 4K->1080p/30fps output is the point,
+     *    not merely a smaller number of bytes). Whenever [outputFps] caps the source or
+     *    [outputHeight] differs from the source height, this returns false and the encode runs.
+     *  - ORIENTATION-CONSERVATIVE. The lossy floor tables key off raw `source.height`, which
+     *    mis-tiers portrait clips (a 1080x1920 clip is 1080p-class, but height 1920 selects the
+     *    1440p tier). The verdict is therefore re-checked against an orientation-normalized source
+     *    (short edge as height); a mis-tier can then only make this guard fire LESS often. Note
+     *    this deliberately does NOT change any floor — it only refuses to skip on a doubtful tier.
+     */
+    fun lossyTargetHasNoHeadroom(
+        source: VideoSourceInfo,
+        mode: BatchQualityMode,
+        outputMimeType: String,
+        outputFps: Int? = null,
+        outputHeight: Int = source.height
+    ): Boolean {
+        if (mode != BatchQualityMode.HIGH_QUALITY && mode != BatchQualityMode.STORAGE_SAVER) return false
+        val sourceVideoBitrate = source.videoBitrate
+        if (sourceVideoBitrate <= 0) return false
+        // Never deny a transformation the user explicitly asked for.
+        if (outputFps != null) return false
+        if (source.height <= 0 || outputHeight != source.height) return false
+
+        val target = calculateVideoBitrate(
+            source = source,
+            mode = mode,
+            outputMimeType = outputMimeType,
+            outputFps = null,
+            outputHeight = outputHeight
+        )
+        if (target < sourceVideoBitrate) return false
+
+        // Re-check on the orientation-normalized source: if the clip's short edge puts it in a
+        // lower floor tier, the encode may still have real headroom and must not be skipped.
+        val normalized = source.copy(
+            width = maxOf(source.width, source.height),
+            height = minOf(source.width, source.height).coerceAtLeast(1)
+        )
+        val conservativeTarget = calculateVideoBitrate(
+            source = normalized,
+            mode = mode,
+            outputMimeType = outputMimeType,
+            outputFps = null,
+            outputHeight = normalized.height
+        )
+        return conservativeTarget >= sourceVideoBitrate
+    }
+
     fun calculateVideoBitrate(
         source: VideoSourceInfo,
         mode: BatchQualityMode,

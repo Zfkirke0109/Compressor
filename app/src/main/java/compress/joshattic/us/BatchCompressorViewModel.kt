@@ -557,7 +557,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 batchWasPerceptualLossless = true,
                 terminal = item.terminalResult,
                 sourceVideoBitrate = item.toSourceInfo().videoBitrate,
-                sourceHeight = item.originalHeight
+                sourceHeight = item.originalHeight,
+                sourceSizeBytes = item.originalSize
             )
         }.map { it.sourceUri }
     }
@@ -825,6 +826,74 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     if (perceptualPlan?.preferRemux == true) {
                         effectiveQuality = BatchQualityPreset.REMUX_ONLY
                         preEncodeRemuxNote = perceptualPlan.remuxReason
+                    }
+                    // Doomed-encode guard for the LOSSY modes. When the source already sits at or
+                    // below its resolution's bitrate floor, the floor clamps the target back up to
+                    // the source bitrate, so the encode cannot produce a smaller file — it burns
+                    // full encode time and yields a same-or-larger output that is then discarded.
+                    // Reaching that same honest verdict up front keeps the original and skips the
+                    // wasted work (measured: 11 clips, 7.9 min, +25 MB of discarded output on the
+                    // 2026-07-31 S23 batch). Fails open on unknown bitrate; PL/Remux are excluded
+                    // inside the policy, so this can never divert a Perceptually Lossless decision.
+                    // Only a PURE BITRATE re-encode may be skipped. If the user explicitly chose an
+                    // output codec, the transcode itself is the thing they asked for and its output
+                    // is delivered to them as a copy even when it is not smaller — so skipping it
+                    // would silently withhold a requested result. Under Auto the app picks the codec
+                    // itself, so nothing the user asked for is lost. (FPS caps and resolution changes
+                    // are excluded inside lossyTargetHasNoHeadroom for the same reason.)
+                    if (codec == BatchCodecOption.AUTO &&
+                        effectiveQuality != BatchQualityPreset.REMUX_ONLY && resolvedMime != null &&
+                        BatchQualityBitratePolicy.lossyTargetHasNoHeadroom(
+                            source = item.toSourceInfo(),
+                            mode = effectiveQuality.toMode(),
+                            outputMimeType = resolvedMime,
+                            outputFps = plannedFps,
+                            outputHeight = targetHeightFor(item, effectiveQuality)
+                        )
+                    ) {
+                        // Keep the original and write NOTHING — deliberately the same
+                        // no-output shape as the SKIPPED_WOULD_DEGRADE path above, NOT a
+                        // switch to Remux Only. Routing these into the remux stream copy would
+                        // expose non-MP4 sources (e.g. the MKV/AV1 clips in real libraries) to a
+                        // muxer that cannot carry them, turning a merely-wasteful encode into an
+                        // outright failure. Nothing is re-encoded, copied, or replaced here.
+                        val skipMessage =
+                            "Already efficient for ${quality.label}: this video's bitrate is already at or " +
+                                "below the quality floor for its resolution, so re-encoding could not make it " +
+                                "smaller. Original kept unchanged."
+                        Log.i(
+                            "CompressorBatch",
+                            "doomed-encode skip; job=${diagnosticJobId(item)}; mode=${quality.label}; " +
+                                "sourceVideoBitrate=${item.toSourceInfo().videoBitrate}; encode skipped, original kept"
+                        )
+                        recordDiagnosticJob(
+                            diagnostics = diagnostics,
+                            item = item,
+                            requestedQuality = quality,
+                            effectiveQuality = quality,
+                            resolvedMime = resolvedMime,
+                            plannedTargetRatio = null,
+                            plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
+                            plannedDecisionReason = "lossy target has no headroom below the source bitrate",
+                            wasStreamCopy = false,
+                            verification = null,
+                            outputSize = 0L,
+                            terminal = BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED,
+                            elapsedMs = System.currentTimeMillis() - itemStartedAt,
+                            precedingCooldownMs = precedingHandoffCooldownMs
+                        )
+                        updateItem(index) {
+                            it.copy(
+                                status = BatchItemStatus.Skipped,
+                                progress = 1f,
+                                currentOutputSize = 0L,
+                                targetOutputSize = 0L,
+                                outputSize = 0L,
+                                terminalResult = BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED,
+                                message = skipMessage
+                            )
+                        }
+                        return@forEachIndexed
                     }
                     // Keep-original remux FAST PATH (perf/remux-keep-original-fast-path): when the
                     // pipeline has already DECIDED to keep the original bytes, and the audited
