@@ -314,42 +314,49 @@ object OutputVerifier {
         // floor was the SOLE failure: that specific case may be re-judged by sampled pixel
         // certification (measured pixels outrank the inferred floor), and a measured pass
         // re-verifies here with a pixel-proven floor. Every other failure stays terminal.
-        val perceptuallyLosslessVerifiedExceptVideoBitrate = playable &&
-            criticalFieldsComplete &&
-            durationMatches &&
-            frameCountMatches &&
-            videoMatches &&
-            fpsComparison == VerificationTransitionStatus.MATCH &&
-            hdrMatches &&
-            standardMatches &&
-            rangeMatches &&
-            audioCodecMatches &&
-            audioShapeMatches &&
-            audioBitratePass &&
-            rotationMatches &&
-            locationMatches &&
-            mediaStoreDateMatches &&
-            mp4DateMatches
+        // Single source of truth for every verdict AND its failure diagnostic. Previously these
+        // were separate: the verdict was an inline && chain here, while the diagnostic was
+        // reconstructed by scanning rendered display text for a "warn" suffix. Seven predicates
+        // render no such suffix, so they failed invisibly — a real device produced
+        // "Remux Verification Failed" with "failing=none-identified". Deriving both from
+        // VerificationChecks makes that divergence unrepresentable.
+        val checks = VerificationChecks(
+            playable = playable,
+            criticalFieldsComplete = criticalFieldsComplete,
+            durationMatches = durationMatches,
+            frameCountMatches = frameCountMatches,
+            videoMatches = videoMatches,
+            fpsMatches = fpsComparison == VerificationTransitionStatus.MATCH,
+            videoCodecMatches = videoCodecMatches,
+            audioCodecMatches = audioCodecMatches,
+            audioShapeMatches = audioShapeMatches,
+            audioBitratePass = audioBitratePass,
+            hdrMatches = hdrMatches,
+            standardMatches = standardMatches,
+            rangeMatches = rangeMatches,
+            rotationMatches = rotationMatches,
+            locationMatches = locationMatches,
+            mediaStoreDateMatches = mediaStoreDateMatches,
+            mp4DateMatches = mp4DateMatches,
+            videoBitratePass = bitratePass
+        )
 
-        val perceptuallyLosslessVerified = perceptuallyLosslessVerifiedExceptVideoBitrate && bitratePass
+        val perceptuallyLosslessVerifiedExceptVideoBitrate =
+            checks.passes(VerificationChecks.Scope.PERCEPTUAL_LOSSLESS_EXCEPT_VIDEO_BITRATE)
 
-        val remuxVerified = playable &&
-            criticalFieldsComplete &&
-            durationMatches &&
-            frameCountMatches &&
-            videoMatches &&
-            fpsComparison == VerificationTransitionStatus.MATCH &&
-            videoCodecMatches &&
-            audioCodecMatches &&
-            audioShapeMatches &&
-            audioBitratePass &&
-            hdrMatches &&
-            standardMatches &&
-            rangeMatches &&
-            rotationMatches &&
-            locationMatches &&
-            mediaStoreDateMatches &&
-            mp4DateMatches
+        val perceptuallyLosslessVerified =
+            checks.passes(VerificationChecks.Scope.PERCEPTUAL_LOSSLESS)
+
+        val remuxVerified = checks.passes(VerificationChecks.Scope.REMUX)
+
+        // The failing predicates for the mode actually being judged, straight from the same
+        // structure that produced the verdict above.
+        val failedChecks = when (input.mode) {
+            BatchQualityMode.REMUX_ONLY -> checks.failures(VerificationChecks.Scope.REMUX)
+            BatchQualityMode.PERCEPTUAL_LOSSLESS ->
+                checks.failures(VerificationChecks.Scope.PERCEPTUAL_LOSSLESS)
+            else -> emptyList()
+        }
 
         val outputWithinTolerance = input.sourceSize <= 0L ||
             input.outputSize <= (input.sourceSize * (1.0 + BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_SIZE_TOLERANCE)).toLong()
@@ -443,6 +450,7 @@ object OutputVerifier {
             replacementSafe = replacementSafe,
             replacementBlockReason = blockReason,
             criticalFieldsComplete = criticalFieldsComplete,
+            failedChecks = failedChecks,
             verified = when (input.mode) {
                 BatchQualityMode.REMUX_ONLY -> remuxVerified
                 BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance

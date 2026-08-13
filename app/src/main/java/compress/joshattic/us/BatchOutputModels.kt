@@ -120,7 +120,11 @@ data class OutputVerificationReport(
     // certification was merely unavailable (decoder/geometry/alignment failure) and the encode was
     // accepted structurally at the codec-default ratio. Defaults false so any path that does not
     // explicitly prove pixels stays honest — the "Verified" wording is chosen from this flag.
-    val pixelCertified: Boolean = false
+    val pixelCertified: Boolean = false,
+    // The predicate names that actually failed, taken from the SAME [VerificationChecks] instance
+    // that produced [verdict]. Authoritative — [failingChecks] prefers it over any reconstruction.
+    // Empty on a pass, and empty on legacy/synthetic reports built without it.
+    val failedChecks: List<String> = emptyList()
 ) {
     /**
      * Names of the per-field checks that did NOT pass, for diagnosing a rejection.
@@ -135,26 +139,46 @@ data class OutputVerificationReport(
      * diagnostic that disagrees with the verdict is worse than none. Fields that carry no status
      * suffix (free-text metadata lines) simply never appear.
      */
-    fun failingChecks(): List<String> = buildList {
-        fun check(name: String, rendered: String) {
-            if (rendered.trimEnd().endsWith("warn")) add(name)
+    fun failingChecks(): List<String> {
+        // Authoritative path: the predicates the verdict itself was computed from.
+        if (failedChecks.isNotEmpty()) return failedChecks
+
+        // Fallback for reports built without [failedChecks] (legacy records, synthetic fixtures).
+        // It must recognise the three ways a failure hides in rendered text, because scanning only
+        // for a "warn" suffix is exactly what produced "failing=none-identified" on-device:
+        //   1. a "warn" status suffix          - the obvious case
+        //   2. the literal "unverified"        - what the date/location labels say on failure
+        //   3. a transition with no suffix     - NOT_EXPOSED renders "a -> b" with neither ok nor
+        //      warn, yet anything other than MATCH fails the verdict
+        // Purely informational fields (videoBitrate, fileSize) carry no status and are excluded;
+        // flagging them would bury the real cause in noise.
+        return buildList {
+            fun suffixed(name: String, rendered: String) {
+                if (rendered.trimEnd().endsWith("warn")) add(name)
+            }
+            fun labelled(name: String, rendered: String) {
+                if (rendered.trim().equals("unverified", ignoreCase = true)) add(name)
+            }
+            fun transition(name: String, rendered: String) {
+                val t = rendered.trimEnd()
+                if (t.endsWith("warn")) add(name)
+                else if (t.contains("->") && !t.endsWith("ok")) add(name)
+            }
+            suffixed("video", video)
+            transition("fps", fps)
+            suffixed("videoCodec", videoCodec)
+            suffixed("audioCodec", audioCodec)
+            suffixed("audioDetails", audioDetails)
+            suffixed("audioBitrate", audioBitrate)
+            suffixed("hdr", hdr)
+            suffixed("colorStandard", colorStandard)
+            suffixed("colorRange", colorRange)
+            suffixed("rotation", rotation)
+            suffixed("durationParity", durationParity)
+            labelled("mediaStoreDate", mediaStoreDate)
+            labelled("mp4Date", mp4Date)
+            labelled("location", location)
         }
-        check("video", video)
-        check("fps", fps)
-        check("videoBitrate", videoBitrate)
-        check("videoCodec", videoCodec)
-        check("audioCodec", audioCodec)
-        check("audioDetails", audioDetails)
-        check("audioBitrate", audioBitrate)
-        check("hdr", hdr)
-        check("colorStandard", colorStandard)
-        check("colorRange", colorRange)
-        check("rotation", rotation)
-        check("fileSize", fileSize)
-        check("durationParity", durationParity)
-        check("mediaStoreDate", mediaStoreDate)
-        check("mp4Date", mp4Date)
-        check("location", location)
     }
 
     val summaryLines: List<String>
