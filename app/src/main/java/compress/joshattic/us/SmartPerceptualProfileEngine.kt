@@ -25,10 +25,24 @@ import androidx.media3.common.MimeTypes
  */
 class SmartPerceptualProfileEngine(private val store: ProfileStore) {
 
-    /** Minimal key/value storage so the learning core is unit-testable without Android. */
+    /**
+     * Minimal key/value storage so the learning core is unit-testable without Android.
+     *
+     * [snapshot] and [clear] exist for experiment control, not for the app's own use. Learned
+     * profile state persists across runs and silently changes what later runs do — two 219-job
+     * captures differed in probe counts and runtime partly because the second inherited
+     * measured-rejection latches from the first, which makes them non-comparable as an A/B.
+     * An experiment must be able to record the state it started from and reset between arms.
+     */
     interface ProfileStore {
         fun read(key: String): String?
         fun write(key: String, value: String)
+
+        /** Every stored entry, for recording an experiment's starting state. */
+        fun snapshot(): Map<String, String>
+
+        /** Remove all learned state, so an arm starts from a known-empty baseline. */
+        fun clear()
     }
 
     class InMemoryProfileStore : ProfileStore {
@@ -37,6 +51,9 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         override fun write(key: String, value: String) {
             values[key] = value
         }
+
+        override fun snapshot(): Map<String, String> = values.toMap()
+        override fun clear() = values.clear()
     }
 
     class SharedPreferencesProfileStore(context: Context) : ProfileStore {
@@ -47,7 +64,44 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         override fun write(key: String, value: String) {
             prefs.edit().putString(key, value).apply()
         }
+
+        override fun snapshot(): Map<String, String> =
+            prefs.all.entries.mapNotNull { (k, v) -> (v as? String)?.let { k to it } }.toMap()
+
+        // commit(), not apply(): an experiment arm must not start until the reset is on disk.
+        @Suppress("ApplySharedPref")
+        override fun clear() {
+            prefs.edit().clear().commit()
+        }
     }
+
+    /**
+     * Learned state as it stands right now, for an experiment record. Keys are technical buckets
+     * only (manufacturer/model/SDK/codec/resolution/fps/HDR/bitrate class), never file paths or
+     * per-file identifiers, so a snapshot is safe to attach to a report.
+     */
+    fun snapshotLearnedState(): Map<String, String> = store.snapshot()
+
+    /**
+     * A short stable fingerprint of the learned state, so a report can prove two arms started
+     * from equivalent state without embedding the whole map. Order-independent.
+     */
+    fun learnedStateIdentity(): String {
+        val entries = store.snapshot()
+        if (entries.isEmpty()) return "empty"
+        val digest = entries.entries
+            .sortedBy { it.key }
+            .joinToString(";") { "${it.key}=${it.value}" }
+            .hashCode()
+        return "n=${entries.size},h=${Integer.toHexString(digest)}"
+    }
+
+    /**
+     * Reset every learned profile. Destructive and irreversible for the caller, so
+     * [snapshotLearnedState] first if the prior state matters. Intended for experiment setup, and
+     * exposed on device only through a debug-build receiver.
+     */
+    fun resetLearnedState() = store.clear()
 
     /**
      * Technical (non-private) bucketed description of one device + source + encoder combination.
