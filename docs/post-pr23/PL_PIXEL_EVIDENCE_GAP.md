@@ -67,6 +67,35 @@ frame-rate-converts either input" and scores with plain `vmaf_v0.6.1`. Every thr
 the high-frequency coding artifacts the thresholds exist to catch — an invisible loosening of
 the bar disguised as a performance optimization.
 
+### Open question: is `vmaf_v0.6.1` the right model at 4K?
+
+This change scores native 4K frames with the **1080p-trained** default model. That is off-label:
+Netflix's guidance for 4K material is `vmaf_4k_v0.6.1`, trained on 4K displays at 1.5x height.
+`vmaf_jni.c` loads `vmaf_v0.6.1` only (optionally with `VMAF_MODEL_FLAG_ENABLE_TRANSFORM` for the
+phone variant, which `VmafPairScorer` deliberately leaves off because the transform maps scores
+upward).
+
+What makes the current choice defensible is *consistency*, not model-correctness: the offline
+harness does exactly the same thing, so on-device and offline scores remain comparable and the
+calibrated thresholds keep their meaning. Whether that shared choice is the right one for 4K is
+unresolved, and the bias direction has not been measured. Do not assume it is conservative.
+
+Resolving it means scoring the same 4K pairs under `vmaf_v0.6.1` and `vmaf_4k_v0.6.1` offline and
+comparing against the window thresholds. If the models disagree materially, the thresholds and
+both harnesses have to move together — never the on-device scorer alone.
+
+### Related gap: VMAF is weak on banding
+
+VMAF is known to under-weight contrast banding, which is the signature artifact of re-encoding
+smooth gradients (skies, walls, fades) at exactly the conservative bitrates Smart PL targets. A
+clip can clear 95.5 / 91.0 / 84.0 and still show visible banding.
+
+CAMBI (Contrast Aware Multiscale Banding Index) is built into libvmaf from 2.2 onward, and
+`vmaf_jni.c` already links **libvmaf v3.0.0** — so the feature is compiled into the shipped
+binary and simply never registered; the JNI only calls `vmaf_use_features_from_model`. Adding it
+is a native change plus its own threshold calibration, so it is a separate piece of work, but it
+needs no new dependency.
+
 ### Why this cannot weaken a verdict
 
 For newly-covered geometry the change is monotone in the honest direction:
