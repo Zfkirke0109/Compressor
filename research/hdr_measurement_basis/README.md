@@ -81,20 +81,42 @@ Independent spot-checks against published values:
 Resulting sensitivity on a 100-nit neutral patch: 1% luminance error ≈ 0.72 JND
 (sub-threshold), 5% ≈ 3.53 JND (clearly visible). 1 JND falls near a 1.4% error.
 
-**Not yet implemented:** the frame-extraction layer — ffmpeg decode of an HDR pair to
-linear BT.2020 RGB, PTS-aligned window sampling, and fail-closed colour-metadata
-validation (refuse when transfer/primaries disagree between the two files, rather than
-silently comparing across colour spaces). It should follow the structure of
-`measure_quality.py`: pure command-construction and validation logic unit-tested, the
-subprocess path integration-only. No ffmpeg was available in the session that wrote this,
-so nothing of that layer is stubbed in rather than shipped untested.
+**Extraction layer — implemented and verified:**
+
+- `scripts/hdr_pair_measure.py` — decodes matched windows of two HDR files to linear BT.2020
+  RGB and reports per-window ΔE<sub>ITP</sub> and PU21-PSNR as JSON.
+- `scripts/test_hdr_pair_measure.py` — **12 tests, all passing**, covering the fail-closed
+  validation and the exact ffmpeg invocation.
+- `python3 hdr_pair_measure.py --self-test` — synthesizes a PQ/BT.2020 pair with ffmpeg and
+  measures it end to end. Identical inputs score **exactly 0.000000**; a deliberately bad
+  encode scores far higher. This caught a real bug on its first run: the `scale` filter takes
+  `in_color_matrix=bt2020`, not `bt2020nc` (the `-colorspace`/ffprobe spelling for the same
+  matrix), which fails with an unhelpful "Undefined constant" error.
+
+Requires `ffmpeg` and `ffprobe` on PATH. The self-test path needs only ffmpeg and falls back to
+the `imageio-ffmpeg` static build.
+
+What it refuses to do, deliberately:
+
+- **HLG is rejected, not measured.** Its EOTF is a different curve; applying the PQ curve would
+  produce confident, wrong numbers instead of an error.
+- **SDR is redirected** to `measure_quality.py`, which has a validated VMAF path.
+- **Nothing is rescaled, tone-mapped, or transfer-converted.** A geometry, transfer, or
+  primaries mismatch fails the run rather than being papered over, and a test asserts the
+  decode command contains no `tonemap` / `zscale` / transfer conversion.
+- **The report carries `"verdict": null`.** No calibrated HDR threshold exists yet, so it states
+  measurements and refuses to imply a pass.
+
+Window sampling mirrors `QualityProbePolicy.probeWindows` (20/50/80% of the clip, 1.2 s each),
+so offline numbers and on-device numbers describe the same parts of a clip.
 
 ## What must be true before ANY production change
 
 This tooling measures; it does not authorize. Before a single HDR clip is re-encoded by
 Smart Perceptually Lossless:
 
-1. The extraction layer exists and is validated on known pairs.
+1. ~~The extraction layer exists and is validated on known pairs.~~ **Done** — but validated
+   only against synthetic clips so far, never against real S23 Ultra HDR footage.
 2. A corpus of real HDR camera clips is measured across a bitrate ladder, giving a
    ΔE<sub>ITP</sub> distribution for HDR re-encodes at each ratio.
 3. A threshold is derived from that distribution — including what fraction of the frame
