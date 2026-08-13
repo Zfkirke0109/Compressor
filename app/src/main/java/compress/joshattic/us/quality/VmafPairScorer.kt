@@ -16,8 +16,45 @@ data class WindowScore(
     val min: Double,
     // Pairing diagnostics for the window (null on legacy/synthetic scores). Telemetry only:
     // never consulted by any pass/fail decision.
-    val pairing: WindowPairingDiag? = null
+    val pairing: WindowPairingDiag? = null,
+    // Banding diagnostics for the window (null when banding was not collected, or when the
+    // native feature could not be registered). Telemetry only: never consulted by any pass/fail
+    // decision — see [WindowBandingDiag] for why it is not a gate yet.
+    val banding: WindowBandingDiag? = null
 )
+
+/**
+ * Per-window CAMBI (Contrast Aware Multiscale Banding Index) summary of the DISTORTED frames.
+ *
+ * Why this exists: VMAF is known to under-weight contrast banding, and banding is the signature
+ * artifact of re-encoding smooth gradients — skies, walls, fades — at exactly the conservative
+ * bitrates Smart Perceptually Lossless targets. A clip can clear every VMAF window threshold and
+ * still show visible banding, which means the transparency claim currently has a blind spot.
+ *
+ * Why it is NOT a gate: this codebase's window thresholds came from a calibrated VMAF suite. No
+ * equivalent calibration exists for CAMBI on this content, and inventing a cut-off would gate a
+ * user-facing "Perceptually Lossless" claim on a number nobody measured — the exact failure the
+ * truth rules exist to prevent. So this ships as recorded evidence first; a separate, calibrated
+ * change may later turn it into an acceptance criterion.
+ *
+ * Polarity is the opposite of VMAF: **higher means more banding**, and a clean frame scores near 0.
+ * [p95] and [max] are therefore the worst-case ends of the window, not the best.
+ *
+ * Calibration caveat for whoever turns this into a gate: CAMBI's default window size is
+ * 4K-referenced (libvmaf documents 63 as "~1 degree at 4k"), so absolute values are not
+ * necessarily comparable across source resolutions. Any future threshold has to be established
+ * per resolution class, or with the window size pinned — not by picking one number from a paper.
+ */
+data class WindowBandingDiag(
+    val frames: Int,
+    val mean: Double,
+    val p95: Double,
+    val max: Double
+) {
+    /** Compact capture form: "cambi=mean/p95/max". Locale-pinned like [WindowPairingDiag.compact]. */
+    fun compact(): String =
+        "cambi=%.4f/%.4f/%.4f".format(java.util.Locale.US, mean, p95, max)
+}
 
 /**
  * Per-window frame-pairing diagnostics. Frames are paired in decode order; the skew of pair i
@@ -106,6 +143,25 @@ object VmafPairScorer {
      */
     private const val QUEUE_BYTE_BUDGET = 64L * 1024 * 1024
 
+    /**
+     * Summarizes per-frame CAMBI into a window diagnostic, or null when there is nothing
+     * trustworthy to report. Fails to null rather than reporting a partial figure: `-1.0` is the
+     * native per-frame retrieval-failure sentinel, and averaging it in would understate banding —
+     * the wrong direction for a signal whose whole purpose is to catch a missed artifact.
+     */
+    internal fun summarizeBanding(perFrameCambi: DoubleArray?): WindowBandingDiag? {
+        if (perFrameCambi == null || perFrameCambi.isEmpty()) return null
+        if (perFrameCambi.any { it < 0.0 || !it.isFinite() }) return null
+        val sorted = perFrameCambi.sortedArray()
+        val p95Index = ((sorted.size - 1) * 0.95).toInt()
+        return WindowBandingDiag(
+            frames = sorted.size,
+            mean = perFrameCambi.average(),
+            p95 = sorted[p95Index],
+            max = sorted.last()
+        )
+    }
+
     /** Per-queue depth for a frame of these dimensions; at least 1, never more than [MAX_QUEUE_CAPACITY]. */
     internal fun queueCapacityFor(width: Int, height: Int): Int {
         val frameBytes = width.toLong() * height.toLong() * 3L / 2L
@@ -129,7 +185,13 @@ object VmafPairScorer {
      * [PairScoreOutcome.MisalignmentRejected] when the streams were measurably NOT temporally
      * comparable (fail closed — never scored, never structurally certifiable). Never throws.
      */
-    fun score(context: Context, ref: Uri, dist: Uri, windows: List<ScoreWindow>): PairScoreOutcome {
+    fun score(
+        context: Context,
+        ref: Uri,
+        dist: Uri,
+        windows: List<ScoreWindow>,
+        collectBanding: Boolean = false
+    ): PairScoreOutcome {
         if (!VmafNative.isAvailable) return PairScoreOutcome.Unavailable
         val refGeom = YuvFrameReader.displayGeometry(context, ref) ?: return PairScoreOutcome.Unavailable
         val distGeom = YuvFrameReader.displayGeometry(context, dist) ?: return PairScoreOutcome.Unavailable
@@ -146,7 +208,7 @@ object VmafPairScorer {
 
         val results = mutableListOf<WindowScore>()
         for (window in windows) {
-            when (val outcome = scoreWindow(context, ref, dist, window, width, height)) {
+            when (val outcome = scoreWindow(context, ref, dist, window, width, height, collectBanding)) {
                 is WindowOutcome.Scored -> results += outcome.score
                 WindowOutcome.Unavailable -> return PairScoreOutcome.Unavailable
                 WindowOutcome.Misaligned -> return PairScoreOutcome.MisalignmentRejected
@@ -167,12 +229,15 @@ object VmafPairScorer {
         dist: Uri,
         window: ScoreWindow,
         width: Int,
-        height: Int
+        height: Int,
+        collectBanding: Boolean
     ): WindowOutcome {
         // Plain vmaf_v0.6.1 (no phone transform): every threshold in QualityProbePolicy was
         // calibrated against the PC harness's default-model scores, and mixing models would
         // silently loosen the bar (the phone transform maps scores upward).
-        val handle = VmafNative.open(width, height, phoneModel = false, threads = 2)
+        val handle = VmafNative.open(
+            width, height, phoneModel = false, threads = 2, collectBanding = collectBanding
+        )
         if (handle == 0L) return WindowOutcome.Unavailable
         val queueCapacity = queueCapacityFor(width, height)
         val refQueue = ArrayBlockingQueue<I420Frame>(queueCapacity)
@@ -321,6 +386,10 @@ object VmafPairScorer {
             return if (misaligned) WindowOutcome.Misaligned else WindowOutcome.Unavailable
         }
         val perFrame = VmafNative.flush(handle)
+        // Banding scores must be read AFTER the flush (which signals end-of-stream) and BEFORE
+        // close. Telemetry only: any failure here yields a null diagnostic and never affects the
+        // window's outcome.
+        val perFrameCambi = if (collectBanding) VmafNative.cambiScores(handle) else null
         VmafNative.close(handle)
         if (perFrame == null || perFrame.isEmpty() || perFrame.any { it < 0 }) {
             Log.w(TAG, "vmaf flush failed for window")
@@ -344,13 +413,15 @@ object VmafPairScorer {
             mean = perFrame.average(),
             p5 = sorted[p5Index],
             min = sorted.first(),
-            pairing = pairing
+            pairing = pairing,
+            banding = summarizeBanding(perFrameCambi)
         )
         Log.i(
             TAG,
             "window [${window.startUs / 1000}ms..${window.endUs / 1000}ms] frames=${result.comparedFrames} " +
                 "mean=%.2f p5=%.2f min=%.2f".format(java.util.Locale.US, result.mean, result.p5, result.min) +
-                " pairing[${pairing.compact()}]"
+                " pairing[${pairing.compact()}]" +
+                (result.banding?.let { " banding[${it.compact()}]" } ?: "")
         )
         return WindowOutcome.Scored(result)
     }

@@ -147,6 +147,11 @@ class DiagnosticsRecorder private constructor(
         // moments in time. Separates "measured real quality" from "scored misaligned frames".
         probePairDiag: String? = null,
         certWindowScores: String? = null,
+        // Per-window CAMBI banding summary of the certified output ("cambi=mean/p95/max;…"),
+        // collected on certification only. Higher means MORE banding — the opposite polarity to
+        // VMAF. Recorded so a capture round can establish what banding real perceptually-lossless
+        // outputs actually produce; NO acceptance decision reads it (see WindowBandingDiag).
+        certBandingDiag: String? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
         // Inter-item handoff: thermal cooldown (ms) applied after the previous item, before this
@@ -203,6 +208,7 @@ class DiagnosticsRecorder private constructor(
                 "probeWindowScores" to probeWindowScores,
                 "probePairDiag" to probePairDiag,
                 "certWindowScores" to certWindowScores,
+                "certBandingDiag" to certBandingDiag,
                 "thermalStart" to thermalStart,
                 "thermalEnd" to thermalEnd,
                 "precedingCooldownMs" to precedingCooldownMs,

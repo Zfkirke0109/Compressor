@@ -240,7 +240,12 @@ class PerceptualQualityProber(private val context: Context) {
         val windows = QualityProbePolicy.probeWindows(durationMs * 1000L)
         if (windows.isEmpty()) return PairScoreOutcome.Unavailable
         return withContext(Dispatchers.IO) {
-            VmafPairScorer.score(context, sourceUri, Uri.fromFile(outputFile), windows)
+            // Banding telemetry is collected on certification only, never on ladder rungs: it is
+            // extra native work per frame, and certification runs once per output while the ladder
+            // runs up to four times. Recorded for calibration; no verdict reads it.
+            VmafPairScorer.score(
+                context, sourceUri, Uri.fromFile(outputFile), windows, collectBanding = true
+            )
         }
     }
 }

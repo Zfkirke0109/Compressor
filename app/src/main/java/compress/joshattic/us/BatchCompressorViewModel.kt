@@ -680,6 +680,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // Compact per-window scores of the final output's sampled certification —
                     // recorded pass OR fail so captures carry the real numbers behind verdicts.
                     var diagnosticCertWindowScores: String? = null
+                    var diagnosticCertBandingDiag: String? = null
                     // True ONLY once sampled VMAF has actually measured this output and passed. Stays
                     // false when certification never ran (not probe-eligible) or returned no measured
                     // evidence (Unavailable/misaligned) and the encode was accepted structurally.
@@ -1016,6 +1017,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         val recoveryOutcome = qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
                         val recoveryScores = (recoveryOutcome as? PairScoreOutcome.Scored)?.windows
                         diagnosticCertWindowScores = compactWindowScores(recoveryScores)
+                        diagnosticCertBandingDiag = compactBandingDiag(recoveryScores)
                         if (QualityProbePolicy.windowsPass(recoveryScores)) {
                             floorRecoveryCertScores = recoveryScores
                             val certifiedVideoBitrate = encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
@@ -1070,6 +1072,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             ?: qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
                         val certScores = (certOutcome as? PairScoreOutcome.Scored)?.windows
                         diagnosticCertWindowScores = compactWindowScores(certScores)
+                        diagnosticCertBandingDiag = compactBandingDiag(certScores)
                         val certOk = if (perceptualPlan.probeEligible) {
                             QualityProbePolicy.certificationOutcomePasses(
                                 usedRatio = perceptualPlan.targetRatio,
@@ -1136,6 +1139,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 probeWindowScores = perceptualPlan.probeWindowScores,
                                 probePairDiag = perceptualPlan.probePairDiag,
                                 certWindowScores = diagnosticCertWindowScores,
+                                certBandingDiag = diagnosticCertBandingDiag,
                                 precedingCooldownMs = precedingHandoffCooldownMs
                             )
                             updateItem(index) {
@@ -1289,6 +1293,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         probeWindowScores = perceptualPlan?.probeWindowScores,
                         probePairDiag = perceptualPlan?.probePairDiag,
                         certWindowScores = diagnosticCertWindowScores,
+                        certBandingDiag = diagnosticCertBandingDiag,
                         thermalStart = metrics.thermalStart,
                         thermalEnd = metrics.thermalEnd,
                         precedingCooldownMs = precedingHandoffCooldownMs,
@@ -2439,6 +2444,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // of the same probe rung — separates measured quality from misaligned comparisons.
         probePairDiag: String? = null,
         certWindowScores: String? = null,
+        certBandingDiag: String? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
         // Inter-item handoff telemetry: the thermal cooldown (ms) that was applied AFTER the
@@ -2507,6 +2513,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probeWindowScores = probeWindowScores,
             probePairDiag = probePairDiag,
             certWindowScores = certWindowScores,
+            certBandingDiag = certBandingDiag,
             thermalStart = thermalStart,
             thermalEnd = thermalEnd,
             precedingCooldownMs = precedingCooldownMs,
@@ -2522,14 +2529,27 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     // Compact "mean/p5/min" per window, ";"-joined — the capture-friendly form of VMAF window
     // scores (e.g. "96.2/92.0/85.1;97.0/93.4/88.8"). Null when nothing was measured.
     // Locale-pinned so comma-decimal device locales cannot corrupt the capture format.
+    // Three decimals, NOT one: production compares the UNROUNDED WindowScore doubles, so a floor
+    // logged as "95.5" could be anything in [95.45, 95.55) and a study fit to it inherits a
+    // rounding artifact near every threshold boundary. The v1 calibration study's entire reported
+    // "improvement" turned out to be one such artifact (research/perceptual_calibration/
+    // REVIEW_FINDINGS.md), and NEXT_ROUND_INSTRUMENTATION.md item 1 asks for exactly this widening.
+    // Logging precision only: every decision still reads the unrounded doubles.
     private fun compactWindowScores(scores: List<WindowScore>?): String? =
         scores?.takeIf { it.isNotEmpty() }
-            ?.joinToString(";") { "%.1f/%.1f/%.1f".format(java.util.Locale.US, it.mean, it.p5, it.min) }
+            ?.joinToString(";") { "%.3f/%.3f/%.3f".format(java.util.Locale.US, it.mean, it.p5, it.min) }
 
     // Compact per-window pairing diagnostics, ";"-joined (see WindowPairingDiag.compact()).
     // Null when nothing was measured or the scores carry no pairing data.
     private fun compactPairingDiag(scores: List<WindowScore>?): String? =
         scores?.mapNotNull { it.pairing?.compact() }
+            ?.takeIf { it.isNotEmpty() }
+            ?.joinToString(";")
+
+    // Compact per-window banding diagnostics, ";"-joined (see WindowBandingDiag.compact()).
+    // Null when banding was not collected or the native feature was unavailable. Telemetry only.
+    private fun compactBandingDiag(scores: List<WindowScore>?): String? =
+        scores?.mapNotNull { it.banding?.compact() }
             ?.takeIf { it.isNotEmpty() }
             ?.joinToString(";")
 
