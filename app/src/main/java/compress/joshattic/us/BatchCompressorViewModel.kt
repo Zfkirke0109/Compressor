@@ -2211,6 +2211,21 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             "mode=${quality.label}; job=${diagnosticJobId(item)}; verification=${verification.verdict}; playable=${verification.playability}; " +
                 "replaceAllowed=${verification.replacementSafe}; blockReason=${verification.replacementBlockReason ?: "none"}; outputSize=${outputSize}"
         )
+        // On a FAILURE, name the specific checks that failed. The summary above reports only the
+        // verdict, which makes a rejection undiagnosable from a capture: a 2026-08-13 S23 Ultra
+        // batch produced two outputs that were pixel-proven at ratio 0.65 (VMAF 98.9/97.0/91.0)
+        // and were then discarded with nothing in the log to say which parity check rejected them.
+        // Emitted only when the verdict is negative, so healthy batches gain no extra noise.
+        if (!verification.verified) {
+            val failing = verification.failingChecks()
+            Log.w(
+                "CompressorVerification",
+                "verification detail; job=${diagnosticJobId(item)}; verdict=${verification.verdict}; " +
+                    "criticalFieldsComplete=${verification.criticalFieldsComplete}; " +
+                    "failedOnlyOnVideoBitrateFloor=${verification.failedOnlyOnVideoBitrateFloor}; " +
+                    "failing=${if (failing.isEmpty()) "none-identified" else failing.joinToString(",")}"
+            )
+        }
     }
 
     private suspend fun compressOne(

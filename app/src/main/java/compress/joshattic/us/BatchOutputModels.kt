@@ -122,6 +122,41 @@ data class OutputVerificationReport(
     // explicitly prove pixels stays honest — the "Verified" wording is chosen from this flag.
     val pixelCertified: Boolean = false
 ) {
+    /**
+     * Names of the per-field checks that did NOT pass, for diagnosing a rejection.
+     *
+     * `OutputVerifier` renders each field as human text ending in `statusSuffix()` — "ok" when the
+     * check passed, "warn" when it did not — but only the overall verdict was ever logged. That
+     * made a failed verification undiagnosable from a capture, which is exactly what happened to
+     * two pixel-proven outputs in the 2026-08-13 S23 Ultra batch.
+     *
+     * Reads the rendered strings rather than re-deriving the predicates deliberately: duplicating
+     * the pass/fail logic here would let this drift out of step with the real decision, and a
+     * diagnostic that disagrees with the verdict is worse than none. Fields that carry no status
+     * suffix (free-text metadata lines) simply never appear.
+     */
+    fun failingChecks(): List<String> = buildList {
+        fun check(name: String, rendered: String) {
+            if (rendered.trimEnd().endsWith("warn")) add(name)
+        }
+        check("video", video)
+        check("fps", fps)
+        check("videoBitrate", videoBitrate)
+        check("videoCodec", videoCodec)
+        check("audioCodec", audioCodec)
+        check("audioDetails", audioDetails)
+        check("audioBitrate", audioBitrate)
+        check("hdr", hdr)
+        check("colorStandard", colorStandard)
+        check("colorRange", colorRange)
+        check("rotation", rotation)
+        check("fileSize", fileSize)
+        check("durationParity", durationParity)
+        check("mediaStoreDate", mediaStoreDate)
+        check("mp4Date", mp4Date)
+        check("location", location)
+    }
+
     val summaryLines: List<String>
         get() = listOf(
             "Verdict: $verdict",
