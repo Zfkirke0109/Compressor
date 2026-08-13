@@ -318,7 +318,7 @@ private fun BatchSettingsCard(
                 if (remuxOnly) {
                     "No re-encode: video/audio copied unchanged. This keeps quality exact but may not shrink much."
                 } else {
-                    "Perceptually Lossless must preserve source resolution, FPS, HDR/color, and audio or fall back to Remux Only. High Quality is lossy. Storage Saver warns about visible loss."
+                    "Perceptually Lossless only shrinks a file when it can with no visible change — otherwise it keeps the original unchanged (many phone videos are already efficient, so this is common and honest). High Quality re-encodes at a lower bitrate (same resolution and FPS) for a small quality trade — the usual way to shrink files PL leaves unchanged (already low-bitrate videos may not shrink). Storage Saver goes smaller still and may show visible loss."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant

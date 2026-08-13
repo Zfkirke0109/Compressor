@@ -158,7 +158,7 @@ object BatchQualityBitratePolicy {
             )
             BatchQualityMode.HIGH_QUALITY -> BatchModeProfile(
                 label = mode.label,
-                honestSummary = "Strong compression with measurable difference possible.",
+                honestSummary = "Re-encodes at a lower bitrate, same resolution and frame rate, for a small quality trade — the usual way to shrink files Perceptually Lossless leaves unchanged.",
                 allowsResolutionReduction = false,
                 allowsFrameRateReduction = false
             )
