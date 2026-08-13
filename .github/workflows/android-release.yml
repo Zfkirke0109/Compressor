@@ -1,0 +1,118 @@
+name: Android Release (signed)
+
+# Deliberately separate from android-ci.yml. Release signing material is decoded ONLY here, so
+# it is never present on a runner during pull-request CI — including PRs from forks, which
+# cannot read repository secrets at all.
+on:
+  workflow_dispatch:
+    inputs:
+      build_aab:
+        description: 'Also build an .aab bundle (needed for Play Store upload)'
+        type: boolean
+        default: true
+  push:
+    tags:
+      - 'v*'
+
+# Never run against a fork: secrets would be empty and the job would fail confusingly.
+jobs:
+  release:
+    if: github.repository == 'Zfkirke0109/Compressor'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android API 36
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Make Gradle executable
+        run: chmod +x ./gradlew
+
+      - name: Restore and validate release signing key
+        shell: bash
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_SIGNER_SHA256: ${{ secrets.RELEASE_SIGNER_SHA256 }}
+        run: |
+          set -euo pipefail
+          for secret in RELEASE_KEYSTORE_BASE64 RELEASE_KEYSTORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_SIGNER_SHA256; do
+            test -n "${!secret}" || { echo "::error::Required secret $secret is not configured. See docs/RELEASE_SIGNING.md"; exit 1; }
+          done
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > release.keystore
+          chmod 600 release.keystore
+          keytool -list -keystore release.keystore -storepass "$RELEASE_KEYSTORE_PASSWORD" -alias "$RELEASE_KEY_ALIAS" >/dev/null
+          # Fingerprint check: proves this is the key you meant, before anything is published
+          # under it. Signing with the wrong key is effectively unrecoverable once shipped.
+          actual="$(keytool -exportcert -keystore release.keystore -storepass "$RELEASE_KEYSTORE_PASSWORD" -alias "$RELEASE_KEY_ALIAS" | sha256sum | awk '{print toupper($1)}')"
+          expected="$(printf '%s' "$RELEASE_SIGNER_SHA256" | tr -d '[:space:]:' | tr '[:lower:]' '[:upper:]')"
+          test "$actual" = "$expected" || { echo "::error::Release signing certificate fingerprint mismatch — refusing to build."; exit 1; }
+          echo "Release signing key validated."
+
+      - name: Build signed release APK
+        env:
+          COMPRESSOR_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          COMPRESSOR_RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          COMPRESSOR_RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew :app:assembleRelease --stacktrace --console=plain
+
+      - name: Build signed release bundle (.aab)
+        if: github.event_name == 'push' || inputs.build_aab
+        env:
+          COMPRESSOR_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          COMPRESSOR_RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          COMPRESSOR_RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew :app:bundleRelease --stacktrace --console=plain
+
+      - name: Verify the APK is actually signed by the expected key
+        shell: bash
+        env:
+          RELEASE_SIGNER_SHA256: ${{ secrets.RELEASE_SIGNER_SHA256 }}
+        run: |
+          set -euo pipefail
+          # The Gradle config falls back to an UNSIGNED release when credentials are missing, so
+          # this step is the guard that a silently-unsigned artifact can never be published.
+          apk="$(find app/build/outputs/apk/release -name '*.apk' | head -1)"
+          test -n "$apk" || { echo "::error::No release APK produced."; exit 1; }
+          apksigner="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -r | head -1)"
+          "$apksigner" verify --print-certs "$apk" > signer.txt
+          grep -qiE 'Signer #1 certificate SHA-?256 digest' signer.txt || { echo "::error::APK is not signed."; exit 1; }
+          actual="$(grep -iE 'Signer #1 certificate SHA-?256 digest' signer.txt | awk '{print toupper($NF)}')"
+          expected="$(printf '%s' "$RELEASE_SIGNER_SHA256" | tr -d '[:space:]:' | tr '[:lower:]' '[:upper:]')"
+          test "$actual" = "$expected" || { echo "::error::APK signer fingerprint does not match the expected release key."; exit 1; }
+          echo "Verified: $apk is signed by the expected release key."
+
+      - name: Remove signing material from runner
+        if: always()
+        shell: bash
+        run: rm -f release.keystore signer.txt
+
+      - name: Upload signed APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: compressor-release-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload signed bundle
+        if: github.event_name == 'push' || inputs.build_aab
+        uses: actions/upload-artifact@v4
+        with:
+          name: compressor-release-aab
+          path: app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error

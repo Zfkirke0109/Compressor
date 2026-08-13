@@ -10,12 +10,28 @@ Add these under:
 
 Settings -> Secrets and variables -> Actions -> New repository secret
 
-Required secrets:
+Required secrets (these are the names `.github/workflows/android-ci.yml` actually reads):
 
-- COMPRESSOR_DEBUG_KEYSTORE_BASE64
-- COMPRESSOR_DEBUG_KEYSTORE_PASSWORD
-- COMPRESSOR_DEBUG_KEY_ALIAS
-- COMPRESSOR_DEBUG_KEY_PASSWORD
+- KEYSTORE_BASE64
+- KEYSTORE_PASSWORD
+- KEY_ALIAS
+- KEY_PASSWORD
+- EXPECTED_SIGNER_SHA256
+
+Do not confuse these with the `COMPRESSOR_DEBUG_*` names below. Those are the **environment
+variables** the workflow sets for Gradle, not secret names — `app/build.gradle.kts` reads
+`COMPRESSOR_DEBUG_KEYSTORE_PASSWORD` / `COMPRESSOR_DEBUG_KEY_ALIAS` /
+`COMPRESSOR_DEBUG_KEY_PASSWORD`, and the workflow feeds them from the secrets above. An earlier
+version of this document listed the env-var names as the secret names; setting those as secrets
+would leave the real ones empty and fail the build at the "Required secret is not configured"
+check.
+
+`EXPECTED_SIGNER_SHA256` is the debug certificate's SHA-256 fingerprint:
+
+    keytool -exportcert -keystore ci-debug.keystore -alias compressor-debug | sha256sum
+
+For **release** signing — a separate key, separate secrets, and a workflow that never runs on
+pull requests — see [RELEASE_SIGNING.md](RELEASE_SIGNING.md).
 
 ## Generate a stable debug keystore later
 

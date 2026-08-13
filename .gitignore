@@ -24,6 +24,11 @@ output-metadata.json
 *.apk
 *.log
 ci-debug.keystore
+# Release signing material - decoded from secrets at build time, never committed.
+release.keystore
+*.jks
+*.p12
+*.keystore
 app/release/baselineProfiles/0/app-release.dm
 app/release/baselineProfiles/0/app-release.dm
 
