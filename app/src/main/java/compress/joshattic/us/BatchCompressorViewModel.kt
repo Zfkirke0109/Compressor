@@ -244,6 +244,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // directions. Codec downgrades (e.g. AV1 -> HEVC) never probe: a fake bitrate delta
         // cannot be pixel-justified.
         val probeEligible: Boolean = false,
+        // Whether the finished output can be pixel-scored against its source at all. Strictly wider
+        // than [probeEligible]: 4K-class sources are certifiable but too expensive to run a ladder
+        // on. Only this flag may gate post-encode certification — gating it on probe eligibility is
+        // what previously made the pixel-proven label unreachable for every source above 1080p.
+        val pixelCertifiable: Boolean = false,
         val defaultRatio: Double = targetRatio,
         // Ratio proven by on-device VMAF probe windows for THIS clip. May sit ABOVE the
         // learned/default target when only a safer retreat rung passed its windows.
@@ -1001,7 +1006,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // back exactly as before.
                     var floorRecoveryCertScores: List<WindowScore>? = null
                     if (effectiveQuality == BatchQualityPreset.ORIGINAL &&
-                        perceptualPlan != null && perceptualPlan.probeEligible &&
+                        perceptualPlan != null && perceptualPlan.pixelCertifiable &&
                         verification.failedOnlyOnVideoBitrateFloor &&
                         item.originalSize > 0L && outputSize in 1 until item.originalSize
                     ) {
@@ -1043,14 +1048,19 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             )
                         }
                     }
-                    // Sampled pixel certification of the full output (SDR probe-eligible encodes
-                    // only). Measured-bad always fails; unmeasurable fails only when the encode's
-                    // target was below the codec default (pixel evidence was its sole justification).
-                    // A certification failure SKIPS the item — pixel evidence just proved the encode
-                    // degrades this clip, so the honest outcome is the untouched original, not a
-                    // stream-copy that saves nothing.
+                    // Sampled pixel certification of the full output (any SDR, non-downgrade encode
+                    // whose geometry the scorer can handle — NOT just ladder-eligible ones).
+                    // Measured-bad always fails; a certification failure SKIPS the item — pixel
+                    // evidence just proved the encode degrades this clip, so the honest outcome is
+                    // the untouched original, not a stream-copy that saves nothing.
+                    //
+                    // Unmeasurable evidence is handled by two different rules depending on what
+                    // justified the target. When a ladder ran, a sub-default ratio rests on pixel
+                    // evidence alone and must fail closed without it. When no ladder ran (4K-class),
+                    // the target never depended on pixels, so the structural verdict stands exactly
+                    // as it does today — certification can only ADD proof for these sources.
                     if (effectiveQuality == BatchQualityPreset.ORIGINAL &&
-                        perceptualPlan != null && perceptualPlan.probeEligible &&
+                        perceptualPlan != null && perceptualPlan.pixelCertifiable &&
                         !PerceptualLosslessVerifier.shouldFallbackToRemux(verification, item.originalSize, outputSize)
                     ) {
                         updateItem(index) {
@@ -1060,11 +1070,15 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             ?: qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
                         val certScores = (certOutcome as? PairScoreOutcome.Scored)?.windows
                         diagnosticCertWindowScores = compactWindowScores(certScores)
-                        val certOk = QualityProbePolicy.certificationOutcomePasses(
-                            usedRatio = perceptualPlan.targetRatio,
-                            defaultRatio = perceptualPlan.defaultRatio,
-                            outcome = certOutcome
-                        )
+                        val certOk = if (perceptualPlan.probeEligible) {
+                            QualityProbePolicy.certificationOutcomePasses(
+                                usedRatio = perceptualPlan.targetRatio,
+                                defaultRatio = perceptualPlan.defaultRatio,
+                                outcome = certOutcome
+                            )
+                        } else {
+                            QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(certOutcome)
+                        }
                         // Pixel proof requires BOTH a pass AND measured windows — see
                         // QualityProbePolicy.isPixelCertified (pure + unit-tested) for why certOk
                         // alone is insufficient.
@@ -1881,13 +1895,21 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             source.videoMime,
             outputMime
         )
-        // Pixel scoring is capped at 1080p-class geometry (VmafPairScorer.MAX_COMPARE_PIXELS). A
-        // source above the cap would run the full probe ladder — encoding a real ~1.2 s clip per
-        // rung — only for VmafPairScorer.score to return Unavailable on the geometry check and
-        // discard it. Gate probe eligibility on scoreable geometry so >1080p sources skip the
-        // doomed encodes entirely; they already fall back to structural verification unchanged.
-        val pixelScoreable = QualityProbePolicy.isPixelScoreableGeometry(source.width, source.height)
-        val probeEligible = !codecDowngrade && !source.isHdr && VmafNative.isAvailable && pixelScoreable
+        // Pixel evidence has TWO separate gates, because scoring an output once and searching for a
+        // lower ratio cost very different amounts of work:
+        //
+        //  - pixelCertifiable: the output can be scored against the source at all (SDR, non-downgrade
+        //    output codec, VMAF present, geometry within VmafPairScorer.MAX_COMPARE_PIXELS). This is
+        //    what unlocks the pixel-proven "Perceptually Lossless Verified" label. It now reaches
+        //    4K-class sources, which previously could never be pixel-proven at any ratio.
+        //  - probeEligible: additionally worth spending the ladder's trial encodes on
+        //    (QualityProbePolicy.PROBE_LADDER_MAX_PIXELS). Above that bar the ladder cannot finish
+        //    inside the prober's budget, so the plan keeps its default/learned ratio and relies on
+        //    certification alone.
+        val pixelCertifiable = !codecDowngrade && !source.isHdr && VmafNative.isAvailable &&
+            QualityProbePolicy.isPixelScoreableGeometry(source.width, source.height)
+        val probeEligible = pixelCertifiable &&
+            QualityProbePolicy.isProbeLadderGeometry(source.width, source.height)
         Log.i(
             "CompressorLearning",
             "plan; profileKey=${profileKey.asKey()}; defaultRatio=$defaultRatio; learnedRatio=$targetRatio; " +
@@ -1905,6 +1927,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             useCbrCeiling = useCbrCeiling,
             expectedOvershootFactor = expectedOvershootFactor,
             probeEligible = probeEligible,
+            pixelCertifiable = pixelCertifiable,
             defaultRatio = defaultRatio
         )
     }

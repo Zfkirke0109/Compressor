@@ -80,10 +80,39 @@ sealed interface PairScoreOutcome {
  */
 object VmafPairScorer {
     private const val TAG = "VmafPairScorer"
-    private const val QUEUE_CAPACITY = 4
+    private const val MAX_QUEUE_CAPACITY = 4
     private const val QUEUE_POLL_TIMEOUT_S = 30L
     private const val FRAME_COUNT_TOLERANCE = 2
-    const val MAX_COMPARE_PIXELS = 1920 * 1088 // pixel scoring capped at 1080p-class for memory/time
+
+    /**
+     * Geometry ceiling for pixel scoring: 4K-class (3840x2176 covers 3840x2160 and its portrait
+     * transpose). Scoring runs at NATIVE resolution — never rescaled — because every threshold in
+     * [QualityProbePolicy] was calibrated against the offline harness
+     * (`scripts/diagnostics/measure_quality.py`), which states as a contract that it "never
+     * rescales or frame-rate-converts either input" and scores with plain `vmaf_v0.6.1`.
+     * Downscaling 4K to 1080p here would hide exactly the high-frequency coding artifacts the
+     * thresholds exist to catch, silently loosening the bar.
+     *
+     * Above this ceiling the pair would need two simultaneous 8K hardware decoders and ~50 MB per
+     * decoded frame, which is neither reliably supported nor affordable inside a batch encode;
+     * those sources keep the pre-existing "evidence unavailable" behavior.
+     */
+    const val MAX_COMPARE_PIXELS = 3840 * 2176
+
+    /**
+     * Peak decoded-frame bytes allowed across BOTH in-flight frame queues. Queue depth is derived
+     * from frame size rather than fixed, so 1080p keeps its original 4-deep queues while 4K drops
+     * to 2 and stays inside the same memory envelope (~50 MB) instead of scaling to ~100 MB.
+     */
+    private const val QUEUE_BYTE_BUDGET = 64L * 1024 * 1024
+
+    /** Per-queue depth for a frame of these dimensions; at least 1, never more than [MAX_QUEUE_CAPACITY]. */
+    internal fun queueCapacityFor(width: Int, height: Int): Int {
+        val frameBytes = width.toLong() * height.toLong() * 3L / 2L
+        if (frameBytes <= 0L) return 1
+        val perQueueBudget = QUEUE_BYTE_BUDGET / 2L
+        return (perQueueBudget / frameBytes).coerceIn(1L, MAX_QUEUE_CAPACITY.toLong()).toInt()
+    }
 
     private val END = I420Frame(ByteArray(0), 0, 0, Long.MIN_VALUE)
 
@@ -145,8 +174,9 @@ object VmafPairScorer {
         // silently loosen the bar (the phone transform maps scores upward).
         val handle = VmafNative.open(width, height, phoneModel = false, threads = 2)
         if (handle == 0L) return WindowOutcome.Unavailable
-        val refQueue = ArrayBlockingQueue<I420Frame>(QUEUE_CAPACITY)
-        val distQueue = ArrayBlockingQueue<I420Frame>(QUEUE_CAPACITY)
+        val queueCapacity = queueCapacityFor(width, height)
+        val refQueue = ArrayBlockingQueue<I420Frame>(queueCapacity)
+        val distQueue = ArrayBlockingQueue<I420Frame>(queueCapacity)
         val error = AtomicReference<String?>(null)
         val windowLenUs = window.endUs - window.startUs
 

@@ -21,14 +21,31 @@ object QualityProbePolicy {
 
     /**
      * True only when a source of these display dimensions can actually be pixel-scored by
-     * [VmafPairScorer] (its geometry is at or below the 1080p-class scoring cap). Above the cap the
-     * scorer returns Unavailable AFTER the probe clip has already been encoded — so probing such a
-     * source burns full-resolution encodes for zero pixel evidence and then falls back to structural
-     * verification anyway. Gating probe eligibility on this predicate skips that doomed work with no
-     * change to the eventual acceptance decision. Pure so it is unit-testable without a device.
+     * [VmafPairScorer] (its geometry is at or below the 4K-class scoring cap). Above the cap the
+     * scorer returns Unavailable, so the output can only ever be accepted structurally and can
+     * never earn the pixel-certified label. Pure so it is unit-testable without a device.
      */
     fun isPixelScoreableGeometry(width: Int, height: Int): Boolean =
         width > 0 && height > 0 && width.toLong() * height.toLong() <= VmafPairScorer.MAX_COMPARE_PIXELS
+
+    /**
+     * Geometry ceiling for spending PROBE LADDER encodes, as distinct from scoring pixels once.
+     *
+     * Post-encode certification scores three ~1.2 s windows of an output that already exists. The
+     * ladder additionally *encodes* a real clip per rung — up to four rungs x three windows — and
+     * scores every one of them. At 4K that work does not fit inside
+     * `PerceptualQualityProber.TOTAL_BUDGET_MS`, so the ladder would time out mid-search and return
+     * "no evidence" after having burned the battery anyway.
+     *
+     * So above this bar the plan keeps its codec-default/learned ratio and skips the ladder, but
+     * still runs certification — which is what actually unlocks the pixel-proven label.
+     */
+    const val PROBE_LADDER_MAX_PIXELS = 1920 * 1088
+
+    /** True when a probe ladder is both scoreable and affordable at these dimensions. */
+    fun isProbeLadderGeometry(width: Int, height: Int): Boolean =
+        isPixelScoreableGeometry(width, height) &&
+            width.toLong() * height.toLong() <= PROBE_LADDER_MAX_PIXELS
 
     // The probe ladder may never target below this ratio no matter what windows say:
     // sampled windows are evidence, not proof, and the measured suite has nothing below
@@ -171,6 +188,30 @@ object QualityProbePolicy {
         when (outcome) {
             is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
             PairScoreOutcome.Unavailable -> certificationPasses(usedRatio, defaultRatio, null)
+            PairScoreOutcome.MisalignmentRejected -> false
+        }
+
+    /**
+     * Certification verdict for an encode whose target ratio was NOT justified by probe pixels —
+     * the case for sources above [PROBE_LADDER_MAX_PIXELS], where no ladder ever runs and the
+     * target comes from the codec default plus the learning engine's floor-clamped ratio.
+     *
+     * Measured evidence still rules in the negative direction, exactly as everywhere else:
+     *  - measured and passing -> certified (and, being [PairScoreOutcome.Scored], pixel-proven)
+     *  - measured and failing -> NOT certified
+     *  - measured misalignment -> NOT certified
+     *  - unmeasurable -> the structural verdict stands, because no part of this encode's target
+     *    depended on pixel evidence in the first place. This is the pre-existing behavior for
+     *    these sources, so enabling certification for them can only ADD proof, never withdraw an
+     *    acceptance the app already grants today.
+     *
+     * The ratio-aware [certificationOutcomePasses] must keep being used wherever a ladder DID run:
+     * there a sub-default target was justified by pixels alone, so their absence has to fail closed.
+     */
+    fun certificationOutcomePassesWithoutProbeBasis(outcome: PairScoreOutcome): Boolean =
+        when (outcome) {
+            is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
+            PairScoreOutcome.Unavailable -> true
             PairScoreOutcome.MisalignmentRejected -> false
         }
 
