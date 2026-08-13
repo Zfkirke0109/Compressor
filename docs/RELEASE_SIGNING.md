@@ -59,11 +59,34 @@ Settings → Secrets and variables → Actions → New repository secret:
 
 ## Building
 
+- **On every pull request:** a signed release APK is built and uploaded as an artifact, so you
+  can install the actual release-signed build straight from the PR. The `.aab` is skipped here
+  — it is only needed for Play upload and would just add build time.
 - **Manually:** Actions → *Android Release (signed)* → Run workflow. The `build_aab` input
   controls whether a Play-ready `.aab` is produced alongside the APK.
 - **On a version tag:** pushing a `v*` tag builds both automatically.
 
 Artifacts: `compressor-release-apk` and `compressor-release-aab`.
+
+Combined with the debug signing in `android-ci.yml` and `android.yml`, every APK this repo
+produces from Actions is signed — debug builds with the stable debug key, release builds with
+the release key.
+
+### Before the secrets exist
+
+Until the five `RELEASE_*` secrets are configured, pull-request runs **skip** the signed
+release build and log a notice naming the missing secrets. They do not fail — configuring
+release signing should not be a prerequisite for CI being green.
+
+A tag push or a manual run behaves the opposite way and **fails** on missing secrets: a real
+release must never be silently unsigned.
+
+### Fork and collaborator note
+
+The job does not run for pull requests opened from forks, because GitHub does not expose
+secrets to them. For same-repo pull requests the workflow file used is the one **on the PR
+branch**, so anyone who can push a branch can modify this workflow and read the release key.
+That is fine for a single-maintainer repository; revisit it before adding collaborators.
 
 ## What the workflow guarantees
 
