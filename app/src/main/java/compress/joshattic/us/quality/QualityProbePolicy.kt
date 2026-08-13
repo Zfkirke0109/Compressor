@@ -58,6 +58,12 @@ object QualityProbePolicy {
     // is only worth an extra probe encode when the gap is at least this wide.
     const val REFINEMENT_MIN_GAP = 0.06
 
+    // Upward near-miss refinement: when the SAFEST probed rung fails but its worst window is within
+    // this many VMAF points of the bars, one more probe at [SAFEST_RATIO_CEILING] (a higher, safer,
+    // higher-quality rung) may close the gap. Kept small so the extra encode is spent only when a
+    // pass is plausible — a rung that failed by a lot will not be rescued by a slightly higher one.
+    const val NEAR_MISS_UPWARD_MARGIN = 2.5
+
     // Full-encode certification uses the same window thresholds; a certified sub-default
     // encode must PROVE its windows, an unmeasurable certification fails closed only when
     // the ratio was below the codec default (pixel evidence was the sole justification).
@@ -113,6 +119,38 @@ object QualityProbePolicy {
         if (lowestPassingRatio - lowerBound < REFINEMENT_MIN_GAP) return null
         val midpoint = (lowestPassingRatio + lowerBound) / 2.0
         return (Math.round(midpoint * 100.0) / 100.0).coerceAtLeast(HARD_RATIO_FLOOR)
+    }
+
+    /**
+     * How far the WORST window falls below the acceptance bars, in VMAF points: > 0 means it fails
+     * by that margin, <= 0 means every window passes. Null when there is nothing measured. Used to
+     * decide whether a near-miss is worth one more (higher, safer) probe.
+     */
+    fun worstWindowShortfall(scores: List<WindowScore>?): Double? {
+        if (scores.isNullOrEmpty()) return null
+        return scores.maxOf {
+            maxOf(WINDOW_MEAN_MIN - it.mean, WINDOW_P5_MIN - it.p5, WINDOW_MIN_MIN - it.min)
+        }
+    }
+
+    /**
+     * When the safest probed rung FAILED but only just, one more probe at [SAFEST_RATIO_CEILING] may
+     * close the gap — a higher ratio keeps more bitrate and buys a few VMAF points. Returns that
+     * ceiling ratio, or null when: the rung is already at/above the ceiling (nowhere higher to go),
+     * it actually passed (nothing to refine), or it failed by more than [NEAR_MISS_UPWARD_MARGIN]
+     * (a slightly higher rung will not rescue it, so the extra encode would be wasted).
+     *
+     * This is honest: it only ever tries a MORE conservative, higher-quality rung. Any pass is still
+     * gated downstream by the strictly-smaller and minimum-savings checks, so it can never turn a
+     * non-saving or degrading re-encode into a claimed win — only recover a genuine near-transparent
+     * saving (typically a cross-codec H.264 -> HEVC clip) that the fixed ladder stopped just short of.
+     */
+    fun upwardRefinementCandidate(highestFailedRatio: Double, highestFailedScores: List<WindowScore>?): Double? {
+        if (highestFailedRatio >= SAFEST_RATIO_CEILING - 1e-9) return null
+        val shortfall = worstWindowShortfall(highestFailedScores) ?: return null
+        if (shortfall <= 0.0) return null
+        if (shortfall > NEAR_MISS_UPWARD_MARGIN) return null
+        return SAFEST_RATIO_CEILING
     }
 
     /** True when every window individually clears the acceptance thresholds. */
