@@ -94,6 +94,76 @@ class SmartPerceptualProfileEngineTest {
     }
 
     @Test
+    fun pixelCertifiedSuccessStepsTheTargetDownButStructuralDoesNot() {
+        // The whole distinction: a structural pass proves nothing perceptual, a pixel-certified
+        // one carries measured windows scored against the source.
+        val structural = engine()
+            .recordVerifiedSuccess(key(), 0.95, 0.96, floorRatio = 0.80, pixelCertified = false)
+        assertEquals(0.95, structural.nextTargetRatio!!, 1e-9)
+
+        val certified = engine()
+            .recordVerifiedSuccess(key(), 0.95, 0.96, floorRatio = 0.80, pixelCertified = true)
+        assertEquals(0.94, certified.nextTargetRatio!!, 1e-9)
+    }
+
+    @Test
+    fun defaultingPixelCertifiedKeepsTheStrictStructuralBehavior() {
+        // Any caller that cannot say what was proven must get the safe path. If this flips, every
+        // existing call site silently starts lowering targets on perceptually-blind evidence.
+        val e = engine()
+        val updated = e.recordVerifiedSuccess(key(), 0.95, 0.96, floorRatio = 0.80)
+        assertEquals(0.95, updated.nextTargetRatio!!, 1e-9)
+    }
+
+    @Test
+    fun certifiedRecoveryHealsTheRatchetButNeverBeatsTheCodecDefault() {
+        // The ratchet: one failure raises the target and nothing used to lower it again, so a
+        // profile drifted to permanent conservatism. Certified successes must walk that back --
+        // and must stop at the codec default, never below it.
+        val e = engine()
+        val default = 0.90
+        val floor = 0.80
+
+        e.recordFailure(key(), usedTargetRatio = default, reason = "verification failed", floorRatio = floor)
+        assertEquals(0.95, e.recommendedTargetRatio(key(), default, floor), 1e-9)
+
+        // Simulate real runs: each encode uses whatever the engine currently recommends.
+        repeat(5) {
+            val used = e.recommendedTargetRatio(key(), default, floor)
+            e.recordVerifiedSuccess(key(), used, 0.9, floorRatio = floor, pixelCertified = true)
+        }
+        assertEquals("five certified successes undo one failure", default, e.recommendedTargetRatio(key(), default, floor), 1e-9)
+
+        // Twenty more must NOT push below the codec default: recommendedTargetRatio's lower bound
+        // is max(floorRatio, defaultRatio). Sub-default targets come only from per-clip probes.
+        repeat(20) {
+            val used = e.recommendedTargetRatio(key(), default, floor)
+            e.recordVerifiedSuccess(key(), used, 0.9, floorRatio = floor, pixelCertified = true)
+        }
+        assertEquals(default, e.recommendedTargetRatio(key(), default, floor), 1e-9)
+    }
+
+    @Test
+    fun certifiedRecoveryIsSlowerThanFailureRetreat() {
+        // Retreat must stay faster than recovery, or a flapping profile drifts toward aggression.
+        assertTrue(
+            SmartPerceptualProfileEngine.PIXEL_CERTIFIED_STEP_DOWN <
+                SmartPerceptualProfileEngine.FAILURE_STEP_UP
+        )
+        // And the structural constant must stay exactly zero — the 2026-07-14 invariant.
+        assertEquals(0.0, SmartPerceptualProfileEngine.SUCCESS_STEP_DOWN, 1e-12)
+    }
+
+    @Test
+    fun certifiedStepDownIsClampedByTheSafetyFloorAtWriteTime() {
+        // A high floor (e.g. HDR 120fps at 0.90) must bound the stored value immediately, not
+        // only when it is read back.
+        val e = engine()
+        val updated = e.recordVerifiedSuccess(key(), 0.90, 0.95, floorRatio = 0.90, pixelCertified = true)
+        assertEquals(0.90, updated.nextTargetRatio!!, 1e-9)
+    }
+
+    @Test
     fun failureRaisesFutureTargetRatio() {
         val e = engine()
         val updated = e.recordFailure(key(), usedTargetRatio = 0.85, reason = "output bitrate below floor", floorRatio = 0.80)

@@ -1344,11 +1344,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 plan.targetRatio,
                                 sizeRatio,
                                 plan.floorRatio,
-                                measuredOvershoot
+                                measuredOvershoot,
+                                // Only a pixel-certified success may lower the next target. A
+                                // structural-only pass keeps the strict no-step-down behavior,
+                                // because the structural verifier cannot see perceptual damage.
+                                pixelCertified = pixelCertifiedThisRun
                             )
                             Log.i(
                                 "CompressorLearning",
                                 "result=verified; profileKey=${plan.profileKey.asKey()}; usedRatio=${plan.targetRatio}; " +
+                                    "pixelCertified=$pixelCertifiedThisRun; " +
                                     "bitrateMode=${encodeAttempt?.requestedBitrateModeLabel ?: "unknown"}; encoderName=${encodeAttempt?.videoEncoderName ?: "unknown"}; " +
                                     "measuredOvershoot=${measuredOvershoot ?: "unknown"}; learnedOvershoot=${learned.measuredOvershootFactor ?: "none"}; " +
                                     "sizeRatio=$sizeRatio; nextRatio=${learned.nextTargetRatio}"

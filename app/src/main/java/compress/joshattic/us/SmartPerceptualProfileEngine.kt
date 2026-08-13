@@ -244,21 +244,36 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             .coerceIn(MIN_OVERSHOOT_FACTOR, MAX_OVERSHOOT_FACTOR)
 
     /**
-     * Record a verification-passed Perceptually Lossless encode. Since the 2026-07-14 VMAF suite
-     * ([SUCCESS_STEP_DOWN] = 0.0) a structural pass no longer steps the next target DOWN: the
-     * verifier is structural-only and repeatedly rewarded encodes that VMAF later proved visibly
-     * degraded (f030dffc553d walked 0.90 -> 0.60 -> VMAF 87.4). Success still clears failure
-     * latches and records the measured overshoot.
+     * Record a verification-passed Perceptually Lossless encode.
+     *
+     * How far the next target moves depends entirely on WHAT was proven:
+     *
+     *  - **Structural pass only** ([pixelCertified] false): no step down at all
+     *    ([SUCCESS_STEP_DOWN] = 0.0). The structural verifier cannot see perceptual damage and
+     *    repeatedly rewarded encodes VMAF later proved visibly degraded — profile f030dffc553d
+     *    walked 0.90 -> 0.60 that way and measured VMAF 87.4. Unchanged since 2026-07-14.
+     *  - **Pixel-certified pass** ([pixelCertified] true): a small
+     *    [PIXEL_CERTIFIED_STEP_DOWN]. Here `OutputVerifier` was not the only witness —
+     *    `QualityProbePolicy.isPixelCertified` confirmed real sampled windows scored against the
+     *    source and passed, which is precisely the evidence the structural path lacks.
+     *
+     * Defaults to false so any caller that cannot say what was proven keeps the strict
+     * structural behavior. This never decides "verified" — it only picks the next target, and
+     * the result is still clamped to [floorRatio] and re-verified on the next encode.
+     *
+     * Success also clears failure latches and records the measured overshoot in both cases.
      */
     fun recordVerifiedSuccess(
         key: EncodeProfileKey,
         usedTargetRatio: Double,
         outputToSourceBytesRatio: Double,
         floorRatio: Double,
-        measuredOvershootFactor: Double? = null
+        measuredOvershootFactor: Double? = null,
+        pixelCertified: Boolean = false
     ): LearnedEncodeProfile {
         val current = profile(key)
-        val next = (usedTargetRatio - SUCCESS_STEP_DOWN)
+        val stepDown = if (pixelCertified) PIXEL_CERTIFIED_STEP_DOWN else SUCCESS_STEP_DOWN
+        val next = (usedTargetRatio - stepDown)
             .coerceIn(floorRatio, BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO)
         val updated = current.copy(
             successCount = current.successCount + 1,
@@ -336,6 +351,29 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         // history must never buy a lower target), larger steps up after failures.
         const val SUCCESS_STEP_DOWN = 0.0
         const val FAILURE_STEP_UP = 0.05
+
+        // Step-down for a PIXEL-CERTIFIED success only — see [recordVerifiedSuccess].
+        //
+        // [SUCCESS_STEP_DOWN] stays 0.0 because a structural pass proves nothing about perceptual
+        // damage. That argument does not extend to a success whose sampled windows were actually
+        // measured against the source and passed: there the evidence the structural verifier lacks
+        // is exactly what was collected. Without this, adaptation is a one-way ratchet — failures
+        // raise the target by [FAILURE_STEP_UP] forever and nothing ever lowers it, so every
+        // profile drifts to remux-preferred and can never re-earn savings even once measurement
+        // says it could.
+        //
+        // Deliberately 1/5th of [FAILURE_STEP_UP]: five certified successes to undo one failure.
+        // The asymmetry is the point — recovery should be slow and evidence-backed while retreat
+        // stays fast. Still clamped to floorRatio, and the next encode at the lower target must
+        // itself certify or it fails and steps straight back up.
+        //
+        // This is a RECOVERY mechanism, not an aggressiveness one, and that is enforced by
+        // [recommendedTargetRatio], whose lower bound is max(floorRatio, defaultRatio). A learned
+        // ratio can therefore never target below the codec default no matter how many certified
+        // successes accumulate — the step-down can only walk a profile back from the conservatism
+        // that earlier failures imposed. Going BELOW the default remains the exclusive job of
+        // per-clip probe evidence (pixelProvenRatio), which is measured per file and never learned.
+        const val PIXEL_CERTIFIED_STEP_DOWN = 0.01
         const val HIGH_RATIO_FAILURE_THRESHOLD = 0.93
         const val HIGH_RATIO_FAILURES_BEFORE_REMUX = 2
 

@@ -14,9 +14,10 @@ several are fine. They are simply the places where nobody would notice if they w
 
 ---
 
-## Finding 1 — The learning engine is a one-way ratchet (PL) — **highest payoff**
+## Finding 1 — The learning engine is a one-way ratchet (PL) — **IMPLEMENTED**
 
-**Status: unbacked consequence of a measured decision.**
+**Status: was an unbacked consequence of a measured decision. Fixed; see the bottom of this
+section for what shipped and one correction to the original diagnosis.**
 
 `SmartPerceptualProfileEngine` adapts in one direction only:
 
@@ -65,6 +66,33 @@ clamp to `floorRatio` and `OutputVerifier` remain the backstops.
 
 **Why this ranks first:** it is the only finding here that compounds. Every other constant is
 a fixed offset; this one silently degrades over time.
+
+### What shipped
+
+`PIXEL_CERTIFIED_STEP_DOWN = 0.01`, applied in `recordVerifiedSuccess` only when the caller
+passes `pixelCertified = true`. `SUCCESS_STEP_DOWN` stays `0.0` and the parameter defaults to
+`false`, so every path that cannot prove what it measured keeps the strict behavior unchanged.
+`BatchCompressorViewModel` passes `pixelCertifiedThisRun`, which is set by
+`QualityProbePolicy.isPixelCertified` and therefore requires a `Scored` outcome.
+
+Five new tests, and the three original invariant guards
+(`verifiedSuccessStoresProfileWithoutSteppingTheTargetDown`,
+`repeatedSuccessesNeverLowerTheTargetBelowTheDefault`,
+`learningCannotBypassVerificationDecisions`) still pass unmodified.
+
+### Correction to the diagnosis above
+
+The original write-up implied learning could not "re-earn savings" in general. That overstates
+it. `recommendedTargetRatio` bounds the learned value below by `max(floorRatio, defaultRatio)`,
+so a learned ratio was never able to target below the codec default in the first place — the
+ratchet's real effect is that a profile stuck at a *worse-than-default* target after failures
+could never return to default.
+
+That makes the fix narrower and safer than first described: it is a **recovery** mechanism, not
+an aggressiveness one. Certified successes walk a profile back to the codec default and stop
+there, no matter how many accumulate. Targeting below the default remains the exclusive job of
+per-clip probe evidence (`pixelProvenRatio`), which is measured per file and never learned.
+`certifiedRecoveryHealsTheRatchetButNeverBeatsTheCodecDefault` pins exactly this.
 
 ---
 
@@ -180,10 +208,11 @@ Listed for completeness. None is obviously wrong; none has a stated derivation.
 
 ## Suggested order
 
-1. **Finding 1** — plumb pixel certification into the learning engine. Self-contained, testable
-   in JVM tests, and the only issue that compounds over time.
-2. **Device-validate PR #41** — unblocks trusting 4K certification, which Finding 1 depends on
-   for 4K profiles.
+1. ~~**Finding 1** — plumb pixel certification into the learning engine.~~ **Done.**
+2. **Device-validate PR #41** — now doubly important: Finding 1's recovery path only engages for
+   pixel-certified successes, and on 4K profiles those depend entirely on the certification path
+   this PR introduces. Until the device run happens, 4K profiles keep the old structural
+   behavior in practice.
 3. **Finding 3** — capture round with CAMBI now recording; cheap, since the data collects itself.
 4. **Finding 2** — HQ target-quality mode. Largest user-visible win, largest amount of work.
 5. **Findings 4-6** — resolve alongside whichever capture round is already running.
