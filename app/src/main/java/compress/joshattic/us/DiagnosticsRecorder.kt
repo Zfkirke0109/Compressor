@@ -155,6 +155,10 @@ class DiagnosticsRecorder private constructor(
         // Why sampled pixel certification did or did not run (see CertificationStatus). A null
         // certWindowScores is ambiguous on its own; this disambiguates it.
         certificationStatus: String? = null,
+        // Requested vs actual encoder configuration (see EncoderConfigDelta). Media3 format
+        // fallback can substitute MIME or resolution and still report success; without this a
+        // later verification rejection is inexplicable from a capture alone.
+        encoderConfig: String? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
         // Inter-item handoff: thermal cooldown (ms) applied after the previous item, before this
@@ -213,6 +217,7 @@ class DiagnosticsRecorder private constructor(
                 "certWindowScores" to certWindowScores,
                 "certBandingDiag" to certBandingDiag,
                 "certificationStatus" to certificationStatus,
+                "encoderConfig" to encoderConfig,
                 "thermalStart" to thermalStart,
                 "thermalEnd" to thermalEnd,
                 "precedingCooldownMs" to precedingCooldownMs,

@@ -283,7 +283,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val requestedVideoBitrate: Int,
         val requestedBitrateModeLabel: String,
         val videoEncoderName: String?,
-        val reportedAverageVideoBitrate: Int
+        val reportedAverageVideoBitrate: Int,
+        // Requested vs actual encoder configuration. Media3 format fallback substitutes an
+        // unsupported MIME or resolution and still reports success, and a resolution substitution
+        // would trip videoMatches inside the PL verification scope - so a rejection could be
+        // caused by the encoder quietly producing something else. Recorded, never acted on:
+        // OutputVerifier measuring the finished file remains the only verdict.
+        val configDelta: EncoderConfigDelta? = null
     )
 
     fun refreshShizukuStatus(context: Context) {
@@ -1286,6 +1292,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 certWindowScores = diagnosticCertWindowScores,
                                 certBandingDiag = diagnosticCertBandingDiag,
                                 certificationStatus = diagnosticCertStatus,
+                                encoderConfig = encodeAttempt?.configDelta?.compact(),
                                 precedingCooldownMs = precedingHandoffCooldownMs
                             )
                             updateItem(index) {
@@ -1446,6 +1453,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         certWindowScores = diagnosticCertWindowScores,
                         certBandingDiag = diagnosticCertBandingDiag,
                         certificationStatus = diagnosticCertStatus,
+                        encoderConfig = encodeAttempt?.configDelta?.compact(),
                         thermalStart = metrics.thermalStart,
                         thermalEnd = metrics.thermalEnd,
                         precedingCooldownMs = precedingHandoffCooldownMs,
@@ -2323,13 +2331,33 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     override fun onCompleted(composition: Composition, exportResult: ExportResult) {
                         progressJob?.cancel()
                         val finalSize = outputFile.length()
+                        val configDelta = EncoderConfigDelta(
+                            requestedMime = videoMimeType,
+                            actualMime = exportResult.videoMimeType,
+                            requestedWidth = item.originalWidth,
+                            requestedHeight = item.originalHeight,
+                            actualWidth = exportResult.width,
+                            actualHeight = exportResult.height,
+                            requestedVideoBitrate = targetBitrate,
+                            actualAverageVideoBitrate = exportResult.averageVideoBitrate,
+                            requestedBitrateMode = bitrateModeLabel,
+                            encoderName = exportResult.videoEncoderName
+                        )
                         Log.i(
                             "CompressorEncoderPlan",
                             "encodeResult; mode=${quality.label}; requestedVideoBitrate=$targetBitrate; requestedBitrateMode=$bitrateModeLabel; " +
                                 "encoderName=${exportResult.videoEncoderName ?: "unknown"}; reportedAverageVideoBitrate=${exportResult.averageVideoBitrate}; " +
                                 "overshootFactor=${if (targetBitrate > 0 && exportResult.averageVideoBitrate > 0) "%.3f".format(exportResult.averageVideoBitrate.toDouble() / targetBitrate) else "unknown"}; " +
-                                "outputBytes=$finalSize"
+                                "outputBytes=$finalSize; config[${configDelta.compact()}]"
                         )
+                        if (configDelta.formatFellBack) {
+                            // Loud on purpose: a silent substitution is exactly the kind of thing
+                            // that makes a later verification rejection look inexplicable.
+                            Log.w(
+                                "CompressorEncoderPlan",
+                                "encoder format fallback; job=${diagnosticJobId(item)}; ${configDelta.compact()}"
+                            )
+                        }
                         updateItem(index) {
                             it.copy(
                                 progress = 1f,
@@ -2345,7 +2373,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                     requestedVideoBitrate = targetBitrate,
                                     requestedBitrateModeLabel = bitrateModeLabel,
                                     videoEncoderName = exportResult.videoEncoderName,
-                                    reportedAverageVideoBitrate = exportResult.averageVideoBitrate
+                                    reportedAverageVideoBitrate = exportResult.averageVideoBitrate,
+                                    configDelta = configDelta
                                 )
                             )
                         }
@@ -2621,6 +2650,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         certWindowScores: String? = null,
         certBandingDiag: String? = null,
         certificationStatus: String? = null,
+        encoderConfig: String? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
         // Inter-item handoff telemetry: the thermal cooldown (ms) that was applied AFTER the
@@ -2691,6 +2721,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             certWindowScores = certWindowScores,
             certBandingDiag = certBandingDiag,
             certificationStatus = certificationStatus,
+            encoderConfig = encoderConfig,
             thermalStart = thermalStart,
             thermalEnd = thermalEnd,
             precedingCooldownMs = precedingCooldownMs,
