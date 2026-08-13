@@ -304,4 +304,53 @@ class QualityProbePolicyTest {
         val refined = QualityProbePolicy.refinementCandidate(0.90, null)
         assertTrue(refined == null || refined >= QualityProbePolicy.HARD_RATIO_FLOOR)
     }
+
+    @Test
+    fun theTwoQualityBarsAreOrderedAndDistinct() {
+        val pl = QualityProbePolicy.PERCEPTUAL_LOSSLESS
+        val hq = QualityProbePolicy.HIGH_QUALITY
+
+        // The transparency bar must keep its calibrated values exactly.
+        assertEquals(95.5, pl.meanMin, 1e-9)
+        assertEquals(91.0, pl.p5Min, 1e-9)
+        assertEquals(84.0, pl.minMin, 1e-9)
+
+        // HQ is explicitly LOSSY, so every threshold must sit strictly below transparency. If
+        // these ever met or crossed, "High Quality" could quietly accept what PL rejects while
+        // still being described as the lower-quality mode.
+        assertTrue(hq.meanMin < pl.meanMin)
+        assertTrue(hq.p5Min < pl.p5Min)
+        assertTrue(hq.minMin < pl.minMin)
+
+        // ...and HQ must not be a free-for-all either; it is still a quality bar.
+        assertTrue(hq.meanMin > 80.0)
+        assertTrue(hq.minMin > 60.0)
+    }
+
+    @Test
+    fun barAwareWindowsPassDefaultsToTransparencyForEveryExistingCaller() {
+        // The regression that matters: adding a second bar must not move the PL decision.
+        // A window between the two bars passes HQ and fails PL.
+        val between = listOf(WindowScore(30, mean = 94.0, p5 = 89.5, min = 82.0))
+
+        assertFalse(QualityProbePolicy.windowsPass(between))
+        assertFalse(QualityProbePolicy.windowsPass(between, QualityProbePolicy.PERCEPTUAL_LOSSLESS))
+        assertTrue(QualityProbePolicy.windowsPass(between, QualityProbePolicy.HIGH_QUALITY))
+    }
+
+    @Test
+    fun theHighQualityBarStillRejectsRealDegradation() {
+        // A lower bar is not an absent one.
+        val bad = listOf(WindowScore(30, mean = 70.0, p5 = 60.0, min = 40.0))
+        assertFalse(QualityProbePolicy.windowsPass(bad, QualityProbePolicy.HIGH_QUALITY))
+
+        // One weak window still rejects the whole set, same as PL.
+        val mixed = listOf(good(), WindowScore(30, mean = 94.0, p5 = 70.0, min = 82.0))
+        assertFalse(QualityProbePolicy.windowsPass(mixed, QualityProbePolicy.HIGH_QUALITY))
+
+        // Too few compared frames is still "no evidence", not "weak evidence", at any bar.
+        val tooFew = listOf(WindowScore(5, mean = 99.0, p5 = 99.0, min = 99.0))
+        assertFalse(QualityProbePolicy.windowsPass(tooFew, QualityProbePolicy.HIGH_QUALITY))
+        assertFalse(QualityProbePolicy.windowsPass(tooFew, QualityProbePolicy.PERCEPTUAL_LOSSLESS))
+    }
 }
