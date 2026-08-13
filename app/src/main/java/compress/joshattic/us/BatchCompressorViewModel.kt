@@ -163,9 +163,14 @@ data class BatchCompressorUiState(
     val batchMetrics: BatchMetricsSummary? = null,
     val deviceProfile: String = DeviceCapabilityProfiles.current().name,
     val hasHardwareAv1Encoder: Boolean = false,
+    // Source URIs of items a just-finished Perceptually Lossless batch honestly kept at original
+    // size, but that High Quality could actually shrink (see HighQualityRetryPolicy). Drives the
+    // post-batch "shrink these with High Quality?" offer. Empty except right after a PL batch.
+    val highQualityRetryCandidates: List<Uri> = emptyList(),
     val statusMessage: String? = null,
     val errorMessage: String? = null
 ) {
+    val highQualityRetryCount: Int get() = highQualityRetryCandidates.size
     val doneCount: Int get() = items.count { it.status == BatchItemStatus.Done || it.status == BatchItemStatus.Replaced || it.status == BatchItemStatus.SavedCopy }
     val failedCount: Int get() = items.count { it.status == BatchItemStatus.Failed }
     val skippedCount: Int get() = items.count { it.status == BatchItemStatus.Skipped || it.isAlreadyCompressed }
@@ -493,6 +498,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 it.copy(
                     items = items,
                     isLoading = false,
+                    highQualityRetryCandidates = emptyList(),
                     deviceProfile = DeviceCapabilityProfiles.current().name,
                     hasHardwareAv1Encoder = hasEncoder(MimeTypes.VIDEO_AV1),
                     statusMessage = when {
@@ -542,6 +548,54 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         }
     }
 
+    /**
+     * Source URIs of items the just-finished batch honestly kept at original size but that High
+     * Quality could actually shrink — feeds the post-batch "shrink these with High Quality?" offer.
+     * Only populated when the batch ran in Perceptually Lossless; every other mode returns empty.
+     * Pure and cheap (no codec queries), so it is safe to call inline on the completion update.
+     */
+    private fun highQualityRetryCandidatesFor(state: BatchCompressorUiState): List<Uri> {
+        val wasPerceptualLossless = qualityFromLabel(state.qualityPreset) == BatchQualityPreset.ORIGINAL
+        if (!wasPerceptualLossless) return emptyList()
+        return state.items.filter { item ->
+            HighQualityRetryPolicy.isEligible(
+                batchWasPerceptualLossless = true,
+                terminal = item.terminalResult,
+                sourceVideoBitrate = item.toSourceInfo().videoBitrate,
+                sourceHeight = item.originalHeight,
+                sourceSizeBytes = item.originalSize
+            )
+        }.map { it.sourceUri }
+    }
+
+    /**
+     * Re-run only the kept-original videos from the last Perceptually Lossless batch in High
+     * Quality — the honest lossy lever that trades a little quality for a real size reduction.
+     * Reuses the existing pipeline: it narrows the batch to the offered sources, switches the mode
+     * to High Quality, and starts a fresh run (which resets and processes them). Originals are never
+     * touched here; only new output files are produced. A no-op while a batch is running.
+     */
+    fun retryUnshrunkAsHighQuality(context: Context) {
+        val current = _uiState.value
+        if (current.isCompressing || compressionJob?.isCompleted == false) return
+        val candidateUris = current.highQualityRetryCandidates.toSet()
+        if (candidateUris.isEmpty()) return
+        val subset = current.items.filter { it.sourceUri in candidateUris }
+        if (subset.isEmpty()) return
+        _uiState.update {
+            it.copy(
+                items = subset,
+                qualityPreset = BatchQualityPreset.HIGH.label,
+                selectedPreset = null,
+                highQualityRetryCandidates = emptyList(),
+                batchMetrics = null,
+                errorMessage = null,
+                statusMessage = "Re-running ${subset.size} video${if (subset.size == 1) "" else "s"} in High Quality…"
+            )
+        }
+        startCompression(context)
+    }
+
     fun startCompression(context: Context) {
         val current = _uiState.value
         if (current.items.isEmpty() || current.isCompressing || compressionJob?.isCompleted == false) return
@@ -561,6 +615,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     isCompressing = true,
                     errorMessage = null,
                     batchMetrics = null,
+                    highQualityRetryCandidates = emptyList(),
                     statusMessage = "Compressing with thermal-safe batch pacing."
                 )
             }
@@ -777,6 +832,74 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     if (perceptualPlan?.preferRemux == true) {
                         effectiveQuality = BatchQualityPreset.REMUX_ONLY
                         preEncodeRemuxNote = perceptualPlan.remuxReason
+                    }
+                    // Doomed-encode guard for the LOSSY modes. When the source already sits at or
+                    // below its resolution's bitrate floor, the floor clamps the target back up to
+                    // the source bitrate, so the encode cannot produce a smaller file — it burns
+                    // full encode time and yields a same-or-larger output that is then discarded.
+                    // Reaching that same honest verdict up front keeps the original and skips the
+                    // wasted work (measured: 11 clips, 7.9 min, +25 MB of discarded output on the
+                    // 2026-07-31 S23 batch). Fails open on unknown bitrate; PL/Remux are excluded
+                    // inside the policy, so this can never divert a Perceptually Lossless decision.
+                    // Only a PURE BITRATE re-encode may be skipped. If the user explicitly chose an
+                    // output codec, the transcode itself is the thing they asked for and its output
+                    // is delivered to them as a copy even when it is not smaller — so skipping it
+                    // would silently withhold a requested result. Under Auto the app picks the codec
+                    // itself, so nothing the user asked for is lost. (FPS caps and resolution changes
+                    // are excluded inside lossyTargetHasNoHeadroom for the same reason.)
+                    if (codec == BatchCodecOption.AUTO &&
+                        effectiveQuality != BatchQualityPreset.REMUX_ONLY && resolvedMime != null &&
+                        BatchQualityBitratePolicy.lossyTargetHasNoHeadroom(
+                            source = item.toSourceInfo(),
+                            mode = effectiveQuality.toMode(),
+                            outputMimeType = resolvedMime,
+                            outputFps = plannedFps,
+                            outputHeight = targetHeightFor(item, effectiveQuality)
+                        )
+                    ) {
+                        // Keep the original and write NOTHING — deliberately the same
+                        // no-output shape as the SKIPPED_WOULD_DEGRADE path above, NOT a
+                        // switch to Remux Only. Routing these into the remux stream copy would
+                        // expose non-MP4 sources (e.g. the MKV/AV1 clips in real libraries) to a
+                        // muxer that cannot carry them, turning a merely-wasteful encode into an
+                        // outright failure. Nothing is re-encoded, copied, or replaced here.
+                        val skipMessage =
+                            "Already efficient for ${quality.label}: this video's bitrate is already at or " +
+                                "below the quality floor for its resolution, so re-encoding could not make it " +
+                                "smaller. Original kept unchanged."
+                        Log.i(
+                            "CompressorBatch",
+                            "doomed-encode skip; job=${diagnosticJobId(item)}; mode=${quality.label}; " +
+                                "sourceVideoBitrate=${item.toSourceInfo().videoBitrate}; encode skipped, original kept"
+                        )
+                        recordDiagnosticJob(
+                            diagnostics = diagnostics,
+                            item = item,
+                            requestedQuality = quality,
+                            effectiveQuality = quality,
+                            resolvedMime = resolvedMime,
+                            plannedTargetRatio = null,
+                            plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
+                            plannedDecisionReason = "lossy target has no headroom below the source bitrate",
+                            wasStreamCopy = false,
+                            verification = null,
+                            outputSize = 0L,
+                            terminal = BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED,
+                            elapsedMs = System.currentTimeMillis() - itemStartedAt,
+                            precedingCooldownMs = precedingHandoffCooldownMs
+                        )
+                        updateItem(index) {
+                            it.copy(
+                                status = BatchItemStatus.Skipped,
+                                progress = 1f,
+                                currentOutputSize = 0L,
+                                targetOutputSize = 0L,
+                                outputSize = 0L,
+                                terminalResult = BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED,
+                                message = skipMessage
+                            )
+                        }
+                        return@forEachIndexed
                     }
                     // Keep-original remux FAST PATH (perf/remux-keep-original-fast-path): when the
                     // pipeline has already DECIDED to keep the original bytes, and the audited
@@ -1468,6 +1591,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     it.copy(
                         isCompressing = false,
                         batchMetrics = metrics,
+                        highQualityRetryCandidates = highQualityRetryCandidatesFor(it),
                         statusMessage = "Finished ${it.doneCount} output${if (it.doneCount == 1) "" else "s"}. " +
                             "Real compressions: ${accounting.realCompressionCount}. " +
                             "Saved ${formatFileSize(accounting.totalBytesSaved)} by real compression.",
@@ -2729,14 +2853,48 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 }
             )
         }
-        val recoveryStaged = runCatching {
-            if (recoveryCopy.exists()) recoveryCopy.delete()
-            context.contentResolver.openInputStream(item.sourceUri)?.use { input ->
-                recoveryCopy.outputStream().use { output -> input.copyTo(output) }
-            } != null && recoveryCopy.length() > 0L
-        }.getOrDefault(false)
-        if (!recoveryStaged) {
-            runCatching { recoveryCopy.delete() }
+        // The stage -> write -> verify -> rollback decision lives in OriginalReplacementCoordinator so
+        // it is exercised by OriginalReplacementCoordinatorTest, including the cases that cannot be
+        // injected on a device (ENOSPC mid-write, a provider that will not report a size, a rollback
+        // that itself fails). This object supplies only the raw IO.
+        val replacementIo = object : OriginalReplacementIo {
+            override fun stageRecoveryCopy(): Long {
+                if (recoveryCopy.exists()) recoveryCopy.delete()
+                val opened = context.contentResolver.openInputStream(item.sourceUri)?.use { input ->
+                    recoveryCopy.outputStream().use { output -> input.copyTo(output) }
+                }
+                return if (opened == null) -1L else recoveryCopy.length()
+            }
+
+            override fun writeOutputOverOriginal() {
+                context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
+                    outputFile.inputStream().use { input -> input.copyTo(out) }
+                    // Best-effort durability so the size read-back reflects committed bytes.
+                    runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
+                } ?: error("Could not open original for writing")
+            }
+
+            override fun readBackOriginalSize(): Long =
+                context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { it.statSize } ?: -1L
+
+            override fun restoreOriginalFromRecovery() {
+                context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
+                    recoveryCopy.inputStream().use { input -> input.copyTo(out) }
+                    runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
+                } ?: error("Could not reopen original to restore it")
+            }
+
+            override fun recoveryCopyLength(): Long = recoveryCopy.length()
+
+            override fun discardRecoveryCopy() { runCatching { recoveryCopy.delete() } }
+        }
+
+        val expectedLength = outputFile.length()
+        val attempt = OriginalReplacementCoordinator.attempt(replacementIo, expectedLength)
+
+        if (attempt is ReplacementAttempt.OriginalIntact &&
+            attempt.reason == ReplacementAttempt.Reason.RECOVERY_STAGING_FAILED
+        ) {
             val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
             return@withContext ReplacementResult(
                 false,
@@ -2747,21 +2905,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 }
             )
         }
-
-        val expectedLength = outputFile.length()
-        val directResult = runCatching {
-            context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
-                outputFile.inputStream().use { input -> input.copyTo(out) }
-                // Best-effort durability so the size read-back reflects committed bytes.
-                runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
-            } ?: error("Could not open original for writing")
-            val verifiedSize = context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { it.statSize } ?: -1L
-            // STRICT: only a positive, exactly-matching size proves success. Unknown size is not proof.
-            ReplacementSizeCheck.verified(verifiedSize, expectedLength)
-        }
-
-        if (directResult.getOrDefault(false)) {
-            runCatching { recoveryCopy.delete() }
+        if (attempt is ReplacementAttempt.Replaced) {
             val replacedPath = resolveFilesystemPath(context, item.sourceUri)
             val metadataReport = VideoMetadataPreserver.restoreAfterReplacement(
                 context = context,
@@ -2775,26 +2919,22 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             )
         }
 
-        // The destructive write failed or could not be confirmed: the source may now be truncated.
-        // Restore the original bytes from the recovery copy before doing anything else, so the
-        // user's file is at least whole again. Track whether that restore is itself confirmed.
-        val sourceRestored = runCatching {
-            context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
-                recoveryCopy.inputStream().use { input -> input.copyTo(out) }
-                runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
-            } ?: error("Could not reopen original to restore it")
-            val restoredSize = context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { it.statSize } ?: -1L
-            ReplacementSizeCheck.verified(restoredSize, recoveryCopy.length())
-        }.getOrDefault(false)
+        // The coordinator already attempted the rollback when the write failed or could not be
+        // confirmed. OriginalIntact means the source is whole (never truncated, or restored);
+        // OriginalAtRisk means it may be incomplete AND the recovery copy still holds the only
+        // intact original bytes, which the fallback below preserves before reporting.
+        val sourceRestored = attempt is ReplacementAttempt.OriginalIntact
 
         // Shizuku writes the FULL verified output to the path, which also repairs a source that the
         // direct write may have truncated — so success here is a clean replacement. All Shizuku
         // sub-failures fall through to the single honest fallback below (which knows sourceRestored),
         // so a failed direct write can never be reported without accounting for the original's state.
+        var shizukuWriteFailed = false
         if (useShizukuFallback && ShizukuSupport.hasPermission()) {
             val targetPath = resolveFilesystemPath(context, item.sourceUri)
             if (targetPath != null) {
                 val copied = ShizukuSupport.copyFileWithShizuku(outputFile.absolutePath, targetPath)
+                if (!copied) shizukuWriteFailed = true
                 if (copied) {
                     runCatching { recoveryCopy.delete() }
                     val metadataReport = VideoMetadataPreserver.restoreAfterReplacement(
@@ -2811,10 +2951,21 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
         }
 
+        // A FAILED Shizuku attempt may itself have truncated the target: it writes with `cat >`,
+        // which truncates on open. So an earlier successful rollback can no longer be assumed to
+        // still hold — re-verify against the recovery bytes before reassuring the user.
+        val originalStillWhole = if (shizukuWriteFailed && sourceRestored) {
+            runCatching {
+                ReplacementSizeCheck.verified(replacementIo.readBackOriginalSize(), recoveryCopy.length())
+            }.getOrDefault(false)
+        } else {
+            sourceRestored
+        }
+
         // Every replacement attempt failed. Report the TRUTH about the original's state and never
         // claim it was "protected" when the destructive open may have truncated it.
         val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
-        val result = if (sourceRestored) {
+        val result = if (originalStillWhole) {
             runCatching { recoveryCopy.delete() }
             ReplacementResult(
                 false,
@@ -2831,7 +2982,18 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val originalPreserved = saveFileToGallery(
                 context, recoveryCopy, "ORIGINAL_${item.outputName(quality)}", item.metadataSnapshot, privacyMode
             ) != null
-            runCatching { recoveryCopy.delete() }
+            // Only discard once the bytes exist somewhere else. If preserving them failed, this file
+            // IS the user's last intact original — deleting it here would destroy it and make the
+            // "don't clear the cache" advice below a lie. Keep it and say where it is.
+            if (originalPreserved) {
+                runCatching { recoveryCopy.delete() }
+            } else {
+                Log.e(
+                    "CompressorBatch",
+                    "job=${diagnosticJobId(item)}; original may be incomplete and could not be preserved; " +
+                        "retaining the only intact copy at ${recoveryCopy.absolutePath}"
+                )
+            }
             ReplacementResult(
                 false,
                 when {
@@ -2840,7 +3002,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     originalPreserved ->
                         "In-place replacement failed and the original on disk may be incomplete. A copy of your untouched original was saved to your gallery — please recover it from there."
                     else ->
-                        "In-place replacement failed and the original on disk may be incomplete; recovering it also failed. Do not delete the app cache; contact support."
+                        "In-place replacement failed and the original on disk may be incomplete, and saving a recovered copy to your gallery failed. An intact copy of the original is still held inside the app — do not clear the app's storage, and free up space then try again."
                 }
             )
         }
