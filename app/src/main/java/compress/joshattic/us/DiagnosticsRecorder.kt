@@ -152,6 +152,9 @@ class DiagnosticsRecorder private constructor(
         // VMAF. Recorded so a capture round can establish what banding real perceptually-lossless
         // outputs actually produce; NO acceptance decision reads it (see WindowBandingDiag).
         certBandingDiag: String? = null,
+        // Why sampled pixel certification did or did not run (see CertificationStatus). A null
+        // certWindowScores is ambiguous on its own; this disambiguates it.
+        certificationStatus: String? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
         // Inter-item handoff: thermal cooldown (ms) applied after the previous item, before this
@@ -209,6 +212,7 @@ class DiagnosticsRecorder private constructor(
                 "probePairDiag" to probePairDiag,
                 "certWindowScores" to certWindowScores,
                 "certBandingDiag" to certBandingDiag,
+                "certificationStatus" to certificationStatus,
                 "thermalStart" to thermalStart,
                 "thermalEnd" to thermalEnd,
                 "precedingCooldownMs" to precedingCooldownMs,

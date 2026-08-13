@@ -254,6 +254,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // on. Only this flag may gate post-encode certification — gating it on probe eligibility is
         // what previously made the pixel-proven label unreachable for every source above 1080p.
         val pixelCertifiable: Boolean = false,
+        // Which gate closed when [pixelCertifiable] is false, so a capture can say WHY
+        // certification never ran instead of leaving the reader to guess from a null field.
+        val pixelCertifiableBlockReason: String? = null,
         val defaultRatio: Double = targetRatio,
         // Ratio proven by on-device VMAF probe windows for THIS clip. May sit ABOVE the
         // learned/default target when only a safer retreat rung passed its windows.
@@ -736,6 +739,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // recorded pass OR fail so captures carry the real numbers behind verdicts.
                     var diagnosticCertWindowScores: String? = null
                     var diagnosticCertBandingDiag: String? = null
+                    // Why certification did or did not run. An unexplained absence of evidence is
+                    // indistinguishable from a bug, so this is never left null on a PL job.
+                    var diagnosticCertStatus: String? = null
                     // True ONLY once sampled VMAF has actually measured this output and passed. Stays
                     // false when certification never ran (not probe-eligible) or returned no measured
                     // evidence (Unavailable/misaligned) and the encode was accepted structurally.
@@ -1184,6 +1190,21 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // evidence alone and must fail closed without it. When no ladder ran (4K-class),
                     // the target never depended on pixels, so the structural verdict stands exactly
                     // as it does today — certification can only ADD proof for these sources.
+                    // Record WHY certification will not run before the gate, so a null
+                    // certWindowScores is never unexplained. Two 219-job captures had null
+                    // certification fields for all 438 jobs with nothing saying which gate closed.
+                    // Overwritten with the real outcome below when it does run.
+                    diagnosticCertStatus = when {
+                        effectiveQuality != BatchQualityPreset.ORIGINAL ->
+                            CertificationStatus.SKIPPED_NOT_PL_MODE
+                        perceptualPlan == null -> CertificationStatus.SKIPPED_NO_PLAN
+                        !perceptualPlan.pixelCertifiable ->
+                            perceptualPlan.pixelCertifiableBlockReason ?: CertificationStatus.SKIPPED_NO_PLAN
+                        PerceptualLosslessVerifier.shouldFallbackToRemux(
+                            verification, item.originalSize, outputSize
+                        ) -> CertificationStatus.SKIPPED_FELL_BACK_TO_REMUX
+                        else -> null
+                    }
                     if (effectiveQuality == BatchQualityPreset.ORIGINAL &&
                         perceptualPlan != null && perceptualPlan.pixelCertifiable &&
                         !PerceptualLosslessVerifier.shouldFallbackToRemux(verification, item.originalSize, outputSize)
@@ -1208,6 +1229,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         // Pixel proof requires BOTH a pass AND measured windows — see
                         // QualityProbePolicy.isPixelCertified (pure + unit-tested) for why certOk
                         // alone is insufficient.
+                        diagnosticCertStatus = CertificationStatus.forOutcome(certOutcome)
                         pixelCertifiedThisRun = QualityProbePolicy.isPixelCertified(certOk, certOutcome)
                         Log.i(
                             "CompressorProbe",
@@ -1263,6 +1285,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 probePairDiag = perceptualPlan.probePairDiag,
                                 certWindowScores = diagnosticCertWindowScores,
                                 certBandingDiag = diagnosticCertBandingDiag,
+                                certificationStatus = diagnosticCertStatus,
                                 precedingCooldownMs = precedingHandoffCooldownMs
                             )
                             updateItem(index) {
@@ -1422,6 +1445,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         probePairDiag = perceptualPlan?.probePairDiag,
                         certWindowScores = diagnosticCertWindowScores,
                         certBandingDiag = diagnosticCertBandingDiag,
+                        certificationStatus = diagnosticCertStatus,
                         thermalStart = metrics.thermalStart,
                         thermalEnd = metrics.thermalEnd,
                         precedingCooldownMs = precedingHandoffCooldownMs,
@@ -2042,6 +2066,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         //    certification alone.
         val pixelCertifiable = !codecDowngrade && !source.isHdr && VmafNative.isAvailable &&
             QualityProbePolicy.isPixelScoreableGeometry(source.width, source.height)
+        val pixelCertifiableBlockReason = CertificationStatus.blockReasonFor(
+            isHdr = source.isHdr,
+            codecDowngrade = codecDowngrade,
+            vmafAvailable = VmafNative.isAvailable,
+            geometryScoreable = QualityProbePolicy.isPixelScoreableGeometry(source.width, source.height)
+        )
         val probeEligible = pixelCertifiable &&
             QualityProbePolicy.isProbeLadderGeometry(source.width, source.height)
         Log.i(
@@ -2062,6 +2092,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             expectedOvershootFactor = expectedOvershootFactor,
             probeEligible = probeEligible,
             pixelCertifiable = pixelCertifiable,
+            pixelCertifiableBlockReason = pixelCertifiableBlockReason,
             defaultRatio = defaultRatio
         )
     }
@@ -2589,6 +2620,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         probePairDiag: String? = null,
         certWindowScores: String? = null,
         certBandingDiag: String? = null,
+        certificationStatus: String? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
         // Inter-item handoff telemetry: the thermal cooldown (ms) that was applied AFTER the
@@ -2658,6 +2690,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probePairDiag = probePairDiag,
             certWindowScores = certWindowScores,
             certBandingDiag = certBandingDiag,
+            certificationStatus = certificationStatus,
             thermalStart = thermalStart,
             thermalEnd = thermalEnd,
             precedingCooldownMs = precedingCooldownMs,
