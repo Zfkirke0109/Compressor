@@ -49,7 +49,14 @@ def _fast_results(spec: dict[str, Any]) -> dict[str, Any]:
         ("retimed_double_cadence", cfr(30, 33_333), cfr(60, 16_667, 8_000), "MISALIGNED"),
         ("internal_missing_frames", internal_reference, [value for index, value in enumerate(internal_reference) if index not in range(10, 13)], "MISALIGNED"),
         ("leading_repair_then_internal_gap", leading_gap_reference, [value for index, value in enumerate(cfr(30, 33_367)) if index != 15], "MISALIGNED"),
-        ("adaptive_min_gap", [0, 33_367, 66_734], [0, 33_367, 41_700], "MISALIGNED"),
+        ("internal_gap_after_short_interval", [0, 33_367, 66_734], [0, 33_367, 41_700], "MISALIGNED"),
+        # Half-frame grid offset at 25 fps: scored as aligned by the superseded
+        # half-interval tolerance, which is what made VMAF report 1.860/0.000/0.000
+        # for a healthy encode. Must now produce no pixel evidence at all.
+        ("half_frame_offset_25fps", cfr(30, 40_000), cfr(30, 40_000, 20_000), "MISALIGNED"),
+        # Worst-case ms-granular probe-clip start (-999 us, constant): legitimately
+        # aligned and must keep pairing at every frame rate.
+        ("ms_granular_clip_start", cfr(30, 33_367), [value - 999 for value in cfr(30, 33_367)], "ALIGNED"),
     ]
     pts_results = []
     for name, reference, candidate, expected in pts_cases:

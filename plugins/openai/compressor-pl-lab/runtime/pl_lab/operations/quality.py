@@ -939,8 +939,12 @@ def _pts_result(reference: list[int], candidate: list[int], *, tolerance_floor_u
             last_candidate = value
 
     def current_tolerance() -> int:
-        observed = [gap for gap in (min_ref_gap, min_candidate_gap) if gap is not None]
-        return max(tolerance_floor_us, min(observed) // 2) if observed else tolerance_floor_us
+        # Fixed, never derived from the observed frame interval. A correctly aligned pair's
+        # skew is bounded by how the streams were ADDRESSED (<= 999 us from the probe clip's
+        # ms-granular start), not by how far apart their frames are, so a rule that widened
+        # with the interval scored half-frame-offset pairs as measurements at low frame
+        # rates. Kotlin authority: PtsAligner.toleranceUs().
+        return tolerance_floor_us
 
     while ref_index < len(reference) and candidate_index < len(candidate):
         if ref_index > ref_seen:
