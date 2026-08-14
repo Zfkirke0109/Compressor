@@ -25,9 +25,20 @@ object VmafNative {
         }
     }
 
-    fun open(width: Int, height: Int, phoneModel: Boolean = true, threads: Int = 2): Long {
+    /**
+     * @param collectBanding register libvmaf's CAMBI feature for this session. Telemetry only —
+     *   no acceptance decision reads it — and best-effort: if the feature cannot be registered the
+     *   session still scores VMAF normally and [cambiScores] simply returns null.
+     */
+    fun open(
+        width: Int,
+        height: Int,
+        phoneModel: Boolean = true,
+        threads: Int = 2,
+        collectBanding: Boolean = false
+    ): Long {
         if (!isAvailable) return 0L
-        return nativeOpen(width, height, if (phoneModel) 1 else 0, threads)
+        return nativeOpen(width, height, if (phoneModel) 1 else 0, threads, if (collectBanding) 1 else 0)
     }
 
     fun readFrames(handle: Long, refI420: ByteArray, distI420: ByteArray, width: Int, height: Int): Int =
@@ -35,9 +46,22 @@ object VmafNative {
 
     fun flush(handle: Long): DoubleArray? = nativeFlush(handle)
 
+    /**
+     * Per-frame CAMBI banding scores, or null when banding was not collected for this session.
+     * Must be called AFTER [flush] — that call signals end-of-stream, which is what makes the
+     * per-frame feature scores retrievable. Higher means MORE banding (opposite polarity to VMAF).
+     */
+    fun cambiScores(handle: Long): DoubleArray? = nativeCambiScores(handle)
+
     fun close(handle: Long) = nativeClose(handle)
 
-    private external fun nativeOpen(width: Int, height: Int, phoneModel: Int, threads: Int): Long
+    private external fun nativeOpen(
+        width: Int,
+        height: Int,
+        phoneModel: Int,
+        threads: Int,
+        enableCambi: Int
+    ): Long
     private external fun nativeReadFrames(
         handle: Long,
         refI420: ByteArray,
@@ -47,6 +71,7 @@ object VmafNative {
     ): Int
 
     private external fun nativeFlush(handle: Long): DoubleArray?
+    private external fun nativeCambiScores(handle: Long): DoubleArray?
     private external fun nativeClose(handle: Long)
     private external fun nativeVersion(): String
 }

@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Summarize one or two DiagnosticsRecorder session.jsonl captures.
+
+Reads the structured records the app writes to
+`filesDir/diagnostics/<batchId>/session.jsonl` and reports the totals that matter for
+Perceptually Lossless evaluation: real compressions, bytes actually saved, terminal-state
+distribution, and the verification failures that need explaining.
+
+Deliberately conservative about what counts as a win. Remuxes, retained originals, skips, and
+failures save zero bytes and are never reported as compressions, so this tool cannot flatter a
+run. `savedBytes` is summed only from jobs whose own record claims a real compression AND whose
+output is genuinely smaller than the source.
+
+Usage:
+    python3 parse_session_jsonl.py NEW.jsonl [OLD.jsonl] [--json out.json]
+
+Exit codes: 0 ok, 2 unreadable/empty input.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import Counter
+from typing import Any
+
+from session_records import read_records
+
+
+def load(path: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]], dict[str, Any] | None]:
+    """Return (session_start, jobs, session_summary).
+
+    Accepts both capture transports (bare JSONL and logcat-prefixed) and tolerates a truncated
+    tail; see session_records.decode_record for why the prefix has to be handled.
+    """
+    start = summary = None
+    jobs: list[dict[str, Any]] = []
+    for rec in read_records(path):
+        kind = rec.get("type") or rec.get("eventType")
+        if kind == "session_start":
+            start = rec
+        elif kind == "session_summary":
+            summary = rec
+        elif kind == "job":
+            jobs.append(rec)
+    return start, jobs, summary
+
+
+def summarize(path: str) -> dict[str, Any]:
+    start, jobs, summary = load(path)
+    if not jobs:
+        raise SystemExit(f"error: no job records in {path}")
+
+    terminals = Counter(str(j.get("terminal")) for j in jobs)
+    modes = Counter(str(j.get("effectiveMode")) for j in jobs)
+    materialization = Counter(str(j.get("materializationMode")) for j in jobs)
+
+    def num(j: dict[str, Any], key: str) -> int:
+        v = j.get(key)
+        return int(v) if isinstance(v, (int, float)) else 0
+
+    # A real compression must BOTH be claimed by the record and be genuinely smaller.
+    real = [
+        j for j in jobs
+        if j.get("countsAsRealCompression") is True
+        and 0 < num(j, "outputSize") < num(j, "sourceSize")
+    ]
+    claimed_only = [j for j in jobs if j.get("countsAsRealCompression") is True and j not in real]
+
+    failures = [j for j in jobs if str(j.get("terminal")) == "OUTPUT_VALIDATION_FAILED"]
+    unexplained = [
+        j for j in failures
+        if not j.get("failedChecks") and not j.get("blockReason") and not j.get("fallbackReason")
+    ]
+
+    # Which verification predicates actually rejected files. This is the whole point of recording
+    # `failedChecks`: a rejection rate is a symptom, the named predicate is the cause. A single
+    # predicate at 100% of generated outputs means one gate is rejecting everything, which is a
+    # very different problem from a spread across many.
+    #
+    # Counted over every job that carries the field rather than only OUTPUT_VALIDATION_FAILED,
+    # because a failed check can also show up on a job that recovered through a fallback. Jobs from
+    # builds predating the field record null and are simply absent from the denominator.
+    verified_jobs = [j for j in jobs if isinstance(j.get("failedChecks"), list)]
+    check_counts = Counter(
+        c for j in verified_jobs for c in j["failedChecks"] if isinstance(c, str)
+    )
+    silent_rejections = [
+        j for j in verified_jobs
+        if j.get("verified") is False and not j["failedChecks"]
+    ]
+
+    return {
+        "path": path,
+        "batchId": (start or {}).get("batchId"),
+        "buildCommit": (start or {}).get("buildCommit"),
+        "mode": (start or {}).get("mode"),
+        "jobs": len(jobs),
+        "sourceBytes": sum(num(j, "sourceSize") for j in jobs),
+        "realCompressions": len(real),
+        "claimedButNotSmaller": len(claimed_only),
+        "savedBytes": sum(num(j, "sourceSize") - num(j, "outputSize") for j in real),
+        "copyAvoidedBytes": sum(num(j, "copyAvoidedBytes") for j in jobs),
+        "generatedOutputBytes": sum(
+            num(j, "outputSize") for j in jobs
+            if str(j.get("materializationMode")) == "GENERATED_FILE"
+        ),
+        "pixelCertified": sum(1 for j in jobs if j.get("pixelCertified") is True),
+        "pixelProven": sum(1 for j in jobs if j.get("pixelProvenRatio") is not None),
+        "withProbeRatios": sum(1 for j in jobs if j.get("probedRatios")),
+        "certScoresPresent": sum(1 for j in jobs if j.get("certWindowScores")),
+        "bandingPresent": sum(1 for j in jobs if j.get("certBandingDiag")),
+        "validationFailures": len(failures),
+        "unexplainedFailures": len(unexplained),
+        "jobsWithVerification": len(verified_jobs),
+        "failedCheckCounts": dict(check_counts.most_common()),
+        "silentRejections": len(silent_rejections),
+        "learnedStateIdentity": (start or {}).get("learnedStateIdentity"),
+        "terminals": dict(terminals.most_common()),
+        "effectiveModes": dict(modes.most_common()),
+        "materialization": dict(materialization.most_common()),
+        "elapsedMs": (summary or {}).get("elapsedMs"),
+    }
+
+
+def render(s: dict[str, Any]) -> str:
+    out = [
+        f"  batch          : {s['batchId']}  build={s['buildCommit']}  mode={s['mode']}",
+        f"  jobs           : {s['jobs']}",
+        f"  source bytes   : {s['sourceBytes']:,}",
+        f"  REAL compress. : {s['realCompressions']}   savedBytes={s['savedBytes']:,}",
+        f"  pixel-certified: {s['pixelCertified']}   pixel-proven={s['pixelProven']}   probed={s['withProbeRatios']}",
+        f"  cert scores    : {s['certScoresPresent']}   banding records={s['bandingPresent']}",
+        f"  copy avoided   : {s['copyAvoidedBytes']:,}",
+        f"  generated bytes: {s['generatedOutputBytes']:,}",
+        f"  validation fail: {s['validationFailures']}   unexplained={s['unexplainedFailures']}",
+        f"  learned state  : {s['learnedStateIdentity'] or 'NOT RECORDED (runs are not comparable)'}",
+        f"  terminals      : {s['terminals']}",
+        f"  effective modes: {s['effectiveModes']}",
+    ]
+    if s["jobsWithVerification"]:
+        out.append(f"  failing checks : ({s['jobsWithVerification']} job(s) carry verification)")
+        for name, n in s["failedCheckCounts"].items():
+            share = n / s["jobsWithVerification"]
+            out.append(f"      {n:5}  {share:6.1%}  {name}")
+        if not s["failedCheckCounts"]:
+            out.append("      (none — every verified job passed every predicate in scope)")
+    else:
+        out.append("  failing checks : not recorded by this build; a rejection cannot be diagnosed")
+    if s["silentRejections"]:
+        out.append(
+            f"  !! {s['silentRejections']} rejected job(s) name NO failing check — a verdict that"
+            " identifies nothing is a defect in the verifier, not a result"
+        )
+    if s["claimedButNotSmaller"]:
+        out.append(
+            f"  !! {s['claimedButNotSmaller']} job(s) claim a real compression but are not smaller"
+        )
+    return "\n".join(out)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("sessions", nargs="+", help="one or two session.jsonl files")
+    ap.add_argument("--json", help="write the machine-readable summary here")
+    args = ap.parse_args()
+
+    summaries = [summarize(p) for p in args.sessions]
+    for s in summaries:
+        print(f"\n=== {s['path']} ===")
+        print(render(s))
+
+    if len(summaries) == 2:
+        a, b = summaries
+        print("\n=== delta (second minus first) ===")
+        for key in ("jobs", "realCompressions", "savedBytes", "validationFailures",
+                    "unexplainedFailures", "copyAvoidedBytes", "generatedOutputBytes",
+                    "pixelCertified", "withProbeRatios"):
+            print(f"  {key:22}: {b[key] - a[key]:+,}")
+        # Refuse causal language: these runs are not a controlled experiment.
+        print("\n  NOTE: differences are observational only. Learned-profile state, thermal")
+        print("  history, and execution order were not controlled, so no cause may be inferred.")
+
+    if args.json:
+        with open(args.json, "w") as fh:
+            json.dump(summaries, fh, indent=2)
+        print(f"\nwrote {args.json}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

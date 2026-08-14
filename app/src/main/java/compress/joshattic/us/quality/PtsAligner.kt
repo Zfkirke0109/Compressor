@@ -5,11 +5,40 @@ package compress.joshattic.us.quality
  *
  * Both streams are normalized to window-relative time (ref: pts − windowStart; dist:
  * pts − distStart). Two head frames may be scored as a pair only when their normalized
- * timestamps sit within an adaptive tolerance: half the smallest frame interval observed
- * on either stream so far, floored at [TOLERANCE_FLOOR_US]. Before any interval is known
- * the tolerance stays at the floor — a truly aligned pair has ~0 skew at any frame rate
- * (the probe clip re-encodes the same source frames with preserved timestamps), while a
- * one-frame offset is ≥ 8.3 ms even at 120 fps.
+ * timestamps sit within [TOLERANCE_FLOOR_US] — a FIXED tolerance that does not vary with
+ * frame rate.
+ *
+ * Why fixed, and why 4 ms specifically. A correctly aligned pair's skew is bounded by how the
+ * two streams were ADDRESSED, not by how far apart their frames are. The probe path is the
+ * widest case: [VmafPairScorer] is handed `ScoreWindow(startUs, endUs, distStartUs = 0)` while
+ * `PerceptualQualityProber.exportClip` cuts the clip with `setStartPositionMs(startUs / 1000)`,
+ * so the clip really begins at `startUs − (startUs % 1000)`. A source frame at pts P therefore
+ * normalizes to `P − startUs` on the ref side and `P − (startUs − startUs % 1000)` on the dist
+ * side, leaving a CONSTANT skew of `−(startUs % 1000)` — at most 999 µs, at any frame rate.
+ * Certification is tighter still (both streams share one timeline; only muxer timescale rounding
+ * separates them). 4 ms is ~4× that 999 µs bound: wide enough to absorb legitimate addressing
+ * noise, narrow enough that a one-frame offset — ≥ 8.3 ms even at 120 fps — is never mistaken
+ * for alignment.
+ *
+ * This is deliberately NOT adaptive. A superseded rule widened the tolerance to half the smallest
+ * observed frame interval, which grew it exactly where frames are furthest apart (20.0 ms at
+ * 25 fps, 16.7 ms at 30 fps) and so scored frames up to half a frame out of step as if they were
+ * aligned. Measured on device across 368 probe windows in five 219-file batches: every window
+ * that CLEARED the Perceptually Lossless bar had skew ≤ 0.80 ms, while every catastrophic window
+ * (min < 20) had skew ≥ 1.90 ms — two populations with no overlap. A fixed 4 ms tolerance keeps
+ * 100% of the passing windows and refuses 80 of the 90 catastrophic ones, which were otherwise
+ * being fed to the probe-skip ratchet as if they were quality measurements.
+ *
+ * Two limits this does NOT remove, recorded rather than papered over:
+ *  - Catastrophic windows whose skew falls between 1.90 ms and the 4 ms floor (10 of the 90
+ *    observed) are still scored. Narrowing the floor to reach them would trade the 4× margin
+ *    above for ~1.5×, on a passing-window corpus of only three distinct clips; that needs a
+ *    broader corpus first, not a guess.
+ *  - When the frame interval is itself at or below the floor (> 250 fps, or VFR frames closer
+ *    than 4 ms), a one-frame offset can still land inside the tolerance. The superseded rule
+ *    behaved identically there — `max(4 ms, minGap/2)` is exactly 4 ms whenever minGap ≤ 8 ms —
+ *    so this is pre-existing and unchanged, not a regression. [smallestFrameIntervalUs] records
+ *    the observation a future calibration round would need to close it honestly.
  *
  * Drop-based repair is allowed ONLY at the window's leading boundary — before the first
  * scored pair (measured on device: the Transformer probe clip and the reference window
@@ -65,12 +94,21 @@ class PtsAligner(
         lastDistUs = normPtsUs
     }
 
-    /** Current pairing tolerance: half the smallest observed frame interval, floored. */
-    fun toleranceUs(): Long {
-        val minGap = minOf(minRefGapUs, minDistGapUs)
-        if (minGap == Long.MAX_VALUE) return toleranceFloorUs
-        return maxOf(toleranceFloorUs, minGap / 2)
-    }
+    /**
+     * The pairing tolerance: fixed at [toleranceFloorUs], independent of frame rate. See the
+     * class KDoc for why a correctly aligned pair's skew is bounded by stream addressing
+     * (≤ 999 µs) rather than by the frame interval.
+     */
+    fun toleranceUs(): Long = toleranceFloorUs
+
+    /**
+     * Smallest frame interval observed on either stream so far, or null until two frames of one
+     * stream have been seen. Diagnostic only — no decision reads it. Recorded because the fixed
+     * tolerance's one known blind spot is content whose frame interval is at or below the floor,
+     * and closing that honestly needs this observation from real high-frame-rate content.
+     */
+    fun smallestFrameIntervalUs(): Long? =
+        minOf(minRefGapUs, minDistGapUs).takeIf { it != Long.MAX_VALUE }
 
     /** Decide what to do with the current heads. Never scores a pair beyond tolerance. */
     fun decide(refNormUs: Long, distNormUs: Long): Action {

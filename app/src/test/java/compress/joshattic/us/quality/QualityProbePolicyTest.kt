@@ -23,21 +23,94 @@ class QualityProbePolicyTest {
     }
 
     @Test
-    fun pixelScoreableGeometryGatesAtTheScoringCap() {
-        // At/below the 1080p-class cap: scoreable, so probe-eligible.
+    fun pixelScoreableGeometryReachesFourKClass() {
+        // At/below the 4K-class cap: the finished output can be scored, so it can be pixel-proven.
         assertTrue(QualityProbePolicy.isPixelScoreableGeometry(1920, 1080))
         assertTrue(QualityProbePolicy.isPixelScoreableGeometry(1080, 1920)) // portrait
         assertTrue(QualityProbePolicy.isPixelScoreableGeometry(1280, 720))
-        // Above the cap: the scorer would return Unavailable after a wasted encode -> not scoreable.
-        assertFalse(QualityProbePolicy.isPixelScoreableGeometry(3840, 2160)) // 4K
-        assertFalse(QualityProbePolicy.isPixelScoreableGeometry(2560, 1440)) // 1440p
+        assertTrue(QualityProbePolicy.isPixelScoreableGeometry(2560, 1440)) // 1440p
+        assertTrue(QualityProbePolicy.isPixelScoreableGeometry(3840, 2160)) // 4K, the S23 Ultra case
+        assertTrue(QualityProbePolicy.isPixelScoreableGeometry(2160, 3840)) // 4K portrait
+        // Above the cap two simultaneous 8K decoders are needed: still no evidence.
         assertFalse(QualityProbePolicy.isPixelScoreableGeometry(7680, 4320)) // 8K
         // Degenerate dimensions never scoreable.
         assertFalse(QualityProbePolicy.isPixelScoreableGeometry(0, 0))
         assertFalse(QualityProbePolicy.isPixelScoreableGeometry(-1, 1080))
-        // Exactly at the cap boundary (1920*1088) is scoreable; one pixel over is not.
-        assertTrue(QualityProbePolicy.isPixelScoreableGeometry(1920, 1088))
-        assertFalse(QualityProbePolicy.isPixelScoreableGeometry(1921, 1088))
+        // Exactly at the cap boundary (3840*2176) is scoreable; one pixel over is not.
+        assertTrue(QualityProbePolicy.isPixelScoreableGeometry(3840, 2176))
+        assertFalse(QualityProbePolicy.isPixelScoreableGeometry(3841, 2176))
+    }
+
+    @Test
+    fun probeLadderGeometryStaysAtTheAffordableBar() {
+        // The ladder's trial encodes stay 1080p-class: at 4K they cannot finish inside the
+        // prober's budget, so the plan keeps its default ratio and relies on certification.
+        assertTrue(QualityProbePolicy.isProbeLadderGeometry(1920, 1080))
+        assertTrue(QualityProbePolicy.isProbeLadderGeometry(1920, 1088))
+        assertTrue(QualityProbePolicy.isProbeLadderGeometry(1080, 1920))
+        assertFalse(QualityProbePolicy.isProbeLadderGeometry(1921, 1088))
+        assertFalse(QualityProbePolicy.isProbeLadderGeometry(2560, 1440))
+        assertFalse(QualityProbePolicy.isProbeLadderGeometry(3840, 2160))
+        assertFalse(QualityProbePolicy.isProbeLadderGeometry(0, 0))
+    }
+
+    @Test
+    fun ladderGeometryIsStrictlyNarrowerThanScoreableGeometry() {
+        // The invariant the two gates rest on: anything worth a ladder is always scoreable, and
+        // 4K-class sources are scoreable WITHOUT being ladder-eligible. If these ever collapse
+        // into one predicate, 4K silently loses either its certification or its budget guard.
+        assertTrue(QualityProbePolicy.PROBE_LADDER_MAX_PIXELS < VmafPairScorer.MAX_COMPARE_PIXELS)
+        listOf(1280 to 720, 1920 to 1080, 1920 to 1088).forEach { (w, h) ->
+            assertTrue(QualityProbePolicy.isProbeLadderGeometry(w, h))
+            assertTrue(QualityProbePolicy.isPixelScoreableGeometry(w, h))
+        }
+        listOf(2560 to 1440, 3840 to 2160).forEach { (w, h) ->
+            assertFalse(QualityProbePolicy.isProbeLadderGeometry(w, h))
+            assertTrue(QualityProbePolicy.isPixelScoreableGeometry(w, h))
+        }
+    }
+
+    @Test
+    fun certificationWithoutProbeBasisStillFailsOnMeasuredEvidence() {
+        // Sources above the ladder bar never had a pixel-justified target, so merely-unavailable
+        // evidence leaves the structural verdict standing (the behavior they already get today).
+        assertTrue(
+            QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(PairScoreOutcome.Unavailable)
+        )
+        // ...but measured evidence still rules in the negative direction, exactly as elsewhere.
+        assertFalse(
+            QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(PairScoreOutcome.MisalignmentRejected)
+        )
+        assertFalse(
+            QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(
+                PairScoreOutcome.Scored(listOf(good(), good().copy(mean = 90.0)))
+            )
+        )
+        assertTrue(
+            QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(
+                PairScoreOutcome.Scored(listOf(good(), good(), good()))
+            )
+        )
+    }
+
+    @Test
+    fun unavailableEvidenceNeverWearsThePixelProvenLabel() {
+        // The no-probe-basis fallback accepts, but acceptance is not proof: only measured windows
+        // may set pixelCertified, so a 4K output whose scoring failed still reads structural-only.
+        val acceptedWithoutEvidence =
+            QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(PairScoreOutcome.Unavailable)
+        assertTrue(acceptedWithoutEvidence)
+        assertFalse(
+            QualityProbePolicy.isPixelCertified(acceptedWithoutEvidence, PairScoreOutcome.Unavailable)
+        )
+        // A measured pass at 4K-class geometry is the case this whole change exists to unlock.
+        val scored = PairScoreOutcome.Scored(listOf(good(), good(), good()))
+        assertTrue(
+            QualityProbePolicy.isPixelCertified(
+                QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(scored),
+                scored
+            )
+        )
     }
 
     @Test
@@ -147,6 +220,30 @@ class QualityProbePolicyTest {
     }
 
     @Test
+    fun misalignmentYieldsNoMeasuredWindowsSoItCannotBeReadAsDegradation() {
+        // The ratchet in BatchCompressorViewModel fires on a MEASURED rejection at the safest
+        // rung, which SmartPerceptualProfileEngine then turns into skipped probes for a whole
+        // profile class. The property that keeps misalignment out of it is that a misaligned
+        // window produces no WindowScore at all — only PairScoreOutcome.Scored carries windows,
+        // so PerceptualQualityProber.probeOneRatio returns null and the rung is "unmeasurable",
+        // never "measured and failing". Pinned here because getting it wrong trains the engine
+        // on pairing noise as if it were pixel evidence.
+        val misaligned: PairScoreOutcome = PairScoreOutcome.MisalignmentRejected
+        assertFalse(misaligned is PairScoreOutcome.Scored)
+
+        // With no measured windows there is nothing for the near-miss machinery to read, so an
+        // unalignable ladder can neither compute a shortfall nor spend another probe encode.
+        assertNull(QualityProbePolicy.worstWindowShortfall(null))
+        assertNull(QualityProbePolicy.worstWindowShortfall(emptyList()))
+        assertNull(QualityProbePolicy.upwardRefinementCandidate(0.90, null))
+        assertNull(QualityProbePolicy.upwardRefinementCandidate(0.90, emptyList()))
+
+        // And an empty/absent score list never passes the bar, so it can never certify either.
+        assertFalse(QualityProbePolicy.windowsPass(null))
+        assertFalse(QualityProbePolicy.windowsPass(emptyList()))
+    }
+
+    @Test
     fun probeWindowsSampleAwayFromClipEdges() {
         // Too short to probe honestly.
         assertTrue(QualityProbePolicy.probeWindows(1_500_000L).isEmpty())
@@ -230,5 +327,54 @@ class QualityProbePolicyTest {
         // The refinement may never dip below the hard floor.
         val refined = QualityProbePolicy.refinementCandidate(0.90, null)
         assertTrue(refined == null || refined >= QualityProbePolicy.HARD_RATIO_FLOOR)
+    }
+
+    @Test
+    fun theTwoQualityBarsAreOrderedAndDistinct() {
+        val pl = QualityProbePolicy.PERCEPTUAL_LOSSLESS
+        val hq = QualityProbePolicy.HIGH_QUALITY
+
+        // The transparency bar must keep its calibrated values exactly.
+        assertEquals(95.5, pl.meanMin, 1e-9)
+        assertEquals(91.0, pl.p5Min, 1e-9)
+        assertEquals(84.0, pl.minMin, 1e-9)
+
+        // HQ is explicitly LOSSY, so every threshold must sit strictly below transparency. If
+        // these ever met or crossed, "High Quality" could quietly accept what PL rejects while
+        // still being described as the lower-quality mode.
+        assertTrue(hq.meanMin < pl.meanMin)
+        assertTrue(hq.p5Min < pl.p5Min)
+        assertTrue(hq.minMin < pl.minMin)
+
+        // ...and HQ must not be a free-for-all either; it is still a quality bar.
+        assertTrue(hq.meanMin > 80.0)
+        assertTrue(hq.minMin > 60.0)
+    }
+
+    @Test
+    fun barAwareWindowsPassDefaultsToTransparencyForEveryExistingCaller() {
+        // The regression that matters: adding a second bar must not move the PL decision.
+        // A window between the two bars passes HQ and fails PL.
+        val between = listOf(WindowScore(30, mean = 94.0, p5 = 89.5, min = 82.0))
+
+        assertFalse(QualityProbePolicy.windowsPass(between))
+        assertFalse(QualityProbePolicy.windowsPass(between, QualityProbePolicy.PERCEPTUAL_LOSSLESS))
+        assertTrue(QualityProbePolicy.windowsPass(between, QualityProbePolicy.HIGH_QUALITY))
+    }
+
+    @Test
+    fun theHighQualityBarStillRejectsRealDegradation() {
+        // A lower bar is not an absent one.
+        val bad = listOf(WindowScore(30, mean = 70.0, p5 = 60.0, min = 40.0))
+        assertFalse(QualityProbePolicy.windowsPass(bad, QualityProbePolicy.HIGH_QUALITY))
+
+        // One weak window still rejects the whole set, same as PL.
+        val mixed = listOf(good(), WindowScore(30, mean = 94.0, p5 = 70.0, min = 82.0))
+        assertFalse(QualityProbePolicy.windowsPass(mixed, QualityProbePolicy.HIGH_QUALITY))
+
+        // Too few compared frames is still "no evidence", not "weak evidence", at any bar.
+        val tooFew = listOf(WindowScore(5, mean = 99.0, p5 = 99.0, min = 99.0))
+        assertFalse(QualityProbePolicy.windowsPass(tooFew, QualityProbePolicy.HIGH_QUALITY))
+        assertFalse(QualityProbePolicy.windowsPass(tooFew, QualityProbePolicy.PERCEPTUAL_LOSSLESS))
     }
 }
