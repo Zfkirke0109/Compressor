@@ -21,10 +21,15 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import compress.joshattic.us.ui.theme.CompressorTheme
@@ -175,6 +180,7 @@ private fun BatchCompressorScreen(
             }
 
             item { BatchSettingsCard(state, viewModel, context, requestOriginalMediaAccess) }
+            item { DiagnosticsExportCard(context) }
             if (state.items.isNotEmpty()) {
                 item { BatchSummaryCard(state) }
                 item { PreservationReportCard(state) }
@@ -293,6 +299,151 @@ private fun HighQualityRetryCard(count: Int, onRetry: () -> Unit) {
             )
             Button(onClick = onRetry, modifier = Modifier.fillMaxWidth()) {
                 Text("Shrink $count with High Quality")
+            }
+        }
+    }
+}
+
+/**
+ * Diagnostics export.
+ *
+ * Getting captures off this device has been the slowest part of every debugging round: the
+ * recorder writes to the app's private files directory, which adb cannot read across Android users
+ * (from Secure Folder there is no adb route at all), and the logcat workaround is bounded by a
+ * 5 MiB buffer this device will not raise — a 219-job capture arrived with its `session_start`
+ * record already lost. Both buttons here need no adb, no root and no PC.
+ *
+ * The Termux row is offered only as a live-capture aid, and it deliberately never claims more than
+ * it can verify: Termux additionally requires `allow-external-apps=true`, which no API exposes, so
+ * a dispatched command is reported as *sent* and the copy-to-clipboard route stays available in
+ * every state.
+ */
+@Composable
+private fun DiagnosticsExportCard(context: Context) {
+    val scope = rememberCoroutineScope()
+    var busy by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+    var isError by remember { mutableStateOf(false) }
+    val clipboard = LocalClipboardManager.current
+    val termuxAvailability = remember { DiagnosticsExporter.termuxAvailability(context) }
+
+    fun report(result: DiagnosticsExporter.ExportResult) {
+        when (result) {
+            is DiagnosticsExporter.ExportResult.Written -> {
+                isError = false
+                message = "Saved ${result.displayName} " +
+                    "(${DiagnosticsExportPlan.describeSize(result.bytes)}) to " +
+                    "Downloads/${DiagnosticsExportPlan.EXPORT_SUBDIRECTORY}."
+            }
+            is DiagnosticsExporter.ExportResult.Empty -> {
+                isError = false
+                message = result.reason
+            }
+            is DiagnosticsExporter.ExportResult.Failed -> {
+                isError = true
+                message = result.reason
+            }
+        }
+    }
+
+    // Export reads files and spawns logcat, so it never runs on the UI thread.
+    fun runExport(block: () -> DiagnosticsExporter.ExportResult) {
+        if (busy) return
+        busy = true
+        message = null
+        scope.launch {
+            val result = withContext(Dispatchers.IO) { block() }
+            report(result)
+            busy = false
+        }
+    }
+
+    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("Diagnostics", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                "Save this app's own batch records and log to Downloads. No adb, root or PC needed, " +
+                    "and it works inside Secure Folder.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Button(
+                onClick = { runExport { DiagnosticsExporter.exportSessions(context) } },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !busy
+            ) { Text("Save batch records to Downloads") }
+            Text(
+                "The structured per-job records (session.jsonl) for every batch this app has run.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            OutlinedButton(
+                onClick = { runExport { DiagnosticsExporter.exportLogcat(context) } },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !busy
+            ) { Text("Save log to Downloads") }
+            Text(
+                "This app's own log lines only — including the per-check verification detail that " +
+                    "the batch records do not carry. Export soon after a batch: the system log " +
+                    "buffer is small and overwrites itself.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            HorizontalDivider()
+
+            Text("Live capture with Termux", style = MaterialTheme.typography.labelLarge)
+            Text(
+                when (termuxAvailability) {
+                    DiagnosticsExportPlan.TermuxAvailability.CAN_RUN_COMMAND ->
+                        "Termux can be started directly. It must also have allow-external-apps=true " +
+                            "set, which cannot be checked from here — confirm the command actually ran."
+                    DiagnosticsExportPlan.TermuxAvailability.INSTALLED_WITHOUT_PERMISSION ->
+                        "Termux is installed but has not granted RUN_COMMAND, so it cannot be " +
+                            "started from here. Copy the command and paste it into Termux."
+                    DiagnosticsExportPlan.TermuxAvailability.NOT_INSTALLED ->
+                        "Termux is not installed. The command is still available to copy."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedButton(
+                    onClick = { runExport { DiagnosticsExporter.startTermuxCapture(context) } },
+                    modifier = Modifier.weight(1f),
+                    enabled = !busy &&
+                        termuxAvailability == DiagnosticsExportPlan.TermuxAvailability.CAN_RUN_COMMAND
+                ) { Text("Start in Termux") }
+                OutlinedButton(
+                    onClick = {
+                        clipboard.setText(AnnotatedString(DiagnosticsExporter.termuxScript(context)))
+                        isError = false
+                        message = "Command copied. Paste it into Termux before starting the batch."
+                    },
+                    modifier = Modifier.weight(1f),
+                    enabled = !busy
+                ) { Text("Copy command") }
+            }
+            if (termuxAvailability != DiagnosticsExportPlan.TermuxAvailability.NOT_INSTALLED) {
+                TextButton(
+                    onClick = {
+                        DiagnosticsExporter.termuxLaunchIntent(context)?.let { context.startActivity(it) }
+                    },
+                    enabled = !busy
+                ) { Text("Open Termux") }
+            }
+
+            if (busy) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+            message?.let {
+                Text(
+                    it,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                )
             }
         }
     }
