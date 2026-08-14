@@ -39,13 +39,34 @@ data class EncoderConfigDelta(
         get() = requestedMime != null && actualMime != null &&
             !requestedMime.equals(actualMime, ignoreCase = true)
 
+    private val geometryKnown: Boolean
+        get() = requestedWidth > 0 && requestedHeight > 0 && actualWidth > 0 && actualHeight > 0
+
     /**
-     * True when the output geometry differs from the request. Unknown values (<= 0) are NOT
-     * treated as a change: absent information is not evidence of substitution, and claiming
-     * otherwise would manufacture false fallbacks in reports.
+     * True when the actual geometry is the requested one with the axes swapped — 1080x1920 asked
+     * for, 1920x1080 produced.
+     *
+     * This is not a substitution. Media3 landscape-encodes a portrait source by default and writes
+     * a compensating 90/270-degree orientation hint, so the coded frame is transposed while the
+     * displayed frame is unchanged; `OutputVerifier.sameDisplayOrientation` accepts exactly this
+     * case. Reporting it as a fallback was a false positive — capture batch_1786651683689 flagged
+     * three portrait clips (1080x1920, 480x1030, 676x1080) as `FALLBACK=resolution` when nothing
+     * had been substituted at all.
+     *
+     * A square request cannot be transposed, so it never qualifies.
+     */
+    val orientationTransposed: Boolean
+        get() = geometryKnown && requestedWidth != requestedHeight &&
+            requestedWidth == actualHeight && requestedHeight == actualWidth
+
+    /**
+     * True when the output geometry differs from the request in a way that changes the picture:
+     * a different pixel count or aspect, not merely a transposed coding orientation. Unknown
+     * values (<= 0) are NOT treated as a change: absent information is not evidence of
+     * substitution, and claiming otherwise would manufacture false fallbacks in reports.
      */
     val resolutionChanged: Boolean
-        get() = requestedWidth > 0 && requestedHeight > 0 && actualWidth > 0 && actualHeight > 0 &&
+        get() = geometryKnown && !orientationTransposed &&
             (requestedWidth != actualWidth || requestedHeight != actualHeight)
 
     /**
@@ -78,6 +99,9 @@ data class EncoderConfigDelta(
         bitrateRatio?.let { append(";ratio=").append(String.format(java.util.Locale.US, "%.3f", it)) }
         append(";mode=").append(requestedBitrateMode ?: "?")
         append(";encoder=").append(encoderName ?: "?")
+        // Recorded, not hidden: a transposition is expected for portrait sources, but a capture
+        // still has to show that the axes moved, so a genuinely rotated output stays visible.
+        if (orientationTransposed) append(";coded=transposed")
         if (formatFellBack) {
             append(";FALLBACK=")
             append(listOfNotNull(

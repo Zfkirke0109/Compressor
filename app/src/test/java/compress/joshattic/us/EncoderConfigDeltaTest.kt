@@ -60,6 +60,39 @@ class EncoderConfigDeltaTest {
     }
 
     @Test
+    fun aTransposedPortraitEncodeIsNotAResolutionSubstitution() {
+        // Media3 landscape-encodes portrait sources and writes a compensating quarter-turn hint;
+        // the displayed frame is unchanged and OutputVerifier.sameDisplayOrientation accepts it.
+        // Three clips in batch_1786651683689 were flagged FALLBACK=resolution for exactly this.
+        for ((w, h) in listOf(1080 to 1920, 480 to 1030, 676 to 1080)) {
+            val d = delta(reqW = w, reqH = h, actW = h, actH = w)
+            assertTrue("$w x $h should read as transposed", d.orientationTransposed)
+            assertFalse(d.resolutionChanged)
+            assertFalse(d.formatFellBack)
+            assertFalse(d.compact().contains("FALLBACK"))
+            // Still visible in the capture — suppressed from the fallback signal, not from the record.
+            assertTrue(d.compact().contains(";coded=transposed"))
+        }
+    }
+
+    @Test
+    fun aTransposedGeometryThatAlsoRescalesIsStillASubstitution() {
+        // 1080x1920 -> 1080x1920-transposed is 1920x1080. Anything else changes the picture.
+        val d = delta(reqW = 1080, reqH = 1920, actW = 1280, actH = 720)
+        assertFalse(d.orientationTransposed)
+        assertTrue(d.resolutionChanged)
+        assertTrue(d.compact().contains("FALLBACK=resolution"))
+    }
+
+    @Test
+    fun aSquareRequestCannotBeTransposed() {
+        val d = delta(reqW = 1080, reqH = 1080, actW = 1080, actH = 1080)
+        assertFalse(d.orientationTransposed)
+        assertFalse(d.resolutionChanged)
+        assertFalse(d.compact().contains(";coded=transposed"))
+    }
+
+    @Test
     fun unknownValuesAreNotReportedAsSubstitutions() {
         // Absent information is not evidence of a fallback. Treating it as one would manufacture
         // false positives in reports, which is worse than reporting nothing.
