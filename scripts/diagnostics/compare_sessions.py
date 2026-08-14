@@ -28,6 +28,8 @@ import sys
 from collections import Counter
 from typing import Any
 
+from session_records import read_records
+
 # Terminal states in which no output file is produced, so no byte saving is possible.
 NON_PRODUCING = {
     "ALREADY_HIGHLY_OPTIMIZED",
@@ -38,22 +40,15 @@ NON_PRODUCING = {
 
 
 def load_jobs(path: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Accepts both capture transports; see session_records.decode_record."""
     start: dict[str, Any] = {}
     jobs: list[dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            kind = rec.get("type") or rec.get("eventType")
-            if kind == "session_start":
-                start = rec
-            elif kind == "job":
-                jobs.append(rec)
+    for rec in read_records(path):
+        kind = rec.get("type") or rec.get("eventType")
+        if kind == "session_start":
+            start = rec
+        elif kind == "job":
+            jobs.append(rec)
     return start, jobs
 
 

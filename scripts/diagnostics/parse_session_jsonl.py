@@ -25,27 +25,25 @@ import sys
 from collections import Counter
 from typing import Any
 
+from session_records import read_records
+
 
 def load(path: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]], dict[str, Any] | None]:
-    """Return (session_start, jobs, session_summary). Tolerates trailing/partial lines."""
+    """Return (session_start, jobs, session_summary).
+
+    Accepts both capture transports (bare JSONL and logcat-prefixed) and tolerates a truncated
+    tail; see session_records.decode_record for why the prefix has to be handled.
+    """
     start = summary = None
     jobs: list[dict[str, Any]] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # a truncated tail must not invalidate the whole capture
-            kind = rec.get("type") or rec.get("eventType")
-            if kind == "session_start":
-                start = rec
-            elif kind == "session_summary":
-                summary = rec
-            elif kind == "job":
-                jobs.append(rec)
+    for rec in read_records(path):
+        kind = rec.get("type") or rec.get("eventType")
+        if kind == "session_start":
+            start = rec
+        elif kind == "session_summary":
+            summary = rec
+        elif kind == "job":
+            jobs.append(rec)
     return start, jobs, summary
 
 
