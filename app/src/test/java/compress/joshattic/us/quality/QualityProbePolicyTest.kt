@@ -220,6 +220,30 @@ class QualityProbePolicyTest {
     }
 
     @Test
+    fun misalignmentYieldsNoMeasuredWindowsSoItCannotBeReadAsDegradation() {
+        // The ratchet in BatchCompressorViewModel fires on a MEASURED rejection at the safest
+        // rung, which SmartPerceptualProfileEngine then turns into skipped probes for a whole
+        // profile class. The property that keeps misalignment out of it is that a misaligned
+        // window produces no WindowScore at all — only PairScoreOutcome.Scored carries windows,
+        // so PerceptualQualityProber.probeOneRatio returns null and the rung is "unmeasurable",
+        // never "measured and failing". Pinned here because getting it wrong trains the engine
+        // on pairing noise as if it were pixel evidence.
+        val misaligned: PairScoreOutcome = PairScoreOutcome.MisalignmentRejected
+        assertFalse(misaligned is PairScoreOutcome.Scored)
+
+        // With no measured windows there is nothing for the near-miss machinery to read, so an
+        // unalignable ladder can neither compute a shortfall nor spend another probe encode.
+        assertNull(QualityProbePolicy.worstWindowShortfall(null))
+        assertNull(QualityProbePolicy.worstWindowShortfall(emptyList()))
+        assertNull(QualityProbePolicy.upwardRefinementCandidate(0.90, null))
+        assertNull(QualityProbePolicy.upwardRefinementCandidate(0.90, emptyList()))
+
+        // And an empty/absent score list never passes the bar, so it can never certify either.
+        assertFalse(QualityProbePolicy.windowsPass(null))
+        assertFalse(QualityProbePolicy.windowsPass(emptyList()))
+    }
+
+    @Test
     fun probeWindowsSampleAwayFromClipEdges() {
         // Too short to probe honestly.
         assertTrue(QualityProbePolicy.probeWindows(1_500_000L).isEmpty())

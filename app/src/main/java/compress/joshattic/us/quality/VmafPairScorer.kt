@@ -271,8 +271,8 @@ object VmafPairScorer {
         // and the reference window reader can disagree by one frame about where the window
         // starts (measured: constant 33.2 ms skew at 29.97 fps, capture batch_20260716_185345),
         // and decode-order pairing then scores inter-frame motion as if it were encode quality.
-        // The aligner drops the earlier head (budgeted) until the heads agree within half a
-        // frame interval; unalignable windows FAIL — misalignment is never scored.
+        // The aligner drops the earlier head (budgeted) until the heads agree within a FIXED
+        // 4 ms tolerance; unalignable windows FAIL — misalignment is never scored.
         val aligner = PtsAligner()
         // Pairing telemetry accumulators (diagnostics only — no influence on scoring).
         var refSeen = 0

@@ -137,14 +137,81 @@ class PtsAlignerTest {
     }
 
     @Test
-    fun toleranceAdaptsToTheSmallestObservedFrameInterval() {
+    fun toleranceIsFixedAndNeverWidensWithTheFrameInterval() {
+        // The superseded rule returned half the smallest observed interval (20.0 ms at 25 fps),
+        // widening the tolerance exactly where frames are furthest apart. It is now constant.
         val aligner = PtsAligner()
         assertEquals(PtsAligner.TOLERANCE_FLOOR_US, aligner.toleranceUs())
-        aligner.onRefFrame(0L); aligner.onRefFrame(33_367L)
-        aligner.onDistFrame(0L); aligner.onDistFrame(33_367L)
-        assertEquals(33_367L / 2, aligner.toleranceUs())
-        // 120fps-class dist stream tightens it further
-        aligner.onDistFrame(33_367L + 8_333L)
-        assertEquals(8_333L / 2, aligner.toleranceUs())
+        assertNull(aligner.smallestFrameIntervalUs())
+
+        aligner.onRefFrame(0L); aligner.onRefFrame(40_000L)   // 25 fps
+        aligner.onDistFrame(0L); aligner.onDistFrame(40_000L)
+        assertEquals(PtsAligner.TOLERANCE_FLOOR_US, aligner.toleranceUs())
+        assertEquals(40_000L, aligner.smallestFrameIntervalUs())
+
+        // A 120 fps-class stream does not move it either — only the observation changes.
+        aligner.onDistFrame(48_333L)
+        assertEquals(PtsAligner.TOLERANCE_FLOOR_US, aligner.toleranceUs())
+        assertEquals(8_333L, aligner.smallestFrameIntervalUs())
+    }
+
+    @Test
+    fun halfFrameGridOffsetAt25FpsFailsClosedInsteadOfBeingScored() {
+        // Device signature (job 80bff5a136f7, 676x1080 @ 25 fps): the heads sat 20.0 ms apart —
+        // exactly half a 40 ms frame interval, i.e. precisely ON the superseded tolerance — and
+        // were SCORED, returning VMAF 1.860/0.000/0.000 for an HEVC ratio-0.70 encode. A
+        // half-frame-offset grid is not a measurement; it must produce no pixel evidence at all.
+        val ref = cfr(30, 40_000L, offsetUs = 0L)
+        val dist = cfr(30, 40_000L, offsetUs = 20_000L)
+        val (pairs, fail, aligner) = run(ref, dist)
+        assertEquals(PtsAligner.Action.FAIL, fail)
+        assertEquals(0, pairs.size) // nothing was ever scored
+        assertEquals(PtsAligner.MAX_ALIGNMENT_DROPS, aligner.refDropped + aligner.distDropped)
+        assertTrue(aligner.failureReason!!.contains("not aligned"))
+    }
+
+    @Test
+    fun halfFrameOffsetFailsAtEveryRateTheOldRuleWouldHaveScored() {
+        // 24 / 25 / 30 fps: the superseded minGap/2 tolerance was 20.8 / 20.0 / 16.7 ms, so a
+        // half-frame offset sat at or inside the boundary and was scored at every one of them.
+        for (intervalUs in listOf(41_667L, 40_000L, 33_333L)) {
+            val ref = cfr(30, intervalUs)
+            val dist = cfr(30, intervalUs, offsetUs = intervalUs / 2)
+            val (pairs, fail, _) = run(ref, dist)
+            assertEquals("interval $intervalUs must fail closed", PtsAligner.Action.FAIL, fail)
+            assertEquals("interval $intervalUs must score nothing", 0, pairs.size)
+        }
+    }
+
+    @Test
+    fun worstCaseMsGranularClipStartSkewStillPairsAtEveryFrameRate() {
+        // The probe clip is cut with setStartPositionMs(startUs / 1000), so a CORRECTLY aligned
+        // probe carries a constant skew of -(startUs % 1000): at most 999 us, whatever the frame
+        // rate. That bound is exactly what the 4 ms floor exists to absorb — it must never fail.
+        for (intervalUs in listOf(41_667L, 40_000L, 33_367L, 16_667L, 8_333L)) {
+            val ref = cfr(30, intervalUs)
+            val dist = ref.map { it - 999L }
+            val (pairs, fail, aligner) = run(ref, dist)
+            assertNull("interval $intervalUs must still pair", fail)
+            assertEquals("interval $intervalUs must score every frame", 30, pairs.size)
+            assertEquals(0, aligner.refDropped + aligner.distDropped)
+        }
+    }
+
+    @Test
+    fun theDocumentedOneFrameLeadingOffsetStillRepairsUnderTheFixedTolerance() {
+        // capture batch_20260716_185345: constant 33.2 ms skew at 29.97 fps (interval 33_367 us),
+        // i.e. the probe clip carried one leading frame the reference reader excluded. The 4 ms
+        // tolerance must still repair this with a SINGLE drop, leaving a residual well inside it.
+        val interval = 33_367L
+        val ref = cfr(35, interval, offsetUs = 33_200L) // measured skew, not an exact frame
+        val dist = cfr(35, interval, offsetUs = 0L)
+        val (pairs, fail, aligner) = run(ref, dist)
+        assertNull(fail)
+        assertEquals(1, aligner.distDropped)
+        assertEquals(0, aligner.refDropped)
+        assertEquals(34, pairs.size)
+        // Residual skew after the drop is 33_200 - 33_367 = -167 us: inside the 4 ms floor.
+        assertTrue(pairs.all { (r, d) -> kotlin.math.abs(r - d) <= PtsAligner.TOLERANCE_FLOOR_US })
     }
 }
