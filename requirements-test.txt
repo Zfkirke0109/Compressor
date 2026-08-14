@@ -1,0 +1,10 @@
+# Third-party packages the Python test suites need. Everything else in
+# scripts/diagnostics/ and research/ runs on the standard library alone, which is deliberate:
+# the capture-analysis tooling has to be runnable on any machine holding a device capture.
+#
+# Install with:  python3 -m pip install -r requirements-test.txt
+#
+# numpy - research/hdr_measurement_basis/scripts (hdr_metrics, hdr_pair_measure). The HDR
+#   measurement basis works on per-pixel arrays in PQ/ICtCp space; those transforms are not
+#   something to reimplement by hand when correctness is the entire point of the module.
+numpy>=1.24

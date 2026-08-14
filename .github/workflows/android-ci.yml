@@ -122,6 +122,9 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install Python test dependencies
+        run: python3 -m pip install --disable-pip-version-check -r requirements-test.txt
+
       - name: Run diagnostics and research test suites
         shell: bash
         run: |
