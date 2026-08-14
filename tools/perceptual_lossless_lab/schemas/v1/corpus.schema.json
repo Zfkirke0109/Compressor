@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Corpus identity record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "record_type", "producer_role", "run_id", "created_at", "experiment_spec_sha256", "links", "payload", "content_sha256"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "record_type": {"const": "corpus"},
+    "producer_role": {"const": "deterministic-core"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+    "created_at": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"},
+    "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "links": {
+      "type": "object", "additionalProperties": false, "required": ["experiment_spec"],
+      "properties": {"experiment_spec": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    },
+    "payload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["manifest_sha256", "source_identities_sha256", "pair_identities_sha256", "item_count", "manifest_alias"],
+      "properties": {
+        "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_identities_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "pair_identities_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "item_count": {"type": "integer", "minimum": 1},
+        "manifest_alias": {"type": "string", "minLength": 1, "pattern": "^[^/\\\\]+$"}
+      }
+    },
+    "supersedes_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

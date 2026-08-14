@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pl-benchmark named workflow request v1",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "workflow_id", "run_id", "created_at", "experiment_spec_sha256", "payload"],
+  "properties": {
+    "schema_version": {"const": "1"}, "workflow_id": {"const": "pl-benchmark"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+    "created_at": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"},
+    "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "payload": {
+      "type": "object", "additionalProperties": false, "required": ["initial_evidence", "step_payloads"],
+      "properties": {
+        "initial_evidence": {
+          "type": "object", "additionalProperties": false,
+          "required": ["corpus_sha256", "calibration_sha256", "baseline_sha256", "baseline_artifact_sha256", "baseline_evaluation_sha256"],
+          "properties": {
+            "corpus_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "calibration_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "baseline_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "baseline_artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "baseline_evaluation_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "step_payloads": {
+          "type": "object", "additionalProperties": false,
+          "required": ["pl_device_inventory", "pl_build_install", "pl_encode_candidate", "pl_score_pair", "pl_hdr_compare", "pl_pts_compare", "pl_compare_baseline", "pl_generate_report"],
+          "properties": {
+            "pl_device_inventory": {
+              "type": "object", "additionalProperties": false,
+              "required": ["adb_executable", "device_serial", "android_user", "package_id", "expected_firmware_sha256"],
+              "properties": {
+                "adb_executable": {"type": "string", "minLength": 1}, "device_serial": {"type": "string", "minLength": 1},
+                "android_user": {"type": "integer", "minimum": 0}, "package_id": {"type": "string", "minLength": 1},
+                "expected_firmware_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+              }
+            },
+            "pl_build_install": {
+              "type": "object", "additionalProperties": false,
+              "required": ["adb_executable", "apksigner_executable", "aapt_executable", "apk_path", "device_serial", "android_user", "package_id", "expected_build_identity", "expected_signer_sha256", "expected_firmware_sha256", "max_duration_seconds", "max_storage_bytes"],
+              "properties": {
+                "adb_executable": {"type": "string", "minLength": 1}, "apksigner_executable": {"type": "string", "minLength": 1},
+                "aapt_executable": {"type": "string", "minLength": 1}, "apk_path": {"type": "string", "minLength": 1},
+                "device_serial": {"type": "string", "minLength": 1}, "android_user": {"type": "integer", "minimum": 0},
+                "package_id": {"type": "string", "minLength": 1},
+                "expected_build_identity": {
+                  "type": "object", "additionalProperties": false, "required": ["version_code", "version_name"],
+                  "properties": {"version_code": {"type": "integer", "minimum": 0}, "version_name": {"type": "string", "minLength": 1}}
+                },
+                "expected_signer_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "expected_firmware_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "max_duration_seconds": {"type": "integer", "minimum": 1}, "max_storage_bytes": {"type": "integer", "minimum": 1}
+              }
+            },
+            "pl_encode_candidate": {
+              "type": "object", "additionalProperties": false,
+              "required": ["candidate_id", "source_path", "output_logical_path", "requested_configuration", "adapter_id", "max_duration_seconds", "max_storage_bytes"],
+              "properties": {
+                "candidate_id": {"type": "string", "minLength": 1}, "source_path": {"type": "string", "minLength": 1},
+                "output_logical_path": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?![A-Za-z]:)(?!.*[<>:\"|?*\\u0000-\\u001F])(?!.*(?:^|/)[^/]*[ .](?:/|$))(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//).+$"},
+                "requested_configuration": {"type": "object"}, "adapter_id": {"const": "android-media3"},
+                "max_duration_seconds": {"type": "integer", "minimum": 1}, "max_storage_bytes": {"type": "integer", "minimum": 1}
+              }
+            },
+            "pl_score_pair": {
+              "type": "object", "additionalProperties": false,
+              "required": ["source_path", "output_path", "pair_id", "ffmpeg_executable", "ffprobe_executable", "model_id", "max_duration_seconds", "max_storage_bytes"],
+              "properties": {
+                "source_path": {"type": "string", "minLength": 1}, "output_path": {"type": "string", "minLength": 1},
+                "pair_id": {"type": "string", "minLength": 1}, "ffmpeg_executable": {"type": "string", "minLength": 1},
+                "ffprobe_executable": {"type": "string", "minLength": 1}, "model_id": {"const": "vmaf_v0.6.1"},
+                "max_duration_seconds": {"type": "integer", "minimum": 1}, "max_storage_bytes": {"type": "integer", "minimum": 1}
+              }
+            },
+            "pl_hdr_compare": {
+              "type": "object", "additionalProperties": false, "required": ["reference", "candidate"],
+              "properties": {
+                "reference": {
+                  "type": "object", "additionalProperties": false, "required": ["standard", "transfer", "range", "bit_depth", "dynamic_metadata_sha256"],
+                  "properties": {
+                    "standard": {"type": "integer"}, "transfer": {"type": "integer"}, "range": {"type": "integer"},
+                    "bit_depth": {"type": "integer", "minimum": 1}, "dynamic_metadata_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                  }
+                },
+                "candidate": {
+                  "type": "object", "additionalProperties": false, "required": ["standard", "transfer", "range", "bit_depth", "dynamic_metadata_sha256"],
+                  "properties": {
+                    "standard": {"type": "integer"}, "transfer": {"type": "integer"}, "range": {"type": "integer"},
+                    "bit_depth": {"type": "integer", "minimum": 1}, "dynamic_metadata_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                  }
+                }
+              }
+            },
+            "pl_pts_compare": {
+              "type": "object", "additionalProperties": false, "required": ["reference_pts_us", "candidate_pts_us"],
+              "properties": {
+                "reference_pts_us": {"type": "array", "minItems": 1, "items": {"type": "integer"}},
+                "candidate_pts_us": {"type": "array", "minItems": 1, "items": {"type": "integer"}}
+              }
+            },
+            "pl_compare_baseline": {"type": "object", "additionalProperties": false},
+            "pl_generate_report": {"type": "object", "additionalProperties": false}
+          }
+        }
+      }
+    }
+  }
+}

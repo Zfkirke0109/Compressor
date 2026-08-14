@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Named workflow command result v1",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "workflow_id", "status", "dry_run", "final_gate", "experiment_spec_sha256", "plan", "step_results", "errors", "exit_code", "content_sha256"],
+  "properties": {
+    "schema_version": {"const": "1"}, "workflow_id": {"enum": ["pl-calibrate", "pl-benchmark", "pl-investigate"]},
+    "status": {"enum": ["DRY_RUN", "COMPLETED", "BLOCKED", "ERROR"]}, "dry_run": {"type": "boolean"},
+    "final_gate": {"type": "boolean"}, "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "plan": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "workflow_id", "run_id", "request_sha256", "experiment_spec_sha256", "steps", "created_at", "content_sha256"],
+      "properties": {
+        "schema_version": {"const": "1"}, "workflow_id": {"enum": ["pl-calibrate", "pl-benchmark", "pl-investigate"]},
+        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+        "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "steps": {
+          "type": "array", "minItems": 1, "maxItems": 8,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["index", "operation_id", "producer_role", "status"],
+            "properties": {
+              "index": {"type": "integer", "minimum": 1, "maximum": 8},
+              "operation_id": {"enum": ["pl_device_inventory", "pl_build_install", "pl_encode_candidate", "pl_score_pair", "pl_score_corpus", "pl_hdr_compare", "pl_pts_compare", "pl_run_boundary_suite", "pl_compare_baseline", "pl_generate_report"]},
+              "producer_role": {"enum": ["deterministic-core", "codec-scientist", "perceptual-evaluator", "android-device-lab", "regression-judge"]},
+              "status": {"const": "PENDING"}
+            }
+          }
+        },
+        "created_at": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"},
+        "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "step_results": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["operation_id", "status", "skipped", "request_sha256", "output_sha256s", "envelope_sha256"],
+        "properties": {
+          "operation_id": {"enum": ["pl_device_inventory", "pl_build_install", "pl_encode_candidate", "pl_score_pair", "pl_score_corpus", "pl_hdr_compare", "pl_pts_compare", "pl_run_boundary_suite", "pl_compare_baseline", "pl_generate_report"]},
+          "status": {"enum": ["DRY_RUN", "COMPLETED", "BLOCKED", "ERROR"]}, "skipped": {"type": "boolean"},
+          "request_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "output_sha256s": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+          "envelope_sha256": {"type": ["string", "null"], "pattern": "^[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["code", "message", "details", "exit_code"],
+        "properties": {
+          "code": {"type": "string", "minLength": 1}, "message": {"type": "string", "minLength": 1},
+          "details": {"type": "object"}, "exit_code": {"type": "integer", "minimum": 10, "maximum": 15}
+        }
+      }
+    },
+    "exit_code": {"enum": [0, 2, 10, 11, 12, 13, 14, 15]},
+    "spec_freeze": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "status", "dry_run", "run_id", "experiment_spec_sha256", "corpus_sha256", "calibration_sha256", "repository_authority_sha256", "planned_identities", "output_identities", "content_sha256"],
+      "properties": {
+        "schema_version": {"const": "1"}, "status": {"enum": ["DRY_RUN", "COMPLETED"]}, "dry_run": {"type": "boolean"},
+        "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+        "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "corpus_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "calibration_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "repository_authority_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "planned_identities": {
+          "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["kind", "sha256"],
+            "properties": {"kind": {"enum": ["experiment_spec", "corpus", "calibration"]}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+          }
+        },
+        "output_identities": {
+          "type": "array", "uniqueItems": true,
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["kind", "sha256"],
+            "properties": {"kind": {"enum": ["experiment_spec", "corpus", "calibration"]}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+          }
+        },
+        "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "quality_verdict": {"enum": ["PASS", "FAIL", "BLOCKED"]},
+    "calibration_identity": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "sha256"],
+      "properties": {"kind": {"const": "calibration"}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    },
+    "investigation_identity": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "sha256"],
+      "properties": {"kind": {"const": "investigation"}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+    },
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "oneOf": [
+    {
+      "type": "object", "required": ["workflow_id", "final_gate", "plan", "step_results", "spec_freeze"],
+      "properties": {
+        "workflow_id": {"const": "pl-calibrate"}, "final_gate": {"const": false},
+        "plan": {"type": "object", "properties": {"workflow_id": {"const": "pl-calibrate"}, "steps": {"type": "array", "minItems": 2, "maxItems": 2}}},
+        "step_results": {"type": "array", "maxItems": 2}, "quality_verdict": {"const": null}, "investigation_identity": {"const": null}
+      },
+      "oneOf": [
+        {"type": "object", "properties": {"status": {"const": "DRY_RUN"}, "dry_run": {"const": true}, "step_results": {"type": "array", "minItems": 2}, "errors": {"type": "array", "maxItems": 0}, "exit_code": {"const": 0}, "calibration_identity": {"const": null}}},
+        {"type": "object", "required": ["calibration_identity"], "properties": {"status": {"const": "COMPLETED"}, "dry_run": {"const": false}, "step_results": {"type": "array", "minItems": 2}, "errors": {"type": "array", "maxItems": 0}, "exit_code": {"const": 0}}},
+        {"type": "object", "properties": {"status": {"const": "BLOCKED"}, "dry_run": {"const": false}, "step_results": {"type": "array", "minItems": 1}, "errors": {"type": "array", "minItems": 1}, "exit_code": {"type": "integer", "minimum": 10, "maximum": 15}, "calibration_identity": {"const": null}}},
+        {"type": "object", "properties": {"status": {"const": "ERROR"}, "dry_run": {"const": false}, "step_results": {"type": "array", "minItems": 1}, "errors": {"type": "array", "minItems": 1}, "exit_code": {"type": "integer", "minimum": 10, "maximum": 15}, "calibration_identity": {"const": null}}}
+      ]
+    },
+    {
+      "type": "object", "required": ["workflow_id", "plan", "step_results"],
+      "properties": {
+        "workflow_id": {"const": "pl-benchmark"}, "spec_freeze": {"const": null}, "investigation_identity": {"const": null},
+        "plan": {"type": "object", "properties": {"workflow_id": {"const": "pl-benchmark"}, "steps": {"type": "array", "minItems": 8, "maxItems": 8}}},
+        "step_results": {"type": "array", "maxItems": 8}
+      },
+      "oneOf": [
+        {"type": "object", "properties": {"status": {"const": "DRY_RUN"}, "dry_run": {"const": true}, "step_results": {"type": "array", "minItems": 8}, "errors": {"type": "array", "maxItems": 0}, "exit_code": {"const": 0}, "quality_verdict": {"const": null}}},
+        {"type": "object", "required": ["quality_verdict"], "properties": {"status": {"const": "COMPLETED"}, "dry_run": {"const": false}, "final_gate": {"const": false}, "step_results": {"type": "array", "minItems": 8}, "errors": {"type": "array", "maxItems": 0}, "exit_code": {"const": 0}, "quality_verdict": {"enum": ["PASS", "FAIL"]}}},
+        {"type": "object", "required": ["quality_verdict"], "properties": {"status": {"const": "COMPLETED"}, "dry_run": {"const": false}, "final_gate": {"const": true}, "step_results": {"type": "array", "minItems": 8}, "errors": {"type": "array", "maxItems": 0}, "exit_code": {"const": 0}, "quality_verdict": {"const": "PASS"}}},
+        {"type": "object", "required": ["quality_verdict"], "properties": {"status": {"const": "COMPLETED"}, "dry_run": {"const": false}, "final_gate": {"const": true}, "step_results": {"type": "array", "minItems": 8}, "errors": {"type": "array", "maxItems": 0}, "exit_code": {"const": 2}, "quality_verdict": {"const": "FAIL"}}},
+        {"type": "object", "properties": {"status": {"const": "BLOCKED"}, "dry_run": {"const": false}, "step_results": {"type": "array", "minItems": 1}, "errors": {"type": "array", "minItems": 1}, "exit_code": {"type": "integer", "minimum": 10, "maximum": 15}, "quality_verdict": {"const": "BLOCKED"}}},
+        {"type": "object", "properties": {"status": {"const": "ERROR"}, "dry_run": {"const": false}, "step_results": {"type": "array", "minItems": 1}, "errors": {"type": "array", "minItems": 1}, "exit_code": {"type": "integer", "minimum": 10, "maximum": 15}, "quality_verdict": {"const": null}}}
+      ]
+    },
+    {
+      "type": "object", "required": ["workflow_id", "final_gate", "plan", "step_results"],
+      "properties": {
+        "workflow_id": {"const": "pl-investigate"}, "final_gate": {"const": false}, "spec_freeze": {"const": null}, "quality_verdict": {"const": null},
+        "plan": {"type": "object", "properties": {"workflow_id": {"const": "pl-investigate"}, "steps": {"type": "array", "minItems": 2, "maxItems": 2}}},
+        "step_results": {"type": "array", "maxItems": 2}
+      },
+      "oneOf": [
+        {"type": "object", "properties": {"status": {"const": "DRY_RUN"}, "dry_run": {"const": true}, "step_results": {"type": "array", "minItems": 2}, "errors": {"type": "array", "maxItems": 0}, "exit_code": {"const": 0}, "investigation_identity": {"const": null}}},
+        {"type": "object", "required": ["investigation_identity"], "properties": {"status": {"const": "COMPLETED"}, "dry_run": {"const": false}, "step_results": {"type": "array", "minItems": 2}, "errors": {"type": "array", "maxItems": 0}, "exit_code": {"const": 0}}},
+        {"type": "object", "properties": {"status": {"const": "BLOCKED"}, "dry_run": {"const": false}, "step_results": {"type": "array", "minItems": 1}, "errors": {"type": "array", "minItems": 1}, "exit_code": {"type": "integer", "minimum": 10, "maximum": 15}, "investigation_identity": {"const": null}}},
+        {"type": "object", "properties": {"status": {"const": "ERROR"}, "dry_run": {"const": false}, "step_results": {"type": "array", "minItems": 1}, "errors": {"type": "array", "minItems": 1}, "exit_code": {"type": "integer", "minimum": 10, "maximum": 15}, "investigation_identity": {"const": null}}}
+      ]
+    }
+  ]
+}

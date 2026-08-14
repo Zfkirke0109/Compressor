@@ -1,0 +1,18 @@
+{
+  "name": "compressor-pl-lab",
+  "version": "0.1.0",
+  "description": "Bounded, deterministic Compressor perceptual-lossless calibration, benchmark, and investigation workflows.",
+  "author": {
+    "name": "Zfkirke0109",
+    "url": "https://github.com/Zfkirke0109"
+  },
+  "homepage": "https://github.com/Zfkirke0109/Compressor",
+  "repository": "https://github.com/Zfkirke0109/Compressor",
+  "license": "MIT",
+  "keywords": [
+    "android",
+    "media3",
+    "perceptual-quality",
+    "vmaf"
+  ]
+}

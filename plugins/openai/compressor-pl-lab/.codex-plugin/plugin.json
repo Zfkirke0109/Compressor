@@ -1,0 +1,38 @@
+{
+  "name": "compressor-pl-lab",
+  "version": "0.1.0",
+  "description": "Bounded, deterministic Compressor perceptual-lossless calibration, benchmark, and investigation workflows.",
+  "author": {
+    "name": "Zfkirke0109",
+    "url": "https://github.com/Zfkirke0109"
+  },
+  "homepage": "https://github.com/Zfkirke0109/Compressor",
+  "repository": "https://github.com/Zfkirke0109/Compressor",
+  "license": "MIT",
+  "keywords": [
+    "android",
+    "media3",
+    "perceptual-quality",
+    "vmaf"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Compressor PL Lab",
+    "shortDescription": "Evidence-backed PL workflows",
+    "longDescription": "In Codex, run bounded local Compressor workflows with immutable evidence and a deterministic judge. In ChatGPT, guide the workflow or inspect supplied evidence; local and device-backed claims remain BLOCKED without admissible records.",
+    "developerName": "Zfkirke0109",
+    "category": "Productivity",
+    "capabilities": [
+      "Codex-local deterministic tools",
+      "Cross-surface evidence contract guidance"
+    ],
+    "websiteURL": "https://github.com/Zfkirke0109/Compressor",
+    "brandColor": "#2457C5",
+    "brandColorDark": "#80A7FF",
+    "logo": "./assets/logo.svg",
+    "composerIcon": "./assets/composer-icon.svg",
+    "defaultPrompt": [
+      "In Codex, dry-run the matching PL workflow; in ChatGPT, inspect supplied evidence and keep unavailable claims BLOCKED."
+    ]
+  }
+}

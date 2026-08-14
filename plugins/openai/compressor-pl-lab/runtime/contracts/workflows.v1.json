@@ -1,0 +1,20 @@
+{
+  "schema_version": "1",
+  "workflows": {
+    "pl-calibrate": {
+      "request_schema": "v1/pl-calibrate-request.schema.json",
+      "result_schema": "v1/workflow-command-result.schema.json",
+      "steps": ["pl_run_boundary_suite", "pl_score_corpus"]
+    },
+    "pl-benchmark": {
+      "request_schema": "v1/pl-benchmark-request.schema.json",
+      "result_schema": "v1/workflow-command-result.schema.json",
+      "steps": ["pl_device_inventory", "pl_build_install", "pl_encode_candidate", "pl_score_pair", "pl_hdr_compare", "pl_pts_compare", "pl_compare_baseline", "pl_generate_report"]
+    },
+    "pl-investigate": {
+      "request_schema": "v1/pl-investigate-request.schema.json",
+      "result_schema": "v1/workflow-command-result.schema.json",
+      "steps": ["pl_compare_baseline", "pl_run_boundary_suite"]
+    }
+  }
+}

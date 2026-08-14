@@ -1,0 +1,6 @@
+interface:
+  display_name: "Regression Judge"
+  short_description: "Apply frozen constraints to complete evidence chains."
+  default_prompt: "Use $compressor-pl-lab:regression-judge to judge only complete hash-linked evidence."
+policy:
+  allow_implicit_invocation: false

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pl_build_install request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "operation_id", "run_id", "experiment_spec_sha256", "payload"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "operation_id": {"const": "pl_build_install"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+    "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adb_executable", "apksigner_executable", "aapt_executable", "apk_path", "device_serial", "android_user", "package_id", "expected_build_identity", "expected_signer_sha256", "expected_firmware_sha256", "max_duration_seconds", "max_storage_bytes"],
+      "properties": {
+        "adb_executable": {"type": "string", "minLength": 1},
+        "apksigner_executable": {"type": "string", "minLength": 1},
+        "aapt_executable": {"type": "string", "minLength": 1},
+        "apk_path": {"type": "string", "minLength": 1},
+        "device_serial": {"type": "string", "minLength": 1},
+        "android_user": {"type": "integer", "minimum": 0},
+        "package_id": {"type": "string", "minLength": 1},
+        "expected_build_identity": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version_code", "version_name"],
+          "properties": {
+            "version_code": {"type": "integer", "minimum": 0},
+            "version_name": {"type": "string", "minLength": 1}
+          }
+        },
+        "expected_signer_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "expected_firmware_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "max_duration_seconds": {"type": "integer", "minimum": 1},
+        "max_storage_bytes": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "schema_version": "1",
+  "record_authorities": {
+    "experiment_spec": "deterministic-core",
+    "corpus": "deterministic-core",
+    "artifact": "deterministic-core",
+    "baseline": "deterministic-core",
+    "candidate": "codec-scientist",
+    "evaluation": "perceptual-evaluator",
+    "device": "android-device-lab",
+    "comparison": "deterministic-core",
+    "calibration": "deterministic-core",
+    "investigation": "deterministic-core",
+    "verdict": "regression-judge",
+    "report": "regression-judge"
+  },
+  "quality_verdict_producers": ["regression-judge"],
+  "quality_verdict_operations": ["pl_generate_report"]
+}

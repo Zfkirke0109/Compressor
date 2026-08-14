@@ -1,0 +1,6 @@
+interface:
+  display_name: "Media3 PL Constitution"
+  short_description: "Apply Compressor perceptual-lossless truth invariants."
+  default_prompt: "Use $compressor-pl-lab:android-media3-perceptual-compression to apply the lab's truth invariants."
+policy:
+  allow_implicit_invocation: true

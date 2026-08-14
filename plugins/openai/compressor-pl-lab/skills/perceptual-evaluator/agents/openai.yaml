@@ -1,0 +1,6 @@
+interface:
+  display_name: "Perceptual Evaluator"
+  short_description: "Evaluate alignment, VMAF, HDR, and temporal quality."
+  default_prompt: "Use $compressor-pl-lab:perceptual-evaluator to measure evidence without issuing the overall verdict."
+policy:
+  allow_implicit_invocation: false
