@@ -682,7 +682,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 context = context,
                 batchId = "batch_$batchStartedAt",
                 mode = quality.label,
-                selectedCount = _uiState.value.items.size
+                selectedCount = _uiState.value.items.size,
+                // Captured BEFORE the batch mutates it, so the record describes the state the run
+                // actually started from rather than the state it ended in.
+                learnedStateIdentity = runCatching { learningEngine.learnedStateIdentity() }.getOrNull()
             )
             _uiState.value.items.filter { it.isAlreadyCompressed }.forEach { skippedItem ->
                 recordDiagnosticJob(
@@ -2699,6 +2702,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // decision time — the verdict string makes the distinction explicit and machine-
             // readable via materializationMode=REUSED_SOURCE.
             verified = retainedValidation?.readableAtDecisionTime ?: (verification?.verified == true),
+            // Only a real output verification can name failing predicates. A retained source was
+            // never verified as an output, so it records null here rather than an empty list that
+            // would read as "verified and nothing failed".
+            failedChecks = verification?.failingChecks(),
             // Retained sources never encode, so they can never be pixel-certified.
             pixelCertified = verification?.pixelCertified == true,
             replacementSafe = if (retainedValidation != null) false else verification?.replacementSafe == true,

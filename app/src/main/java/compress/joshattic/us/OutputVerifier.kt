@@ -203,10 +203,30 @@ object OutputVerifier {
             !input.sourceMetadata.hasLocation -> true
             else -> input.outputMetadata.hasLocation
         }
+        // A MediaStore date lives in the content provider's columns, never inside the file. Output
+        // verification runs on the pre-insertion cache file (`Uri.fromFile` in the entry point
+        // above), and a file:// URI has no provider row at all — `VideoMetadataSnapshot.capture`
+        // cannot query one, so `outputMetadata.dateSource` can never begin with "MediaStore".
+        // Requiring it therefore asked a temp file for a property only a gallery entry can have:
+        // an unsatisfiable predicate, failing 100% of generated outputs whose source came from the
+        // gallery. That matches the field data exactly — an S23 Ultra capture rejected 16 of 16
+        // generated outputs with `blockReason: null`, and null is the signature of precisely the
+        // four predicates the blockReason chain below has no arm for (this one, mp4Date, location,
+        // audioShape). Two of those 16 were pixel-proven perceptually lossless at ratio 0.65
+        // (VMAF windows 98.9/97.0/91.0) and were discarded anyway.
+        //
+        // The columns are written from the captured SOURCE snapshot when the output is inserted
+        // (`saveFileToGallery` -> `applyToNewGalleryValues`). So what is evaluable at this point is
+        // narrower, and stated as narrowly as it is true: the source date that restore depends on
+        // was actually captured, AND the output file still carries a date of its own. Losing
+        // either remains a hard failure. This does NOT prove the finished gallery entry received
+        // the date; that is only observable after the insert.
         val mediaStoreDateMatches = when {
             input.privacyMode.removeDate -> true
             input.sourceMetadata.dateSource?.startsWith("MediaStore") != true -> true
-            else -> input.outputMetadata.dateSource?.startsWith("MediaStore") == true
+            // An output that IS a MediaStore item is held to the original, stricter comparison.
+            input.outputMetadata.dateSource?.startsWith("MediaStore") == true -> true
+            else -> input.sourceMetadata.hasDate && input.outputMetadata.hasDate
         }
         val mp4DateMatches = when {
             input.privacyMode.removeDate -> true
@@ -434,10 +454,13 @@ object OutputVerifier {
                 },
             colorStandard = "${colorStandardLabel(input.sourceTrackProbe.colorStandard)} -> ${colorStandardLabel(input.outputTrackProbe.colorStandard)} ${statusSuffix(standardMatches)}",
             colorRange = "${colorRangeLabel(input.sourceTrackProbe.colorRange)} -> ${colorRangeLabel(input.outputTrackProbe.colorRange)} ${statusSuffix(rangeMatches)}",
+            // Reports the predicate that is actually judged, not a stricter one the verdict never
+            // used: a label saying "unverified" beside a passing check is how a real failure went
+            // unnoticed in the first place.
             mediaStoreDate = dateVerificationLabel(
                 input.privacyMode.removeDate,
                 input.sourceMetadata.dateSource?.startsWith("MediaStore") == true,
-                input.outputMetadata.dateSource?.startsWith("MediaStore") == true
+                mediaStoreDateMatches
             ),
             mp4Date = dateVerificationLabel(
                 input.privacyMode.removeDate,

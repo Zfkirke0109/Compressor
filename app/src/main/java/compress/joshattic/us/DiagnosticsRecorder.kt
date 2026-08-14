@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import android.util.Log
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
@@ -67,7 +68,14 @@ class DiagnosticsRecorder private constructor(
         runCatching { sessionFile?.appendText(line + "\n") }
     }
 
-    fun sessionStart(mode: String, selectedCount: Int) {
+    /**
+     * @param learnedStateIdentity fingerprint of the learned per-profile ratios at batch start
+     *   (see [SmartPerceptualProfileEngine.learnedStateIdentity]). The engine is a ratchet: once a
+     *   profile class has measured visible loss it stops probing for several ladders, so two runs
+     *   of the same corpus are NOT comparable unless this value matches. Recording it is what lets
+     *   `compare_sessions.py` say whether a difference between runs was controlled for at all.
+     */
+    fun sessionStart(mode: String, selectedCount: Int, learnedStateIdentity: String? = null) {
         record(
             "session_start",
             fields = mapOf(
@@ -87,6 +95,7 @@ class DiagnosticsRecorder private constructor(
                 "sdkInt" to Build.VERSION.SDK_INT,
                 "mode" to mode,
                 "selectedCount" to selectedCount,
+                "learnedStateIdentity" to learnedStateIdentity,
                 "privacy" to "redacted-hashes"
             )
         )
@@ -159,6 +168,18 @@ class DiagnosticsRecorder private constructor(
         // fallback can substitute MIME or resolution and still report success; without this a
         // later verification rejection is inexplicable from a capture alone.
         encoderConfig: String? = null,
+        // The named verification predicates that did NOT pass (VerificationChecks.failures).
+        // Three distinct states, all meaningful, so this is emitted as a JSON array and never
+        // collapsed to a string:
+        //   null  - no output verification ran (retained source, or the job never produced a file)
+        //   []    - verification ran and every predicate in scope passed... OR the verdict was
+        //           negative while naming nothing, which is the "failing=none-identified"
+        //           contradiction and must stay visible in the capture rather than be hidden
+        //   [..]  - the diagnosable case
+        // A capture without this field cannot explain a rejection: two 219-job batches ended with
+        // a 0% pass rate on generated outputs and nothing on record to say which parity check
+        // rejected them.
+        failedChecks: List<String>? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
         // Inter-item handoff: thermal cooldown (ms) applied after the previous item, before this
@@ -204,6 +225,7 @@ class DiagnosticsRecorder private constructor(
                 "wasStreamCopy" to wasStreamCopy,
                 "verdict" to verdict,
                 "verified" to verified,
+                "failedChecks" to failedChecks?.let { JSONArray(it) },
                 "pixelCertified" to pixelCertified,
                 "replacementSafe" to replacementSafe,
                 "blockReason" to blockReason,
@@ -350,14 +372,15 @@ class DiagnosticsRecorder private constructor(
             context: Context,
             batchId: String,
             mode: String,
-            selectedCount: Int
+            selectedCount: Int,
+            learnedStateIdentity: String? = null
         ): DiagnosticsRecorder {
             val file = runCatching {
                 val dir = File(context.filesDir, "diagnostics/$batchId").apply { mkdirs() }
                 File(dir, "session.jsonl")
             }.getOrNull()
             return DiagnosticsRecorder(batchId, file, buildIdentity(context)).also {
-                it.sessionStart(mode, selectedCount)
+                it.sessionStart(mode, selectedCount, learnedStateIdentity)
             }
         }
 
