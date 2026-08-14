@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Experiment specification freeze result v1",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "status", "dry_run", "run_id", "experiment_spec_sha256", "corpus_sha256", "calibration_sha256", "repository_authority_sha256", "planned_identities", "output_identities", "content_sha256"],
+  "properties": {
+    "schema_version": {"const": "1"}, "status": {"enum": ["DRY_RUN", "COMPLETED"]}, "dry_run": {"type": "boolean"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+    "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "corpus_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "calibration_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "repository_authority_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "planned_identities": {
+      "type": "array", "minItems": 3, "maxItems": 3, "uniqueItems": true,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["kind", "sha256"],
+        "properties": {"kind": {"enum": ["experiment_spec", "corpus", "calibration"]}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+      }
+    },
+    "output_identities": {
+      "type": "array", "uniqueItems": true,
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["kind", "sha256"],
+        "properties": {"kind": {"enum": ["experiment_spec", "corpus", "calibration"]}, "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}}
+      }
+    },
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  },
+  "oneOf": [
+    {
+      "type": "object", "required": ["status", "dry_run", "output_identities"],
+      "properties": {"status": {"const": "DRY_RUN"}, "dry_run": {"const": true}, "output_identities": {"type": "array", "maxItems": 0}}
+    },
+    {
+      "type": "object", "required": ["status", "dry_run", "output_identities"],
+      "properties": {"status": {"const": "COMPLETED"}, "dry_run": {"const": false}, "output_identities": {"type": "array", "minItems": 3, "maxItems": 3}}
+    }
+  ]
+}

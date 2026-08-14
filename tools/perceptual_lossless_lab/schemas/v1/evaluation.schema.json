@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Evaluation record v1",
+  "type": "object", "additionalProperties": false,
+  "oneOf": [
+    {
+      "type": "object", "required": ["links", "payload"],
+      "properties": {
+        "links": {
+          "type": "object", "additionalProperties": false,
+          "required": ["experiment_spec", "subject", "artifact", "device"],
+          "properties": {
+            "experiment_spec": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "subject": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "artifact": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "device": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "payload": {"type": "object", "required": ["evaluation_kind"], "properties": {"evaluation_kind": {"const": "subject_quality"}}}
+      }
+    },
+    {
+      "type": "object", "required": ["links", "payload"],
+      "properties": {
+        "links": {
+          "type": "object", "additionalProperties": false,
+          "required": ["experiment_spec", "corpus"],
+          "properties": {
+            "experiment_spec": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "corpus": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "payload": {"type": "object", "required": ["evaluation_kind"], "properties": {"evaluation_kind": {"const": "corpus_calibration"}}}
+      }
+    }
+  ],
+  "required": ["schema_version", "record_type", "producer_role", "run_id", "created_at", "experiment_spec_sha256", "links", "payload", "content_sha256"],
+  "properties": {
+    "schema_version": {"const": "1"}, "record_type": {"const": "evaluation"}, "producer_role": {"const": "perceptual-evaluator"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+    "created_at": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"},
+    "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "links": {
+      "type": "object", "additionalProperties": false, "required": ["experiment_spec"],
+      "properties": {
+        "experiment_spec": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "subject": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "artifact": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "device": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "corpus": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "payload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["evaluation_kind", "evaluation_id", "subject_sha256", "metric_results", "alignment", "hdr", "provenance", "status", "confounders"],
+      "properties": {
+        "evaluation_kind": {"enum": ["subject_quality", "corpus_calibration"]},
+        "evaluation_id": {"type": "string", "minLength": 1},
+        "subject_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "metric_results": {"type": "object"},
+        "alignment": {
+          "type": "object", "required": ["status"],
+          "properties": {"status": {"enum": ["ALIGNED", "MISALIGNED", "BLOCKED", "NOT_APPLICABLE"]}}
+        },
+        "hdr": {
+          "type": "object", "required": ["status"],
+          "properties": {"status": {"enum": ["MATCH", "MISMATCH", "BLOCKED", "NOT_APPLICABLE"]}}
+        },
+        "provenance": {"type": "object"},
+        "status": {"enum": ["COMPLETE", "BLOCKED"]},
+        "confounders": {"type": "array", "items": {"type": "string"}},
+        "window_results": {"type": "array", "items": {"type": "object"}}
+      }
+    },
+    "supersedes_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pl_score_pair request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "operation_id", "run_id", "experiment_spec_sha256", "payload"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "operation_id": {"const": "pl_score_pair"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+    "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_path", "output_path", "pair_id", "ffmpeg_executable", "ffprobe_executable", "model_id", "max_duration_seconds", "max_storage_bytes"],
+      "properties": {
+        "source_path": {"type": "string", "minLength": 1},
+        "output_path": {"type": "string", "minLength": 1},
+        "pair_id": {"type": "string", "minLength": 1},
+        "ffmpeg_executable": {"type": "string", "minLength": 1},
+        "ffprobe_executable": {"type": "string", "minLength": 1},
+        "model_id": {"const": "vmaf_v0.6.1"},
+        "max_duration_seconds": {"type": "integer", "minimum": 1},
+        "max_storage_bytes": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

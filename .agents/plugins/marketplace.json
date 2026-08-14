@@ -1,0 +1,20 @@
+{
+  "name": "compressor-local",
+  "interface": {
+    "displayName": "Compressor Local Plugins"
+  },
+  "plugins": [
+    {
+      "name": "compressor-pl-lab",
+      "source": {
+        "source": "local",
+        "path": "./plugins/openai/compressor-pl-lab"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_USE"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

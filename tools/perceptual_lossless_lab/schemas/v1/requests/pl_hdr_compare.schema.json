@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pl_hdr_compare request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "operation_id", "run_id", "experiment_spec_sha256", "payload"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "operation_id": {"const": "pl_hdr_compare"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+    "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["input_evaluation_sha256", "reference", "candidate"],
+      "properties": {
+        "input_evaluation_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "reference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["standard", "transfer", "range", "bit_depth", "dynamic_metadata_sha256"],
+          "properties": {
+            "standard": {"type": "integer"},
+            "transfer": {"type": "integer"},
+            "range": {"type": "integer"},
+            "bit_depth": {"type": "integer", "minimum": 1},
+            "dynamic_metadata_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "candidate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["standard", "transfer", "range", "bit_depth", "dynamic_metadata_sha256"],
+          "properties": {
+            "standard": {"type": "integer"},
+            "transfer": {"type": "integer"},
+            "range": {"type": "integer"},
+            "bit_depth": {"type": "integer", "minimum": 1},
+            "dynamic_metadata_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Candidate record v1",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "record_type", "producer_role", "run_id", "created_at", "experiment_spec_sha256", "links", "payload", "content_sha256"],
+  "properties": {
+    "schema_version": {"const": "1"}, "record_type": {"const": "candidate"}, "producer_role": {"const": "codec-scientist"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+    "created_at": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"},
+    "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "links": {
+      "type": "object", "additionalProperties": false, "required": ["experiment_spec"],
+      "properties": {
+        "experiment_spec": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "artifact": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "device": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "source_artifact": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "payload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["candidate_id", "configuration", "artifact_sha256", "status", "warnings"],
+      "properties": {
+        "candidate_id": {"type": "string", "minLength": 1},
+        "configuration": {"type": "object"},
+        "artifact_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "status": {"enum": ["COMPLETE", "BLOCKED"]},
+        "warnings": {"type": "array", "items": {"type": "string"}},
+        "requested_configuration": {"type": "object"},
+        "actual_configuration": {"type": "object"}
+      }
+    },
+    "supersedes_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "content_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

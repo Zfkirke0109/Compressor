@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pl_encode_candidate request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "operation_id", "run_id", "experiment_spec_sha256", "payload"],
+  "properties": {
+    "schema_version": {"const": "1"},
+    "operation_id": {"const": "pl_encode_candidate"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+    "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_id", "source_path", "output_logical_path", "requested_configuration", "adapter_id", "max_duration_seconds", "max_storage_bytes"],
+      "properties": {
+        "candidate_id": {"type": "string", "minLength": 1},
+        "source_path": {"type": "string", "minLength": 1},
+        "output_logical_path": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?![A-Za-z]:)(?!.*[<>:\"|?*\\u0000-\\u001F])(?!.*(?:^|/)[^/]*[ .](?:/|$))(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//).+$"},
+        "requested_configuration": {"type": "object"},
+        "adapter_id": {"const": "android-media3"},
+        "max_duration_seconds": {"type": "integer", "minimum": 1},
+        "max_storage_bytes": {"type": "integer", "minimum": 1}
+      }
+    }
+  }
+}

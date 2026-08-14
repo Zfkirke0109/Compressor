@@ -1,0 +1,6 @@
+interface:
+  display_name: "PL Calibrate"
+  short_description: "Freeze and validate a perceptual-lossless calibration."
+  default_prompt: "Use $compressor-pl-lab:pl-calibrate to freeze a bounded Compressor perceptual-lossless calibration."
+policy:
+  allow_implicit_invocation: false

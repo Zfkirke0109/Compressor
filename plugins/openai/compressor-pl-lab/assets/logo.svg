@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="Compressor PL Lab">
+  <rect width="256" height="256" rx="52" fill="#10224a"/>
+  <path d="M54 70h72c35 0 58 20 58 50s-23 50-58 50H92v32H54V70Zm38 34v32h31c14 0 22-6 22-16s-8-16-22-16H92Z" fill="#fff"/>
+  <path d="M165 54h37v148h-37z" fill="#80a7ff"/>
+  <circle cx="183.5" cy="181" r="10" fill="#fff"/>
+</svg>

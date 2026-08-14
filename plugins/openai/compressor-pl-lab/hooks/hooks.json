@@ -1,0 +1,30 @@
+{
+  "description": "Run bounded Compressor PL regressions after relevant edits and validate structured completion claims in Codex.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^(?:Edit|Write|apply_patch)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -B \"${PLUGIN_ROOT}/scripts/hook_dispatch.py\" post-tool-use",
+            "commandWindows": "python -B \"%PLUGIN_ROOT%\\scripts\\hook_dispatch.py\" post-tool-use",
+            "timeout": 900
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -B \"${PLUGIN_ROOT}/scripts/hook_dispatch.py\" stop",
+            "commandWindows": "python -B \"%PLUGIN_ROOT%\\scripts\\hook_dispatch.py\" stop",
+            "timeout": 600
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -134,5 +134,13 @@ jobs:
             echo "::group::$test"
             ( cd "$(dirname "$test")" && python3 "$(basename "$test")" ) || failed=1
             echo "::endgroup::"
-          done < <(git ls-files '*/test_*.py' | sort)
+          done < <(git ls-files '*/test_*.py' | grep -v '^tools/perceptual_lossless_lab/tests/' | sort)
+          # The perceptual-lossless lab is a package, not a set of standalone scripts: its
+          # suites import pl_lab, which only its own runner puts on sys.path. Running those
+          # files individually fails with ModuleNotFoundError, so delegate to that runner.
+          if [ -f tools/perceptual_lossless_lab/run_tests.py ]; then
+            echo "::group::tools/perceptual_lossless_lab/run_tests.py"
+            python3 -B tools/perceptual_lossless_lab/run_tests.py || failed=1
+            echo "::endgroup::"
+          fi
           test "$failed" -eq 0 || { echo "::error::One or more Python test suites failed."; exit 1; }

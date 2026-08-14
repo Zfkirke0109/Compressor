@@ -1,0 +1,38 @@
+{
+  "description": "Run bounded Compressor PL regressions after relevant edits and validate structured completion claims.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "-B",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hook_dispatch.py",
+              "post-tool-use"
+            ],
+            "timeout": 900
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python",
+            "args": [
+              "-B",
+              "${CLAUDE_PLUGIN_ROOT}/scripts/hook_dispatch.py",
+              "stop"
+            ],
+            "timeout": 600
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "schema_version": "1",
+  "operations": {
+    "pl_device_inventory": {"module": "pl_lab.operations.device", "producer_role": "android-device-lab", "output_record_types": ["device"], "request_schema": "v1/requests/pl_device_inventory.schema.json", "result_schema": "v1/result-envelope.schema.json", "exit_codes": [0, 10, 11, 12, 13, 14, 15]},
+    "pl_build_install": {"module": "pl_lab.operations.device", "producer_role": "android-device-lab", "output_record_types": ["device"], "request_schema": "v1/requests/pl_build_install.schema.json", "result_schema": "v1/result-envelope.schema.json", "exit_codes": [0, 10, 11, 12, 13, 14, 15]},
+    "pl_encode_candidate": {"module": "pl_lab.operations.codec", "producer_role": "codec-scientist", "output_record_types": ["candidate"], "request_schema": "v1/requests/pl_encode_candidate.schema.json", "result_schema": "v1/result-envelope.schema.json", "exit_codes": [0, 10, 11, 13, 14, 15]},
+    "pl_score_pair": {"module": "pl_lab.operations.quality", "producer_role": "perceptual-evaluator", "output_record_types": ["evaluation"], "request_schema": "v1/requests/pl_score_pair.schema.json", "result_schema": "v1/result-envelope.schema.json", "exit_codes": [0, 10, 11, 13, 14, 15]},
+    "pl_score_corpus": {"module": "pl_lab.operations.quality", "producer_role": "perceptual-evaluator", "output_record_types": ["evaluation"], "request_schema": "v1/requests/pl_score_corpus.schema.json", "result_schema": "v1/result-envelope.schema.json", "exit_codes": [0, 10, 11, 13, 14, 15]},
+    "pl_hdr_compare": {"module": "pl_lab.operations.quality", "producer_role": "perceptual-evaluator", "output_record_types": ["evaluation"], "request_schema": "v1/requests/pl_hdr_compare.schema.json", "result_schema": "v1/result-envelope.schema.json", "exit_codes": [0, 10, 13, 14, 15]},
+    "pl_pts_compare": {"module": "pl_lab.operations.quality", "producer_role": "perceptual-evaluator", "output_record_types": ["evaluation"], "request_schema": "v1/requests/pl_pts_compare.schema.json", "result_schema": "v1/result-envelope.schema.json", "exit_codes": [0, 10, 13, 14, 15]},
+    "pl_run_boundary_suite": {"module": "pl_lab.operations.boundary", "producer_role": "deterministic-core", "output_record_types": ["artifact"], "request_schema": "v1/requests/pl_run_boundary_suite.schema.json", "result_schema": "v1/result-envelope.schema.json", "exit_codes": [0, 10, 11, 13, 14, 15]},
+    "pl_optimize_policy": {"module": "pl_lab.operations.codec", "producer_role": "codec-scientist", "output_record_types": ["candidate"], "request_schema": "v1/requests/pl_optimize_policy.schema.json", "result_schema": "v1/result-envelope.schema.json", "exit_codes": [0, 10, 11, 13, 14, 15]},
+    "pl_compare_baseline": {"module": "pl_lab.operations.compare", "producer_role": "deterministic-core", "output_record_types": ["comparison"], "request_schema": "v1/requests/pl_compare_baseline.schema.json", "result_schema": "v1/result-envelope.schema.json", "exit_codes": [0, 10, 13, 14, 15]},
+    "pl_generate_report": {"module": "pl_lab.operations.report", "producer_role": "regression-judge", "output_record_types": ["verdict", "report"], "request_schema": "v1/requests/pl_generate_report.schema.json", "result_schema": "v1/result-envelope.schema.json", "exit_codes": [0, 2, 10, 13, 14, 15]}
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "pl-investigate named workflow request v1",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "workflow_id", "run_id", "created_at", "experiment_spec_sha256", "payload"],
+  "properties": {
+    "schema_version": {"const": "1"}, "workflow_id": {"const": "pl-investigate"},
+    "run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"},
+    "created_at": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$"},
+    "experiment_spec_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "payload": {
+      "type": "object", "additionalProperties": false, "required": ["target_verdict_sha256", "step_payloads"],
+      "properties": {
+        "target_verdict_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "step_payloads": {
+          "type": "object", "additionalProperties": false, "required": ["pl_compare_baseline", "pl_run_boundary_suite"],
+          "properties": {
+            "pl_compare_baseline": {"type": "object", "additionalProperties": false},
+            "pl_run_boundary_suite": {
+              "type": "object", "additionalProperties": false, "required": ["mode"],
+              "properties": {
+                "mode": {"enum": ["fast", "expensive"]}, "max_candidates": {"type": "integer", "minimum": 1},
+                "max_workers": {"const": 1}, "max_duration_seconds": {"type": "integer", "minimum": 1},
+                "max_storage_bytes": {"type": "integer", "minimum": 1}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
