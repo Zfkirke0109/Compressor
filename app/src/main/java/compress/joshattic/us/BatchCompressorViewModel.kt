@@ -249,6 +249,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // directions. Codec downgrades (e.g. AV1 -> HEVC) never probe: a fake bitrate delta
         // cannot be pixel-justified.
         val probeEligible: Boolean = false,
+        // Whether the finished output can be pixel-scored against its source at all. Strictly wider
+        // than [probeEligible]: 4K-class sources are certifiable but too expensive to run a ladder
+        // on. Only this flag may gate post-encode certification — gating it on probe eligibility is
+        // what previously made the pixel-proven label unreachable for every source above 1080p.
+        val pixelCertifiable: Boolean = false,
+        // Which gate closed when [pixelCertifiable] is false, so a capture can say WHY
+        // certification never ran instead of leaving the reader to guess from a null field.
+        val pixelCertifiableBlockReason: String? = null,
         val defaultRatio: Double = targetRatio,
         // Ratio proven by on-device VMAF probe windows for THIS clip. May sit ABOVE the
         // learned/default target when only a safer retreat rung passed its windows.
@@ -275,7 +283,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val requestedVideoBitrate: Int,
         val requestedBitrateModeLabel: String,
         val videoEncoderName: String?,
-        val reportedAverageVideoBitrate: Int
+        val reportedAverageVideoBitrate: Int,
+        // Requested vs actual encoder configuration. Media3 format fallback substitutes an
+        // unsupported MIME or resolution and still reports success, and a resolution substitution
+        // would trip videoMatches inside the PL verification scope - so a rejection could be
+        // caused by the encoder quietly producing something else. Recorded, never acted on:
+        // OutputVerifier measuring the finished file remains the only verdict.
+        val configDelta: EncoderConfigDelta? = null
     )
 
     fun refreshShizukuStatus(context: Context) {
@@ -668,7 +682,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 context = context,
                 batchId = "batch_$batchStartedAt",
                 mode = quality.label,
-                selectedCount = _uiState.value.items.size
+                selectedCount = _uiState.value.items.size,
+                // Captured BEFORE the batch mutates it, so the record describes the state the run
+                // actually started from rather than the state it ended in.
+                learnedStateIdentity = runCatching { learningEngine.learnedStateIdentity() }.getOrNull()
             )
             _uiState.value.items.filter { it.isAlreadyCompressed }.forEach { skippedItem ->
                 recordDiagnosticJob(
@@ -730,6 +747,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // Compact per-window scores of the final output's sampled certification —
                     // recorded pass OR fail so captures carry the real numbers behind verdicts.
                     var diagnosticCertWindowScores: String? = null
+                    var diagnosticCertBandingDiag: String? = null
+                    // Why certification did or did not run. An unexplained absence of evidence is
+                    // indistinguishable from a bug, so this is never left null on a PL job.
+                    var diagnosticCertStatus: String? = null
                     // True ONLY once sampled VMAF has actually measured this output and passed. Stays
                     // false when certification never ran (not probe-eligible) or returned no measured
                     // evidence (Unavailable/misaligned) and the encode was accepted structurally.
@@ -1123,8 +1144,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // failed or unmeasurable certification changes nothing and the encode falls
                     // back exactly as before.
                     var floorRecoveryCertScores: List<WindowScore>? = null
+                    // Set only when recovery ran and failed to recover the encode. It wins over the
+                    // skip-reason gate evaluated below, which describes a certification that never
+                    // started — claiming that while certWindowScores is populated makes the record
+                    // contradict itself.
+                    var failedFloorRecoveryStatus: String? = null
                     if (effectiveQuality == BatchQualityPreset.ORIGINAL &&
-                        perceptualPlan != null && perceptualPlan.probeEligible &&
+                        perceptualPlan != null && perceptualPlan.pixelCertifiable &&
                         verification.failedOnlyOnVideoBitrateFloor &&
                         item.originalSize > 0L && outputSize in 1 until item.originalSize
                     ) {
@@ -1134,6 +1160,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         val recoveryOutcome = qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
                         val recoveryScores = (recoveryOutcome as? PairScoreOutcome.Scored)?.windows
                         diagnosticCertWindowScores = compactWindowScores(recoveryScores)
+                        diagnosticCertBandingDiag = compactBandingDiag(recoveryScores)
                         if (QualityProbePolicy.windowsPass(recoveryScores)) {
                             floorRecoveryCertScores = recoveryScores
                             val certifiedVideoBitrate = encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
@@ -1160,20 +1187,44 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 PairScoreOutcome.MisalignmentRejected -> "rejected (output frames not time-alignable)"
                                 PairScoreOutcome.Unavailable -> "unavailable"
                             }
+                            failedFloorRecoveryStatus = CertificationStatus.forFailedRecoveryOutcome(recoveryOutcome)
                             Log.i(
                                 "CompressorProbe",
                                 "floor recovery; job=${diagnosticJobId(item)}; certification $cause; fallback proceeds"
                             )
                         }
                     }
-                    // Sampled pixel certification of the full output (SDR probe-eligible encodes
-                    // only). Measured-bad always fails; unmeasurable fails only when the encode's
-                    // target was below the codec default (pixel evidence was its sole justification).
-                    // A certification failure SKIPS the item — pixel evidence just proved the encode
-                    // degrades this clip, so the honest outcome is the untouched original, not a
-                    // stream-copy that saves nothing.
+                    // Sampled pixel certification of the full output (any SDR, non-downgrade encode
+                    // whose geometry the scorer can handle — NOT just ladder-eligible ones).
+                    // Measured-bad always fails; a certification failure SKIPS the item — pixel
+                    // evidence just proved the encode degrades this clip, so the honest outcome is
+                    // the untouched original, not a stream-copy that saves nothing.
+                    //
+                    // Unmeasurable evidence is handled by two different rules depending on what
+                    // justified the target. When a ladder ran, a sub-default ratio rests on pixel
+                    // evidence alone and must fail closed without it. When no ladder ran (4K-class),
+                    // the target never depended on pixels, so the structural verdict stands exactly
+                    // as it does today — certification can only ADD proof for these sources.
+                    // Record WHY certification will not run before the gate, so a null
+                    // certWindowScores is never unexplained. Two 219-job captures had null
+                    // certification fields for all 438 jobs with nothing saying which gate closed.
+                    // Overwritten with the real outcome below when it does run.
+                    diagnosticCertStatus = when {
+                        // A recovery attempt that ran and measured windows outranks every skip
+                        // reason below: those describe certification that never started.
+                        failedFloorRecoveryStatus != null -> failedFloorRecoveryStatus
+                        effectiveQuality != BatchQualityPreset.ORIGINAL ->
+                            CertificationStatus.SKIPPED_NOT_PL_MODE
+                        perceptualPlan == null -> CertificationStatus.SKIPPED_NO_PLAN
+                        !perceptualPlan.pixelCertifiable ->
+                            perceptualPlan.pixelCertifiableBlockReason ?: CertificationStatus.SKIPPED_NO_PLAN
+                        PerceptualLosslessVerifier.shouldFallbackToRemux(
+                            verification, item.originalSize, outputSize
+                        ) -> CertificationStatus.SKIPPED_FELL_BACK_TO_REMUX
+                        else -> null
+                    }
                     if (effectiveQuality == BatchQualityPreset.ORIGINAL &&
-                        perceptualPlan != null && perceptualPlan.probeEligible &&
+                        perceptualPlan != null && perceptualPlan.pixelCertifiable &&
                         !PerceptualLosslessVerifier.shouldFallbackToRemux(verification, item.originalSize, outputSize)
                     ) {
                         updateItem(index) {
@@ -1183,14 +1234,20 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             ?: qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
                         val certScores = (certOutcome as? PairScoreOutcome.Scored)?.windows
                         diagnosticCertWindowScores = compactWindowScores(certScores)
-                        val certOk = QualityProbePolicy.certificationOutcomePasses(
-                            usedRatio = perceptualPlan.targetRatio,
-                            defaultRatio = perceptualPlan.defaultRatio,
-                            outcome = certOutcome
-                        )
+                        diagnosticCertBandingDiag = compactBandingDiag(certScores)
+                        val certOk = if (perceptualPlan.probeEligible) {
+                            QualityProbePolicy.certificationOutcomePasses(
+                                usedRatio = perceptualPlan.targetRatio,
+                                defaultRatio = perceptualPlan.defaultRatio,
+                                outcome = certOutcome
+                            )
+                        } else {
+                            QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(certOutcome)
+                        }
                         // Pixel proof requires BOTH a pass AND measured windows — see
                         // QualityProbePolicy.isPixelCertified (pure + unit-tested) for why certOk
                         // alone is insufficient.
+                        diagnosticCertStatus = CertificationStatus.forOutcome(certOutcome)
                         pixelCertifiedThisRun = QualityProbePolicy.isPixelCertified(certOk, certOutcome)
                         Log.i(
                             "CompressorProbe",
@@ -1245,6 +1302,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 probeWindowScores = perceptualPlan.probeWindowScores,
                                 probePairDiag = perceptualPlan.probePairDiag,
                                 certWindowScores = diagnosticCertWindowScores,
+                                certBandingDiag = diagnosticCertBandingDiag,
+                                certificationStatus = diagnosticCertStatus,
+                                encoderConfig = encodeAttempt?.configDelta?.compact(),
                                 precedingCooldownMs = precedingHandoffCooldownMs
                             )
                             updateItem(index) {
@@ -1326,11 +1386,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 plan.targetRatio,
                                 sizeRatio,
                                 plan.floorRatio,
-                                measuredOvershoot
+                                measuredOvershoot,
+                                // Only a pixel-certified success may lower the next target. A
+                                // structural-only pass keeps the strict no-step-down behavior,
+                                // because the structural verifier cannot see perceptual damage.
+                                pixelCertified = pixelCertifiedThisRun
                             )
                             Log.i(
                                 "CompressorLearning",
                                 "result=verified; profileKey=${plan.profileKey.asKey()}; usedRatio=${plan.targetRatio}; " +
+                                    "pixelCertified=$pixelCertifiedThisRun; " +
                                     "bitrateMode=${encodeAttempt?.requestedBitrateModeLabel ?: "unknown"}; encoderName=${encodeAttempt?.videoEncoderName ?: "unknown"}; " +
                                     "measuredOvershoot=${measuredOvershoot ?: "unknown"}; learnedOvershoot=${learned.measuredOvershootFactor ?: "none"}; " +
                                     "sizeRatio=$sizeRatio; nextRatio=${learned.nextTargetRatio}"
@@ -1398,6 +1463,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         probeWindowScores = perceptualPlan?.probeWindowScores,
                         probePairDiag = perceptualPlan?.probePairDiag,
                         certWindowScores = diagnosticCertWindowScores,
+                        certBandingDiag = diagnosticCertBandingDiag,
+                        certificationStatus = diagnosticCertStatus,
+                        encoderConfig = encodeAttempt?.configDelta?.compact(),
                         thermalStart = metrics.thermalStart,
                         thermalEnd = metrics.thermalEnd,
                         precedingCooldownMs = precedingHandoffCooldownMs,
@@ -2005,13 +2073,27 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             source.videoMime,
             outputMime
         )
-        // Pixel scoring is capped at 1080p-class geometry (VmafPairScorer.MAX_COMPARE_PIXELS). A
-        // source above the cap would run the full probe ladder — encoding a real ~1.2 s clip per
-        // rung — only for VmafPairScorer.score to return Unavailable on the geometry check and
-        // discard it. Gate probe eligibility on scoreable geometry so >1080p sources skip the
-        // doomed encodes entirely; they already fall back to structural verification unchanged.
-        val pixelScoreable = QualityProbePolicy.isPixelScoreableGeometry(source.width, source.height)
-        val probeEligible = !codecDowngrade && !source.isHdr && VmafNative.isAvailable && pixelScoreable
+        // Pixel evidence has TWO separate gates, because scoring an output once and searching for a
+        // lower ratio cost very different amounts of work:
+        //
+        //  - pixelCertifiable: the output can be scored against the source at all (SDR, non-downgrade
+        //    output codec, VMAF present, geometry within VmafPairScorer.MAX_COMPARE_PIXELS). This is
+        //    what unlocks the pixel-proven "Perceptually Lossless Verified" label. It now reaches
+        //    4K-class sources, which previously could never be pixel-proven at any ratio.
+        //  - probeEligible: additionally worth spending the ladder's trial encodes on
+        //    (QualityProbePolicy.PROBE_LADDER_MAX_PIXELS). Above that bar the ladder cannot finish
+        //    inside the prober's budget, so the plan keeps its default/learned ratio and relies on
+        //    certification alone.
+        val pixelCertifiable = !codecDowngrade && !source.isHdr && VmafNative.isAvailable &&
+            QualityProbePolicy.isPixelScoreableGeometry(source.width, source.height)
+        val pixelCertifiableBlockReason = CertificationStatus.blockReasonFor(
+            isHdr = source.isHdr,
+            codecDowngrade = codecDowngrade,
+            vmafAvailable = VmafNative.isAvailable,
+            geometryScoreable = QualityProbePolicy.isPixelScoreableGeometry(source.width, source.height)
+        )
+        val probeEligible = pixelCertifiable &&
+            QualityProbePolicy.isProbeLadderGeometry(source.width, source.height)
         Log.i(
             "CompressorLearning",
             "plan; profileKey=${profileKey.asKey()}; defaultRatio=$defaultRatio; learnedRatio=$targetRatio; " +
@@ -2029,6 +2111,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             useCbrCeiling = useCbrCeiling,
             expectedOvershootFactor = expectedOvershootFactor,
             probeEligible = probeEligible,
+            pixelCertifiable = pixelCertifiable,
+            pixelCertifiableBlockReason = pixelCertifiableBlockReason,
             defaultRatio = defaultRatio
         )
     }
@@ -2178,6 +2262,21 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             "mode=${quality.label}; job=${diagnosticJobId(item)}; verification=${verification.verdict}; playable=${verification.playability}; " +
                 "replaceAllowed=${verification.replacementSafe}; blockReason=${verification.replacementBlockReason ?: "none"}; outputSize=${outputSize}"
         )
+        // On a FAILURE, name the specific checks that failed. The summary above reports only the
+        // verdict, which makes a rejection undiagnosable from a capture: a 2026-08-13 S23 Ultra
+        // batch produced two outputs that were pixel-proven at ratio 0.65 (VMAF 98.9/97.0/91.0)
+        // and were then discarded with nothing in the log to say which parity check rejected them.
+        // Emitted only when the verdict is negative, so healthy batches gain no extra noise.
+        if (!verification.verified) {
+            val failing = verification.failingChecks()
+            Log.w(
+                "CompressorVerification",
+                "verification detail; job=${diagnosticJobId(item)}; verdict=${verification.verdict}; " +
+                    "criticalFieldsComplete=${verification.criticalFieldsComplete}; " +
+                    "failedOnlyOnVideoBitrateFloor=${verification.failedOnlyOnVideoBitrateFloor}; " +
+                    "failing=${if (failing.isEmpty()) "none-identified" else failing.joinToString(",")}"
+            )
+        }
     }
 
     private suspend fun compressOne(
@@ -2244,13 +2343,33 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     override fun onCompleted(composition: Composition, exportResult: ExportResult) {
                         progressJob?.cancel()
                         val finalSize = outputFile.length()
+                        val configDelta = EncoderConfigDelta(
+                            requestedMime = videoMimeType,
+                            actualMime = exportResult.videoMimeType,
+                            requestedWidth = item.originalWidth,
+                            requestedHeight = item.originalHeight,
+                            actualWidth = exportResult.width,
+                            actualHeight = exportResult.height,
+                            requestedVideoBitrate = targetBitrate,
+                            actualAverageVideoBitrate = exportResult.averageVideoBitrate,
+                            requestedBitrateMode = bitrateModeLabel,
+                            encoderName = exportResult.videoEncoderName
+                        )
                         Log.i(
                             "CompressorEncoderPlan",
                             "encodeResult; mode=${quality.label}; requestedVideoBitrate=$targetBitrate; requestedBitrateMode=$bitrateModeLabel; " +
                                 "encoderName=${exportResult.videoEncoderName ?: "unknown"}; reportedAverageVideoBitrate=${exportResult.averageVideoBitrate}; " +
                                 "overshootFactor=${if (targetBitrate > 0 && exportResult.averageVideoBitrate > 0) "%.3f".format(exportResult.averageVideoBitrate.toDouble() / targetBitrate) else "unknown"}; " +
-                                "outputBytes=$finalSize"
+                                "outputBytes=$finalSize; config[${configDelta.compact()}]"
                         )
+                        if (configDelta.formatFellBack) {
+                            // Loud on purpose: a silent substitution is exactly the kind of thing
+                            // that makes a later verification rejection look inexplicable.
+                            Log.w(
+                                "CompressorEncoderPlan",
+                                "encoder format fallback; job=${diagnosticJobId(item)}; ${configDelta.compact()}"
+                            )
+                        }
                         updateItem(index) {
                             it.copy(
                                 progress = 1f,
@@ -2266,7 +2385,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                     requestedVideoBitrate = targetBitrate,
                                     requestedBitrateModeLabel = bitrateModeLabel,
                                     videoEncoderName = exportResult.videoEncoderName,
-                                    reportedAverageVideoBitrate = exportResult.averageVideoBitrate
+                                    reportedAverageVideoBitrate = exportResult.averageVideoBitrate,
+                                    configDelta = configDelta
                                 )
                             )
                         }
@@ -2540,6 +2660,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // of the same probe rung — separates measured quality from misaligned comparisons.
         probePairDiag: String? = null,
         certWindowScores: String? = null,
+        certBandingDiag: String? = null,
+        certificationStatus: String? = null,
+        encoderConfig: String? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
         // Inter-item handoff telemetry: the thermal cooldown (ms) that was applied AFTER the
@@ -2588,6 +2711,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // decision time — the verdict string makes the distinction explicit and machine-
             // readable via materializationMode=REUSED_SOURCE.
             verified = retainedValidation?.readableAtDecisionTime ?: (verification?.verified == true),
+            // Only a real output verification can name failing predicates. A retained source was
+            // never verified as an output, so it records null here rather than an empty list that
+            // would read as "verified and nothing failed".
+            failedChecks = verification?.failingChecks(),
             // Retained sources never encode, so they can never be pixel-certified.
             pixelCertified = verification?.pixelCertified == true,
             replacementSafe = if (retainedValidation != null) false else verification?.replacementSafe == true,
@@ -2608,6 +2735,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probeWindowScores = probeWindowScores,
             probePairDiag = probePairDiag,
             certWindowScores = certWindowScores,
+            certBandingDiag = certBandingDiag,
+            certificationStatus = certificationStatus,
+            encoderConfig = encoderConfig,
             thermalStart = thermalStart,
             thermalEnd = thermalEnd,
             precedingCooldownMs = precedingCooldownMs,
@@ -2623,14 +2753,27 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     // Compact "mean/p5/min" per window, ";"-joined — the capture-friendly form of VMAF window
     // scores (e.g. "96.2/92.0/85.1;97.0/93.4/88.8"). Null when nothing was measured.
     // Locale-pinned so comma-decimal device locales cannot corrupt the capture format.
+    // Three decimals, NOT one: production compares the UNROUNDED WindowScore doubles, so a floor
+    // logged as "95.5" could be anything in [95.45, 95.55) and a study fit to it inherits a
+    // rounding artifact near every threshold boundary. The v1 calibration study's entire reported
+    // "improvement" turned out to be one such artifact (research/perceptual_calibration/
+    // REVIEW_FINDINGS.md), and NEXT_ROUND_INSTRUMENTATION.md item 1 asks for exactly this widening.
+    // Logging precision only: every decision still reads the unrounded doubles.
     private fun compactWindowScores(scores: List<WindowScore>?): String? =
         scores?.takeIf { it.isNotEmpty() }
-            ?.joinToString(";") { "%.1f/%.1f/%.1f".format(java.util.Locale.US, it.mean, it.p5, it.min) }
+            ?.joinToString(";") { "%.3f/%.3f/%.3f".format(java.util.Locale.US, it.mean, it.p5, it.min) }
 
     // Compact per-window pairing diagnostics, ";"-joined (see WindowPairingDiag.compact()).
     // Null when nothing was measured or the scores carry no pairing data.
     private fun compactPairingDiag(scores: List<WindowScore>?): String? =
         scores?.mapNotNull { it.pairing?.compact() }
+            ?.takeIf { it.isNotEmpty() }
+            ?.joinToString(";")
+
+    // Compact per-window banding diagnostics, ";"-joined (see WindowBandingDiag.compact()).
+    // Null when banding was not collected or the native feature was unavailable. Telemetry only.
+    private fun compactBandingDiag(scores: List<WindowScore>?): String? =
+        scores?.mapNotNull { it.banding?.compact() }
             ?.takeIf { it.isNotEmpty() }
             ?.joinToString(";")
 
@@ -2810,14 +2953,48 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 }
             )
         }
-        val recoveryStaged = runCatching {
-            if (recoveryCopy.exists()) recoveryCopy.delete()
-            context.contentResolver.openInputStream(item.sourceUri)?.use { input ->
-                recoveryCopy.outputStream().use { output -> input.copyTo(output) }
-            } != null && recoveryCopy.length() > 0L
-        }.getOrDefault(false)
-        if (!recoveryStaged) {
-            runCatching { recoveryCopy.delete() }
+        // The stage -> write -> verify -> rollback decision lives in OriginalReplacementCoordinator so
+        // it is exercised by OriginalReplacementCoordinatorTest, including the cases that cannot be
+        // injected on a device (ENOSPC mid-write, a provider that will not report a size, a rollback
+        // that itself fails). This object supplies only the raw IO.
+        val replacementIo = object : OriginalReplacementIo {
+            override fun stageRecoveryCopy(): Long {
+                if (recoveryCopy.exists()) recoveryCopy.delete()
+                val opened = context.contentResolver.openInputStream(item.sourceUri)?.use { input ->
+                    recoveryCopy.outputStream().use { output -> input.copyTo(output) }
+                }
+                return if (opened == null) -1L else recoveryCopy.length()
+            }
+
+            override fun writeOutputOverOriginal() {
+                context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
+                    outputFile.inputStream().use { input -> input.copyTo(out) }
+                    // Best-effort durability so the size read-back reflects committed bytes.
+                    runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
+                } ?: error("Could not open original for writing")
+            }
+
+            override fun readBackOriginalSize(): Long =
+                context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { it.statSize } ?: -1L
+
+            override fun restoreOriginalFromRecovery() {
+                context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
+                    recoveryCopy.inputStream().use { input -> input.copyTo(out) }
+                    runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
+                } ?: error("Could not reopen original to restore it")
+            }
+
+            override fun recoveryCopyLength(): Long = recoveryCopy.length()
+
+            override fun discardRecoveryCopy() { runCatching { recoveryCopy.delete() } }
+        }
+
+        val expectedLength = outputFile.length()
+        val attempt = OriginalReplacementCoordinator.attempt(replacementIo, expectedLength)
+
+        if (attempt is ReplacementAttempt.OriginalIntact &&
+            attempt.reason == ReplacementAttempt.Reason.RECOVERY_STAGING_FAILED
+        ) {
             val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
             return@withContext ReplacementResult(
                 false,
@@ -2828,21 +3005,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 }
             )
         }
-
-        val expectedLength = outputFile.length()
-        val directResult = runCatching {
-            context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
-                outputFile.inputStream().use { input -> input.copyTo(out) }
-                // Best-effort durability so the size read-back reflects committed bytes.
-                runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
-            } ?: error("Could not open original for writing")
-            val verifiedSize = context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { it.statSize } ?: -1L
-            // STRICT: only a positive, exactly-matching size proves success. Unknown size is not proof.
-            ReplacementSizeCheck.verified(verifiedSize, expectedLength)
-        }
-
-        if (directResult.getOrDefault(false)) {
-            runCatching { recoveryCopy.delete() }
+        if (attempt is ReplacementAttempt.Replaced) {
             val replacedPath = resolveFilesystemPath(context, item.sourceUri)
             val metadataReport = VideoMetadataPreserver.restoreAfterReplacement(
                 context = context,
@@ -2856,26 +3019,22 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             )
         }
 
-        // The destructive write failed or could not be confirmed: the source may now be truncated.
-        // Restore the original bytes from the recovery copy before doing anything else, so the
-        // user's file is at least whole again. Track whether that restore is itself confirmed.
-        val sourceRestored = runCatching {
-            context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
-                recoveryCopy.inputStream().use { input -> input.copyTo(out) }
-                runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
-            } ?: error("Could not reopen original to restore it")
-            val restoredSize = context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { it.statSize } ?: -1L
-            ReplacementSizeCheck.verified(restoredSize, recoveryCopy.length())
-        }.getOrDefault(false)
+        // The coordinator already attempted the rollback when the write failed or could not be
+        // confirmed. OriginalIntact means the source is whole (never truncated, or restored);
+        // OriginalAtRisk means it may be incomplete AND the recovery copy still holds the only
+        // intact original bytes, which the fallback below preserves before reporting.
+        val sourceRestored = attempt is ReplacementAttempt.OriginalIntact
 
         // Shizuku writes the FULL verified output to the path, which also repairs a source that the
         // direct write may have truncated — so success here is a clean replacement. All Shizuku
         // sub-failures fall through to the single honest fallback below (which knows sourceRestored),
         // so a failed direct write can never be reported without accounting for the original's state.
+        var shizukuWriteFailed = false
         if (useShizukuFallback && ShizukuSupport.hasPermission()) {
             val targetPath = resolveFilesystemPath(context, item.sourceUri)
             if (targetPath != null) {
                 val copied = ShizukuSupport.copyFileWithShizuku(outputFile.absolutePath, targetPath)
+                if (!copied) shizukuWriteFailed = true
                 if (copied) {
                     runCatching { recoveryCopy.delete() }
                     val metadataReport = VideoMetadataPreserver.restoreAfterReplacement(
@@ -2892,10 +3051,21 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
         }
 
+        // A FAILED Shizuku attempt may itself have truncated the target: it writes with `cat >`,
+        // which truncates on open. So an earlier successful rollback can no longer be assumed to
+        // still hold — re-verify against the recovery bytes before reassuring the user.
+        val originalStillWhole = if (shizukuWriteFailed && sourceRestored) {
+            runCatching {
+                ReplacementSizeCheck.verified(replacementIo.readBackOriginalSize(), recoveryCopy.length())
+            }.getOrDefault(false)
+        } else {
+            sourceRestored
+        }
+
         // Every replacement attempt failed. Report the TRUTH about the original's state and never
         // claim it was "protected" when the destructive open may have truncated it.
         val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
-        val result = if (sourceRestored) {
+        val result = if (originalStillWhole) {
             runCatching { recoveryCopy.delete() }
             ReplacementResult(
                 false,
@@ -2912,7 +3082,18 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val originalPreserved = saveFileToGallery(
                 context, recoveryCopy, "ORIGINAL_${item.outputName(quality)}", item.metadataSnapshot, privacyMode
             ) != null
-            runCatching { recoveryCopy.delete() }
+            // Only discard once the bytes exist somewhere else. If preserving them failed, this file
+            // IS the user's last intact original — deleting it here would destroy it and make the
+            // "don't clear the cache" advice below a lie. Keep it and say where it is.
+            if (originalPreserved) {
+                runCatching { recoveryCopy.delete() }
+            } else {
+                Log.e(
+                    "CompressorBatch",
+                    "job=${diagnosticJobId(item)}; original may be incomplete and could not be preserved; " +
+                        "retaining the only intact copy at ${recoveryCopy.absolutePath}"
+                )
+            }
             ReplacementResult(
                 false,
                 when {
@@ -2921,7 +3102,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     originalPreserved ->
                         "In-place replacement failed and the original on disk may be incomplete. A copy of your untouched original was saved to your gallery — please recover it from there."
                     else ->
-                        "In-place replacement failed and the original on disk may be incomplete; recovering it also failed. Do not delete the app cache; contact support."
+                        "In-place replacement failed and the original on disk may be incomplete, and saving a recovered copy to your gallery failed. An intact copy of the original is still held inside the app — do not clear the app's storage, and free up space then try again."
                 }
             )
         }

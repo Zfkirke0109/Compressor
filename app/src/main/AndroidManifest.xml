@@ -20,6 +20,27 @@
          batch; acquired only while a batch runs and released from every terminal path. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!-- Diagnostics export to Downloads.
+
+         No storage permission is requested. On API 29+ the export writes through MediaStore's
+         Downloads collection, which needs none, and the pre-Q legacy path only runs on API 24-28
+         where WRITE_EXTERNAL_STORAGE is install-time on devices that still have it; the export
+         reports a clear failure rather than prompting if the write is refused. Notably the logcat
+         export needs no permission either — it dumps only THIS process's own log lines, which
+         every app may read; READ_LOGS is privileged and is deliberately not requested. -->
+
+    <!-- Optional live-capture hand-off to Termux. Declared, but never assumed: Termux only honours
+         RUN_COMMAND when the user has also set allow-external-apps=true, which no API exposes, so
+         the UI treats a dispatch as "sent" and always offers copy-to-clipboard instead. -->
+    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+
+    <!-- Package visibility (API 30+): without this, querying whether Termux is installed always
+         reports "no" and the UI would silently show the wrong capability. Scoped to the single
+         package rather than a broad QUERY_ALL_PACKAGES. -->
+    <queries>
+        <package android:name="com.termux" />
+    </queries>
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"

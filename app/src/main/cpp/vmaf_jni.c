@@ -2,9 +2,10 @@
  * JNI bridge for on-device VMAF (libvmaf v3.0.0, arm64 NEON, built-in models).
  *
  * Usage contract (single session at a time, guarded on the Kotlin side):
- *   long ctx = nativeOpen(width, height, useNeg ? 1 : 0, nThreads)
+ *   long ctx = nativeOpen(width, height, useNeg ? 1 : 0, nThreads, cambi ? 1 : 0)
  *   nativeReadFrames(ctx, refI420, distI420, width, height)   // repeated, in display order
  *   double[] scores = nativeFlush(ctx)                        // per-frame VMAF scores
+ *   double[] cambi  = nativeCambiScores(ctx)                  // optional, AFTER flush; may be NULL
  *   nativeClose(ctx)
  *
  * Frames are planar I420 (Y then U then V, no padding, even dimensions), 8-bit.
@@ -29,6 +30,10 @@ typedef struct {
     unsigned frame_index;
     int width;
     int height;
+    /* CAMBI (banding) registered successfully for this session. Telemetry only: VMAF scoring
+     * never depends on it, and a registration failure degrades to "no banding data" rather
+     * than failing the session. */
+    int cambi_enabled;
 } VmafSession;
 
 static int fill_picture_i420(VmafPicture *pic, const uint8_t *data, int w, int h) {
@@ -53,7 +58,8 @@ static int fill_picture_i420(VmafPicture *pic, const uint8_t *data, int w, int h
 
 JNIEXPORT jlong JNICALL
 Java_compress_joshattic_us_quality_VmafNative_nativeOpen(
-        JNIEnv *env, jobject thiz, jint width, jint height, jint phoneModel, jint nThreads) {
+        JNIEnv *env, jobject thiz, jint width, jint height, jint phoneModel, jint nThreads,
+        jint enableCambi) {
     (void)env; (void)thiz;
     if (width <= 0 || height <= 0 || (width & 1) || (height & 1)) {
         LOGE("invalid dimensions %dx%d", width, height);
@@ -93,7 +99,24 @@ Java_compress_joshattic_us_quality_VmafNative_nativeOpen(
         free(s);
         return 0;
     }
-    LOGI("vmaf session open %dx%d phone=%d threads=%u", width, height, phoneModel, cfg.n_threads);
+    /* CAMBI (Contrast Aware Multiscale Banding Index) is built into libvmaf from 2.2 onward, so
+     * no extra dependency is linked here. VMAF under-weights contrast banding, which is the
+     * signature artifact of re-encoding smooth gradients at conservative Perceptually Lossless
+     * targets — a clip can clear the VMAF window thresholds and still band visibly.
+     *
+     * Registration is strictly best-effort: on failure the session keeps running with VMAF only.
+     * Banding data is TELEMETRY and no acceptance decision reads it, so losing it must never cost
+     * the caller its quality evidence. */
+    if (enableCambi) {
+        if (vmaf_use_feature(s->vmaf, "cambi", NULL)) {
+            LOGE("vmaf_use_feature(cambi) failed; continuing without banding telemetry");
+        } else {
+            s->cambi_enabled = 1;
+        }
+    }
+
+    LOGI("vmaf session open %dx%d phone=%d threads=%u cambi=%d",
+         width, height, phoneModel, cfg.n_threads, s->cambi_enabled);
     return (jlong)(intptr_t)s;
 }
 
@@ -165,6 +188,39 @@ Java_compress_joshattic_us_quality_VmafNative_nativeFlush(
         double score = -1.0;
         if (vmaf_score_at_index(s->vmaf, s->model, &score, i)) {
             LOGE("vmaf_score_at_index(%u) failed", i);
+            score = -1.0;
+        }
+        tmp[i] = score;
+    }
+    (*env)->SetDoubleArrayRegion(env, out, 0, (jsize)n, tmp);
+    free(tmp);
+    return out;
+}
+
+/*
+ * Per-frame CAMBI scores, or NULL when banding telemetry was not registered for this session.
+ * MUST be called after nativeFlush: that call signals end-of-stream, after which per-frame
+ * feature scores are retrievable from the same context. Higher CAMBI means MORE banding, the
+ * opposite polarity to VMAF — a frame with no banding scores near 0.
+ *
+ * A per-frame retrieval failure yields -1.0 for that frame (same sentinel nativeFlush uses) so
+ * the Kotlin side can discard a partial result rather than average a bogus value in.
+ */
+JNIEXPORT jdoubleArray JNICALL
+Java_compress_joshattic_us_quality_VmafNative_nativeCambiScores(
+        JNIEnv *env, jobject thiz, jlong handle) {
+    (void)thiz;
+    VmafSession *s = (VmafSession *)(intptr_t)handle;
+    if (!s || !s->cambi_enabled) return NULL;
+
+    unsigned n = s->frame_index;
+    jdoubleArray out = (*env)->NewDoubleArray(env, (jsize)n);
+    if (!out) return NULL;
+    jdouble *tmp = malloc(sizeof(jdouble) * (n ? n : 1));
+    if (!tmp) return NULL;
+    for (unsigned i = 0; i < n; i++) {
+        double score = -1.0;
+        if (vmaf_feature_score_at_index(s->vmaf, "cambi", &score, i)) {
             score = -1.0;
         }
         tmp[i] = score;

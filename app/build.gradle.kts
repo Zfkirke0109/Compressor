@@ -6,6 +6,28 @@ plugins {
 
 val stableDebugKeystore = rootProject.file("ci-debug.keystore")
 
+// Release signing material, supplied only by the release workflow (decoded from repository
+// secrets at build time) or by a local keystore you place yourself. Never committed: both
+// filenames are in .gitignore.
+//
+// Deliberately SEPARATE from the debug keystore. The debug key's password falls back to a
+// literal in this file, and a Play upload key cannot be rotated freely once published, so the
+// two must never be the same key.
+val releaseKeystore = rootProject.file("release.keystore")
+val releaseStorePassword: String? = System.getenv("COMPRESSOR_RELEASE_KEYSTORE_PASSWORD")
+val releaseKeyAlias: String? = System.getenv("COMPRESSOR_RELEASE_KEY_ALIAS")
+val releaseKeyPassword: String? =
+    System.getenv("COMPRESSOR_RELEASE_KEY_PASSWORD") ?: releaseStorePassword
+
+// Sign release builds ONLY when the keystore and every credential are actually present.
+// A partial configuration must fall back to an unsigned release rather than half-configuring
+// AGP, which fails late with an opaque error. This also keeps `./gradlew assembleRelease`
+// working locally and on fork PRs, exactly as it does today.
+val releaseSigningReady: Boolean = releaseKeystore.isFile &&
+    !releaseStorePassword.isNullOrBlank() &&
+    !releaseKeyAlias.isNullOrBlank() &&
+    !releaseKeyPassword.isNullOrBlank()
+
 // Best-effort short git commit for build provenance in structured diagnostics. Never fails the
 // build (shallow CI checkouts or a missing git binary fall back to "unknown").
 val buildGitCommit: String = try {
@@ -65,6 +87,17 @@ android {
                 keyPassword = System.getenv("COMPRESSOR_DEBUG_KEY_PASSWORD") ?: storePassword
             }
         }
+        if (releaseSigningReady) {
+            create("release") {
+                storeFile = releaseKeystore
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+                // Both signature schemes: v1 keeps API 24 installable, v2 is required from API 30.
+                enableV1Signing = true
+                enableV2Signing = true
+            }
+        }
     }
 
     buildTypes {
@@ -77,6 +110,10 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // Unsigned when credentials are absent — the pre-existing behavior — so local and
+            // fork builds keep working. The release workflow verifies the APK is actually
+            // signed afterwards, so a silently-unsigned CI artifact cannot slip through.
+            signingConfig = if (releaseSigningReady) signingConfigs.getByName("release") else null
         }
     }
     compileOptions {

@@ -20,15 +20,84 @@ object QualityProbePolicy {
     const val MIN_COMPARED_FRAMES_PER_WINDOW = 12
 
     /**
+     * A per-window acceptance bar: the three VMAF thresholds a window must clear.
+     *
+     * Exists so the probe/certification machinery can serve more than one quality target. The
+     * numbers themselves are NOT interchangeable — see the two instances below. Every existing
+     * caller keeps using [PERCEPTUAL_LOSSLESS], whose values are unchanged.
+     */
+    data class QualityBar(
+        val meanMin: Double,
+        val p5Min: Double,
+        val minMin: Double,
+        val label: String
+    )
+
+    /**
+     * The transparency bar. Calibrated against the 2026-07-14 VMAF suite and confirmed by the v2
+     * study (`research/perceptual_calibration`), which found current production sits inside the
+     * cross-fold consensus box and stays tied-optimal in 100% of bootstrap resamples.
+     *
+     * Do not move these without a fresh calibration round. They are the meaning of the word
+     * "lossless" in this app's user-facing labels.
+     */
+    val PERCEPTUAL_LOSSLESS = QualityBar(
+        meanMin = WINDOW_MEAN_MIN,
+        p5Min = WINDOW_P5_MIN,
+        minMin = WINDOW_MIN_MIN,
+        label = "Perceptually Lossless"
+    )
+
+    /**
+     * The High Quality bar: an explicitly LOSSY target, deliberately below transparency.
+     *
+     * Why it exists: HQ currently targets a flat 0.72 bitrate ratio with no quality measurement at
+     * all, so "High Quality" names a bitrate cut rather than a quality level. A static talking head
+     * and a 4K60 handheld motion clip get the same ratio and land nowhere near each other. Giving
+     * HQ a measurable bar lets it mean "the smallest file that still clears this", which is
+     * consistent in quality instead of consistent in ratio.
+     *
+     * **These three numbers are provisional and NOT yet calibrated.** They are offset from the
+     * transparency bar by roughly the same margin that bar carries over the full-clip suite
+     * thresholds, which is a reasoned starting point and nothing more. They must be validated
+     * against subjective checks before HQ's user-facing wording leans on them. Crucially, nothing
+     * about this bar may ever be described as lossless or transparent: HQ stays labelled lossy
+     * whatever it measures.
+     */
+    val HIGH_QUALITY = QualityBar(
+        meanMin = 93.0,
+        p5Min = 88.0,
+        minMin = 80.0,
+        label = "High Quality"
+    )
+
+    /**
      * True only when a source of these display dimensions can actually be pixel-scored by
-     * [VmafPairScorer] (its geometry is at or below the 1080p-class scoring cap). Above the cap the
-     * scorer returns Unavailable AFTER the probe clip has already been encoded — so probing such a
-     * source burns full-resolution encodes for zero pixel evidence and then falls back to structural
-     * verification anyway. Gating probe eligibility on this predicate skips that doomed work with no
-     * change to the eventual acceptance decision. Pure so it is unit-testable without a device.
+     * [VmafPairScorer] (its geometry is at or below the 4K-class scoring cap). Above the cap the
+     * scorer returns Unavailable, so the output can only ever be accepted structurally and can
+     * never earn the pixel-certified label. Pure so it is unit-testable without a device.
      */
     fun isPixelScoreableGeometry(width: Int, height: Int): Boolean =
         width > 0 && height > 0 && width.toLong() * height.toLong() <= VmafPairScorer.MAX_COMPARE_PIXELS
+
+    /**
+     * Geometry ceiling for spending PROBE LADDER encodes, as distinct from scoring pixels once.
+     *
+     * Post-encode certification scores three ~1.2 s windows of an output that already exists. The
+     * ladder additionally *encodes* a real clip per rung — up to four rungs x three windows — and
+     * scores every one of them. At 4K that work does not fit inside
+     * `PerceptualQualityProber.TOTAL_BUDGET_MS`, so the ladder would time out mid-search and return
+     * "no evidence" after having burned the battery anyway.
+     *
+     * So above this bar the plan keeps its codec-default/learned ratio and skips the ladder, but
+     * still runs certification — which is what actually unlocks the pixel-proven label.
+     */
+    const val PROBE_LADDER_MAX_PIXELS = 1920 * 1088
+
+    /** True when a probe ladder is both scoreable and affordable at these dimensions. */
+    fun isProbeLadderGeometry(width: Int, height: Int): Boolean =
+        isPixelScoreableGeometry(width, height) &&
+            width.toLong() * height.toLong() <= PROBE_LADDER_MAX_PIXELS
 
     // The probe ladder may never target below this ratio no matter what windows say:
     // sampled windows are evidence, not proof, and the measured suite has nothing below
@@ -57,6 +126,12 @@ object QualityProbePolicy {
     // One bounded bisection refinement between the lowest passing rung and the rung below it
     // is only worth an extra probe encode when the gap is at least this wide.
     const val REFINEMENT_MIN_GAP = 0.06
+
+    // Upward near-miss refinement: when the SAFEST probed rung fails but its worst window is within
+    // this many VMAF points of the bars, one more probe at [SAFEST_RATIO_CEILING] (a higher, safer,
+    // higher-quality rung) may close the gap. Kept small so the extra encode is spent only when a
+    // pass is plausible — a rung that failed by a lot will not be rescued by a slightly higher one.
+    const val NEAR_MISS_UPWARD_MARGIN = 2.5
 
     // Full-encode certification uses the same window thresholds; a certified sub-default
     // encode must PROVE its windows, an unmeasurable certification fails closed only when
@@ -115,16 +190,56 @@ object QualityProbePolicy {
         return (Math.round(midpoint * 100.0) / 100.0).coerceAtLeast(HARD_RATIO_FLOOR)
     }
 
-    /** True when every window individually clears the acceptance thresholds. */
-    fun windowsPass(scores: List<WindowScore>?): Boolean {
+    /**
+     * How far the WORST window falls below the acceptance bars, in VMAF points: > 0 means it fails
+     * by that margin, <= 0 means every window passes. Null when there is nothing measured. Used to
+     * decide whether a near-miss is worth one more (higher, safer) probe.
+     */
+    fun worstWindowShortfall(scores: List<WindowScore>?): Double? {
+        if (scores.isNullOrEmpty()) return null
+        return scores.maxOf {
+            maxOf(WINDOW_MEAN_MIN - it.mean, WINDOW_P5_MIN - it.p5, WINDOW_MIN_MIN - it.min)
+        }
+    }
+
+    /**
+     * When the safest probed rung FAILED but only just, one more probe at [SAFEST_RATIO_CEILING] may
+     * close the gap — a higher ratio keeps more bitrate and buys a few VMAF points. Returns that
+     * ceiling ratio, or null when: the rung is already at/above the ceiling (nowhere higher to go),
+     * it actually passed (nothing to refine), or it failed by more than [NEAR_MISS_UPWARD_MARGIN]
+     * (a slightly higher rung will not rescue it, so the extra encode would be wasted).
+     *
+     * This is honest: it only ever tries a MORE conservative, higher-quality rung. Any pass is still
+     * gated downstream by the strictly-smaller and minimum-savings checks, so it can never turn a
+     * non-saving or degrading re-encode into a claimed win — only recover a genuine near-transparent
+     * saving (typically a cross-codec H.264 -> HEVC clip) that the fixed ladder stopped just short of.
+     */
+    fun upwardRefinementCandidate(highestFailedRatio: Double, highestFailedScores: List<WindowScore>?): Double? {
+        if (highestFailedRatio >= SAFEST_RATIO_CEILING - 1e-9) return null
+        val shortfall = worstWindowShortfall(highestFailedScores) ?: return null
+        if (shortfall <= 0.0) return null
+        if (shortfall > NEAR_MISS_UPWARD_MARGIN) return null
+        return SAFEST_RATIO_CEILING
+    }
+
+    /**
+     * True when every window individually clears [bar].
+     *
+     * The no-bar overload below keeps every existing caller on [PERCEPTUAL_LOSSLESS], so adding a
+     * second bar cannot silently move the transparency decision.
+     */
+    fun windowsPass(scores: List<WindowScore>?, bar: QualityBar): Boolean {
         if (scores.isNullOrEmpty()) return false
         return scores.all {
             it.comparedFrames >= MIN_COMPARED_FRAMES_PER_WINDOW &&
-                it.mean >= WINDOW_MEAN_MIN &&
-                it.p5 >= WINDOW_P5_MIN &&
-                it.min >= WINDOW_MIN_MIN
+                it.mean >= bar.meanMin &&
+                it.p5 >= bar.p5Min &&
+                it.min >= bar.minMin
         }
     }
+
+    /** True when every window clears the Perceptually Lossless bar. */
+    fun windowsPass(scores: List<WindowScore>?): Boolean = windowsPass(scores, PERCEPTUAL_LOSSLESS)
 
     /**
      * Certification verdict for a completed full encode.
@@ -171,6 +286,30 @@ object QualityProbePolicy {
         when (outcome) {
             is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
             PairScoreOutcome.Unavailable -> certificationPasses(usedRatio, defaultRatio, null)
+            PairScoreOutcome.MisalignmentRejected -> false
+        }
+
+    /**
+     * Certification verdict for an encode whose target ratio was NOT justified by probe pixels —
+     * the case for sources above [PROBE_LADDER_MAX_PIXELS], where no ladder ever runs and the
+     * target comes from the codec default plus the learning engine's floor-clamped ratio.
+     *
+     * Measured evidence still rules in the negative direction, exactly as everywhere else:
+     *  - measured and passing -> certified (and, being [PairScoreOutcome.Scored], pixel-proven)
+     *  - measured and failing -> NOT certified
+     *  - measured misalignment -> NOT certified
+     *  - unmeasurable -> the structural verdict stands, because no part of this encode's target
+     *    depended on pixel evidence in the first place. This is the pre-existing behavior for
+     *    these sources, so enabling certification for them can only ADD proof, never withdraw an
+     *    acceptance the app already grants today.
+     *
+     * The ratio-aware [certificationOutcomePasses] must keep being used wherever a ladder DID run:
+     * there a sub-default target was justified by pixels alone, so their absence has to fail closed.
+     */
+    fun certificationOutcomePassesWithoutProbeBasis(outcome: PairScoreOutcome): Boolean =
+        when (outcome) {
+            is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
+            PairScoreOutcome.Unavailable -> true
             PairScoreOutcome.MisalignmentRejected -> false
         }
 

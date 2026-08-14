@@ -115,6 +115,28 @@ class PerceptualQualityProber(private val context: Context) {
             }
             Log.i(TAG, "ratio %.2f rejected by probe windows (measured=${!scores.isNullOrEmpty()})".format(ratio))
         }
+        // Upward near-miss refinement: the whole ladder failed, but if the SAFEST rung only just
+        // missed, one more probe at the safest useful ceiling (a higher, more conservative rung) may
+        // clear it — recovering a genuine near-transparent saving (typically cross-codec H.264->HEVC)
+        // that the fixed ladder stopped one step short of. Only spent on an actual near-miss, so a
+        // clip that failed by a lot never pays for a doomed extra encode.
+        if (highestMeasuredRejected && highestCandidate != null &&
+            System.currentTimeMillis() - startedAt <= TOTAL_BUDGET_MS
+        ) {
+            val upward = QualityProbePolicy.upwardRefinementCandidate(highestCandidate, lastMeasuredScores)
+            if (upward != null && upward !in probed) {
+                probed += upward
+                val upScores = probeOneRatio(
+                    sourceUri, outputMime, upward, targetBitrateForRatio(upward), audioBitrate, windows
+                )
+                if (QualityProbePolicy.windowsPass(upScores)) {
+                    Log.i(TAG, "upward near-miss refinement %.2f pixel-proven (safest rung %.2f just missed)".format(upward, highestCandidate))
+                    return ProbeDecision(upward, probed, upScores, "windows passed at %.2f (upward near-miss refinement)".format(upward))
+                }
+                Log.i(TAG, "upward near-miss refinement %.2f rejected; source cannot be transparently re-encoded".format(upward))
+                if (!upScores.isNullOrEmpty()) lastMeasuredScores = upScores
+            }
+        }
         return ProbeDecision(null, probed, lastMeasuredScores, "no candidate ratio passed", highestMeasuredRejected)
     }
 
@@ -240,7 +262,12 @@ class PerceptualQualityProber(private val context: Context) {
         val windows = QualityProbePolicy.probeWindows(durationMs * 1000L)
         if (windows.isEmpty()) return PairScoreOutcome.Unavailable
         return withContext(Dispatchers.IO) {
-            VmafPairScorer.score(context, sourceUri, Uri.fromFile(outputFile), windows)
+            // Banding telemetry is collected on certification only, never on ladder rungs: it is
+            // extra native work per frame, and certification runs once per output while the ladder
+            // runs up to four times. Recorded for calibration; no verdict reads it.
+            VmafPairScorer.score(
+                context, sourceUri, Uri.fromFile(outputFile), windows, collectBanding = true
+            )
         }
     }
 }
