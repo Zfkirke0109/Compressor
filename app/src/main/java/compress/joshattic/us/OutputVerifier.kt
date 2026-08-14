@@ -370,12 +370,14 @@ object OutputVerifier {
         val remuxVerified = checks.passes(VerificationChecks.Scope.REMUX)
 
         // The failing predicates for the mode actually being judged, straight from the same
-        // structure that produced the verdict above.
-        val failedChecks = when (input.mode) {
+        // structure that produced the verdict above. Null for modes with no verification scope:
+        // those verdicts are not derived from VerificationChecks, so claiming "nothing failed"
+        // would assert something this function never evaluated.
+        val failedChecks: List<String>? = when (input.mode) {
             BatchQualityMode.REMUX_ONLY -> checks.failures(VerificationChecks.Scope.REMUX)
             BatchQualityMode.PERCEPTUAL_LOSSLESS ->
                 checks.failures(VerificationChecks.Scope.PERCEPTUAL_LOSSLESS)
-            else -> emptyList()
+            else -> null
         }
 
         val outputWithinTolerance = input.sourceSize <= 0L ||

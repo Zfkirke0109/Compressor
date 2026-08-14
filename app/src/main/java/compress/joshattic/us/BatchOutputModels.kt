@@ -123,8 +123,17 @@ data class OutputVerificationReport(
     val pixelCertified: Boolean = false,
     // The predicate names that actually failed, taken from the SAME [VerificationChecks] instance
     // that produced [verdict]. Authoritative — [failingChecks] prefers it over any reconstruction.
-    // Empty on a pass, and empty on legacy/synthetic reports built without it.
-    val failedChecks: List<String> = emptyList()
+    //
+    // Nullable on purpose: an EMPTY authoritative list ("derived, and nothing failed") must not be
+    // confused with an ABSENT one ("this report was built without a derivation"). Treating empty as
+    // absent sent passing reports down the text-scanning fallback, which knows nothing about
+    // verification scopes and flagged the deliberate H.264 -> HEVC codec change — so the first two
+    // outputs ever to pass Perceptually Lossless were recorded as `failedChecks: ["videoCodec"]`
+    // while also being verified, pixel-certified and replacement-safe.
+    //   null - no scope-based derivation (legacy/synthetic report, or a mode with no scope)
+    //   []   - derived: every predicate in scope passed
+    //   [..] - derived: these predicates failed
+    val failedChecks: List<String>? = null
 ) {
     /**
      * Names of the per-field checks that did NOT pass, for diagnosing a rejection.
@@ -140,8 +149,9 @@ data class OutputVerificationReport(
      * suffix (free-text metadata lines) simply never appear.
      */
     fun failingChecks(): List<String> {
-        // Authoritative path: the predicates the verdict itself was computed from.
-        if (failedChecks.isNotEmpty()) return failedChecks
+        // Authoritative path: the predicates the verdict itself was computed from. An empty list
+        // is an answer ("nothing failed"), not a missing one, so it returns here too.
+        failedChecks?.let { return it }
 
         // Fallback for reports built without [failedChecks] (legacy records, synthetic fixtures).
         // It must recognise the three ways a failure hides in rendered text, because scanning only

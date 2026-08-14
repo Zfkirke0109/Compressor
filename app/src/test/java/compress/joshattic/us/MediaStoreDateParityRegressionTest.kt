@@ -145,8 +145,8 @@ class MediaStoreDateParityRegressionTest {
         for (input in listOf(perceptuallyLosslessEncode(dateless), streamCopyRemux(dateless))) {
             val report = OutputVerifier.verify(input)
             assertFalse(report.verified)
-            assertTrue("mediaStoreDateMatches" in report.failedChecks)
-            assertTrue("mp4DateMatches" in report.failedChecks)
+            assertTrue("mediaStoreDateMatches" in report.failingChecks())
+            assertTrue("mp4DateMatches" in report.failingChecks())
         }
     }
 
@@ -159,6 +159,20 @@ class MediaStoreDateParityRegressionTest {
     }
 
     @Test
+    fun aPassingEncodeNamesNoFailingCheckEvenThoughTheCodecDeliberatelyChanged() {
+        // Device-observed: the first two outputs ever to pass Perceptually Lossless were recorded
+        // as failedChecks ["videoCodec"] while simultaneously verified, pixel-certified and
+        // replacement-safe. An H.264 -> HEVC change is the POINT of a PL encode and is outside the
+        // PL scope; it only surfaced because an empty authoritative list was mistaken for a
+        // missing one and the text-scanning fallback, which knows nothing of scopes, ran anyway.
+        val report = OutputVerifier.verify(perceptuallyLosslessEncode(cacheFileDate))
+        assertTrue(report.verified)
+        assertEquals(emptyList<String>(), report.failedChecks)
+        assertEquals(emptyList<String>(), report.failingChecks())
+        assertTrue("videoCodec" !in report.failingChecks())
+    }
+
+    @Test
     fun theSilentFailureSignatureIsReproducibleAndNowHasANamedCause() {
         // This is the exact device signature: rejected, nothing in blockReason. It must never again
         // be reachable without failedChecks naming the predicate responsible, because a verdict
@@ -167,7 +181,7 @@ class MediaStoreDateParityRegressionTest {
         val report = OutputVerifier.verify(streamCopyRemux(dateless))
         assertFalse(report.verified)
         assertNull(report.replacementBlockReason)
-        assertTrue(report.failedChecks.isNotEmpty())
+        assertTrue(report.failingChecks().isNotEmpty())
         assertEquals(report.failedChecks, report.failingChecks())
     }
 }

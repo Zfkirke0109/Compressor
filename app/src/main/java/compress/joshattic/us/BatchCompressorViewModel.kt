@@ -1144,6 +1144,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // failed or unmeasurable certification changes nothing and the encode falls
                     // back exactly as before.
                     var floorRecoveryCertScores: List<WindowScore>? = null
+                    // Set only when recovery ran and failed to recover the encode. It wins over the
+                    // skip-reason gate evaluated below, which describes a certification that never
+                    // started — claiming that while certWindowScores is populated makes the record
+                    // contradict itself.
+                    var failedFloorRecoveryStatus: String? = null
                     if (effectiveQuality == BatchQualityPreset.ORIGINAL &&
                         perceptualPlan != null && perceptualPlan.pixelCertifiable &&
                         verification.failedOnlyOnVideoBitrateFloor &&
@@ -1182,6 +1187,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 PairScoreOutcome.MisalignmentRejected -> "rejected (output frames not time-alignable)"
                                 PairScoreOutcome.Unavailable -> "unavailable"
                             }
+                            failedFloorRecoveryStatus = CertificationStatus.forFailedRecoveryOutcome(recoveryOutcome)
                             Log.i(
                                 "CompressorProbe",
                                 "floor recovery; job=${diagnosticJobId(item)}; certification $cause; fallback proceeds"
@@ -1204,6 +1210,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // certification fields for all 438 jobs with nothing saying which gate closed.
                     // Overwritten with the real outcome below when it does run.
                     diagnosticCertStatus = when {
+                        // A recovery attempt that ran and measured windows outranks every skip
+                        // reason below: those describe certification that never started.
+                        failedFloorRecoveryStatus != null -> failedFloorRecoveryStatus
                         effectiveQuality != BatchQualityPreset.ORIGINAL ->
                             CertificationStatus.SKIPPED_NOT_PL_MODE
                         perceptualPlan == null -> CertificationStatus.SKIPPED_NO_PLAN

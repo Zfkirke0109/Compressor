@@ -19,6 +19,19 @@ object CertificationStatus {
     const val UNAVAILABLE = "ran_unavailable"
     const val MISALIGNED = "ran_misalignment_rejected"
 
+    // Ran as the bitrate-floor RECOVERY attempt and did not pass, so the encode fell back. A
+    // separate family from the ones above because the two certification sites are different
+    // questions: recovery asks "did the encoder undershoot the floor while still looking fine?",
+    // final certification asks "is the accepted output actually perceptually lossless?".
+    //
+    // Without these, a recovery attempt that ran and measured real windows was labelled
+    // SKIPPED_FELL_BACK_TO_REMUX by the gate evaluated afterwards — a capture then showed
+    // populated certWindowScores beside a status claiming certification never happened, which is
+    // the same absent-vs-unexplained confusion this whole type exists to prevent.
+    const val RECOVERY_SCORED_FAILED = "ran_floor_recovery_scored_below_bar"
+    const val RECOVERY_UNAVAILABLE = "ran_floor_recovery_unavailable"
+    const val RECOVERY_MISALIGNED = "ran_floor_recovery_misalignment_rejected"
+
     // Did not run. Each names the specific gate that stopped it.
     const val SKIPPED_NOT_PL_MODE = "skipped_effective_mode_not_perceptually_lossless"
     const val SKIPPED_NO_PLAN = "skipped_no_perceptual_plan"
@@ -53,6 +66,17 @@ object CertificationStatus {
         is PairScoreOutcome.Scored -> SCORED
         PairScoreOutcome.Unavailable -> UNAVAILABLE
         PairScoreOutcome.MisalignmentRejected -> MISALIGNED
+    }
+
+    /**
+     * The status for a bitrate-floor recovery attempt that ran and did NOT recover the encode.
+     * A recovery that passes is not reported through here: the job goes on to full certification,
+     * whose [forOutcome] status is the one that describes the accepted output.
+     */
+    fun forFailedRecoveryOutcome(outcome: PairScoreOutcome): String = when (outcome) {
+        is PairScoreOutcome.Scored -> RECOVERY_SCORED_FAILED
+        PairScoreOutcome.Unavailable -> RECOVERY_UNAVAILABLE
+        PairScoreOutcome.MisalignmentRejected -> RECOVERY_MISALIGNED
     }
 
     /** True when the status means certification never executed. */
