@@ -47,7 +47,7 @@ object EncoderCapabilityDiagnostics {
 
     fun dumpToLogcat() {
         Log.i(TAG, "device=${Build.MANUFACTURER} ${Build.MODEL} (${Build.DEVICE}); soc=${socModel()}; sdk=${Build.VERSION.SDK_INT}; release=${Build.VERSION.RELEASE}")
-        val codecInfos = MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos
+        val codecInfos = DeviceCodecCatalog.codecInfos
 
         // APV / unusual mime scan across ALL codecs (encoders and decoders).
         codecInfos.forEach { info ->

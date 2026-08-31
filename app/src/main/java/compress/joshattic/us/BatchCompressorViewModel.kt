@@ -1975,8 +1975,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     private fun hasEncoder(mimeType: String, sourceInfo: VideoSourceInfo? = null): Boolean {
         return try {
-            val list = android.media.MediaCodecList(android.media.MediaCodecList.ALL_CODECS)
-            list.codecInfos.any { info ->
+            DeviceCodecCatalog.codecInfos.any { info ->
                 info.isEncoder &&
                     (!Build.VERSION.SDK_INT.let { it >= Build.VERSION_CODES.Q } || !info.isSoftwareOnly) &&
                     info.supportedTypes.any { it.equals(mimeType, ignoreCase = true) } &&

@@ -45,7 +45,7 @@ object ExperimentalEncoderControls {
      */
     fun isCbrSupportedByHardwareEncoder(mimeType: String): Boolean {
         return runCatching {
-            MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.any { info ->
+            DeviceCodecCatalog.codecInfos.any { info ->
                 info.isEncoder &&
                     (android.os.Build.VERSION.SDK_INT < 29 || !info.isSoftwareOnly) &&
                     info.supportedTypes.any { it.equals(mimeType, ignoreCase = true) } &&

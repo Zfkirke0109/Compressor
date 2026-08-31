@@ -389,8 +389,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
     private fun hasEncoder(mimeType: String): Boolean {
         try {
-            val list = MediaCodecList(MediaCodecList.ALL_CODECS)
-            for (info in list.codecInfos) {
+            for (info in DeviceCodecCatalog.codecInfos) {
                 if (!info.isEncoder) continue
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -1095,9 +1094,8 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         encoder: Boolean
     ): Boolean {
         return try {
-            val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
             val safeFps = kotlin.math.ceil(if (fps > 0f) fps.toDouble() else 30.0)
-            codecList.codecInfos
+            DeviceCodecCatalog.codecInfos
                 .asSequence()
                 .filter { it.isEncoder == encoder }
                 .filter { info -> info.supportedTypes.any { it.equals(mimeType, ignoreCase = true) } }
