@@ -318,6 +318,30 @@ object QualityProbePolicy {
      * start/end (codec warm-up and tail padding are unrepresentative). Short clips get one
      * centered window. Returns an empty list when the clip is too short to sample honestly.
      */
+    /**
+     * How to describe a ladder that ended without a proven ratio.
+     *
+     * The distinction is load-bearing and was previously lost. "no candidate ratio passed" asserts
+     * that every rung WAS measured and rejected — positive pixel evidence that the clip cannot be
+     * re-encoded transparently. When no rung produced a single scored window, that sentence is
+     * false, and a reader (or a threshold calibrated from captures) takes measurement failure for
+     * evidence of incompressibility. Across the five 219-file S23 Ultra captures, 84 of 425 ladder
+     * runs (19.8%) reported "no candidate ratio passed" having measured nothing at all.
+     *
+     * Only the wording changes here; no acceptance decision reads this string. The gate that
+     * matters — [ProbeDecision.highestCandidateMeasuredRejected], which feeds the probe-skip
+     * ratchet — already required a measured rung and is untouched.
+     */
+    fun ladderExhaustedDetail(measured: Int, misaligned: Int, unavailable: Int): String = when {
+        measured > 0 && (misaligned + unavailable) == 0 -> "no candidate ratio passed"
+        measured > 0 -> "no candidate ratio passed (of ${measured + misaligned + unavailable} rungs, " +
+            "$measured measured; $misaligned not time-alignable, $unavailable unmeasurable)"
+        (misaligned + unavailable) == 0 -> "no candidate ratio passed"
+        else -> "no probe rung could be measured ($misaligned not time-alignable, " +
+            "$unavailable unmeasurable) — nothing was scored, so this is NOT evidence the clip " +
+            "resists re-encoding"
+    }
+
     fun probeWindows(durationUs: Long, windowUs: Long = 1_200_000L): List<ScoreWindow> {
         if (durationUs < 2_000_000L) return emptyList()
         if (durationUs < 10_000_000L) {

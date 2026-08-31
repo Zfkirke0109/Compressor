@@ -81,6 +81,34 @@ def test_learned_state_identity_is_surfaced_for_run_comparability():
     assert summarize(write([start(), job("a")]))["learnedStateIdentity"] is None
 
 
+def test_a_ladder_that_measured_nothing_is_separated_from_one_that_measured_and_failed():
+    # Both report the same terminal, and before the fix both reported the same probeDetail.
+    # Only the presence of window scores tells them apart, which is why the summariser checks it.
+    s = summarize(write([
+        start(),
+        job("a", probedRatios="0.90,0.95", probeWindowScores="97.0/93.0/88.0",
+            probeDetail="no candidate ratio passed"),
+        job("b", probedRatios="0.90,0.95", probeWindowScores=None,
+            probeDetail="no candidate ratio passed"),
+        job("c", probedRatios=None, probeWindowScores=None),
+    ]))
+    assert s["laddersRun"] == 2
+    assert s["laddersWithNoMeasurement"] == 1
+    assert s["laddersMislabelledAsMeasured"] == 1
+
+
+def test_the_corrected_wording_is_not_counted_as_mislabelled():
+    # After the fix the ladder says so itself, so it is no longer a silent misreport.
+    s = summarize(write([
+        start(),
+        job("b", probedRatios="0.90,0.95", probeWindowScores=None,
+            probeDetail="no probe rung could be measured (2 not time-alignable, 0 unmeasurable)"
+                        " — nothing was scored, so this is NOT evidence the clip resists re-encoding"),
+    ]))
+    assert s["laddersWithNoMeasurement"] == 1
+    assert s["laddersMislabelledAsMeasured"] == 0
+
+
 def _main():
     fails = 0
     for name, fn in sorted(globals().items()):
@@ -95,3 +123,5 @@ def _main():
 
 if __name__ == "__main__":
     raise SystemExit(_main())
+
+

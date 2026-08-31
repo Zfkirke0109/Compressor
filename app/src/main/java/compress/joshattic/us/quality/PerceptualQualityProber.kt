@@ -34,8 +34,21 @@ data class ProbeDecision(
     // unmeasurable — and its windows fell below the acceptance thresholds. This is positive
     // pixel evidence that no allowed ratio can encode the clip transparently, which justifies
     // skipping the item entirely instead of writing a useless stream copy.
-    val highestCandidateMeasuredRejected: Boolean = false
-)
+    val highestCandidateMeasuredRejected: Boolean = false,
+    // How many ladder rungs actually produced window scores, and why the rest did not.
+    //
+    // Without these the ladder could not say whether "no candidate ratio passed" meant "every
+    // rung was measured and rejected" or "nothing was ever measured". Across the five 219-file
+    // captures, 84 of 425 ladder runs (19.8%) reported the former while measuring NOTHING —
+    // and a reader (or a calibration) that treats those as pixel evidence of incompressibility
+    // is reading noise as signal. [detail] now distinguishes them; these carry the counts.
+    val rungsMeasured: Int = 0,
+    val rungsMisaligned: Int = 0,
+    val rungsUnavailable: Int = 0
+) {
+    /** True when the ladder ran but not one rung yielded a single scored window. */
+    val nothingMeasured: Boolean get() = rungsMeasured == 0 && (rungsMisaligned + rungsUnavailable) > 0
+}
 
 /**
  * Probe-based per-clip Perceptually Lossless targeting: encodes short clipped windows of the
@@ -79,12 +92,28 @@ class PerceptualQualityProber(private val context: Context) {
         var highestMeasuredRejected = false
         var highestFailedBelow: Double? = null
         var lastMeasuredScores: List<WindowScore>? = null
+        // Rung accounting, so a ladder that measured nothing can never be reported as one that
+        // measured everything and rejected it.
+        var measured = 0
+        var misaligned = 0
+        var unavailable = 0
+        fun countRung(r: RungResult) = when (r) {
+            is RungResult.Measured -> measured++
+            RungResult.Misaligned -> misaligned++
+            RungResult.Unavailable -> unavailable++
+        }
+        fun scoresOf(r: RungResult) = (r as? RungResult.Measured)?.scores
         for (ratio in candidateRatios) {
             if (System.currentTimeMillis() - startedAt > TOTAL_BUDGET_MS) {
-                return ProbeDecision(null, probed, lastMeasuredScores, "probe budget exhausted", highestMeasuredRejected)
+                return ProbeDecision(
+                    null, probed, lastMeasuredScores, "probe budget exhausted", highestMeasuredRejected,
+                    measured, misaligned, unavailable
+                )
             }
             probed += ratio
-            val scores = probeOneRatio(sourceUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows)
+            val rung = probeOneRatio(sourceUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows)
+            countRung(rung)
+            val scores = scoresOf(rung)
             if (!scores.isNullOrEmpty()) lastMeasuredScores = scores
             if (QualityProbePolicy.windowsPass(scores)) {
                 Log.i(TAG, "ratio %.2f pixel-proven over ${windows.size} windows".format(ratio))
@@ -95,16 +124,24 @@ class PerceptualQualityProber(private val context: Context) {
                 val refined = QualityProbePolicy.refinementCandidate(ratio, highestFailedBelow)
                 if (refined != null && System.currentTimeMillis() - startedAt <= TOTAL_BUDGET_MS) {
                     probed += refined
-                    val refinedScores = probeOneRatio(
+                    val refinedRung = probeOneRatio(
                         sourceUri, outputMime, refined, targetBitrateForRatio(refined), audioBitrate, windows
                     )
+                    countRung(refinedRung)
+                    val refinedScores = scoresOf(refinedRung)
                     if (QualityProbePolicy.windowsPass(refinedScores)) {
                         Log.i(TAG, "refinement %.2f pixel-proven (bisection below %.2f)".format(refined, ratio))
-                        return ProbeDecision(refined, probed, refinedScores, "windows passed at %.2f (refined)".format(refined))
+                        return ProbeDecision(
+                            refined, probed, refinedScores, "windows passed at %.2f (refined)".format(refined),
+                            false, measured, misaligned, unavailable
+                        )
                     }
                     Log.i(TAG, "refinement %.2f rejected; keeping proven %.2f".format(refined, ratio))
                 }
-                return ProbeDecision(ratio, probed, scores, "windows passed at %.2f".format(ratio))
+                return ProbeDecision(
+                    ratio, probed, scores, "windows passed at %.2f".format(ratio),
+                    false, measured, misaligned, unavailable
+                )
             }
             if (!scores.isNullOrEmpty()) {
                 highestFailedBelow = ratio
@@ -126,18 +163,27 @@ class PerceptualQualityProber(private val context: Context) {
             val upward = QualityProbePolicy.upwardRefinementCandidate(highestCandidate, lastMeasuredScores)
             if (upward != null && upward !in probed) {
                 probed += upward
-                val upScores = probeOneRatio(
+                val upRung = probeOneRatio(
                     sourceUri, outputMime, upward, targetBitrateForRatio(upward), audioBitrate, windows
                 )
+                countRung(upRung)
+                val upScores = scoresOf(upRung)
                 if (QualityProbePolicy.windowsPass(upScores)) {
                     Log.i(TAG, "upward near-miss refinement %.2f pixel-proven (safest rung %.2f just missed)".format(upward, highestCandidate))
-                    return ProbeDecision(upward, probed, upScores, "windows passed at %.2f (upward near-miss refinement)".format(upward))
+                    return ProbeDecision(
+                        upward, probed, upScores, "windows passed at %.2f (upward near-miss refinement)".format(upward),
+                        false, measured, misaligned, unavailable
+                    )
                 }
                 Log.i(TAG, "upward near-miss refinement %.2f rejected; source cannot be transparently re-encoded".format(upward))
                 if (!upScores.isNullOrEmpty()) lastMeasuredScores = upScores
             }
         }
-        return ProbeDecision(null, probed, lastMeasuredScores, "no candidate ratio passed", highestMeasuredRejected)
+        return ProbeDecision(
+            null, probed, lastMeasuredScores,
+            QualityProbePolicy.ladderExhaustedDetail(measured, misaligned, unavailable),
+            highestMeasuredRejected, measured, misaligned, unavailable
+        )
     }
 
     /** Scores one candidate ratio across all windows; null = evidence unavailable/failed. */
@@ -148,15 +194,15 @@ class PerceptualQualityProber(private val context: Context) {
         videoBitrate: Int,
         audioBitrate: Int,
         windows: List<ScoreWindow>
-    ): List<WindowScore>? {
+    ): RungResult {
         val collected = mutableListOf<WindowScore>()
         for (window in windows) {
             val probeFile = File.createTempFile("probe_${"%.2f".format(ratio)}_", ".mp4", context.cacheDir)
             try {
                 val exported = withTimeoutOrNull(PROBE_EXPORT_TIMEOUT_MS) {
                     exportClip(sourceUri, probeFile, outputMime, videoBitrate, audioBitrate, window)
-                } ?: return null
-                if (!exported) return null
+                } ?: return RungResult.Unavailable
+                if (!exported) return RungResult.Unavailable
                 val outcome = withContext(Dispatchers.IO) {
                     VmafPairScorer.score(
                         context,
@@ -169,23 +215,37 @@ class PerceptualQualityProber(private val context: Context) {
                 val scores = when (outcome) {
                     is PairScoreOutcome.Scored -> outcome.windows
                     // Either way this rung has no pixel evidence: an unalignable PROBE clip
-                    // says the probe pipeline broke, not that the source degrades. Returning
-                    // null keeps the conservative gate decision AND never counts as a
-                    // measured rejection (no probe-skip latch feeding).
+                    // says the probe pipeline broke, not that the source degrades. Reporting it
+                    // as its own outcome keeps the conservative gate decision, never counts as a
+                    // measured rejection (no probe-skip latch feeding), and — unlike the previous
+                    // bare null — lets the ladder tell a capture WHY it has no numbers.
                     PairScoreOutcome.MisalignmentRejected -> {
                         Log.w(TAG, "probe window rejected: clip/source frames not time-alignable")
-                        return null
+                        return RungResult.Misaligned
                     }
-                    PairScoreOutcome.Unavailable -> return null
+                    PairScoreOutcome.Unavailable -> return RungResult.Unavailable
                 }
                 collected += scores
                 // Early exit: one failing window already rejects this ratio.
-                if (!QualityProbePolicy.windowsPass(scores)) return collected
+                if (!QualityProbePolicy.windowsPass(scores)) return RungResult.Measured(collected)
             } finally {
                 runCatching { probeFile.delete() }
             }
         }
-        return collected
+        return RungResult.Measured(collected)
+    }
+
+    /**
+     * What one ladder rung produced. Replaces a nullable score list, which collapsed three very
+     * different situations — measured, frames not time-alignable, and evidence unavailable — into
+     * a single `null` that the ladder then reported as "no candidate ratio passed".
+     */
+    private sealed interface RungResult {
+        data class Measured(val scores: List<WindowScore>) : RungResult
+        /** The probe clip and the source could not be paired in time. Not a quality result. */
+        object Misaligned : RungResult
+        /** No evidence could be produced at all (export failed, decoder/native unavailable). */
+        object Unavailable : RungResult
     }
 
     private suspend fun exportClip(
