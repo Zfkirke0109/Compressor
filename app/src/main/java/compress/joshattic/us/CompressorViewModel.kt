@@ -771,21 +771,30 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             )
             .build()
             
+        // Media3 1.9+ threads a platform-diagnostics LogSessionId through the encoder factory.
+        // It is @Nullable on every overload we call, and Transformer supplies whatever it has —
+        // forwarded verbatim so the CBR/VBR delegates keep whatever session Transformer opened.
         val encoderFactory = object : androidx.media3.transformer.Codec.EncoderFactory {
-            override fun createForAudioEncoding(format: androidx.media3.common.Format): androidx.media3.transformer.Codec {
-                return cbrEncoderFactory.createForAudioEncoding(format)
+            override fun createForAudioEncoding(
+                format: androidx.media3.common.Format,
+                logSessionId: android.media.metrics.LogSessionId?
+            ): androidx.media3.transformer.Codec {
+                return cbrEncoderFactory.createForAudioEncoding(format, logSessionId)
             }
 
-            override fun createForVideoEncoding(format: androidx.media3.common.Format): androidx.media3.transformer.Codec {
+            override fun createForVideoEncoding(
+                format: androidx.media3.common.Format,
+                logSessionId: android.media.metrics.LogSessionId?
+            ): androidx.media3.transformer.Codec {
                 var modifiedFormat = format
                 if (format.colorInfo == null || !androidx.media3.common.ColorInfo.isTransferHdr(format.colorInfo)) {
                      modifiedFormat = format.buildUpon().setColorInfo(null).build()
                 }
 
                 return try {
-                    cbrEncoderFactory.createForVideoEncoding(modifiedFormat)
+                    cbrEncoderFactory.createForVideoEncoding(modifiedFormat, logSessionId)
                 } catch (e: Exception) {
-                    vbrEncoderFactory.createForVideoEncoding(modifiedFormat)
+                    vbrEncoderFactory.createForVideoEncoding(modifiedFormat, logSessionId)
                 }
             }
 
@@ -796,7 +805,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         val transformerBuilder = Transformer.Builder(context)
             .setVideoMimeType(videoMimeType)
             .setAudioMimeType(MimeTypes.AUDIO_AAC)
-            .setAssetLoaderFactory(androidx.media3.transformer.DefaultAssetLoaderFactory(context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT))
+            .setAssetLoaderFactory(androidx.media3.transformer.DefaultAssetLoaderFactory(context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT, null))
             .setEncoderFactory(encoderFactory)
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(composition: Composition, exportResult: ExportResult) {
@@ -901,7 +910,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
 
         val composition = Composition.Builder(
-            listOf(EditedMediaItemSequence(editedMediaItem))
+            listOf(EditedMediaItemSequence.Builder(editedMediaItem).build())
         )
         .setHdrMode(hdrMode)
         .build()

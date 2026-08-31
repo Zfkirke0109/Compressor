@@ -5,6 +5,7 @@ import android.media.MediaCodecInfo
 import android.net.Uri
 import android.util.Log
 import androidx.media3.common.MediaItem
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
@@ -61,6 +62,11 @@ data class ProbeDecision(
  * efficient output codecs — the callers enforce both. Every failure path returns "no
  * evidence" and leaves the conservative gate decision unchanged.
  */
+// Every Media3 Transformer entry point this class uses is marked @UnstableApi. The rest of the
+// app already opts in per class (BatchCompressorViewModel, CompressorViewModel); this file was
+// the one Transformer caller that never did, which is why it carried 33 of the project's 35
+// UnsafeOptInUsageError lint errors on its own.
+@androidx.annotation.OptIn(UnstableApi::class)
 class PerceptualQualityProber(private val context: Context) {
 
     companion object {
@@ -268,9 +274,21 @@ class PerceptualQualityProber(private val context: Context) {
             val mediaItem = MediaItem.Builder()
                 .setUri(sourceUri)
                 .setClippingConfiguration(
+                    // Microsecond precision, NOT setStartPositionMs. The scorer normalises the
+                    // reference side by `pts - window.startUs` while the probe clip restarts at 0,
+                    // so any difference between the requested and the actual clip start becomes
+                    // per-window pairing skew. Millisecond granularity introduced a systematic
+                    // `-(startUs % 1000)` offset — up to 999 us, and measured on device as exactly
+                    // that: windows at 0.2/0.5/0.8 ms skew for a clip whose window starts ended in
+                    // 200/500/800 us. Requesting the same microseconds the scorer normalises by
+                    // removes that term at the source instead of widening a tolerance to absorb it.
+                    //
+                    // This does NOT remove the larger residual that appears when the trimmed clip
+                    // lands on a different frame than the requested instant; that is a separate
+                    // mechanism and PtsAligner's tolerance still guards it.
                     MediaItem.ClippingConfiguration.Builder()
-                        .setStartPositionMs(window.startUs / 1000)
-                        .setEndPositionMs(window.endUs / 1000)
+                        .setStartPositionUs(window.startUs)
+                        .setEndPositionUs(window.endUs)
                         .build()
                 )
                 .build()
@@ -301,7 +319,7 @@ class PerceptualQualityProber(private val context: Context) {
             }
             try {
                 transformer.start(
-                    Composition.Builder(listOf(EditedMediaItemSequence(edited))).build(),
+                    Composition.Builder(listOf(EditedMediaItemSequence.Builder(edited).build())).build(),
                     outputFile.absolutePath
                 )
             } catch (t: Throwable) {

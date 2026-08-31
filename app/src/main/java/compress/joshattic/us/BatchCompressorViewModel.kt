@@ -2336,7 +2336,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             var progressJob: Job? = null
             val transformer = Transformer.Builder(context)
                 .setVideoMimeType(videoMimeType)
-                .setAssetLoaderFactory(DefaultAssetLoaderFactory(context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT))
+                .setAssetLoaderFactory(DefaultAssetLoaderFactory(context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT, null))
                 .setEncoderFactory(encoderFactory)
                 .addListener(object : Transformer.Listener {
                     override fun onCompleted(composition: Composition, exportResult: ExportResult) {
@@ -2425,7 +2425,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 .setEffects(Effects(emptyList(), effectsList))
                 .build()
 
-            val composition = Composition.Builder(listOf(EditedMediaItemSequence(editedMediaItem)))
+            val composition = Composition.Builder(listOf(EditedMediaItemSequence.Builder(editedMediaItem).build()))
                 .setHdrMode(Composition.HDR_MODE_KEEP_HDR)
                 .build()
 

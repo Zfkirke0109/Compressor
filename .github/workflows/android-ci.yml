@@ -59,6 +59,12 @@ jobs:
           COMPRESSOR_DEBUG_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: ./gradlew :app:assembleDebug --stacktrace --console=plain > gradle-build.log 2>&1
 
+      - name: Verify 16 KB native page-size compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/verify_native_alignment.py app/build/outputs/apk/debug/*.apk
+
       - name: Remove signing material from runner
         if: always()
         shell: bash
