@@ -212,7 +212,7 @@ class PerceptualQualityProber(private val context: Context) {
                 val exported = withTimeoutOrNull(PROBE_EXPORT_TIMEOUT_MS) {
                     exportClip(sourceUri, probeFile, outputMime, videoBitrate, audioBitrate, window)
                 } ?: return RungResult.Unavailable("export timed out after ${PROBE_EXPORT_TIMEOUT_MS}ms")
-                if (!exported) return RungResult.Unavailable("export failed")
+                if (exported != null) return RungResult.Unavailable(exported)
                 val outcome = withContext(Dispatchers.IO) {
                     VmafPairScorer.score(
                         context,
@@ -272,7 +272,7 @@ class PerceptualQualityProber(private val context: Context) {
         videoBitrate: Int,
         audioBitrate: Int,
         window: ScoreWindow
-    ): Boolean = withContext(Dispatchers.Main) {
+    ): String? = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
             val encoderFactory = DefaultEncoderFactory.Builder(context)
                 .setRequestedVideoEncoderSettings(
@@ -311,7 +311,10 @@ class PerceptualQualityProber(private val context: Context) {
                 .setEncoderFactory(encoderFactory)
                 .addListener(object : Transformer.Listener {
                     override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                        if (continuation.isActive) continuation.resume(outputFile.length() > 0L)
+                        // A "successful" export that wrote nothing is still a failure, and a
+                        // different one from an error — say which.
+                        val failure = if (outputFile.length() > 0L) null else "export produced an empty file"
+                        if (continuation.isActive) continuation.resume(failure)
                     }
 
                     override fun onError(
@@ -319,8 +322,16 @@ class PerceptualQualityProber(private val context: Context) {
                         exportResult: ExportResult,
                         exportException: ExportException
                     ) {
+                        // Media3 says exactly what went wrong here — the error code separates an
+                        // unsupported decode format from an encoder init failure from an I/O
+                        // problem, which are three different bugs. Discarding it (the previous
+                        // `resume(false)`) is what left 10 of 16 ladders in capture
+                        // batch_1788252039055 reporting a bare "export failed" with no way to act.
+                        val reason = "export failed: ${exportException.getErrorCodeName()}" +
+                            (exportException.message?.take(120)?.let { " — $it" } ?: "")
+                        Log.w(TAG, "probe export failed: $reason", exportException)
                         runCatching { outputFile.delete() }
-                        if (continuation.isActive) continuation.resume(false)
+                        if (continuation.isActive) continuation.resume(reason)
                     }
                 })
                 .build()

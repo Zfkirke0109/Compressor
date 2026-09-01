@@ -326,6 +326,15 @@ private fun DiagnosticsExportCard(context: Context) {
     var isError by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
     val termuxAvailability = remember { DiagnosticsExporter.termuxAvailability(context) }
+    var learnedState by remember {
+        mutableStateOf(
+            runCatching {
+                SmartPerceptualProfileEngine(
+                    SmartPerceptualProfileEngine.SharedPreferencesProfileStore(context.applicationContext)
+                ).learnedStateIdentity()
+            }.getOrNull()
+        )
+    }
 
     fun report(result: DiagnosticsExporter.ExportResult) {
         when (result) {
@@ -388,6 +397,42 @@ private fun DiagnosticsExportCard(context: Context) {
                 "This app's own log lines only — including the per-check verification detail that " +
                     "the batch records do not carry. Export soon after a batch: the system log " +
                     "buffer is small and overwrites itself.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            HorizontalDivider()
+
+            Text("Learned compression profiles", style = MaterialTheme.typography.labelLarge)
+            Text(
+                learnedState?.let {
+                    if (it == "empty") "No learned profiles — the next batch probes every file."
+                    else "Learned state: $it. Probing is suppressed for classes that recently " +
+                        "measured visible loss, so a comparison against another run is not controlled."
+                } ?: "Learned state unavailable.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            OutlinedButton(
+                onClick = {
+                    runCatching {
+                        SmartPerceptualProfileEngine(
+                            SmartPerceptualProfileEngine.SharedPreferencesProfileStore(context.applicationContext)
+                        ).also { it.resetLearnedState(); learnedState = it.learnedStateIdentity() }
+                    }.onSuccess {
+                        isError = false
+                        message = "Learned profiles cleared. The next batch probes every file."
+                    }.onFailure {
+                        isError = true
+                        message = "Could not clear learned profiles: ${it.message ?: "unknown error"}"
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !busy
+            ) { Text("Reset learned profiles") }
+            Text(
+                "Do this before an A/B run. The adb broadcast cannot reach a Secure Folder install " +
+                    "(it is a separate Android user), so in there this button is the only way.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
