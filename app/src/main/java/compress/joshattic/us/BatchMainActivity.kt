@@ -456,6 +456,7 @@ private fun DiagnosticsExportCard(context: Context, isCompressing: Boolean) {
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !busy && !isCompressing
             ) { Text("Reset learned profiles") }
+            Text(
                 "Do this before an A/B run. The adb broadcast cannot reach a Secure Folder install " +
                     "(it is a separate Android user), so in there this button is the only way.",
                 style = MaterialTheme.typography.bodySmall,
