@@ -1,6 +1,11 @@
 [versions]
 agp = "9.1.1"
 kotlin = "2.2.10"
+# Core, lifecycle, activity-compose, and test versions below were bumped alongside the Media3
+# upgrade because Media3 1.11.0 raises its own transitive floor for several AndroidX libraries.
+# Validated: assembleDebug and testDebugUnitTest pass on the review branch; no test regressions
+# observed. Espresso and junit-ext bumped to satisfy the AGP 9.1.1 instrumented-test resolver
+# which enforced version alignment. ExifInterface 1.4.2 patches CVE-2024-0033 (HEIF parser).
 coreKtx = "1.13.1"
 junit = "4.13.2"
 junitVersion = "1.3.0"

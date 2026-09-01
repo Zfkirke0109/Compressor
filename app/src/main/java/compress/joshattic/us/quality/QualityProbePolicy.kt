@@ -314,11 +314,6 @@ object QualityProbePolicy {
         }
 
     /**
-     * Probe windows for a clip of [durationUs]: up to three short windows away from the very
-     * start/end (codec warm-up and tail padding are unrepresentative). Short clips get one
-     * centered window. Returns an empty list when the clip is too short to sample honestly.
-     */
-    /**
      * How to describe a ladder that ended without a proven ratio.
      *
      * The distinction is load-bearing and was previously lost. "no candidate ratio passed" asserts
@@ -370,6 +365,11 @@ object QualityProbePolicy {
         }
     }
 
+    /**
+     * Probe windows for a clip of [durationUs]: up to three short windows away from the very
+     * start/end (codec warm-up and tail padding are unrepresentative). Short clips get one
+     * centered window. Returns an empty list when the clip is too short to sample honestly.
+     */
     fun probeWindows(durationUs: Long, windowUs: Long = 1_200_000L): List<ScoreWindow> {
         if (durationUs < 2_000_000L) return emptyList()
         if (durationUs < 10_000_000L) {

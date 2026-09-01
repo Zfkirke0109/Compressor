@@ -27,8 +27,11 @@ import java.util.Locale
  * and its own log entries has neither limitation and needs no adb, root or PC.
  *
  * Scope discipline: this module only ever reads Compressor's own data. The logcat dump is filtered
- * to this process id, which is both what the platform will grant without the privileged READ_LOGS
- * permission and what keeps other apps' output out of a file the user is about to share.
+ * by UID (all Compressor processes) and by tag, which is what the platform will grant without the
+ * privileged READ_LOGS permission; without `--pid` we capture records from previous processes
+ * including a batch that crashed, which was the missing context. Other apps' output stays invisible
+ * regardless — since Jelly Bean the log daemon serves an unprivileged reader only its own UID's
+ * entries. The tag filter keeps the file to Compressor's own diagnostics.
  *
  * All decisions live in [DiagnosticsExportPlan] (pure, unit-tested); this file is the IO.
  */

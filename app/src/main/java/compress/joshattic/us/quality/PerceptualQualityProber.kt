@@ -204,7 +204,7 @@ class PerceptualQualityProber(private val context: Context) {
         )
     }
 
-    /** Scores one candidate ratio across all windows; null = evidence unavailable/failed. */
+    /** Scores one candidate ratio across all windows; returns a [RungResult] describing the outcome. */
     private suspend fun probeOneRatio(
         sourceUri: Uri,
         outputMime: String,

@@ -59,8 +59,8 @@ def check(apk_path: str) -> bool:
     with zipfile.ZipFile(apk_path) as z:
         sos = [i for i in z.infolist() if i.filename.endswith(".so")]
         if not sos:
-            print("  no native libraries packaged")
-            return True
+            print("  FAIL  no native libraries packaged (expected at least libcompressorvmaf.so)")
+            return False
         for info in sos:
             aligns = load_segment_alignments(z.read(info))
             off = data_offset(raw, info)
@@ -82,7 +82,11 @@ def main(argv: list[str]) -> int:
     all_ok = True
     for path in argv[1:]:
         print(f"{path}:")
-        all_ok = check(path) and all_ok
+        try:
+            all_ok = check(path) and all_ok
+        except (OSError, zipfile.BadZipFile, struct.error) as exc:
+            print(f"  error: {exc}", file=sys.stderr)
+            return 2
     print()
     print("16 KB native compatibility:", "PASS" if all_ok else "FAIL")
     return 0 if all_ok else 1

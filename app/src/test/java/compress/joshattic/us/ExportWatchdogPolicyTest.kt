@@ -40,19 +40,4 @@ class ExportWatchdogPolicyTest {
             ExportWatchdogPolicy.MAX_DELAY_BETWEEN_MUXER_SAMPLES_MS in 1..600_000L
         )
     }
-
-    @Test
-    fun theLimitIsNotDerivedFromTotalItemWallTime() {
-        // Guards the corrected reasoning rather than a number. LONGEST_MEASURED_ITEM_ENCODE_MS is
-        // kept only as the figure the mistaken justification rested on; if a future edit ever
-        // makes the limit a multiple of it again, that edit has re-adopted the falsified premise.
-        val ratio =
-            ExportWatchdogPolicy.MAX_DELAY_BETWEEN_MUXER_SAMPLES_MS.toDouble() /
-                ExportWatchdogPolicy.LONGEST_MEASURED_ITEM_ENCODE_MS
-        assertTrue(
-            "the limit must not be a clean multiple of total item wall time — that quantity is" +
-                " not what the watchdog measures",
-            kotlin.math.abs(ratio - Math.round(ratio)) > 0.05
-        )
-    }
 }

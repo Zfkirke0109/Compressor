@@ -180,7 +180,7 @@ private fun BatchCompressorScreen(
             }
 
             item { BatchSettingsCard(state, viewModel, context, requestOriginalMediaAccess) }
-            item { DiagnosticsExportCard(context) }
+            item { DiagnosticsExportCard(context, state.isCompressing) }
             if (state.items.isNotEmpty()) {
                 item { BatchSummaryCard(state) }
                 item { PreservationReportCard(state) }
@@ -319,22 +319,28 @@ private fun HighQualityRetryCard(count: Int, onRetry: () -> Unit) {
  * every state.
  */
 @Composable
-private fun DiagnosticsExportCard(context: Context) {
+private fun DiagnosticsExportCard(context: Context, isCompressing: Boolean) {
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     var isError by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
     val termuxAvailability = remember { DiagnosticsExporter.termuxAvailability(context) }
-    var learnedState by remember {
-        mutableStateOf(
-            runCatching {
-                SmartPerceptualProfileEngine(
-                    SmartPerceptualProfileEngine.SharedPreferencesProfileStore(context.applicationContext)
-                ).learnedStateIdentity()
-            }.getOrNull()
-        )
+
+    fun readLearnedState() = runCatching {
+        SmartPerceptualProfileEngine(
+            SmartPerceptualProfileEngine.SharedPreferencesProfileStore(context.applicationContext)
+        ).learnedStateIdentity()
+    }.getOrNull()
+
+    var learnedState by remember { mutableStateOf(readLearnedState()) }
+
+    // Re-read learned profiles when a batch finishes, since the engine mutates them during a run.
+    val prevIsCompressing = remember { mutableStateOf(isCompressing) }
+    if (prevIsCompressing.value && !isCompressing) {
+        learnedState = readLearnedState()
     }
+    prevIsCompressing.value = isCompressing
 
     fun report(result: DiagnosticsExporter.ExportResult) {
         when (result) {
@@ -403,7 +409,27 @@ private fun DiagnosticsExportCard(context: Context) {
 
             HorizontalDivider()
 
-            Text("Learned compression profiles", style = MaterialTheme.typography.labelLarge)
+            var tracingArmed by remember { mutableStateOf(ExportDebugTracing.isEnabled) }
+            Text("Media3 export trace", style = MaterialTheme.typography.labelLarge)
+            Text(
+                if (tracingArmed)
+                    "Trace armed — the next batch will record per-stage pipeline events. " +
+                        "Avoid on multi-hour sources; the summary appears in export failure messages."
+                else
+                    "Not armed. Enable only for a targeted diagnostic batch to avoid accumulating " +
+                        "event data on long or high-frame-rate exports.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (!tracingArmed) {
+                OutlinedButton(
+                    onClick = { ExportDebugTracing.enable(); tracingArmed = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isCompressing
+                ) { Text("Arm trace for next batch") }
+            }
+
+            HorizontalDivider()
             Text(
                 learnedState?.let {
                     if (it == "empty") "No learned profiles — the next batch probes every file."
@@ -428,9 +454,8 @@ private fun DiagnosticsExportCard(context: Context) {
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
-                enabled = !busy
+                enabled = !busy && !isCompressing
             ) { Text("Reset learned profiles") }
-            Text(
                 "Do this before an A/B run. The adb broadcast cannot reach a Secure Folder install " +
                     "(it is a separate Android user), so in there this button is the only way.",
                 style = MaterialTheme.typography.bodySmall,

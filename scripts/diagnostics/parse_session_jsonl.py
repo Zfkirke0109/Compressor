@@ -65,6 +65,8 @@ def load_sessions(path: str) -> "OrderedDict[str, dict[str, Any]]":
             bucket(current)["start"] = rec
         elif kind == "session_summary":
             bucket(rec.get("batchId") or current)["summary"] = rec
+        elif kind in ("session_failed", "session_cancelled"):
+            bucket(rec.get("batchId") or current)["terminal"] = rec
         elif kind == "job":
             bucket(rec.get("batchId") or current)["jobs"].append(rec)
     return sessions

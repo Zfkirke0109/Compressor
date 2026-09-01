@@ -210,12 +210,6 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     private var compressionJob: Job? = null
 
-    init {
-        // Media3's export trace is what turns "no output sample written" into a named stalled
-        // component. See ExportDebugTracing.
-        ExportDebugTracing.enable()
-    }
-
     /**
      * Keeps a failed batch from killing the process.
      *
@@ -2374,8 +2368,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
             var progressJob: Job? = null
             val transformer = Transformer.Builder(context)
-                // See ExportWatchdogPolicy: Media3 1.9+'s 10s default aborts healthy 8K encodes
-                // as an uncaught main-thread exception, killing the batch and its diagnostics.
+                // See ExportWatchdogPolicy: the limit is a hang bound — not sized from total
+                // item wall time, which the watchdog never observes. The 2026-09-01 abort at
+                // 120 s was a wedged export, not a slow healthy encode.
                 .setMaxDelayBetweenMuxerSamplesMs(ExportWatchdogPolicy.MAX_DELAY_BETWEEN_MUXER_SAMPLES_MS)
                 .setVideoMimeType(videoMimeType)
                 .setAssetLoaderFactory(DefaultAssetLoaderFactory(context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT, null))

@@ -18,16 +18,16 @@ import android.media.MediaCodecList
  *
  * Caching is sound because the set of installed codecs is fixed for the lifetime of a process:
  * codecs ship with the system image and vendor partitions, and Android exposes no way for them to
- * appear or disappear while the app is running. A construction failure is cached as an empty list
- * rather than retried, matching the previous per-call `catch` behaviour — callers already treat an
- * empty result as "no such encoder".
+ * appear or disappear while the app is running. A construction failure is NOT caught here — Kotlin
+ * retries a failed `lazy` initializer on the next access, so transient platform failures are
+ * retried rather than permanently cached as an empty list. Callers handle exceptions from the
+ * underlying platform query.
  */
 object DeviceCodecCatalog {
 
-    /** Every codec on the device, encoders and decoders. Empty if the platform query failed. */
+    /** Every codec on the device, encoders and decoders. Throws if the platform query fails. */
     val codecInfos: List<MediaCodecInfo> by lazy {
-        runCatching { MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.toList() }
-            .getOrDefault(emptyList())
+        MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.toList()
     }
 
     /** Encoders only — the common case at every call site in this app. */

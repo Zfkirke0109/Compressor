@@ -17,11 +17,11 @@ import androidx.media3.common.util.UnstableApi
  * nothing, or a muxer that refused the samples — and the diagnosis for each is different.
  * Without the trace the message says only that nothing arrived.
  *
- * Enabled unconditionally rather than behind a debug guard because this app's release builds are
- * what the calibration corpus runs on; a diagnosis available only in a configuration nobody
- * measures is not a diagnosis. The cost is a bounded in-memory ring of event records per export,
- * written on events the pipeline already emits, and it is read only when a trace summary is
- * generated — i.e. when something has already gone wrong.
+ * Tracing is NOT enabled unconditionally. Media3's DebugTraceUtil is debugging instrumentation,
+ * not a bounded ring: on a long or high-frame-rate export it can accumulate substantial event data
+ * and allocation overhead, potentially causing the same process loss it was intended to diagnose.
+ * Call [enable] only from an explicit diagnostic batch — e.g. one the user arms after opening
+ * the diagnostics panel — not from every batch init.
  *
  * The trace reaches captures for free: the summary is embedded in the `ExportException` message,
  * and that message is already recorded by the batch's failure handler under `CompressorBatch`.
@@ -30,6 +30,9 @@ object ExportDebugTracing {
 
     @Volatile
     private var enabled = false
+
+    /** True once [enable] has been called for this process. */
+    val isEnabled: Boolean get() = enabled
 
     /** Idempotent; safe to call from any export entry point. */
     @androidx.annotation.OptIn(UnstableApi::class)

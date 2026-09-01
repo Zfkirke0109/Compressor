@@ -41,14 +41,6 @@ object ExportWatchdogPolicy {
     const val DEFAULT_MEDIA3_LIMIT_MS = 10_000L
 
     /**
-     * Longest single-item wall time measured on device (8K HEVC, thermally warm; job
-     * fba2a7b1814a in batch_1788168857780). Retained ONLY as the figure that the original,
-     * mistaken justification rested on — it is total item time, which the watchdog never
-     * observes. No decision reads it.
-     */
-    const val LONGEST_MEASURED_ITEM_ENCODE_MS = 56_127L
-
-    /**
      * The limit Compressor asks Media3 to use: a hang bound, deliberately above the prober's own
      * 60 s export timeout so a stalled probe reports itself rather than being pre-empted.
      */
