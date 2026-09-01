@@ -3,41 +3,57 @@ package compress.joshattic.us
 /**
  * How long an export may go without writing a muxer sample before Media3 aborts it.
  *
- * Media3 1.9+ runs an export watchdog that Media3 1.5.0 did not have: if no output sample reaches
- * the muxer for [DEFAULT_MEDIA3_LIMIT_MS], `Transformer` throws
- * `ExportException: Muxer error / Abort: no output sample written in the last 10000 milliseconds`.
- * It does not arrive through `Transformer.Listener.onError` — it surfaces as an uncaught
- * exception on the main thread, so it kills the process and takes every diagnostic record for the
- * batch with it.
+ * Media3 1.9+ runs an export watchdog that 1.5.0 did not have: if no output sample reaches the
+ * muxer for [DEFAULT_MEDIA3_LIMIT_MS], `Transformer` raises
+ * `ExportException: Muxer error / Abort: no output sample written in the last N milliseconds`.
  *
- * That is exactly what happened when this project moved 1.5.0 -> 1.11.0, and the captures make it
- * a clean before/after rather than a guess:
+ * CORRECTION, from batch_1788255807578 on build d72cfee. This constant was first justified as
+ * "a little over 2x the longest single-item encode measured (56,127 ms)". That reasoning was
+ * wrong, and the device disproved it: the watchdog measures the gap BETWEEN muxer samples, not
+ * an item's total wall time. A healthy export writes samples continuously, so its inter-sample
+ * gap is milliseconds regardless of how long the whole item takes; the 56 s figure included
+ * probing, certification, verification and remux, none of which the watchdog observes. The raised
+ * limit therefore did not rescue a slow-but-healthy encode. It only changed what the failure
+ * looked like:
  *
- *   build 469684b (Media3 1.5.0)   High Quality, 13 files incl. 8K -> 13/13 exported, summary written
- *   builds ee6853b / a1a186f (1.11.0)  High Quality, 3 files x4 runs -> 0 job records, no summary,
- *                                      process killed with the watchdog stack trace above
+ *   a1a186f (10 s limit)   High Quality 4K -> process killed; probe rungs "2x export failed"
+ *   d72cfee (120 s limit)  High Quality 4K -> "Abort: no output sample written in the last
+ *                          120000 milliseconds"; the same two probe rungs "2x export timed out"
  *
- * 10 seconds is a reasonable default for ordinary phone-camera clips. It is not reasonable for
- * this app's workload: the same corpus contains 7680x4320 HEVC at ~57 Mbps, where single items
- * measured 40.8 s, 56.1 s and 35.6 s of wall time under thermal throttling.
+ * Zero samples in 120 seconds is a wedged export, not a slow one. The watchdog was reporting a
+ * real failure at 10 s and is reporting the same real failure at 120 s.
  *
- * [MAX_DELAY_BETWEEN_MUXER_SAMPLES_MS] is therefore set from that measurement rather than picked:
- * a little over 2x the longest single-item encode this project has recorded (56.1 s, job
- * fba2a7b1814a in batch_1788168857780). A healthy export of the heaviest content we have seen
- * cannot reach it, while a genuinely wedged encoder is still bounded — the watchdog is a hang
- * detector worth keeping, and disabling it outright would leave the batch path with no time bound
- * at all, which is what 1.5.0 had.
+ * So why keep the raised value? Because the limit is now doing the only job it can honestly do —
+ * bounding a hang — and the larger bound buys two things the smaller one destroyed. It lets the
+ * prober's own 60 s [PerceptualQualityProber.PROBE_EXPORT_TIMEOUT_MS] fire first, so a stalled
+ * probe returns through the recoverable timeout path and names itself in the record instead of
+ * being pre-empted by a muxer error; and it keeps the failure attributable, since "no sample in
+ * 120 s" cannot be mistaken for an encoder that was merely busy.
  *
- * Pure Kotlin, no Android dependencies, so the reasoning above is unit-testable.
+ * What it is NOT: a calibrated value. Nothing in the corpus measures the legitimate worst-case
+ * gap before a FIRST muxer sample on 8K content, which is the one healthy case that could
+ * plausibly need seconds. Until a capture records that, treat this as a hang bound with a wide
+ * margin, not as a threshold anyone has fitted.
  */
 object ExportWatchdogPolicy {
 
     /** Media3's own default, quoted here so the comparison in tests is explicit. */
     const val DEFAULT_MEDIA3_LIMIT_MS = 10_000L
 
-    /** Longest single-item encode this project has measured on device (8K HEVC, thermally warm). */
+    /**
+     * Longest single-item wall time measured on device (8K HEVC, thermally warm; job
+     * fba2a7b1814a in batch_1788168857780). Retained ONLY as the figure that the original,
+     * mistaken justification rested on — it is total item time, which the watchdog never
+     * observes. No decision reads it.
+     */
     const val LONGEST_MEASURED_ITEM_ENCODE_MS = 56_127L
 
-    /** The limit Compressor asks Media3 to use. */
+    /**
+     * The limit Compressor asks Media3 to use: a hang bound, deliberately above the prober's own
+     * 60 s export timeout so a stalled probe reports itself rather than being pre-empted.
+     */
     const val MAX_DELAY_BETWEEN_MUXER_SAMPLES_MS = 120_000L
+
+    /** The prober's own per-clip export timeout, which this limit must stay above. */
+    const val PROBE_EXPORT_TIMEOUT_MS = 60_000L
 }

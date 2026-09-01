@@ -65,7 +65,7 @@ object CertificationStatus {
     fun forOutcome(outcome: PairScoreOutcome): String = when (outcome) {
         is PairScoreOutcome.Scored -> SCORED
         PairScoreOutcome.Unavailable -> UNAVAILABLE
-        PairScoreOutcome.MisalignmentRejected -> MISALIGNED
+        is PairScoreOutcome.MisalignmentRejected -> MISALIGNED
     }
 
     /**
@@ -76,7 +76,7 @@ object CertificationStatus {
     fun forFailedRecoveryOutcome(outcome: PairScoreOutcome): String = when (outcome) {
         is PairScoreOutcome.Scored -> RECOVERY_SCORED_FAILED
         PairScoreOutcome.Unavailable -> RECOVERY_UNAVAILABLE
-        PairScoreOutcome.MisalignmentRejected -> RECOVERY_MISALIGNED
+        is PairScoreOutcome.MisalignmentRejected -> RECOVERY_MISALIGNED
     }
 
     /** True when the status means certification never executed. */

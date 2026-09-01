@@ -37,7 +37,13 @@ object DiagnosticsExportPlan {
         "CompressorLearning",
         "CompressorBatch",
         "CompressorEncoderPlan",
-        "CompressorCodecCaps"
+        "CompressorCodecCaps",
+        // The pixel scorer's own tag. Omitting it silently cost a whole diagnosis: 13 of the 27
+        // ladders in batch_1788254475481 ended in "not time-alignable", and PtsAligner had
+        // written the reason for every one of them — under this tag, which the export did not
+        // collect. The capture therefore could not say whether the probe pipeline had failed to
+        // line the streams up or the encode really had dropped frames.
+        "VmafPairScorer"
     )
 
     /**

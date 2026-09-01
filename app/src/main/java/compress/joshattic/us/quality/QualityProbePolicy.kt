@@ -286,7 +286,7 @@ object QualityProbePolicy {
         when (outcome) {
             is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
             PairScoreOutcome.Unavailable -> certificationPasses(usedRatio, defaultRatio, null)
-            PairScoreOutcome.MisalignmentRejected -> false
+            is PairScoreOutcome.MisalignmentRejected -> false
         }
 
     /**
@@ -310,7 +310,7 @@ object QualityProbePolicy {
         when (outcome) {
             is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
             PairScoreOutcome.Unavailable -> true
-            PairScoreOutcome.MisalignmentRejected -> false
+            is PairScoreOutcome.MisalignmentRejected -> false
         }
 
     /**
@@ -336,7 +336,8 @@ object QualityProbePolicy {
         measured: Int,
         misaligned: Int,
         unavailable: Int,
-        unavailableReasons: Map<String, Int> = emptyMap()
+        unavailableReasons: Map<String, Int> = emptyMap(),
+        misalignedReasons: Map<String, Int> = emptyMap()
     ): String {
         // "unmeasurable" alone was still too coarse to act on. The first captures from the fixed
         // 4 ms tolerance showed 28 unavailable rungs, and the count could not distinguish an
@@ -347,12 +348,23 @@ object QualityProbePolicy {
             .sortedByDescending { it.value }
             .joinToString("; ") { "${it.value}x ${it.key}" }
         val unavailableDetail = if (why.isEmpty()) "$unavailable unmeasurable" else "$unavailable unmeasurable [$why]"
+        // Misalignment needs the same treatment, and for a sharper reason: its two causes are
+        // opposite diagnoses. "leading offset not aligned" means the probe pipeline never lined
+        // the streams up and the clip was never fairly measured; "internal frame misalignment"
+        // means frames really are missing or retimed inside the window. A bare count reads as the
+        // second when it may be entirely the first — 13 of 27 ladders in batch_1788254475481
+        // ended here with no way to tell.
+        val misWhy = misalignedReasons.entries
+            .sortedByDescending { it.value }
+            .joinToString("; ") { "${it.value}x ${it.key}" }
+        val misalignedDetail =
+            if (misWhy.isEmpty()) "$misaligned not time-alignable" else "$misaligned not time-alignable [$misWhy]"
         return when {
             measured > 0 && (misaligned + unavailable) == 0 -> "no candidate ratio passed"
             measured > 0 -> "no candidate ratio passed (of ${measured + misaligned + unavailable} rungs, " +
-                "$measured measured; $misaligned not time-alignable, $unavailableDetail)"
+                "$measured measured; $misalignedDetail, $unavailableDetail)"
             (misaligned + unavailable) == 0 -> "no candidate ratio passed"
-            else -> "no probe rung could be measured ($misaligned not time-alignable, " +
+            else -> "no probe rung could be measured ($misalignedDetail, " +
                 "$unavailableDetail) — nothing was scored, so this is NOT evidence the clip " +
                 "resists re-encoding"
         }

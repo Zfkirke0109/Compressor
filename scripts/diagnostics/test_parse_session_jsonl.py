@@ -11,7 +11,7 @@ import json
 import os
 import tempfile
 
-from parse_session_jsonl import summarize
+from parse_session_jsonl import load_sessions, summarize
 
 
 def write(records) -> str:
@@ -34,6 +34,56 @@ def start(**kw):
     d = {"type": "session_start", "batchId": "b1", "buildCommit": "abc1234", "mode": "PL"}
     d.update(kw)
     return d
+
+
+def test_a_capture_holding_several_builds_is_never_merged_into_one_total():
+    # The in-app export writes EVERY session the recorder holds, newest first, so one file
+    # routinely spans several builds. Merging them and labelling the total with whichever
+    # session_start happened to be parsed last attributes one build's jobs to another -- the
+    # 2026-09-01 capture would have read as 387 jobs of the OLDEST batch when the batch under
+    # test contributed 36.
+    path = write([
+        start(batchId="new", buildCommit="d72cfee"),
+        job("a", batchId="new", terminal="ALREADY_HIGHLY_OPTIMIZED", verified=True, failedChecks=[]),
+        {"type": "session_summary", "batchId": "new", "elapsedMs": 10},
+        start(batchId="old", buildCommit="457edfe"),
+        job("b", batchId="old"),
+        job("c", batchId="old"),
+        {"type": "session_summary", "batchId": "old", "elapsedMs": 20},
+    ])
+    sessions = load_sessions(path)
+    assert list(sessions) == ["new", "old"]
+    assert len(sessions["new"]["jobs"]) == 1
+    assert len(sessions["old"]["jobs"]) == 2
+
+    # Default is the newest session, reported under ITS OWN build -- not a merged 3-job total.
+    s = summarize(path)
+    assert s["batchId"] == "new"
+    assert s["buildCommit"] == "d72cfee"
+    assert s["jobs"] == 1
+
+    # And an older batch stays addressable rather than being lost.
+    old = summarize(path, "old")
+    assert old["batchId"] == "old" and old["buildCommit"] == "457edfe" and old["jobs"] == 2
+
+
+def test_records_without_their_own_batch_id_follow_the_session_they_come_after():
+    # Older captures stamp batchId only on session_start and rely on block order. Those must
+    # still land in the right session rather than collapsing into one "None" bucket.
+    path = write([start(batchId="b1"), job("a"), start(batchId="b2"), job("b"), job("c")])
+    sessions = load_sessions(path)
+    assert [len(v["jobs"]) for v in sessions.values()] == [1, 2]
+    assert list(sessions) == ["b1", "b2"]
+
+
+def test_a_batch_that_recorded_no_summary_is_flagged_as_unfinished():
+    # A batch killed mid-run still has job records. Reporting its totals as if the run completed
+    # would understate the corpus and hide the fact that it stopped.
+    from parse_session_jsonl import render
+    path = write([start(batchId="b1"), job("a")])
+    s = summarize(path)
+    assert s["completed"] is False
+    assert "did not finish" in render(s)
 
 
 def test_failing_predicates_are_counted_and_shared_against_verified_jobs_only():

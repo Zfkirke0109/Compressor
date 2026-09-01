@@ -210,6 +210,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     private var compressionJob: Job? = null
 
+    init {
+        // Media3's export trace is what turns "no output sample written" into a named stalled
+        // component. See ExportDebugTracing.
+        ExportDebugTracing.enable()
+    }
+
     /**
      * Keeps a failed batch from killing the process.
      *
@@ -1217,7 +1223,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         } else {
                             val cause = when (recoveryOutcome) {
                                 is PairScoreOutcome.Scored -> "failed"
-                                PairScoreOutcome.MisalignmentRejected -> "rejected (output frames not time-alignable)"
+                                is PairScoreOutcome.MisalignmentRejected -> "rejected (output frames not time-alignable)"
                                 PairScoreOutcome.Unavailable -> "unavailable"
                             }
                             failedFloorRecoveryStatus = CertificationStatus.forFailedRecoveryOutcome(recoveryOutcome)

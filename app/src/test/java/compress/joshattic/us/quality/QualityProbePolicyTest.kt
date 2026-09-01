@@ -79,7 +79,7 @@ class QualityProbePolicyTest {
         )
         // ...but measured evidence still rules in the negative direction, exactly as elsewhere.
         assertFalse(
-            QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(PairScoreOutcome.MisalignmentRejected)
+            QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(PairScoreOutcome.MisalignmentRejected(null))
         )
         assertFalse(
             QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(
@@ -194,7 +194,7 @@ class QualityProbePolicyTest {
         )
 
         // Measured misalignment is evidence AGAINST, never certification.
-        assertFalse(QualityProbePolicy.isPixelCertified(true, PairScoreOutcome.MisalignmentRejected))
+        assertFalse(QualityProbePolicy.isPixelCertified(true, PairScoreOutcome.MisalignmentRejected(null)))
 
         // A failed certification is never pixel-certified, even with measured windows.
         assertFalse(QualityProbePolicy.isPixelCertified(certificationPassed = false, outcome = scored))
@@ -215,8 +215,8 @@ class QualityProbePolicyTest {
 
         // Measured misalignment is evidence AGAINST the output (frame loss/retiming):
         // it must fail even at the default ratio, where mere unavailability would pass.
-        assertFalse(QualityProbePolicy.certificationOutcomePasses(0.90, 0.90, PairScoreOutcome.MisalignmentRejected))
-        assertFalse(QualityProbePolicy.certificationOutcomePasses(0.70, 0.90, PairScoreOutcome.MisalignmentRejected))
+        assertFalse(QualityProbePolicy.certificationOutcomePasses(0.90, 0.90, PairScoreOutcome.MisalignmentRejected(null)))
+        assertFalse(QualityProbePolicy.certificationOutcomePasses(0.70, 0.90, PairScoreOutcome.MisalignmentRejected(null)))
     }
 
     @Test
@@ -228,7 +228,7 @@ class QualityProbePolicyTest {
         // so PerceptualQualityProber.probeOneRatio returns null and the rung is "unmeasurable",
         // never "measured and failing". Pinned here because getting it wrong trains the engine
         // on pairing noise as if it were pixel evidence.
-        val misaligned: PairScoreOutcome = PairScoreOutcome.MisalignmentRejected
+        val misaligned: PairScoreOutcome = PairScoreOutcome.MisalignmentRejected(null)
         assertFalse(misaligned is PairScoreOutcome.Scored)
 
         // With no measured windows there is nothing for the near-miss machinery to read, so an

@@ -71,7 +71,11 @@ class PerceptualQualityProber(private val context: Context) {
 
     companion object {
         private const val TAG = "CompressorProbe"
-        private const val PROBE_EXPORT_TIMEOUT_MS = 60_000L
+        // Shared with ExportWatchdogPolicy so the two bounds cannot drift: Media3's muxer
+        // watchdog must stay ABOVE this, or it pre-empts the recoverable timeout path and a
+        // stalled probe is reported as a muxer error instead of naming itself.
+        private const val PROBE_EXPORT_TIMEOUT_MS =
+            compress.joshattic.us.ExportWatchdogPolicy.PROBE_EXPORT_TIMEOUT_MS
         private const val TOTAL_BUDGET_MS = 150_000L
     }
 
@@ -104,9 +108,13 @@ class PerceptualQualityProber(private val context: Context) {
         var misaligned = 0
         var unavailable = 0
         val unavailableReasons = linkedMapOf<String, Int>()
+        val misalignedReasons = linkedMapOf<String, Int>()
         fun countRung(r: RungResult) = when (r) {
             is RungResult.Measured -> measured++
-            RungResult.Misaligned -> misaligned++
+            is RungResult.Misaligned -> {
+                misaligned++
+                misalignedReasons[r.reason] = (misalignedReasons[r.reason] ?: 0) + 1
+            }
             is RungResult.Unavailable -> {
                 unavailable++
                 unavailableReasons[r.reason] = (unavailableReasons[r.reason] ?: 0) + 1
@@ -191,7 +199,7 @@ class PerceptualQualityProber(private val context: Context) {
         }
         return ProbeDecision(
             null, probed, lastMeasuredScores,
-            QualityProbePolicy.ladderExhaustedDetail(measured, misaligned, unavailable, unavailableReasons),
+            QualityProbePolicy.ladderExhaustedDetail(measured, misaligned, unavailable, unavailableReasons, misalignedReasons),
             highestMeasuredRejected, measured, misaligned, unavailable
         )
     }
@@ -237,9 +245,10 @@ class PerceptualQualityProber(private val context: Context) {
                     // as its own outcome keeps the conservative gate decision, never counts as a
                     // measured rejection (no probe-skip latch feeding), and — unlike the previous
                     // bare null — lets the ladder tell a capture WHY it has no numbers.
-                    PairScoreOutcome.MisalignmentRejected -> {
-                        Log.w(TAG, "probe window rejected: clip/source frames not time-alignable")
-                        return RungResult.Misaligned
+                    is PairScoreOutcome.MisalignmentRejected -> {
+                        val why = outcome.reason ?: "cause not reported by the aligner"
+                        Log.w(TAG, "probe window rejected: clip/source frames not time-alignable — $why")
+                        return RungResult.Misaligned(why)
                     }
                     PairScoreOutcome.Unavailable -> return RungResult.Unavailable("scorer produced no evidence")
                 }
@@ -270,8 +279,14 @@ class PerceptualQualityProber(private val context: Context) {
 
     private sealed interface RungResult {
         data class Measured(val scores: List<WindowScore>) : RungResult
-        /** The probe clip and the source could not be paired in time. Not a quality result. */
-        object Misaligned : RungResult
+        /**
+         * The probe clip and the source could not be paired in time. Not a quality result.
+         *
+         * [reason] distinguishes a probe-pipeline addressing failure ("leading offset not aligned")
+         * from real frame loss inside the window ("internal frame misalignment"). Both fail closed,
+         * but only the second says anything about the source.
+         */
+        data class Misaligned(val reason: String) : RungResult
         /**
          * No evidence could be produced at all. [reason] separates the causes, which behave very
          * differently: an export timeout is a budget problem that scales with source length, an

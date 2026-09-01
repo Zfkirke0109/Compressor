@@ -102,7 +102,23 @@ data class ScoreWindow(val startUs: Long, val endUs: Long, val distStartUs: Long
 sealed interface PairScoreOutcome {
     data class Scored(val windows: List<WindowScore>) : PairScoreOutcome
     object Unavailable : PairScoreOutcome
-    object MisalignmentRejected : PairScoreOutcome
+
+    /**
+     * [reason] names WHICH of PtsAligner's two failures occurred, because they are different
+     * diagnoses and only one of them is about the source:
+     *
+     *  - "leading offset not aligned within N drops" — the two streams were never lined up at the
+     *    window's start. That is an addressing/seek problem in the probe pipeline, and the clip
+     *    was never given a fair measurement.
+     *  - "internal frame misalignment after N leading drops" — a frame is missing or retimed
+     *    INSIDE the window. That is real temporal degradation in the encode.
+     *
+     * Both fail closed, so the reason changes no decision. It exists because 13 of the 27 ladders
+     * in batch_1788254475481 ended here and the capture could not say which had happened: the
+     * reason was written to logcat under a tag the in-app export did not collect, and the outcome
+     * carried no payload, so nothing reached the structured record either.
+     */
+    data class MisalignmentRejected(val reason: String?) : PairScoreOutcome
 }
 
 /**
@@ -211,7 +227,7 @@ object VmafPairScorer {
             when (val outcome = scoreWindow(context, ref, dist, window, width, height, collectBanding)) {
                 is WindowOutcome.Scored -> results += outcome.score
                 WindowOutcome.Unavailable -> return PairScoreOutcome.Unavailable
-                WindowOutcome.Misaligned -> return PairScoreOutcome.MisalignmentRejected
+                is WindowOutcome.Misaligned -> return PairScoreOutcome.MisalignmentRejected(outcome.reason)
             }
         }
         return PairScoreOutcome.Scored(results)
@@ -220,7 +236,7 @@ object VmafPairScorer {
     private sealed interface WindowOutcome {
         data class Scored(val score: WindowScore) : WindowOutcome
         object Unavailable : WindowOutcome
-        object Misaligned : WindowOutcome
+        data class Misaligned(val reason: String?) : WindowOutcome
     }
 
     private fun scoreWindow(
@@ -383,7 +399,7 @@ object VmafPairScorer {
             Log.w(TAG, "window [${window.startUs}..${window.endUs}] failed: ${err ?: "no frames"}")
             VmafNative.close(handle)
             // Measured misalignment is positive evidence, not mere absence of evidence.
-            return if (misaligned) WindowOutcome.Misaligned else WindowOutcome.Unavailable
+            return if (misaligned) WindowOutcome.Misaligned(aligner.failureReason) else WindowOutcome.Unavailable
         }
         val perFrame = VmafNative.flush(handle)
         // Banding scores must be read AFTER the flush (which signals end-of-stream) and BEFORE

@@ -117,4 +117,35 @@ class LadderExhaustedDetailTest {
         assertTrue(detail.contains("2 unmeasurable"))
         assertFalse("no empty bracket: $detail", detail.contains("[]"))
     }
+    @Test
+    fun misalignmentNamesWhichOfItsTwoOppositeCausesOccurred() {
+        // "not time-alignable" covers two opposite diagnoses. "leading offset not aligned" means
+        // the probe pipeline never lined the streams up, so the clip was never fairly measured.
+        // "internal frame misalignment" means frames really are missing or retimed inside the
+        // window. A bare count reads as the second when it may be entirely the first — which is
+        // how 13 of the 27 ladders in batch_1788254475481 ended, with no way to tell.
+        val detail = QualityProbePolicy.ladderExhaustedDetail(
+            measured = 0, misaligned = 3, unavailable = 0,
+            misalignedReasons = mapOf(
+                "leading offset not aligned within 8 drops" to 2,
+                "internal frame misalignment after 0 leading drops" to 1
+            )
+        )
+        assertTrue("counts stay: $detail", detail.contains("3 not time-alignable"))
+        assertTrue("pipeline cause named: $detail", detail.contains("2x leading offset not aligned within 8 drops"))
+        assertTrue("frame-loss cause named: $detail", detail.contains("1x internal frame misalignment after 0 leading drops"))
+        assertTrue(
+            "commonest cause leads: $detail",
+            detail.indexOf("2x leading offset") < detail.indexOf("1x internal frame")
+        )
+    }
+
+    @Test
+    fun anUnrecordedMisalignmentCauseIsOmittedRatherThanInvented() {
+        // Captures from builds predating the reason plumbing must keep the old wording exactly,
+        // so a run recorded before the fix stays comparable with one recorded after it.
+        val detail = QualityProbePolicy.ladderExhaustedDetail(measured = 0, misaligned = 2, unavailable = 1)
+        assertTrue(detail.contains("2 not time-alignable"))
+        assertFalse("no empty bracket: $detail", detail.contains("[]"))
+    }
 }
