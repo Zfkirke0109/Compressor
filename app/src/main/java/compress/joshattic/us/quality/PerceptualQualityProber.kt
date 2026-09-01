@@ -103,10 +103,14 @@ class PerceptualQualityProber(private val context: Context) {
         var measured = 0
         var misaligned = 0
         var unavailable = 0
+        val unavailableReasons = linkedMapOf<String, Int>()
         fun countRung(r: RungResult) = when (r) {
             is RungResult.Measured -> measured++
             RungResult.Misaligned -> misaligned++
-            RungResult.Unavailable -> unavailable++
+            is RungResult.Unavailable -> {
+                unavailable++
+                unavailableReasons[r.reason] = (unavailableReasons[r.reason] ?: 0) + 1
+            }
         }
         fun scoresOf(r: RungResult) = (r as? RungResult.Measured)?.scores
         for (ratio in candidateRatios) {
@@ -187,7 +191,7 @@ class PerceptualQualityProber(private val context: Context) {
         }
         return ProbeDecision(
             null, probed, lastMeasuredScores,
-            QualityProbePolicy.ladderExhaustedDetail(measured, misaligned, unavailable),
+            QualityProbePolicy.ladderExhaustedDetail(measured, misaligned, unavailable, unavailableReasons),
             highestMeasuredRejected, measured, misaligned, unavailable
         )
     }
@@ -207,8 +211,8 @@ class PerceptualQualityProber(private val context: Context) {
             try {
                 val exported = withTimeoutOrNull(PROBE_EXPORT_TIMEOUT_MS) {
                     exportClip(sourceUri, probeFile, outputMime, videoBitrate, audioBitrate, window)
-                } ?: return RungResult.Unavailable
-                if (!exported) return RungResult.Unavailable
+                } ?: return RungResult.Unavailable("export timed out after ${PROBE_EXPORT_TIMEOUT_MS}ms")
+                if (!exported) return RungResult.Unavailable("export failed")
                 val outcome = withContext(Dispatchers.IO) {
                     VmafPairScorer.score(
                         context,
@@ -229,7 +233,7 @@ class PerceptualQualityProber(private val context: Context) {
                         Log.w(TAG, "probe window rejected: clip/source frames not time-alignable")
                         return RungResult.Misaligned
                     }
-                    PairScoreOutcome.Unavailable -> return RungResult.Unavailable
+                    PairScoreOutcome.Unavailable -> return RungResult.Unavailable("scorer produced no evidence")
                 }
                 collected += scores
                 // Early exit: one failing window already rejects this ratio.
@@ -250,8 +254,15 @@ class PerceptualQualityProber(private val context: Context) {
         data class Measured(val scores: List<WindowScore>) : RungResult
         /** The probe clip and the source could not be paired in time. Not a quality result. */
         object Misaligned : RungResult
-        /** No evidence could be produced at all (export failed, decoder/native unavailable). */
-        object Unavailable : RungResult
+        /**
+         * No evidence could be produced at all. [reason] separates the causes, which behave very
+         * differently: an export timeout is a budget problem that scales with source length, an
+         * export failure is a pipeline problem, and a scorer with no evidence is a decode or
+         * geometry problem. The first ee6853b captures showed 28 unavailable rungs concentrated on
+         * the four longest sources in the corpus (52, 32, 31 and 28 minutes) — a pattern that is
+         * only actionable once the cause is named.
+         */
+        data class Unavailable(val reason: String) : RungResult
     }
 
     private suspend fun exportClip(

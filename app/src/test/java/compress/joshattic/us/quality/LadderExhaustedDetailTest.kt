@@ -74,4 +74,47 @@ class LadderExhaustedDetailTest {
             }
         }
     }
+
+    @Test
+    fun unavailableRungsNameTheirCauseSoTheyCanBeActedOn() {
+        // "unmeasurable" alone could not separate an export that timed out on a 52-minute source
+        // from a decoder that failed on a 90-second one — different problems, different fixes.
+        val detail = QualityProbePolicy.ladderExhaustedDetail(
+            measured = 0, misaligned = 0, unavailable = 3,
+            unavailableReasons = mapOf("export timed out after 60000ms" to 2, "export failed" to 1)
+        )
+        assertTrue(detail.contains("3 unmeasurable"))
+        assertTrue(detail.contains("2x export timed out after 60000ms"))
+        assertTrue(detail.contains("1x export failed"))
+        assertTrue(detail.contains("NOT evidence"))
+    }
+
+    @Test
+    fun theCommonestCauseIsNamedFirst() {
+        val detail = QualityProbePolicy.ladderExhaustedDetail(
+            measured = 0, misaligned = 0, unavailable = 4,
+            unavailableReasons = mapOf("export failed" to 1, "scorer produced no evidence" to 3)
+        )
+        assertTrue(
+            "commonest cause should lead: $detail",
+            detail.indexOf("3x scorer produced no evidence") < detail.indexOf("1x export failed")
+        )
+    }
+
+    @Test
+    fun aLadderWithNoUnavailableRungsGainsNoCauseList() {
+        // A fully-measured ladder keeps the original sentence verbatim, so captures stay comparable.
+        assertEquals(
+            "no candidate ratio passed",
+            QualityProbePolicy.ladderExhaustedDetail(4, 0, 0, emptyMap())
+        )
+    }
+
+    @Test
+    fun causesAreOmittedRatherThanFakedWhenUnrecorded() {
+        // Callers predating the reason map must not produce an empty bracket.
+        val detail = QualityProbePolicy.ladderExhaustedDetail(measured = 0, misaligned = 1, unavailable = 2)
+        assertTrue(detail.contains("2 unmeasurable"))
+        assertFalse("no empty bracket: $detail", detail.contains("[]"))
+    }
 }

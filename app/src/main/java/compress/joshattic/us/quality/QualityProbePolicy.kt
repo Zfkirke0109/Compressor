@@ -332,14 +332,30 @@ object QualityProbePolicy {
      * matters — [ProbeDecision.highestCandidateMeasuredRejected], which feeds the probe-skip
      * ratchet — already required a measured rung and is untouched.
      */
-    fun ladderExhaustedDetail(measured: Int, misaligned: Int, unavailable: Int): String = when {
-        measured > 0 && (misaligned + unavailable) == 0 -> "no candidate ratio passed"
-        measured > 0 -> "no candidate ratio passed (of ${measured + misaligned + unavailable} rungs, " +
-            "$measured measured; $misaligned not time-alignable, $unavailable unmeasurable)"
-        (misaligned + unavailable) == 0 -> "no candidate ratio passed"
-        else -> "no probe rung could be measured ($misaligned not time-alignable, " +
-            "$unavailable unmeasurable) — nothing was scored, so this is NOT evidence the clip " +
-            "resists re-encoding"
+    fun ladderExhaustedDetail(
+        measured: Int,
+        misaligned: Int,
+        unavailable: Int,
+        unavailableReasons: Map<String, Int> = emptyMap()
+    ): String {
+        // "unmeasurable" alone was still too coarse to act on. The first captures from the fixed
+        // 4 ms tolerance showed 28 unavailable rungs, and the count could not distinguish an
+        // export that timed out on a 52-minute source from a decoder that failed on a 90-second
+        // one — which point at completely different fixes. Naming them costs nothing and is the
+        // difference between a capture that poses a question and one that answers it.
+        val why = unavailableReasons.entries
+            .sortedByDescending { it.value }
+            .joinToString("; ") { "${it.value}x ${it.key}" }
+        val unavailableDetail = if (why.isEmpty()) "$unavailable unmeasurable" else "$unavailable unmeasurable [$why]"
+        return when {
+            measured > 0 && (misaligned + unavailable) == 0 -> "no candidate ratio passed"
+            measured > 0 -> "no candidate ratio passed (of ${measured + misaligned + unavailable} rungs, " +
+                "$measured measured; $misaligned not time-alignable, $unavailableDetail)"
+            (misaligned + unavailable) == 0 -> "no candidate ratio passed"
+            else -> "no probe rung could be measured ($misaligned not time-alignable, " +
+                "$unavailableDetail) — nothing was scored, so this is NOT evidence the clip " +
+                "resists re-encoding"
+        }
     }
 
     fun probeWindows(durationUs: Long, windowUs: Long = 1_200_000L): List<ScoreWindow> {
