@@ -1,5 +1,6 @@
 package compress.joshattic.us.quality
 
+import compress.joshattic.us.DiagLog
 import android.content.Context
 import android.media.MediaCodecInfo
 import android.net.Uri
@@ -134,7 +135,7 @@ class PerceptualQualityProber(private val context: Context) {
             val scores = scoresOf(rung)
             if (!scores.isNullOrEmpty()) lastMeasuredScores = scores
             if (QualityProbePolicy.windowsPass(scores)) {
-                Log.i(TAG, "ratio %.2f pixel-proven over ${windows.size} windows".format(ratio))
+                DiagLog.i(TAG, "ratio %.2f pixel-proven over ${windows.size} windows".format(ratio))
                 // One bounded bisection between this pass and the measured failure below it:
                 // an extra probe encode may reclaim up to half the rung gap in real savings.
                 // The passing result above is ALWAYS kept as the fallback — a failed or
@@ -148,13 +149,13 @@ class PerceptualQualityProber(private val context: Context) {
                     countRung(refinedRung)
                     val refinedScores = scoresOf(refinedRung)
                     if (QualityProbePolicy.windowsPass(refinedScores)) {
-                        Log.i(TAG, "refinement %.2f pixel-proven (bisection below %.2f)".format(refined, ratio))
+                        DiagLog.i(TAG, "refinement %.2f pixel-proven (bisection below %.2f)".format(refined, ratio))
                         return ProbeDecision(
                             refined, probed, refinedScores, "windows passed at %.2f (refined)".format(refined),
                             false, measured, misaligned, unavailable
                         )
                     }
-                    Log.i(TAG, "refinement %.2f rejected; keeping proven %.2f".format(refined, ratio))
+                    DiagLog.i(TAG, "refinement %.2f rejected; keeping proven %.2f".format(refined, ratio))
                 }
                 return ProbeDecision(
                     ratio, probed, scores, "windows passed at %.2f".format(ratio),
@@ -168,7 +169,7 @@ class PerceptualQualityProber(private val context: Context) {
                     highestMeasuredRejected = true
                 }
             }
-            Log.i(TAG, "ratio %.2f rejected by probe windows (measured=${!scores.isNullOrEmpty()})".format(ratio))
+            DiagLog.i(TAG, "ratio %.2f rejected by probe windows (measured=${!scores.isNullOrEmpty()})".format(ratio))
         }
         // Upward near-miss refinement: the whole ladder failed, but if the SAFEST rung only just
         // missed, one more probe at the safest useful ceiling (a higher, more conservative rung) may
@@ -187,13 +188,13 @@ class PerceptualQualityProber(private val context: Context) {
                 countRung(upRung)
                 val upScores = scoresOf(upRung)
                 if (QualityProbePolicy.windowsPass(upScores)) {
-                    Log.i(TAG, "upward near-miss refinement %.2f pixel-proven (safest rung %.2f just missed)".format(upward, highestCandidate))
+                    DiagLog.i(TAG, "upward near-miss refinement %.2f pixel-proven (safest rung %.2f just missed)".format(upward, highestCandidate))
                     return ProbeDecision(
                         upward, probed, upScores, "windows passed at %.2f (upward near-miss refinement)".format(upward),
                         false, measured, misaligned, unavailable
                     )
                 }
-                Log.i(TAG, "upward near-miss refinement %.2f rejected; source cannot be transparently re-encoded".format(upward))
+                DiagLog.i(TAG, "upward near-miss refinement %.2f rejected; source cannot be transparently re-encoded".format(upward))
                 if (!upScores.isNullOrEmpty()) lastMeasuredScores = upScores
             }
         }
@@ -235,7 +236,7 @@ class PerceptualQualityProber(private val context: Context) {
                 // record can tell. Diagnostic only — this never changes a decision.
                 withContext(Dispatchers.IO) {
                     ProbeClipGeometry.describe(probeFile, window.startUs, window.endUs)
-                }?.let { Log.i(TAG, it) }
+                }?.let { DiagLog.i(TAG, it) }
                 val outcome = withContext(Dispatchers.IO) {
                     VmafPairScorer.score(
                         context,
@@ -254,7 +255,7 @@ class PerceptualQualityProber(private val context: Context) {
                     // bare null — lets the ladder tell a capture WHY it has no numbers.
                     is PairScoreOutcome.MisalignmentRejected -> {
                         val why = outcome.reason ?: "cause not reported by the aligner"
-                        Log.w(TAG, "probe window rejected: clip/source frames not time-alignable — $why")
+                        DiagLog.w(TAG, "probe window rejected: clip/source frames not time-alignable — $why")
                         return RungResult.Misaligned(why)
                     }
                     PairScoreOutcome.Unavailable -> return RungResult.Unavailable("scorer produced no evidence")
@@ -379,7 +380,7 @@ class PerceptualQualityProber(private val context: Context) {
                         // batch_1788252039055 reporting a bare "export failed" with no way to act.
                         val reason = "export failed: ${exportException.getErrorCodeName()}" +
                             (exportException.message?.take(120)?.let { " — $it" } ?: "")
-                        Log.w(TAG, "probe export failed: $reason", exportException)
+                        DiagLog.w(TAG, "probe export failed: $reason", exportException)
                         runCatching { outputFile.delete() }
                         if (continuation.isActive) continuation.resume(ExportOutcome.Failed(reason))
                     }

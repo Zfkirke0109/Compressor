@@ -1,5 +1,6 @@
 package compress.joshattic.us.quality
 
+import compress.joshattic.us.DiagLog
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.util.Log
@@ -56,7 +57,7 @@ object ProbeClipGeometry {
             }
             found
         } catch (t: Throwable) {
-            Log.w(TAG, "could not read probe clip geometry: ${t.message}")
+            DiagLog.w(TAG, "could not read probe clip geometry: ${t.message}")
             null
         } finally {
             runCatching { extractor.release() }

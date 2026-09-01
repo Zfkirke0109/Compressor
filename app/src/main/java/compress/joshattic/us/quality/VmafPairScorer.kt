@@ -1,5 +1,6 @@
 package compress.joshattic.us.quality
 
+import compress.joshattic.us.DiagLog
 import android.content.Context
 import android.net.Uri
 import android.util.Log
@@ -212,13 +213,13 @@ object VmafPairScorer {
         val refGeom = YuvFrameReader.displayGeometry(context, ref) ?: return PairScoreOutcome.Unavailable
         val distGeom = YuvFrameReader.displayGeometry(context, dist) ?: return PairScoreOutcome.Unavailable
         if (refGeom.first != distGeom.first || refGeom.second != distGeom.second) {
-            Log.w(TAG, "display geometry mismatch ${refGeom.first}x${refGeom.second} vs ${distGeom.first}x${distGeom.second}")
+            DiagLog.w(TAG, "display geometry mismatch ${refGeom.first}x${refGeom.second} vs ${distGeom.first}x${distGeom.second}")
             return PairScoreOutcome.Unavailable
         }
         val width = refGeom.first
         val height = refGeom.second
         if (width * height > MAX_COMPARE_PIXELS) {
-            Log.i(TAG, "geometry ${width}x$height above pixel-scoring cap; skipping")
+            DiagLog.i(TAG, "geometry ${width}x$height above pixel-scoring cap; skipping")
             return PairScoreOutcome.Unavailable
         }
 
@@ -396,7 +397,7 @@ object VmafPairScorer {
 
         val err = error.get()
         if (err != null || fed == 0) {
-            Log.w(TAG, "window [${window.startUs}..${window.endUs}] failed: ${err ?: "no frames"}")
+            DiagLog.w(TAG, "window [${window.startUs}..${window.endUs}] failed: ${err ?: "no frames"}")
             VmafNative.close(handle)
             // Measured misalignment is positive evidence, not mere absence of evidence.
             return if (misaligned) WindowOutcome.Misaligned(aligner.failureReason) else WindowOutcome.Unavailable
@@ -408,7 +409,7 @@ object VmafPairScorer {
         val perFrameCambi = if (collectBanding) VmafNative.cambiScores(handle) else null
         VmafNative.close(handle)
         if (perFrame == null || perFrame.isEmpty() || perFrame.any { it < 0 }) {
-            Log.w(TAG, "vmaf flush failed for window")
+            DiagLog.w(TAG, "vmaf flush failed for window")
             return WindowOutcome.Unavailable
         }
         val sorted = perFrame.sortedArray()
@@ -432,7 +433,7 @@ object VmafPairScorer {
             pairing = pairing,
             banding = summarizeBanding(perFrameCambi)
         )
-        Log.i(
+        DiagLog.i(
             TAG,
             "window [${window.startUs / 1000}ms..${window.endUs / 1000}ms] frames=${result.comparedFrames} " +
                 "mean=%.2f p5=%.2f min=%.2f".format(java.util.Locale.US, result.mean, result.p5, result.min) +

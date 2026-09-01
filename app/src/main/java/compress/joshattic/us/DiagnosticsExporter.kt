@@ -87,20 +87,40 @@ object DiagnosticsExporter {
      * are never written to it — including the `CompressorVerification` per-check detail line.
      */
     fun exportLogcat(context: Context): ExportResult {
+        // The app's OWN decision logs come first, because they are the only copy that cannot be
+        // evicted. batch_1788273016134 ran 07:30-08:0x and was exported at 08:08; the buffer held
+        // nothing older than 08:07:57, so all 64 jobs survived in session.jsonl while every
+        // decision line behind them was gone. Logcat is still appended -- it carries lines from
+        // outside a batch, and from builds predating DiagLog -- but it is no longer the only copy.
+        val decisions = recordedDecisionLogs(context)
         // Ask for every process this app has run in, not just the live one: a batch that crashed
         // logged its records under a pid that no longer exists, and those are the records worth
         // exporting. Falls back to the pid-scoped form only if the broader dump comes back empty,
         // so this can never return less than it did before.
-        val output = readLogcat(DiagnosticsExportPlan.logcatDumpArgsAllProcesses())
+        val logcat = readLogcat(DiagnosticsExportPlan.logcatDumpArgsAllProcesses())
             .let { broad ->
                 if (broad != null && broad.isNotBlank()) broad
                 else readLogcat(DiagnosticsExportPlan.logcatDumpArgs(Process.myPid())) ?: broad
             }
-            ?: return ExportResult.Failed("Could not read this app's log.")
+        if (decisions.isEmpty() && logcat == null) {
+            return ExportResult.Failed("Could not read this app's log.")
+        }
+        val output = buildString {
+            for (file in decisions) {
+                val text = runCatching { file.readText() }.getOrNull() ?: continue
+                if (text.isBlank()) continue
+                append("===== decisions: ${file.parentFile?.name} =====\n")
+                append(text)
+                if (!text.endsWith("\n")) append('\n')
+            }
+            if (!logcat.isNullOrBlank()) {
+                append("===== logcat (device buffer, may be truncated) =====\n")
+                append(logcat)
+            }
+        }
         if (output.isBlank()) {
             return ExportResult.Empty(
-                "This app's log buffer holds no diagnostic lines yet. Run a batch, then export " +
-                    "before the buffer rolls over."
+                "No diagnostic lines yet. Run a batch, then export."
             )
         }
         return write(
@@ -108,6 +128,16 @@ object DiagnosticsExporter {
             DiagnosticsExportPlan.exportFileName("compressor-logcat", null, timestamp()),
             output
         )
+    }
+
+    /** Every batch's durable decision log, newest first. See [DiagLog]. */
+    private fun recordedDecisionLogs(context: Context): List<File> {
+        val root = File(context.filesDir, "diagnostics")
+        if (!root.isDirectory) return emptyList()
+        return root.listFiles().orEmpty()
+            .filter { it.isDirectory }
+            .mapNotNull { File(it, "decisions.log").takeIf { f -> f.isFile && f.length() > 0 } }
+            .sortedByDescending { it.lastModified() }
     }
 
     /** Runs one `logcat` dump; null means the dump itself failed, "" means it produced nothing. */
