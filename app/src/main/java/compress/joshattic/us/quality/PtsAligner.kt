@@ -126,11 +126,19 @@ class PtsAligner(
         if (pairedAtLeastOnce) {
             // Misalignment AFTER a scored pair = a frame is missing or retimed INSIDE the
             // window. Dropping around it would hide real temporal degradation; fail closed.
-            failureReason = "internal frame misalignment after ${refDropped + distDropped} leading drops (frame loss or retiming inside the window)"
+            failureReason = "internal frame misalignment after ${refDropped + distDropped} leading drops" +
+                " (frame loss or retiming inside the window; skew ${skew / 1000}ms)"
             return Action.FAIL
         }
         if (refDropped + distDropped >= maxDrops) {
-            failureReason = "leading offset not aligned within $maxDrops drops"
+            // The magnitude and SIGN of the unclosed offset are the diagnosis, and naming only
+            // the failure withheld both. 12 of the 13 misaligned ladders in batch_1788257645030
+            // ended here, and the capture could not say whether the clip began a hair late (a
+            // rounding residue worth widening the budget for) or seconds early (a clip cut at a
+            // different instant than requested, which no number of drops can repair). A positive
+            // skew means the CLIP is ahead of the source window; negative means it lags.
+            failureReason = "leading offset not aligned within $maxDrops drops" +
+                " (unclosed skew ${skew / 1000}ms, ref dropped $refDropped, dist dropped $distDropped)"
             return Action.FAIL
         }
         return if (skew > 0) {

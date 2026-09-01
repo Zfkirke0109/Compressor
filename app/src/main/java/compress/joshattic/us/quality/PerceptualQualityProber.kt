@@ -229,6 +229,13 @@ class PerceptualQualityProber(private val context: Context) {
                     return RungResult.Unavailable("export timed out after ${PROBE_EXPORT_TIMEOUT_MS}ms")
                 }
                 if (exported is ExportOutcome.Failed) return RungResult.Unavailable(exported.reason)
+                // Verify, rather than assume, that the clip holds the window we asked for. See
+                // ProbeClipGeometry: if the clip does not start at the requested instant, the
+                // scorer pairs correct timestamps against the wrong pixels and no downstream
+                // record can tell. Diagnostic only — this never changes a decision.
+                withContext(Dispatchers.IO) {
+                    ProbeClipGeometry.describe(probeFile, window.startUs, window.endUs)
+                }?.let { Log.i(TAG, it) }
                 val outcome = withContext(Dispatchers.IO) {
                     VmafPairScorer.score(
                         context,
