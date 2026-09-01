@@ -209,10 +209,18 @@ class PerceptualQualityProber(private val context: Context) {
         for (window in windows) {
             val probeFile = File.createTempFile("probe_${"%.2f".format(ratio)}_", ".mp4", context.cacheDir)
             try {
+                // withTimeoutOrNull collapses its own timeout into null, so exportClip must NEVER
+                // use null to mean anything itself: a nullable "failure reason" made a successful
+                // export (null reason) indistinguishable from a timeout, and every probe would
+                // have been reported as timing out. The sealed result keeps the two apart by
+                // construction.
                 val exported = withTimeoutOrNull(PROBE_EXPORT_TIMEOUT_MS) {
                     exportClip(sourceUri, probeFile, outputMime, videoBitrate, audioBitrate, window)
-                } ?: return RungResult.Unavailable("export timed out after ${PROBE_EXPORT_TIMEOUT_MS}ms")
-                if (exported != null) return RungResult.Unavailable(exported)
+                }
+                if (exported == null) {
+                    return RungResult.Unavailable("export timed out after ${PROBE_EXPORT_TIMEOUT_MS}ms")
+                }
+                if (exported is ExportOutcome.Failed) return RungResult.Unavailable(exported.reason)
                 val outcome = withContext(Dispatchers.IO) {
                     VmafPairScorer.score(
                         context,
@@ -250,6 +258,16 @@ class PerceptualQualityProber(private val context: Context) {
      * different situations — measured, frames not time-alignable, and evidence unavailable — into
      * a single `null` that the ladder then reported as "no candidate ratio passed".
      */
+    /**
+     * Outcome of one probe-clip export. Deliberately NOT a nullable reason string: the caller wraps
+     * this in `withTimeoutOrNull`, which already uses null for its own timeout, so any null the
+     * export produces would be read as a timeout instead.
+     */
+    private sealed interface ExportOutcome {
+        object Success : ExportOutcome
+        data class Failed(val reason: String) : ExportOutcome
+    }
+
     private sealed interface RungResult {
         data class Measured(val scores: List<WindowScore>) : RungResult
         /** The probe clip and the source could not be paired in time. Not a quality result. */
@@ -272,7 +290,7 @@ class PerceptualQualityProber(private val context: Context) {
         videoBitrate: Int,
         audioBitrate: Int,
         window: ScoreWindow
-    ): String? = withContext(Dispatchers.Main) {
+    ): ExportOutcome = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
             val encoderFactory = DefaultEncoderFactory.Builder(context)
                 .setRequestedVideoEncoderSettings(
@@ -313,8 +331,12 @@ class PerceptualQualityProber(private val context: Context) {
                     override fun onCompleted(composition: Composition, exportResult: ExportResult) {
                         // A "successful" export that wrote nothing is still a failure, and a
                         // different one from an error — say which.
-                        val failure = if (outputFile.length() > 0L) null else "export produced an empty file"
-                        if (continuation.isActive) continuation.resume(failure)
+                        val outcome = if (outputFile.length() > 0L) {
+                            ExportOutcome.Success
+                        } else {
+                            ExportOutcome.Failed("export produced an empty file")
+                        }
+                        if (continuation.isActive) continuation.resume(outcome)
                     }
 
                     override fun onError(
@@ -331,7 +353,7 @@ class PerceptualQualityProber(private val context: Context) {
                             (exportException.message?.take(120)?.let { " — $it" } ?: "")
                         Log.w(TAG, "probe export failed: $reason", exportException)
                         runCatching { outputFile.delete() }
-                        if (continuation.isActive) continuation.resume(reason)
+                        if (continuation.isActive) continuation.resume(ExportOutcome.Failed(reason))
                     }
                 })
                 .build()
