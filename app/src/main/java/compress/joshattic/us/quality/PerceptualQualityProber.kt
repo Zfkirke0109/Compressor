@@ -325,6 +325,12 @@ class PerceptualQualityProber(private val context: Context) {
                 .setRemoveAudio(true) // probes judge video pixels only; audio is stream-copied in PL
                 .build()
             val transformer = Transformer.Builder(context)
+                // See ExportWatchdogPolicy. The prober's own PROBE_EXPORT_TIMEOUT_MS (60s) fires
+                // first for probe clips; this only stops the watchdog pre-empting it with a
+                // process-killing throw instead of the recoverable timeout path.
+                .setMaxDelayBetweenMuxerSamplesMs(
+                    compress.joshattic.us.ExportWatchdogPolicy.MAX_DELAY_BETWEEN_MUXER_SAMPLES_MS
+                )
                 .setVideoMimeType(outputMime)
                 .setEncoderFactory(encoderFactory)
                 .addListener(object : Transformer.Listener {

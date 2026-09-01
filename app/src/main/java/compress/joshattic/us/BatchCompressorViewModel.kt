@@ -36,6 +36,7 @@ import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.VideoEncoderSettings
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -208,6 +209,38 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     val uiState = _uiState.asStateFlow()
 
     private var compressionJob: Job? = null
+
+    /**
+     * Keeps a failed batch from killing the process.
+     *
+     * The per-item and outer handlers below deliberately rethrow: a run that failed must complete
+     * as a *failed* Job, not quietly report success. But `viewModelScope.launch` has no consumer
+     * for that throw, so without a handler here kotlinx routes it to the platform's uncaught
+     * handler and the process dies.
+     *
+     * That is not an abstract worry — it is what the 2026-09-01 High Quality captures were:
+     *
+     *   FATAL EXCEPTION: main
+     *   androidx.media3.transformer.ExportException: Muxer error
+     *     at Transformer.lambda$maybeInitializeExportWatchdogTimer$0(Transformer.java:1301)
+     *   Suppressed: DiagnosticCoroutineContextException: [StandaloneCoroutine{Cancelling}, Dispatchers.Main]
+     *
+     * A crash is the worst possible failure mode for a measurement app: the batch's structured
+     * records live in this process's log buffer, so killing the process destroys the evidence for
+     * the run that would have explained the failure. The run's own `finally` has already written
+     * its records and returned the UI to idle by the time this runs, so this handler only has to
+     * make sure the process survives to be read.
+     */
+    private val compressionExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        Log.e("CompressorBatch", "Batch run ended with an unhandled failure", throwable)
+        _uiState.update { state ->
+            state.copy(
+                isCompressing = false,
+                errorMessage = state.errorMessage
+                    ?: "Batch stopped: ${throwable.message ?: throwable.javaClass.simpleName}"
+            )
+        }
+    }
     private var activeTransformer: Transformer? = null
 
     // Brackets a running batch with foreground protection + a CPU wake lock (see PERF-001). Holds
@@ -613,7 +646,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             return
         }
 
-        compressionJob = viewModelScope.launch(Dispatchers.Main) {
+        compressionJob = viewModelScope.launch(Dispatchers.Main + compressionExceptionHandler) {
             val batchStartedAt = System.currentTimeMillis()
             // Post-item thermal cooldown that was applied BEFORE the current item started (i.e. the
             // cooldown after the previous item). Carried across iterations so each item's structured
@@ -2335,6 +2368,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
             var progressJob: Job? = null
             val transformer = Transformer.Builder(context)
+                // See ExportWatchdogPolicy: Media3 1.9+'s 10s default aborts healthy 8K encodes
+                // as an uncaught main-thread exception, killing the batch and its diagnostics.
+                .setMaxDelayBetweenMuxerSamplesMs(ExportWatchdogPolicy.MAX_DELAY_BETWEEN_MUXER_SAMPLES_MS)
                 .setVideoMimeType(videoMimeType)
                 .setAssetLoaderFactory(DefaultAssetLoaderFactory(context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT, null))
                 .setEncoderFactory(encoderFactory)

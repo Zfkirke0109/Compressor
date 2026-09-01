@@ -74,20 +74,38 @@ object DiagnosticsExportPlan {
     /**
      * Argv for a one-shot dump of THIS process's diagnostic lines.
      *
-     * `--pid` is what makes this work without the privileged READ_LOGS permission: since Jelly
-     * Bean an app may read only its own log entries, and asking for exactly those is both the
-     * honest request and the one the platform will answer. It also keeps other apps' output — and
-     * anything private in it — out of a file the user is about to share.
-     *
      * `-d` dumps and exits rather than streaming, so the caller cannot hang waiting for EOF.
+     *
+     * Kept as the narrower fallback for [logcatDumpArgsAllProcesses], which explains why the
+     * cross-process form is the one an export should normally ask for.
      */
     fun logcatDumpArgs(pid: Int, tags: List<String> = DIAGNOSTIC_TAGS): List<String> {
         require(pid > 0) { "pid must be positive, was $pid" }
+        return dumpArgs(tags) { add("--pid=$pid") }
+    }
+
+    /**
+     * Argv for a dump of this *app's* diagnostic lines, across every process it has run in.
+     *
+     * The `--pid` form above cannot see the run that mattered most. When a batch crashes the
+     * process, the export is necessarily taken from a new process with a new pid, so filtering on
+     * it hides exactly the records that would explain the crash — which is what happened to the
+     * 2026-09-01 High Quality captures: they came back with zero job records and no session
+     * summary, not because nothing was logged, but because everything logged had a dead pid.
+     *
+     * Dropping `--pid` does not widen what this app can read. Since Jelly Bean the log daemon
+     * serves an unprivileged reader only entries from its own UID, so other apps' output stays
+     * invisible whether or not we ask for a pid; `--pid` was narrowing our own history, not
+     * anyone else's privacy. The tag filter still keeps the file to Compressor's own diagnostics.
+     */
+    fun logcatDumpArgsAllProcesses(tags: List<String> = DIAGNOSTIC_TAGS): List<String> = dumpArgs(tags)
+
+    private fun dumpArgs(tags: List<String>, extra: MutableList<String>.() -> Unit = {}): List<String> {
         require(tags.isNotEmpty()) { "at least one tag is required; an empty list would silence everything" }
         return buildList {
             add("logcat")
             add("-d")
-            add("--pid=$pid")
+            extra()
             add("-v")
             add("threadtime")
             tags.forEach { add("-s"); add("$it:V") }

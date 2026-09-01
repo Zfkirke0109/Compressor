@@ -803,6 +803,8 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
         
         val transformerBuilder = Transformer.Builder(context)
+            // See ExportWatchdogPolicy.
+            .setMaxDelayBetweenMuxerSamplesMs(ExportWatchdogPolicy.MAX_DELAY_BETWEEN_MUXER_SAMPLES_MS)
             .setVideoMimeType(videoMimeType)
             .setAudioMimeType(MimeTypes.AUDIO_AAC)
             .setAssetLoaderFactory(androidx.media3.transformer.DefaultAssetLoaderFactory(context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT, null))

@@ -77,24 +77,23 @@ object DiagnosticsExporter {
     }
 
     /**
-     * Dump this process's diagnostic log lines into `Downloads/Compressor/`.
+     * Dump this app's diagnostic log lines into `Downloads/Compressor/`.
      *
      * Complements the session export rather than duplicating it: the JSONL carries the structured
      * per-job records, while logcat additionally carries the human-readable decision lines that
      * are never written to it — including the `CompressorVerification` per-check detail line.
      */
     fun exportLogcat(context: Context): ExportResult {
-        val pid = Process.myPid()
-        val args = DiagnosticsExportPlan.logcatDumpArgs(pid)
-        val output = runCatching {
-            val process = ProcessBuilder(args).redirectErrorStream(true).start()
-            val text = process.inputStream.bufferedReader().use { it.readText() }
-            process.waitFor()
-            text
-        }.getOrElse {
-            Log.w(TAG, "logcat export failed", it)
-            return ExportResult.Failed("Could not read this app's log: ${it.message ?: it::class.java.simpleName}")
-        }
+        // Ask for every process this app has run in, not just the live one: a batch that crashed
+        // logged its records under a pid that no longer exists, and those are the records worth
+        // exporting. Falls back to the pid-scoped form only if the broader dump comes back empty,
+        // so this can never return less than it did before.
+        val output = readLogcat(DiagnosticsExportPlan.logcatDumpArgsAllProcesses())
+            .let { broad ->
+                if (broad != null && broad.isNotBlank()) broad
+                else readLogcat(DiagnosticsExportPlan.logcatDumpArgs(Process.myPid())) ?: broad
+            }
+            ?: return ExportResult.Failed("Could not read this app's log.")
         if (output.isBlank()) {
             return ExportResult.Empty(
                 "This app's log buffer holds no diagnostic lines yet. Run a batch, then export " +
@@ -106,6 +105,17 @@ object DiagnosticsExporter {
             DiagnosticsExportPlan.exportFileName("compressor-logcat", null, timestamp()),
             output
         )
+    }
+
+    /** Runs one `logcat` dump; null means the dump itself failed, "" means it produced nothing. */
+    private fun readLogcat(args: List<String>): String? = runCatching {
+        val process = ProcessBuilder(args).redirectErrorStream(true).start()
+        val text = process.inputStream.bufferedReader().use { it.readText() }
+        process.waitFor()
+        text
+    }.getOrElse {
+        Log.w(TAG, "logcat dump failed for $args", it)
+        null
     }
 
     /** Every `session.jsonl` the recorder has written, newest first. */
