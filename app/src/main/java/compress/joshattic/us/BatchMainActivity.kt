@@ -180,7 +180,7 @@ private fun BatchCompressorScreen(
             }
 
             item { BatchSettingsCard(state, viewModel, context, requestOriginalMediaAccess) }
-            item { DiagnosticsExportCard(context) }
+            item { DiagnosticsExportCard(context, state.isCompressing) }
             if (state.items.isNotEmpty()) {
                 item { BatchSummaryCard(state) }
                 item { PreservationReportCard(state) }
@@ -319,13 +319,28 @@ private fun HighQualityRetryCard(count: Int, onRetry: () -> Unit) {
  * every state.
  */
 @Composable
-private fun DiagnosticsExportCard(context: Context) {
+private fun DiagnosticsExportCard(context: Context, isCompressing: Boolean) {
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     var isError by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
     val termuxAvailability = remember { DiagnosticsExporter.termuxAvailability(context) }
+
+    fun readLearnedState() = runCatching {
+        SmartPerceptualProfileEngine(
+            SmartPerceptualProfileEngine.SharedPreferencesProfileStore(context.applicationContext)
+        ).learnedStateIdentity()
+    }.getOrNull()
+
+    var learnedState by remember { mutableStateOf(readLearnedState()) }
+
+    // Re-read learned profiles when a batch finishes, since the engine mutates them during a run.
+    val prevIsCompressing = remember { mutableStateOf(isCompressing) }
+    if (prevIsCompressing.value && !isCompressing) {
+        learnedState = readLearnedState()
+    }
+    prevIsCompressing.value = isCompressing
 
     fun report(result: DiagnosticsExporter.ExportResult) {
         when (result) {
@@ -388,6 +403,71 @@ private fun DiagnosticsExportCard(context: Context) {
                 "This app's own log lines only — including the per-check verification detail that " +
                     "the batch records do not carry. Export soon after a batch: the system log " +
                     "buffer is small and overwrites itself.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            HorizontalDivider()
+
+            var tracingArmed by remember { mutableStateOf(ExportDebugTracing.isEnabled) }
+            Text("Media3 export trace", style = MaterialTheme.typography.labelLarge)
+            Text(
+                if (tracingArmed)
+                    "Trace armed — the next batch will record per-stage pipeline events. " +
+                        "Avoid on multi-hour sources; the summary appears in export failure messages."
+                else
+                    "Not armed. Enable only for a targeted diagnostic batch to avoid accumulating " +
+                        "event data on long or high-frame-rate exports.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (!tracingArmed) {
+                OutlinedButton(
+                    onClick = { ExportDebugTracing.enable(); tracingArmed = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isCompressing
+                ) { Text("Arm trace for next batch") }
+            }
+
+            HorizontalDivider()
+            // Which build is actually running. Checking this used to mean exporting a capture and
+            // diffing a log string against the source; on 2026-09-01 a whole calibration round was
+            // spent on an APK that predated the instrumentation it was meant to exercise. The
+            // build number is monotonic, so "is this newer than the one I ran?" is answerable here.
+            Text(
+                "Build ${BuildConfig.BUILD_TAG} (${BuildConfig.GIT_COMMIT}) • v${BuildConfig.VERSION_NAME}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                learnedState?.let {
+                    if (it == "empty") "No learned profiles — the next batch probes every file."
+                    else "Learned state: $it. Probing is suppressed for classes that recently " +
+                        "measured visible loss, so a comparison against another run is not controlled."
+                } ?: "Learned state unavailable.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            OutlinedButton(
+                onClick = {
+                    runCatching {
+                        SmartPerceptualProfileEngine(
+                            SmartPerceptualProfileEngine.SharedPreferencesProfileStore(context.applicationContext)
+                        ).also { it.resetLearnedState(); learnedState = it.learnedStateIdentity() }
+                    }.onSuccess {
+                        isError = false
+                        message = "Learned profiles cleared. The next batch probes every file."
+                    }.onFailure {
+                        isError = true
+                        message = "Could not clear learned profiles: ${it.message ?: "unknown error"}"
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !busy && !isCompressing
+            ) { Text("Reset learned profiles") }
+            Text(
+                "Do this before an A/B run. The adb broadcast cannot reach a Secure Folder install " +
+                    "(it is a separate Android user), so in there this button is the only way.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )

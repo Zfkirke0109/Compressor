@@ -22,35 +22,90 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import Counter
+from collections import Counter, OrderedDict
 from typing import Any
 
 from session_records import read_records
 
 
-def load(path: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]], dict[str, Any] | None]:
-    """Return (session_start, jobs, session_summary).
+def load_sessions(path: str) -> "OrderedDict[str, dict[str, Any]]":
+    """Group a capture's records by batchId, in the order each batch first appears.
+
+    The app's in-app export writes EVERY session.jsonl the recorder holds, newest first, so one
+    file routinely carries a dozen batches from several different builds. An earlier version of
+    this loader kept a single `start`/`summary` pair and appended every job to one list, which
+    silently produced a merged total labelled with the LAST session_start in the file -- i.e. the
+    OLDEST batch's id and build. The capture uploaded on 2026-09-01 would have been reported as
+    387 jobs of "batch_1786611119841 build=457edfe" when the batch actually under test contributed
+    36 of them and 219 came from a build four revisions older.
+
+    A summary that attributes one build's jobs to another is worse than no summary: it is the
+    exact failure this tooling exists to prevent. So sessions are kept separate and the caller has
+    to say which one it means.
 
     Accepts both capture transports (bare JSONL and logcat-prefixed) and tolerates a truncated
     tail; see session_records.decode_record for why the prefix has to be handled.
     """
-    start = summary = None
-    jobs: list[dict[str, Any]] = []
+    sessions: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+
+    def bucket(batch_id: Any) -> dict[str, Any]:
+        key = str(batch_id)
+        if key not in sessions:
+            sessions[key] = {"batchId": key, "start": None, "summary": None, "jobs": []}
+        return sessions[key]
+
+    # Records are attributed by their own batchId where they carry one, and otherwise to the
+    # session_start they follow. Both are needed: current builds stamp batchId on every record,
+    # while older captures stamp it only on session_start and rely on block order.
+    current: Any = None
     for rec in read_records(path):
         kind = rec.get("type") or rec.get("eventType")
         if kind == "session_start":
-            start = rec
+            current = rec.get("batchId")
+            bucket(current)["start"] = rec
         elif kind == "session_summary":
-            summary = rec
+            bucket(rec.get("batchId") or current)["summary"] = rec
+        elif kind in ("session_failed", "session_cancelled"):
+            bucket(rec.get("batchId") or current)["terminal"] = rec
         elif kind == "job":
-            jobs.append(rec)
-    return start, jobs, summary
+            bucket(rec.get("batchId") or current)["jobs"].append(rec)
+    return sessions
 
 
-def summarize(path: str) -> dict[str, Any]:
-    start, jobs, summary = load(path)
+def select_session(path: str, batch_id: str | None) -> dict[str, Any]:
+    """Pick one batch out of a capture, refusing to guess when the choice is not obvious."""
+    sessions = load_sessions(path)
+    if not sessions:
+        raise SystemExit(f"error: no records in {path}")
+    if batch_id is not None:
+        if batch_id not in sessions:
+            known = ", ".join(sessions) or "(none)"
+            raise SystemExit(f"error: {batch_id} is not in {path}; it holds: {known}")
+        return sessions[batch_id]
+    # Newest first is the exporter's own order, so the first batch is the run just captured.
+    chosen = next(iter(sessions.values()))
+    if len(sessions) > 1:
+        others = [
+            f"{sid} ({len(s['jobs'])} jobs, build={(s['start'] or {}).get('buildCommit')})"
+            for sid, s in list(sessions.items())[1:]
+        ]
+        print(
+            f"note: {path} holds {len(sessions)} sessions; reporting only the newest,"
+            f" {chosen['batchId']}. Also present: {'; '.join(others)}."
+            " Use --batch <id> or --all for the others.",
+            file=sys.stderr,
+        )
+    return chosen
+
+
+def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
+    session = select_session(path, batch_id)
+    start, jobs, summary = session["start"], session["jobs"], session["summary"]
     if not jobs:
-        raise SystemExit(f"error: no job records in {path}")
+        raise SystemExit(
+            f"error: batch {session['batchId']} in {path} recorded no job records"
+            + ("" if summary else " and no session summary — it did not complete")
+        )
 
     terminals = Counter(str(j.get("terminal")) for j in jobs)
     modes = Counter(str(j.get("effectiveMode")) for j in jobs)
@@ -82,7 +137,19 @@ def summarize(path: str) -> dict[str, Any]:
     # Counted over every job that carries the field rather than only OUTPUT_VALIDATION_FAILED,
     # because a failed check can also show up on a job that recovered through a fallback. Jobs from
     # builds predating the field record null and are simply absent from the denominator.
+
+    # Probe ladders that ran but produced no measurement at all. Detectable on ANY capture,
+    # including ones predating the fix: the ladder recorded candidate ratios but no window
+    # scores. Those jobs were reported as "no candidate ratio passed", which asserts the rungs
+    # were measured and rejected — so a reader (or a threshold calibrated from captures) takes
+    # measurement failure for pixel evidence that the clip resists re-encoding.
     verified_jobs = [j for j in jobs if isinstance(j.get("failedChecks"), list)]
+    ladders = [j for j in jobs if j.get("probedRatios")]
+    ladders_unmeasured = [j for j in ladders if not j.get("probeWindowScores")]
+    mislabelled = [
+        j for j in ladders_unmeasured
+        if str(j.get("probeDetail")) == "no candidate ratio passed"
+    ]
     check_counts = Counter(
         c for j in verified_jobs for c in j["failedChecks"] if isinstance(c, str)
     )
@@ -93,7 +160,7 @@ def summarize(path: str) -> dict[str, Any]:
 
     return {
         "path": path,
-        "batchId": (start or {}).get("batchId"),
+        "batchId": (start or {}).get("batchId") or session["batchId"],
         "buildCommit": (start or {}).get("buildCommit"),
         "mode": (start or {}).get("mode"),
         "jobs": len(jobs),
@@ -113,6 +180,9 @@ def summarize(path: str) -> dict[str, Any]:
         "bandingPresent": sum(1 for j in jobs if j.get("certBandingDiag")),
         "validationFailures": len(failures),
         "unexplainedFailures": len(unexplained),
+        "laddersRun": len(ladders),
+        "laddersWithNoMeasurement": len(ladders_unmeasured),
+        "laddersMislabelledAsMeasured": len(mislabelled),
         "jobsWithVerification": len(verified_jobs),
         "failedCheckCounts": dict(check_counts.most_common()),
         "silentRejections": len(silent_rejections),
@@ -121,6 +191,7 @@ def summarize(path: str) -> dict[str, Any]:
         "effectiveModes": dict(modes.most_common()),
         "materialization": dict(materialization.most_common()),
         "elapsedMs": (summary or {}).get("elapsedMs"),
+        "completed": summary is not None,
     }
 
 
@@ -136,9 +207,12 @@ def render(s: dict[str, Any]) -> str:
         f"  generated bytes: {s['generatedOutputBytes']:,}",
         f"  validation fail: {s['validationFailures']}   unexplained={s['unexplainedFailures']}",
         f"  learned state  : {s['learnedStateIdentity'] or 'NOT RECORDED (runs are not comparable)'}",
+        f"  probe ladders  : {s['laddersRun']}   measured nothing: {s['laddersWithNoMeasurement']}",
         f"  terminals      : {s['terminals']}",
         f"  effective modes: {s['effectiveModes']}",
     ]
+    if not s["completed"]:
+        out.insert(1, "  !! NO session_summary — this batch did not finish; totals are a partial run")
     if s["jobsWithVerification"]:
         out.append(f"  failing checks : ({s['jobsWithVerification']} job(s) carry verification)")
         for name, n in s["failedCheckCounts"].items():
@@ -148,6 +222,11 @@ def render(s: dict[str, Any]) -> str:
             out.append("      (none — every verified job passed every predicate in scope)")
     else:
         out.append("  failing checks : not recorded by this build; a rejection cannot be diagnosed")
+    if s["laddersMislabelledAsMeasured"]:
+        out.append(
+            f"  !! {s['laddersMislabelledAsMeasured']} ladder(s) report 'no candidate ratio passed'"
+            " having measured NOTHING — that wording claims pixel evidence this run does not have"
+        )
     if s["silentRejections"]:
         out.append(
             f"  !! {s['silentRejections']} rejected job(s) name NO failing check — a verdict that"
@@ -164,14 +243,34 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sessions", nargs="+", help="one or two session.jsonl files")
     ap.add_argument("--json", help="write the machine-readable summary here")
+    ap.add_argument(
+        "--batch",
+        help="batchId to report; default is the newest session in the capture. A capture normally"
+             " holds every session the recorder has ever written, across several builds.",
+    )
+    ap.add_argument(
+        "--all",
+        action="store_true",
+        help="report every session in the capture separately (never merged)",
+    )
     args = ap.parse_args()
 
-    summaries = [summarize(p) for p in args.sessions]
+    if args.all:
+        summaries = []
+        for p in args.sessions:
+            for sid, sess in load_sessions(p).items():
+                if not sess["jobs"]:
+                    print(f"\n=== {p} :: {sid} ===")
+                    print(f"  (no job records{'' if sess['summary'] else '; no session summary either'})")
+                    continue
+                summaries.append(summarize(p, sid))
+    else:
+        summaries = [summarize(p, args.batch) for p in args.sessions]
     for s in summaries:
         print(f"\n=== {s['path']} ===")
         print(render(s))
 
-    if len(summaries) == 2:
+    if len(summaries) == 2 and not args.all:
         a, b = summaries
         print("\n=== delta (second minus first) ===")
         for key in ("jobs", "realCompressions", "savedBytes", "validationFailures",

@@ -37,7 +37,7 @@ class CertificationStatusRecoveryTest {
 
     @Test
     fun everyRecoveryOutcomeReadsAsHavingRun() {
-        for (outcome in listOf(scored, PairScoreOutcome.Unavailable, PairScoreOutcome.MisalignmentRejected)) {
+        for (outcome in listOf(scored, PairScoreOutcome.Unavailable, PairScoreOutcome.MisalignmentRejected(null))) {
             val status = CertificationStatus.forFailedRecoveryOutcome(outcome)
             assertFalse(status, CertificationStatus.didNotRun(status))
             assertTrue(status, status.startsWith("ran_"))
@@ -47,7 +47,7 @@ class CertificationStatusRecoveryTest {
     @Test
     fun recoveryStatusesAreDistinctFromFinalCertificationStatuses() {
         // Same scorer outcome, different question asked — the capture must not conflate them.
-        for (outcome in listOf(scored, PairScoreOutcome.Unavailable, PairScoreOutcome.MisalignmentRejected)) {
+        for (outcome in listOf(scored, PairScoreOutcome.Unavailable, PairScoreOutcome.MisalignmentRejected(null))) {
             assertTrue(
                 CertificationStatus.forOutcome(outcome) !=
                     CertificationStatus.forFailedRecoveryOutcome(outcome)

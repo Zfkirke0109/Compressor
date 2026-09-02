@@ -36,6 +36,7 @@ import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.VideoEncoderSettings
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -208,6 +209,38 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     val uiState = _uiState.asStateFlow()
 
     private var compressionJob: Job? = null
+
+    /**
+     * Keeps a failed batch from killing the process.
+     *
+     * The per-item and outer handlers below deliberately rethrow: a run that failed must complete
+     * as a *failed* Job, not quietly report success. But `viewModelScope.launch` has no consumer
+     * for that throw, so without a handler here kotlinx routes it to the platform's uncaught
+     * handler and the process dies.
+     *
+     * That is not an abstract worry — it is what the 2026-09-01 High Quality captures were:
+     *
+     *   FATAL EXCEPTION: main
+     *   androidx.media3.transformer.ExportException: Muxer error
+     *     at Transformer.lambda$maybeInitializeExportWatchdogTimer$0(Transformer.java:1301)
+     *   Suppressed: DiagnosticCoroutineContextException: [StandaloneCoroutine{Cancelling}, Dispatchers.Main]
+     *
+     * A crash is the worst possible failure mode for a measurement app: the batch's structured
+     * records live in this process's log buffer, so killing the process destroys the evidence for
+     * the run that would have explained the failure. The run's own `finally` has already written
+     * its records and returned the UI to idle by the time this runs, so this handler only has to
+     * make sure the process survives to be read.
+     */
+    private val compressionExceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        DiagLog.e("CompressorBatch", "Batch run ended with an unhandled failure", throwable)
+        _uiState.update { state ->
+            state.copy(
+                isCompressing = false,
+                errorMessage = state.errorMessage
+                    ?: "Batch stopped: ${throwable.message ?: throwable.javaClass.simpleName}"
+            )
+        }
+    }
     private var activeTransformer: Transformer? = null
 
     // Brackets a running batch with foreground protection + a CPU wake lock (see PERF-001). Holds
@@ -613,7 +646,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             return
         }
 
-        compressionJob = viewModelScope.launch(Dispatchers.Main) {
+        compressionJob = viewModelScope.launch(Dispatchers.Main + compressionExceptionHandler) {
             val batchStartedAt = System.currentTimeMillis()
             // Post-item thermal cooldown that was applied BEFORE the current item started (i.e. the
             // cooldown after the previous item). Carried across iterations so each item's structured
@@ -678,6 +711,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
             // Package, version, build commit, Android user id, and profile kind are resolved inside
             // start() from the context + BuildConfig so every record self-identifies its environment.
+            // Mirror the decision lines into a file this app owns. See DiagLog: the structured
+            // records survive every capture because they are written to filesDir, while the
+            // human-readable "why" lines lived only in a device-wide ring buffer that has now
+            // been evicted out from under three consecutive rounds of evidence.
+            DiagLog.attach(context, "batch_$batchStartedAt")
             val diagnostics = DiagnosticsRecorder.start(
                 context = context,
                 batchId = "batch_$batchStartedAt",
@@ -882,7 +920,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             "Already efficient for ${quality.label}: this video's bitrate is already at or " +
                                 "below the quality floor for its resolution, so re-encoding could not make it " +
                                 "smaller. Original kept unchanged."
-                        Log.i(
+                        DiagLog.i(
                             "CompressorBatch",
                             "doomed-encode skip; job=${diagnosticJobId(item)}; mode=${quality.label}; " +
                                 "sourceVideoBitrate=${item.toSourceInfo().videoBitrate}; encode skipped, original kept"
@@ -962,7 +1000,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                     retainedOriginalNoOutput = true
                                 )
                             )
-                            Log.i(
+                            DiagLog.i(
                                 "CompressorBatch",
                                 "keep-original fast path; job=${diagnosticJobId(item)}; " +
                                     "materialization=REUSED_SOURCE; copyAvoidedBytes=${item.originalSize}; " +
@@ -1027,7 +1065,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             }
                             return@forEachIndexed
                         } else if (reuse is OriginalReuseDecision.Blocked) {
-                            Log.i(
+                            DiagLog.i(
                                 "CompressorBatch",
                                 "keep-original fast path blocked; job=${diagnosticJobId(item)}; " +
                                     "reason=${reuse.reason}; falling through to full remux"
@@ -1082,7 +1120,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             if (perceptualPlan == null) throw e
                             val reason = "encoder export failed (${e.errorCodeName})"
                             diagnosticFallbackReason = reason
-                            Log.w(
+                            DiagLog.w(
                                 "CompressorBatch",
                                 "Perceptually lossless encode failed before verification for ${diagnosticJobId(item)}: $reason; falling back to remux"
                             )
@@ -1092,7 +1130,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 reason,
                                 perceptualPlan.floorRatio
                             )
-                            Log.i(
+                            DiagLog.i(
                                 "CompressorLearning",
                                 "result=failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
                                     "reason=$reason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
@@ -1170,7 +1208,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 } else {
                                     1
                                 }
-                            Log.i(
+                            DiagLog.i(
                                 "CompressorProbe",
                                 "floor recovery; job=${diagnosticJobId(item)}; sampled windows passed; " +
                                     "re-verifying with pixel-certified floor $certifiedVideoBitrate"
@@ -1184,11 +1222,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         } else {
                             val cause = when (recoveryOutcome) {
                                 is PairScoreOutcome.Scored -> "failed"
-                                PairScoreOutcome.MisalignmentRejected -> "rejected (output frames not time-alignable)"
+                                is PairScoreOutcome.MisalignmentRejected -> "rejected (output frames not time-alignable)"
                                 PairScoreOutcome.Unavailable -> "unavailable"
                             }
                             failedFloorRecoveryStatus = CertificationStatus.forFailedRecoveryOutcome(recoveryOutcome)
-                            Log.i(
+                            DiagLog.i(
                                 "CompressorProbe",
                                 "floor recovery; job=${diagnosticJobId(item)}; certification $cause; fallback proceeds"
                             )
@@ -1249,7 +1287,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         // alone is insufficient.
                         diagnosticCertStatus = CertificationStatus.forOutcome(certOutcome)
                         pixelCertifiedThisRun = QualityProbePolicy.isPixelCertified(certOk, certOutcome)
-                        Log.i(
+                        DiagLog.i(
                             "CompressorProbe",
                             "certification; job=${diagnosticJobId(item)}; usedRatio=${perceptualPlan.targetRatio}; " +
                                 "windows=${certScores?.size ?: 0}; pass=$certOk; " +
@@ -1274,7 +1312,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 perceptualPlan.floorRatio,
                                 measuredOvershoot
                             )
-                            Log.i(
+                            DiagLog.i(
                                 "CompressorLearning",
                                 "result=failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
                                     "reason=$certReason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
@@ -1337,14 +1375,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             } else {
                                 null
                             }
-                        Log.w(
+                        DiagLog.w(
                             "CompressorBatch",
                             "Perceptually lossless fallback to remux for ${diagnosticJobId(item)}: $failureReason"
                         )
                         // Log the full field-by-field report of the discarded attempt so device
                         // logs show exactly which check failed or which field was not exposed.
                         verification.summaryLines.forEach { line ->
-                            Log.w("CompressorVerification", "discarded PL attempt; $line")
+                            DiagLog.w("CompressorVerification", "discarded PL attempt; $line")
                         }
                         perceptualPlan?.let { plan ->
                             val learned = learningEngine.recordFailure(
@@ -1354,7 +1392,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 plan.floorRatio,
                                 measuredOvershoot
                             )
-                            Log.i(
+                            DiagLog.i(
                                 "CompressorLearning",
                                 "result=failure; profileKey=${plan.profileKey.asKey()}; usedRatio=${plan.targetRatio}; " +
                                     "bitrateMode=${encodeAttempt?.requestedBitrateModeLabel ?: "unknown"}; encoderName=${encodeAttempt?.videoEncoderName ?: "unknown"}; " +
@@ -1392,7 +1430,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 // because the structural verifier cannot see perceptual damage.
                                 pixelCertified = pixelCertifiedThisRun
                             )
-                            Log.i(
+                            DiagLog.i(
                                 "CompressorLearning",
                                 "result=verified; profileKey=${plan.profileKey.asKey()}; usedRatio=${plan.targetRatio}; " +
                                     "pixelCertified=$pixelCertifiedThisRun; " +
@@ -1663,6 +1701,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 // throw in the rest of this block cannot leak them. Idempotent — safe even if begin()
                 // never fired (e.g. a pre-try setup failure).
                 batchGuard.end()
+                DiagLog.detach()
                 if (runCancelled) {
                     val cancelledItems = _uiState.value.items.filter { it.terminalResult == null }
                     _uiState.update { state ->
@@ -1864,7 +1903,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 bitrate = (size * 8000.0 / duration.toDouble())
                     .toLong().coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
                 bitrateWasMeasured = true
-                Log.i(
+                DiagLog.i(
                     "CompressorEncoderPlan",
                     "measured source bitrate from size/duration for ${DiagnosticsRecorder.redactedJobId(uri.toString())}: ${bitrate} bps " +
                         "(container exposed no overall bitrate)"
@@ -1975,8 +2014,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     private fun hasEncoder(mimeType: String, sourceInfo: VideoSourceInfo? = null): Boolean {
         return try {
-            val list = android.media.MediaCodecList(android.media.MediaCodecList.ALL_CODECS)
-            list.codecInfos.any { info ->
+            DeviceCodecCatalog.codecInfos.any { info ->
                 info.isEncoder &&
                     (!Build.VERSION.SDK_INT.let { it >= Build.VERSION_CODES.Q } || !info.isSoftwareOnly) &&
                     info.supportedTypes.any { it.equals(mimeType, ignoreCase = true) } &&
@@ -2094,7 +2132,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         )
         val probeEligible = pixelCertifiable &&
             QualityProbePolicy.isProbeLadderGeometry(source.width, source.height)
-        Log.i(
+        DiagLog.i(
             "CompressorLearning",
             "plan; profileKey=${profileKey.asKey()}; defaultRatio=$defaultRatio; learnedRatio=$targetRatio; " +
                 "floorRatio=$floorRatio; learnedOvershoot=$learnedOvershoot; expectedOvershoot=$expectedOvershootFactor; " +
@@ -2148,7 +2186,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // recent measured evidence" apart from "never tried".
         if (learningEngine.shouldSkipProbes(plan.profileKey)) {
             val latched = learningEngine.noteProbeSkipped(plan.profileKey)
-            Log.i(
+            DiagLog.i(
                 "CompressorProbe",
                 "probe skip; job=${diagnosticJobId(item)}; profile measured-rejected " +
                     "${latched.consecutiveMeasuredProbeRejections}x consecutively; " +
@@ -2176,7 +2214,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             },
             audioBitrate = calculateAudioBitrate(item, BatchQualityPreset.ORIGINAL)
         )
-        Log.i(
+        DiagLog.i(
             "CompressorProbe",
             "probe result; job=${diagnosticJobId(item)}; probed=${decision.probedRatios}; " +
                 "proven=${decision.provenRatio ?: "none"}; detail=${decision.detail}"
@@ -2240,7 +2278,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         learnedTargetRatio: Double? = null
     ) {
         val source = item.toSourceInfo()
-        Log.i(
+        DiagLog.i(
             "CompressorEncoderPlan",
             "mode=${quality.label}; requestedCodec=${requestedCodec.label}; resolvedOutputMime=${resolvedMime ?: "stream-copy"}; " +
                 "source=${item.originalWidth}x${item.originalHeight}@${item.originalFps}fps; bitrate=${item.originalBitrate}; audioBitrate=${item.originalAudioBitrate}; " +
@@ -2257,7 +2295,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         verification: OutputVerificationReport,
         outputSize: Long
     ) {
-        Log.i(
+        DiagLog.i(
             "CompressorVerification",
             "mode=${quality.label}; job=${diagnosticJobId(item)}; verification=${verification.verdict}; playable=${verification.playability}; " +
                 "replaceAllowed=${verification.replacementSafe}; blockReason=${verification.replacementBlockReason ?: "none"}; outputSize=${outputSize}"
@@ -2269,7 +2307,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // Emitted only when the verdict is negative, so healthy batches gain no extra noise.
         if (!verification.verified) {
             val failing = verification.failingChecks()
-            Log.w(
+            DiagLog.w(
                 "CompressorVerification",
                 "verification detail; job=${diagnosticJobId(item)}; verdict=${verification.verdict}; " +
                     "criticalFieldsComplete=${verification.criticalFieldsComplete}; " +
@@ -2336,8 +2374,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
             var progressJob: Job? = null
             val transformer = Transformer.Builder(context)
+                // See ExportWatchdogPolicy: the limit is a hang bound — not sized from total
+                // item wall time, which the watchdog never observes. The 2026-09-01 abort at
+                // 120 s was a wedged export, not a slow healthy encode.
+                .setMaxDelayBetweenMuxerSamplesMs(ExportWatchdogPolicy.MAX_DELAY_BETWEEN_MUXER_SAMPLES_MS)
                 .setVideoMimeType(videoMimeType)
-                .setAssetLoaderFactory(DefaultAssetLoaderFactory(context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT))
+                .setAssetLoaderFactory(DefaultAssetLoaderFactory(context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT, null))
                 .setEncoderFactory(encoderFactory)
                 .addListener(object : Transformer.Listener {
                     override fun onCompleted(composition: Composition, exportResult: ExportResult) {
@@ -2355,7 +2397,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             requestedBitrateMode = bitrateModeLabel,
                             encoderName = exportResult.videoEncoderName
                         )
-                        Log.i(
+                        DiagLog.i(
                             "CompressorEncoderPlan",
                             "encodeResult; mode=${quality.label}; requestedVideoBitrate=$targetBitrate; requestedBitrateMode=$bitrateModeLabel; " +
                                 "encoderName=${exportResult.videoEncoderName ?: "unknown"}; reportedAverageVideoBitrate=${exportResult.averageVideoBitrate}; " +
@@ -2365,7 +2407,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         if (configDelta.formatFellBack) {
                             // Loud on purpose: a silent substitution is exactly the kind of thing
                             // that makes a later verification rejection look inexplicable.
-                            Log.w(
+                            DiagLog.w(
                                 "CompressorEncoderPlan",
                                 "encoder format fallback; job=${diagnosticJobId(item)}; ${configDelta.compact()}"
                             )
@@ -2426,7 +2468,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 .setEffects(Effects(emptyList(), effectsList))
                 .build()
 
-            val composition = Composition.Builder(listOf(EditedMediaItemSequence(editedMediaItem)))
+            val composition = Composition.Builder(listOf(EditedMediaItemSequence.Builder(editedMediaItem).build()))
                 .setHdrMode(Composition.HDR_MODE_KEEP_HDR)
                 .build()
 
@@ -2942,7 +2984,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val cacheAvailable = StorageSpacePolicy.availableBytesFor(recoveryDir)
         if (StorageSpacePolicy.blocks(item.originalSize, cacheAvailable)) {
             val shortfall = StorageSpacePolicy.shortfallMessage(item.originalSize, cacheAvailable)
-            Log.w("CompressorBatch", "replace precheck; job=${diagnosticJobId(item)}; blocked: $shortfall")
+            DiagLog.w("CompressorBatch", "replace precheck; job=${diagnosticJobId(item)}; blocked: $shortfall")
             val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
             return@withContext ReplacementResult(
                 false,
@@ -3088,7 +3130,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             if (originalPreserved) {
                 runCatching { recoveryCopy.delete() }
             } else {
-                Log.e(
+                DiagLog.e(
                     "CompressorBatch",
                     "job=${diagnosticJobId(item)}; original may be incomplete and could not be preserved; " +
                         "retaining the only intact copy at ${recoveryCopy.absolutePath}"

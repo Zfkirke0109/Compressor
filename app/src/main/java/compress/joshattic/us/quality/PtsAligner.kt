@@ -11,10 +11,16 @@ package compress.joshattic.us.quality
  * Why fixed, and why 4 ms specifically. A correctly aligned pair's skew is bounded by how the
  * two streams were ADDRESSED, not by how far apart their frames are. The probe path is the
  * widest case: [VmafPairScorer] is handed `ScoreWindow(startUs, endUs, distStartUs = 0)` while
- * `PerceptualQualityProber.exportClip` cuts the clip with `setStartPositionMs(startUs / 1000)`,
- * so the clip really begins at `startUs − (startUs % 1000)`. A source frame at pts P therefore
- * normalizes to `P − startUs` on the ref side and `P − (startUs − startUs % 1000)` on the dist
- * side, leaving a CONSTANT skew of `−(startUs % 1000)` — at most 999 µs, at any frame rate.
+ * `PerceptualQualityProber.exportClip` now cuts the clip with `setStartPositionUs(startUs)` —
+ * the same microseconds the scorer normalizes by — so that term is zero by construction. It was
+ * not always: the clip was previously requested with `setStartPositionMs(startUs / 1000)`, which
+ * began it at `startUs − (startUs % 1000)` and left a CONSTANT skew of `−(startUs % 1000)`, at
+ * most 999 µs at any frame rate. Device captures show exactly that signature — a clip whose
+ * window starts ended in 200/500/800 µs produced windows at 0.2/0.5/0.8 ms skew. The floor is
+ * kept at 4 ms rather than tightened to match: the residual that appears when the trimmed clip
+ * lands on a different FRAME than the requested instant is a separate, larger mechanism, and
+ * narrowing the floor to the newly-smaller term needs its own calibration round, not an
+ * inference.
  * Certification is tighter still (both streams share one timeline; only muxer timescale rounding
  * separates them). 4 ms is ~4× that 999 µs bound: wide enough to absorb legitimate addressing
  * noise, narrow enough that a one-frame offset — ≥ 8.3 ms even at 120 fps — is never mistaken
@@ -120,11 +126,19 @@ class PtsAligner(
         if (pairedAtLeastOnce) {
             // Misalignment AFTER a scored pair = a frame is missing or retimed INSIDE the
             // window. Dropping around it would hide real temporal degradation; fail closed.
-            failureReason = "internal frame misalignment after ${refDropped + distDropped} leading drops (frame loss or retiming inside the window)"
+            failureReason = "internal frame misalignment after ${refDropped + distDropped} leading drops" +
+                " (frame loss or retiming inside the window; skew ${skew / 1000}ms)"
             return Action.FAIL
         }
         if (refDropped + distDropped >= maxDrops) {
-            failureReason = "leading offset not aligned within $maxDrops drops"
+            // The magnitude and SIGN of the unclosed offset are the diagnosis, and naming only
+            // the failure withheld both. 12 of the 13 misaligned ladders in batch_1788257645030
+            // ended here, and the capture could not say whether the clip began a hair late (a
+            // rounding residue worth widening the budget for) or seconds early (a clip cut at a
+            // different instant than requested, which no number of drops can repair). A positive
+            // skew means the CLIP is ahead of the source window; negative means it lags.
+            failureReason = "leading offset not aligned within $maxDrops drops" +
+                " (unclosed skew ${skew / 1000}ms, ref dropped $refDropped, dist dropped $distDropped)"
             return Action.FAIL
         }
         return if (skew > 0) {

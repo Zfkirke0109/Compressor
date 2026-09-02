@@ -26,8 +26,9 @@
          Downloads collection, which needs none, and the pre-Q legacy path only runs on API 24-28
          where WRITE_EXTERNAL_STORAGE is install-time on devices that still have it; the export
          reports a clear failure rather than prompting if the write is refused. Notably the logcat
-         export needs no permission either — it dumps only THIS process's own log lines, which
-         every app may read; READ_LOGS is privileged and is deliberately not requested. -->
+         export needs no permission either — it dumps all of THIS app's own log lines (UID-scoped,
+         across processes, filtered by tag), which every app may read for its own UID; READ_LOGS
+         is privileged and is deliberately not requested. -->
 
     <!-- Optional live-capture hand-off to Termux. Declared, but never assumed: Termux only honours
          RUN_COMMAND when the user has also set allow-external-apps=true, which no API exposes, so

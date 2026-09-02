@@ -116,6 +116,10 @@ jobs:
           COMPRESSOR_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
           COMPRESSOR_RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           COMPRESSOR_RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          # A version tag ships a clean versionName; every other release build carries the
+          # monotonic run number so two of them can be told apart and ordered at a glance.
+          COMPRESSOR_BUILD_NUMBER: ${{ startsWith(github.ref, 'refs/tags/v') && 0 || github.run_number }}
+          COMPRESSOR_BUILD_LABEL: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || (github.event_name == 'pull_request' && format('pr{0}', github.event.pull_request.number) || 'main') }}
         run: ./gradlew :app:assembleRelease --stacktrace --console=plain
 
       # Bundles are for Play Store upload, so build them for real releases and on request —
@@ -128,6 +132,10 @@ jobs:
           COMPRESSOR_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
           COMPRESSOR_RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           COMPRESSOR_RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+          # A version tag ships a clean versionName; every other release build carries the
+          # monotonic run number so two of them can be told apart and ordered at a glance.
+          COMPRESSOR_BUILD_NUMBER: ${{ startsWith(github.ref, 'refs/tags/v') && 0 || github.run_number }}
+          COMPRESSOR_BUILD_LABEL: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || (github.event_name == 'pull_request' && format('pr{0}', github.event.pull_request.number) || 'main') }}
         run: ./gradlew :app:bundleRelease --stacktrace --console=plain
 
       - name: Verify the APK is actually signed by the expected key
@@ -159,7 +167,7 @@ jobs:
         if: steps.creds.outputs.available == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: compressor-release-apk
+          name: compressor-release-apk-b${{ github.run_number }}
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
@@ -169,6 +177,6 @@ jobs:
           (startsWith(github.ref, 'refs/tags/v') || inputs.build_aab)
         uses: actions/upload-artifact@v4
         with:
-          name: compressor-release-aab
+          name: compressor-release-aab-b${{ github.run_number }}
           path: app/build/outputs/bundle/release/*.aab
           if-no-files-found: error

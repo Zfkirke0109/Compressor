@@ -286,7 +286,7 @@ object QualityProbePolicy {
         when (outcome) {
             is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
             PairScoreOutcome.Unavailable -> certificationPasses(usedRatio, defaultRatio, null)
-            PairScoreOutcome.MisalignmentRejected -> false
+            is PairScoreOutcome.MisalignmentRejected -> false
         }
 
     /**
@@ -310,8 +310,60 @@ object QualityProbePolicy {
         when (outcome) {
             is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
             PairScoreOutcome.Unavailable -> true
-            PairScoreOutcome.MisalignmentRejected -> false
+            is PairScoreOutcome.MisalignmentRejected -> false
         }
+
+    /**
+     * How to describe a ladder that ended without a proven ratio.
+     *
+     * The distinction is load-bearing and was previously lost. "no candidate ratio passed" asserts
+     * that every rung WAS measured and rejected — positive pixel evidence that the clip cannot be
+     * re-encoded transparently. When no rung produced a single scored window, that sentence is
+     * false, and a reader (or a threshold calibrated from captures) takes measurement failure for
+     * evidence of incompressibility. Across the five 219-file S23 Ultra captures, 84 of 425 ladder
+     * runs (19.8%) reported "no candidate ratio passed" having measured nothing at all.
+     *
+     * Only the wording changes here; no acceptance decision reads this string. The gate that
+     * matters — [ProbeDecision.highestCandidateMeasuredRejected], which feeds the probe-skip
+     * ratchet — already required a measured rung and is untouched.
+     */
+    fun ladderExhaustedDetail(
+        measured: Int,
+        misaligned: Int,
+        unavailable: Int,
+        unavailableReasons: Map<String, Int> = emptyMap(),
+        misalignedReasons: Map<String, Int> = emptyMap()
+    ): String {
+        // "unmeasurable" alone was still too coarse to act on. The first captures from the fixed
+        // 4 ms tolerance showed 28 unavailable rungs, and the count could not distinguish an
+        // export that timed out on a 52-minute source from a decoder that failed on a 90-second
+        // one — which point at completely different fixes. Naming them costs nothing and is the
+        // difference between a capture that poses a question and one that answers it.
+        val why = unavailableReasons.entries
+            .sortedByDescending { it.value }
+            .joinToString("; ") { "${it.value}x ${it.key}" }
+        val unavailableDetail = if (why.isEmpty()) "$unavailable unmeasurable" else "$unavailable unmeasurable [$why]"
+        // Misalignment needs the same treatment, and for a sharper reason: its two causes are
+        // opposite diagnoses. "leading offset not aligned" means the probe pipeline never lined
+        // the streams up and the clip was never fairly measured; "internal frame misalignment"
+        // means frames really are missing or retimed inside the window. A bare count reads as the
+        // second when it may be entirely the first — 13 of 27 ladders in batch_1788254475481
+        // ended here with no way to tell.
+        val misWhy = misalignedReasons.entries
+            .sortedByDescending { it.value }
+            .joinToString("; ") { "${it.value}x ${it.key}" }
+        val misalignedDetail =
+            if (misWhy.isEmpty()) "$misaligned not time-alignable" else "$misaligned not time-alignable [$misWhy]"
+        return when {
+            measured > 0 && (misaligned + unavailable) == 0 -> "no candidate ratio passed"
+            measured > 0 -> "no candidate ratio passed (of ${measured + misaligned + unavailable} rungs, " +
+                "$measured measured; $misalignedDetail, $unavailableDetail)"
+            (misaligned + unavailable) == 0 -> "no candidate ratio passed"
+            else -> "no probe rung could be measured ($misalignedDetail, " +
+                "$unavailableDetail) — nothing was scored, so this is NOT evidence the clip " +
+                "resists re-encoding"
+        }
+    }
 
     /**
      * Probe windows for a clip of [durationUs]: up to three short windows away from the very
