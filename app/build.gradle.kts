@@ -42,6 +42,31 @@ val buildGitCommit: String = try {
     "unknown"
 }
 
+// Monotonic build identity, so a capture can be matched to the APK it came from at a glance.
+//
+// This exists because it has already cost a round. The 2026-09-01 08:08 batch ran on an APK
+// built before the instrumentation it was meant to exercise, and nothing in the capture said so
+// directly — it took diffing a log wording against the source to establish which commit the
+// build carried. `GIT_COMMIT` alone cannot settle it: PR builds check out `refs/pull/N/merge`,
+// whose SHA is a merge commit GitHub recomputes (so it changes even when the tree does not), and
+// it is not ordered, so two of them cannot be compared for "which is newer".
+//
+// COMPRESSOR_BUILD_NUMBER is the CI run number: monotonic per workflow, and printable. The label
+// says which line it came from ("pr44", "main"). Absent both — a local build — the label is
+// "local" and the number is 0, which is honest rather than pretending to an identity CI assigns.
+val buildNumber: Int = (System.getenv("COMPRESSOR_BUILD_NUMBER")?.toIntOrNull() ?: 0)
+val buildLabel: String = (System.getenv("COMPRESSOR_BUILD_LABEL") ?: "local")
+    .replace(Regex("[^A-Za-z0-9._-]"), "-")
+    .ifBlank { "local" }
+
+/** e.g. "pr44-b123" or "local". Recorded in every session_start; usually also in versionName. */
+val buildTag: String = if (buildNumber > 0) "$buildLabel-b$buildNumber" else buildLabel
+
+// A tagged release ships a clean "1.6.1" — a build suffix is for telling development builds
+// apart, and end users have no use for it. The tag is still recorded in BuildConfig, so a
+// release capture identifies itself just as precisely as a PR one.
+val versionSuffix: String = if (buildTag == "release") "" else "+$buildTag"
+
 android {
     namespace = "compress.joshattic.us"
     compileSdk = 36
@@ -52,11 +77,16 @@ android {
         minSdk = 24
         targetSdk = 36
         versionCode = 26
-        versionName = "1.6.1"
+        // "1.6.1+pr44-b123". The "+" segment is SemVer build metadata: Android treats
+        // versionName as an opaque display string, and the suffix is what makes the running app
+        // self-identify in the About screen, the APK filename, and every diagnostic record.
+        versionName = "1.6.1$versionSuffix"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("String", "GIT_COMMIT", "\"$buildGitCommit\"")
+        buildConfigField("String", "BUILD_TAG", "\"$buildTag\"")
+        buildConfigField("int", "BUILD_NUMBER", "$buildNumber")
 
         // On-device VMAF is arm64-only (libvmaf NEON build). Other ABIs simply run without
         // pixel scoring: VmafNative.isAvailable is false and every caller falls back to the

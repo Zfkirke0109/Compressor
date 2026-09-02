@@ -84,6 +84,10 @@ class DiagnosticsRecorder private constructor(
                 "appVersionName" to identity.appVersionName,
                 "appVersionCode" to identity.appVersionCode,
                 "buildCommit" to identity.buildCommit,
+                // Monotonic and orderable, unlike buildCommit: a PR build's commit is a merge SHA
+                // GitHub recomputes, so two captures cannot be ranked by it. See app/build.gradle.kts.
+                "buildTag" to identity.buildTag,
+                "buildNumber" to identity.buildNumber,
                 "buildType" to identity.buildType,
                 "gitAppId" to APP_ID,
                 "androidUserId" to identity.androidUserId,
@@ -314,6 +318,8 @@ class DiagnosticsRecorder private constructor(
         val appVersionName: String,
         val appVersionCode: Long,
         val buildCommit: String,
+        val buildTag: String,
+        val buildNumber: Int,
         val buildType: String,
         val androidUserId: Int,
         val profileKind: String,
@@ -356,11 +362,15 @@ class DiagnosticsRecorder private constructor(
             val debuggable = context.applicationInfo.flags and
                 android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
             val buildCommit = runCatching { BuildConfig.GIT_COMMIT }.getOrDefault("unknown")
+            val buildTag = runCatching { BuildConfig.BUILD_TAG }.getOrDefault("unknown")
+            val buildNumber = runCatching { BuildConfig.BUILD_NUMBER }.getOrDefault(0)
             return SessionIdentity(
                 packageName = context.packageName,
                 appVersionName = info?.versionName ?: "unknown",
                 appVersionCode = versionCode,
                 buildCommit = buildCommit,
+                buildTag = buildTag,
+                buildNumber = buildNumber,
                 buildType = if (debuggable) "debug" else "release",
                 androidUserId = userId,
                 profileKind = if (userId == 0) "normal" else "secondary_profile",

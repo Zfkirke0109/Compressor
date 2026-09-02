@@ -430,6 +430,15 @@ private fun DiagnosticsExportCard(context: Context, isCompressing: Boolean) {
             }
 
             HorizontalDivider()
+            // Which build is actually running. Checking this used to mean exporting a capture and
+            // diffing a log string against the source; on 2026-09-01 a whole calibration round was
+            // spent on an APK that predated the instrumentation it was meant to exercise. The
+            // build number is monotonic, so "is this newer than the one I ran?" is answerable here.
+            Text(
+                "Build ${BuildConfig.BUILD_TAG} (${BuildConfig.GIT_COMMIT}) • v${BuildConfig.VERSION_NAME}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             Text(
                 learnedState?.let {
                     if (it == "empty") "No learned profiles — the next batch probes every file."
