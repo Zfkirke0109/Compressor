@@ -347,6 +347,23 @@ private fun DiagnosticsExportCard(
         if (!isCompressing) learnedState = withContext(Dispatchers.IO) { readLearnedState() }
     }
 
+    // The reset is irreversible, so the button asks first (the AlertDialog below).
+    var confirmReset by remember { mutableStateOf(false) }
+
+    fun resetLearnedProfiles() {
+        runCatching {
+            SmartPerceptualProfileEngine(
+                SmartPerceptualProfileEngine.SharedPreferencesProfileStore(context.applicationContext)
+            ).also { it.resetLearnedState(); learnedState = it.learnedStateIdentity() }
+        }.onSuccess {
+            isError = false
+            message = "Learned profiles cleared. The next batch starts from the default targets."
+        }.onFailure {
+            isError = true
+            message = "Could not clear learned profiles: ${it.message ?: "unknown error"}"
+        }
+    }
+
     fun report(result: DiagnosticsExporter.ExportResult) {
         when (result) {
             is DiagnosticsExporter.ExportResult.Written -> {
@@ -488,20 +505,26 @@ private fun DiagnosticsExportCard(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            OutlinedButton(
-                onClick = {
-                    runCatching {
-                        SmartPerceptualProfileEngine(
-                            SmartPerceptualProfileEngine.SharedPreferencesProfileStore(context.applicationContext)
-                        ).also { it.resetLearnedState(); learnedState = it.learnedStateIdentity() }
-                    }.onSuccess {
-                        isError = false
-                        message = "Learned profiles cleared. The next batch starts from the default targets."
-                    }.onFailure {
-                        isError = true
-                        message = "Could not clear learned profiles: ${it.message ?: "unknown error"}"
+            if (confirmReset) {
+                AlertDialog(
+                    onDismissRequest = { confirmReset = false },
+                    title = { Text("Reset learned profiles?") },
+                    text = {
+                        Text(
+                            "This erases every learned target and probe skip on this device. It cannot be " +
+                                "undone; the next batch probes every file from the defaults."
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { confirmReset = false; resetLearnedProfiles() }) { Text("Reset") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { confirmReset = false }) { Text("Cancel") }
                     }
-                },
+                )
+            }
+            OutlinedButton(
+                onClick = { confirmReset = true },
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !busy && !isCompressing
             ) { Text("Reset learned profiles") }
