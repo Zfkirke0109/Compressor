@@ -284,6 +284,10 @@ object VmafPairScorer {
         // Shadow v1 session over the SAME frame pairs. Zero when unavailable; every failure on
         // this path just drops the v1 diagnostic and never touches the verdict session.
         var v1Handle = if (shadowV1) VmafNativeV1.open(width, height) else 0L
+        // Wall time spent in the shadow model, logged per window. v1 adds CAMBI and SpEED passes
+        // on every certification frame, including 4K60 outputs, and that cost has never been
+        // measured on the device. Shadow evidence has to justify its battery bill with a number.
+        var v1Nanos = 0L
         fun closeV1() {
             if (v1Handle != 0L) {
                 runCatching { VmafNativeV1.close(v1Handle) }
@@ -399,9 +403,11 @@ object VmafPairScorer {
                             break
                         }
                         if (v1Handle != 0L) {
+                            val v1Start = System.nanoTime()
                             val v1rc = runCatching {
                                 VmafNativeV1.readFrames(v1Handle, r.data, d.data, width, height)
                             }.getOrDefault(-1)
+                            v1Nanos += System.nanoTime() - v1Start
                             if (v1rc < 0) closeV1()
                         }
                         fed++
@@ -450,7 +456,9 @@ object VmafPairScorer {
         val perFrameCambi = if (collectBanding) VmafNative.cambiScores(handle) else null
         VmafNative.close(handle)
         val v1Diag = if (v1Handle != 0L) {
+            val v1Start = System.nanoTime()
             WindowV1Diag.fromPerFrame(runCatching { VmafNativeV1.flush(v1Handle) }.getOrNull())
+                .also { v1Nanos += System.nanoTime() - v1Start }
         } else null
         closeV1()
         if (perFrame == null || perFrame.isEmpty() || perFrame.any { it < 0 }) {
@@ -485,7 +493,7 @@ object VmafPairScorer {
                 "mean=%.2f p5=%.2f min=%.2f".format(java.util.Locale.US, result.mean, result.p5, result.min) +
                 " pairing[${pairing.compact()}]" +
                 (result.banding?.let { " banding[${it.compact()}]" } ?: "") +
-                (result.v1?.let { " v1shadow[${it.compact()}]" } ?: "")
+                (result.v1?.let { " v1shadow[${it.compact()} ms=${v1Nanos / 1_000_000}]" } ?: "")
         )
         return WindowOutcome.Scored(result)
     }

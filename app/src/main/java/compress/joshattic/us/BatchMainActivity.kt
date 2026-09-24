@@ -333,14 +333,14 @@ private fun DiagnosticsExportCard(context: Context, isCompressing: Boolean) {
         ).learnedStateIdentity()
     }.getOrNull()
 
-    var learnedState by remember { mutableStateOf(readLearnedState()) }
+    var learnedState by remember { mutableStateOf<String?>(null) }
 
-    // Re-read learned profiles when a batch finishes, since the engine mutates them during a run.
-    val prevIsCompressing = remember { mutableStateOf(isCompressing) }
-    if (prevIsCompressing.value && !isCompressing) {
-        learnedState = readLearnedState()
+    // Re-read learned profiles on first show and whenever a batch finishes, since the engine
+    // mutates them during a run. Done in an effect on the IO dispatcher: this used to read
+    // SharedPreferences and write state during composition itself, on the main thread.
+    LaunchedEffect(isCompressing) {
+        if (!isCompressing) learnedState = withContext(Dispatchers.IO) { readLearnedState() }
     }
-    prevIsCompressing.value = isCompressing
 
     fun report(result: DiagnosticsExporter.ExportResult) {
         when (result) {
@@ -441,9 +441,9 @@ private fun DiagnosticsExportCard(context: Context, isCompressing: Boolean) {
             )
             Text(
                 learnedState?.let {
-                    if (it == "empty") "No learned profiles — the next batch probes every file."
-                    else "Learned state: $it. Probing is suppressed for classes that recently " +
-                        "measured visible loss, so a comparison against another run is not controlled."
+                    if (it == "empty") "No learned profiles — the next batch starts from the defaults."
+                    else "Learned state: $it. Learned targets, and in Fast search the probe skips, " +
+                        "carry over between runs, so a comparison against another run is not controlled."
                 } ?: "Learned state unavailable.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -456,7 +456,7 @@ private fun DiagnosticsExportCard(context: Context, isCompressing: Boolean) {
                         ).also { it.resetLearnedState(); learnedState = it.learnedStateIdentity() }
                     }.onSuccess {
                         isError = false
-                        message = "Learned profiles cleared. The next batch probes every file."
+                        message = "Learned profiles cleared. The next batch starts from the default targets."
                     }.onFailure {
                         isError = true
                         message = "Could not clear learned profiles: ${it.message ?: "unknown error"}"
@@ -675,9 +675,12 @@ private fun BatchSettingsCard(
             }
             Text(
                 if (state.exhaustivePerceptualLossless)
-                    "Every SDR video gets a real VMAF test before being kept as-is. Same quality bar — " +
-                        "a file is only replaced when the test proves no visible loss. Slower and uses " +
-                        "more battery. HDR is always kept exactly (no validated HDR quality model)."
+                    "Every SDR video up to 1080p gets a real VMAF test before it is kept as-is, and any " +
+                        "verified saving is kept, however small. Same quality bar: a file is only " +
+                        "replaced when the test proves no visible loss. Slower and uses more battery. " +
+                        "HDR is always kept exactly (no validated HDR quality model). Above 1080p the " +
+                        "test is too slow to run before encoding, so those files are either encoded " +
+                        "and then checked, or kept as-is."
                 else
                     "Skips the VMAF test for files that look already compressed, or whose type " +
                         "failed recently. Faster, but some compressible files are never tried.",

@@ -1,6 +1,7 @@
 package compress.joshattic.us.quality
 
 import android.content.Context
+import android.graphics.ImageFormat
 import android.media.Image
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -144,6 +145,20 @@ class YuvFrameReader(
     }
 
     private fun imageToDisplayI420(image: Image, rotation: Int, ptsUs: Long): I420Frame {
+        // Only 8-bit 4:2:0 can be copied byte-for-byte. A 10-bit stream (Main10, including SDR
+        // BT.709 Main10) decodes to YCBCR_P010 on Android 13+: 16-bit little-endian samples, so
+        // the byte copier below would read every sample's LOW byte, which holds noise bits. The
+        // scorer would then compare garbage against a clean frame, and a collapsed score is
+        // indistinguishable from a real measured rejection. It would be recorded as "would visibly
+        // lose quality" and would feed the learning latch. Refusing the frame routes the window to
+        // "evidence unavailable", which is the truth: the scorer is calibrated on 8-bit frames
+        // only and has no validated 10-bit path.
+        if (image.format != ImageFormat.YUV_420_888) {
+            throw IllegalStateException(
+                "unsupported decoder output format 0x${Integer.toHexString(image.format)} " +
+                    "(only 8-bit YUV_420_888 can be scored)"
+            )
+        }
         val crop = image.cropRect
         val w = crop.width() and 1.inv()
         val h = crop.height() and 1.inv()
@@ -181,10 +196,8 @@ class YuvFrameReader(
             val srcRow = base + (cropTop + row) * rowStride + cropLeft * pixStride
             var d = destOffset + row * destStride
             if (pixStride == 1) {
-                val tmp = ByteArray(outW)
                 buf.position(srcRow)
-                buf.get(tmp, 0, outW)
-                System.arraycopy(tmp, 0, dest, d, outW)
+                buf.get(dest, d, outW)
             } else {
                 for (col in 0 until outW) {
                     dest[d++] = buf.get(srcRow + col * pixStride)

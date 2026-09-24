@@ -120,12 +120,30 @@ data class BatchTerminalInput(
      * being probed readable at retention time. Fails closed to OUTPUT_VALIDATION_FAILED when
      * the source itself could not be read.
      */
-    val retainedOriginalNoOutput: Boolean = false
+    val retainedOriginalNoOutput: Boolean = false,
+    /**
+     * Exhaustive Perceptually Lossless: a VERIFIED Perceptually Lossless encode that is smaller by
+     * any amount counts as a size win.
+     *
+     * Exhaustive mode exists to find small savings. It admits any encode predicted to come out
+     * smaller than the source (ExhaustivePerceptualLosslessPolicy.worthEncoding), so the 3 %
+     * [MIN_MEANINGFUL_SAVINGS] bar made it do the encode and the certification, and then throw a
+     * verified 1-2 % saving away as "no meaningful size win; original kept". The quality evidence
+     * is not touched: [verified] must still be true, and only the savings bar is lowered.
+     */
+    val acceptAnyVerifiedSaving: Boolean = false
 ) {
-    /** Meaningful-savings threshold: at least this fraction smaller to call it a size win. */
+    /**
+     * Meaningful-savings threshold: at least [MIN_MEANINGFUL_SAVINGS] smaller to call it a size
+     * win, or any strict reduction under [acceptAnyVerifiedSaving] in Perceptually Lossless mode.
+     */
     val meaningfullySmaller: Boolean
-        get() = sourceSize > 0L && outputSize in 1 until sourceSize &&
-            (sourceSize - outputSize).toDouble() / sourceSize.toDouble() >= MIN_MEANINGFUL_SAVINGS
+        get() = if (acceptAnyVerifiedSaving && effectiveMode == BatchQualityMode.PERCEPTUAL_LOSSLESS) {
+            strictlySmaller
+        } else {
+            sourceSize > 0L && outputSize in 1 until sourceSize &&
+                (sourceSize - outputSize).toDouble() / sourceSize.toDouble() >= MIN_MEANINGFUL_SAVINGS
+        }
 
     val strictlySmaller: Boolean
         get() = sourceSize > 0L && outputSize in 1 until sourceSize

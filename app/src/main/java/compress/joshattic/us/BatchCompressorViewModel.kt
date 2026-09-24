@@ -526,6 +526,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val quality = qualityFromLabel(_uiState.value.qualityPreset)
             val codec = codecFromLabel(_uiState.value.codecOption)
             val frameRate = frameRateFromLabel(_uiState.value.frameRateOption)
+            var unreadable = 0
             val items = distinct.mapNotNull { uri ->
                 try {
                     val item = readMetadata(context, uri)
@@ -546,10 +547,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         )
                     }
                 } catch (e: Exception) {
+                    unreadable++
+                    DiagLog.w("CompressorBatch", "could not read ${DiagnosticsRecorder.redactedJobId(uri.toString())}", e)
                     null
                 }
             }
             val skipped = items.count { it.isAlreadyCompressed }
+            val unreadableNote = if (unreadable > 0) {
+                " $unreadable file${if (unreadable == 1) "" else "s"} could not be read and ${if (unreadable == 1) "was" else "were"} left out."
+            } else {
+                ""
+            }
             _uiState.update {
                 it.copy(
                     items = items,
@@ -561,7 +569,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         items.isEmpty() -> "No readable videos found."
                         skipped > 0 -> "Ready: ${items.size} selected. $skipped already compressed item${if (skipped == 1) "" else "s"} will be skipped."
                         else -> "Ready: ${items.size} video${if (items.size == 1) "" else "s"} selected."
-                    },
+                    } + unreadableNote,
                     errorMessage = null
                 )
             }
@@ -652,7 +660,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         startCompression(context)
     }
 
-    fun startCompression(context: Context) {
+    fun startCompression(callerContext: Context) {
+        // The batch outlives the screen that started it: it keeps running through rotation, a
+        // theme change, or the activity being recreated in the background. Holding the caller's
+        // Activity for the whole run would pin that dead Activity and its view tree in memory for
+        // hours. Nothing in the batch needs an Activity, so it runs on the application context.
+        val context = callerContext.applicationContext
         val current = _uiState.value
         if (current.items.isEmpty() || current.isCompressing || compressionJob?.isCompleted == false) return
         if (current.compressibleCount == 0) {
@@ -680,6 +693,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val frameRate = frameRateFromLabel(_uiState.value.frameRateOption)
             val codec = codecFromLabel(_uiState.value.codecOption)
             val privacyMode = MetadataPrivacyMode.fromLabel(_uiState.value.metadataPrivacyMode)
+            val exhaustivePerceptualLossless = _uiState.value.exhaustivePerceptualLossless
             // Reclaim orphaned cache files, but keep anything the CURRENT results still reference:
             // re-running while previous results are still on screen must not delete files that
             // share/save are still offering. Those entries are replaced by this run's own outputs.
@@ -738,7 +752,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 // Captured BEFORE the batch mutates it, so the record describes the state the run
                 // actually started from rather than the state it ended in.
                 learnedStateIdentity = runCatching { learningEngine.learnedStateIdentity() }.getOrNull(),
-                exhaustivePerceptualLossless = _uiState.value.exhaustivePerceptualLossless
+                exhaustivePerceptualLossless = exhaustivePerceptualLossless
             )
             _uiState.value.items.filter { it.isAlreadyCompressed }.forEach { skippedItem ->
                 recordDiagnosticJob(
@@ -1315,29 +1329,54 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 "scores=${certScores?.joinToString { "%.1f/%.1f/%.1f".format(java.util.Locale.US, it.mean, it.p5, it.min) } ?: "unmeasured"}"
                         )
                         if (!certOk) {
+                            // Only a certification that produced evidence may say the encode loses
+                            // quality. Scored windows below the bar, and frames that could not be
+                            // time-aligned, are both measurements of THIS output. "Unavailable" is
+                            // the absence of a measurement: the original is still kept (the plan
+                            // needed pixel proof and did not get it), but it is not labelled
+                            // "would visibly lose quality" and it does not count against the
+                            // profile in the learning engine.
+                            val certMeasured = certOutcome !is PairScoreOutcome.Unavailable
                             val certReason = when {
                                 certOutcome is PairScoreOutcome.MisalignmentRejected ->
                                     "pixel certification rejected: output frames could not be " +
                                         "time-aligned with the source (frame loss or retiming)"
+                                certScores == null && perceptualPlan.requiresMeasuredCertification ->
+                                    "pixel certification could not measure this output, and this encode " +
+                                        "overturned a keep-original decision, so it needs measured proof"
                                 certScores == null ->
                                     "pixel certification unavailable for a sub-default-ratio encode"
                                 else ->
                                     "pixel certification failed (sampled VMAF below thresholds)"
                             }
+                            val certTerminal = if (certMeasured) {
+                                BatchTerminalResult.SKIPPED_WOULD_DEGRADE
+                            } else {
+                                // "Kept original — re-encode could not be verified".
+                                BatchTerminalResult.UNEXPECTED_REMUX
+                            }
                             diagnosticFallbackReason = certReason
                             diagnosticDiscardedVideoBitrate = encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
-                            val learned = learningEngine.recordFailure(
-                                perceptualPlan.profileKey,
-                                perceptualPlan.targetRatio,
-                                certReason,
-                                perceptualPlan.floorRatio,
-                                measuredOvershoot
-                            )
-                            DiagLog.i(
-                                "CompressorLearning",
-                                "result=failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
-                                    "reason=$certReason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
-                            )
+                            if (certMeasured) {
+                                val learned = learningEngine.recordFailure(
+                                    perceptualPlan.profileKey,
+                                    perceptualPlan.targetRatio,
+                                    certReason,
+                                    perceptualPlan.floorRatio,
+                                    measuredOvershoot
+                                )
+                                DiagLog.i(
+                                    "CompressorLearning",
+                                    "result=failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
+                                        "reason=$certReason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
+                                )
+                            } else {
+                                DiagLog.i(
+                                    "CompressorLearning",
+                                    "result=unmeasured; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
+                                        "reason=$certReason; learned state unchanged (no evidence)"
+                                )
+                            }
                             runCatching { outputFile.delete() }
                             recordDiagnosticJob(
                                 diagnostics = diagnostics,
@@ -1351,7 +1390,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 wasStreamCopy = false,
                                 verification = verification,
                                 outputSize = 0L,
-                                terminal = BatchTerminalResult.SKIPPED_WOULD_DEGRADE,
+                                terminal = certTerminal,
                                 elapsedMs = System.currentTimeMillis() - itemStartedAt,
                                 fallbackReason = certReason,
                                 discardedVideoBitrate = diagnosticDiscardedVideoBitrate,
@@ -1376,7 +1415,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                     outputUri = null,
                                     outputPath = null,
                                     outputSize = 0L,
-                                    terminalResult = BatchTerminalResult.SKIPPED_WOULD_DEGRADE,
+                                    terminalResult = certTerminal,
                                     message = "Skipped: $certReason — original left untouched."
                                 )
                             }
@@ -1484,7 +1523,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             outputSize = outputSize,
                             preEncodeSourceAlreadyEfficient = diagnosticSourceAlreadyEfficient,
                             preEncodeEvidencePreferredRemux = diagnosticEvidencePreferredRemux,
-                            encoderFailed = diagnosticEncoderFailed
+                            encoderFailed = diagnosticEncoderFailed,
+                            acceptAnyVerifiedSaving = exhaustivePerceptualLossless
                         )
                     )
                     val terminalSavedBytes = BatchTerminalAccounting.savedBytes(
@@ -3036,8 +3076,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // copy truncated with no way back. This is independent of backupBeforeReplace: that saves
         // a gallery copy the user opted into and may have turned off; this recovery copy always
         // exists for the duration of the write and is deleted the instant the write is confirmed.
-        val recoveryDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
-        val recoveryCopy = File(recoveryDir, "replace_recovery_${diagnosticJobId(item)}.mp4")
+        // In filesDir, NOT cacheDir. When the replacement fails, this copy can be the user's last
+        // intact original, and the likeliest cause of that failure is a full disk. A full disk is
+        // exactly when Android deletes other apps' cache directories to free space. The cache was
+        // the one place this file was not safe.
+        val recoveryDir = File(context.filesDir, BatchCacheRetention.RECOVERY_DIRECTORY).apply { mkdirs() }
+        val recoveryCopy = File(recoveryDir, "${BatchCacheRetention.RECOVERY_FILE_PREFIX}${diagnosticJobId(item)}.mp4")
 
         // Free-space precheck. The recovery copy is a FULL copy of the original, so if the cache
         // volume cannot hold it we must not begin the destructive truncate-then-write at all — an
@@ -3249,6 +3293,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         metadata: VideoMetadataSnapshot = VideoMetadataSnapshot(),
         privacyMode: MetadataPrivacyMode = MetadataPrivacyMode.PRESERVE_ALL
     ): Uri? {
+        var inserted: Uri? = null
         return try {
             val filteredMetadata = metadata.filteredForPrivacy(privacyMode)
             val values = ContentValues().apply {
@@ -3273,9 +3318,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
 
             val uri = context.contentResolver.insert(collection, values) ?: return null
+            inserted = uri
             context.contentResolver.openOutputStream(uri)?.use { out ->
                 file.inputStream().use { input -> input.copyTo(out) }
-            }
+            } ?: error("could not open the new gallery entry for writing")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 values.clear()
                 values.put(MediaStore.Video.Media.IS_PENDING, 0)
@@ -3283,6 +3329,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
             uri
         } catch (_: Exception) {
+            // Remove the half-written entry. Left behind, it is a truncated video in the gallery,
+            // or on Q+ a pending row that never becomes visible but still holds its bytes.
+            inserted?.let { runCatching { context.contentResolver.delete(it, null, null) } }
             null
         }
     }
