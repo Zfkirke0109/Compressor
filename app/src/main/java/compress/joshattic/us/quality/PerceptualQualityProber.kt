@@ -91,7 +91,10 @@ class PerceptualQualityProber(private val context: Context) {
         outputMime: String,
         candidateRatios: List<Double>,
         targetBitrateForRatio: (Double) -> Int,
-        audioBitrate: Int
+        audioBitrate: Int,
+        // False for the short above-1080p ladder (ExhaustivePerceptualLosslessPolicy): a passing
+        // rung is returned as-is instead of spending one more 4K probe encode on a bisection.
+        allowDownwardRefinement: Boolean = true
     ): ProbeDecision {
         if (!VmafNative.isAvailable) return ProbeDecision(null, emptyList(), null, "vmaf unavailable")
         val windows = QualityProbePolicy.probeWindows(durationMs * 1000L)
@@ -140,7 +143,11 @@ class PerceptualQualityProber(private val context: Context) {
                 // an extra probe encode may reclaim up to half the rung gap in real savings.
                 // The passing result above is ALWAYS kept as the fallback — a failed or
                 // unmeasurable refinement changes nothing.
-                val refined = QualityProbePolicy.refinementCandidate(ratio, highestFailedBelow)
+                val refined = if (allowDownwardRefinement) {
+                    QualityProbePolicy.refinementCandidate(ratio, highestFailedBelow)
+                } else {
+                    null
+                }
                 if (refined != null && System.currentTimeMillis() - startedAt <= TOTAL_BUDGET_MS) {
                     probed += refined
                     val refinedRung = probeOneRatio(

@@ -287,6 +287,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // directions. Codec downgrades (e.g. AV1 -> HEVC) never probe: a fake bitrate delta
         // cannot be pixel-justified.
         val probeEligible: Boolean = false,
+        // True when the ladder must run in its short form: an above-1080p source that exhaustive
+        // mode made probe-eligible (see ExhaustivePerceptualLosslessPolicy.trimToShortLadder).
+        val shortProbeLadder: Boolean = false,
         // Whether the finished output can be pixel-scored against its source at all. Strictly wider
         // than [probeEligible]: 4K-class sources are certifiable but too expensive to run a ladder
         // on. Only this flag may gate post-encode certification — gating it on probe eligibility is
@@ -853,12 +856,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     var effectiveQuality = quality
                     var preEncodeRemuxNote: String? = null
                     val perceptualPlan = if (quality == BatchQualityPreset.ORIGINAL && resolvedMime != null) {
-                        val basePlan = buildPerceptualLosslessPlan(item, resolvedMime)
+                        val basePlan = buildPerceptualLosslessPlan(item, resolvedMime, exhaustivePerceptualLossless)
                         if (basePlan.probeEligible) {
                             updateItem(index) {
                                 it.copy(message = "Probing quality: sampling windows with on-device VMAF…")
                             }
-                            refinePlanWithPixelProbes(item, resolvedMime, basePlan)
+                            refinePlanWithPixelProbes(item, resolvedMime, basePlan, exhaustivePerceptualLossless)
                         } else {
                             basePlan
                         }
@@ -1167,6 +1170,29 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 "result=failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
                                     "reason=$reason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
                             )
+                            if (retainOriginalAfterDiscardedAttempt(
+                                    context = context,
+                                    diagnostics = diagnostics,
+                                    item = item,
+                                    index = index,
+                                    quality = quality,
+                                    privacyMode = privacyMode,
+                                    plan = perceptualPlan,
+                                    resolvedMime = diagnosticResolvedMime,
+                                    plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
+                                    plannedDecisionReason = diagnosticDecisionReason,
+                                    evidence = DiscardedAttemptEvidence(fallbackReason = reason, encoderFailed = true),
+                                    itemStartedAt = itemStartedAt,
+                                    thermalStart = thermalWindow,
+                                    precedingCooldownMs = precedingHandoffCooldownMs
+                                )
+                            ) {
+                                candidateFiles.forEach { runCatching { it.delete() } }
+                                // The encoder failed without producing an output (encodeAttempt is
+                                // null), so no cooldown is owed. That matches the stream-copy path
+                                // this replaces.
+                                return@forEachIndexed
+                            }
                             effectiveQuality = BatchQualityPreset.REMUX_ONLY
                             diagnosticEffectiveQuality = effectiveQuality
                             preEncodeRemuxNote = "Remux Fallback Kept: the encoder rejected the perceptually lossless attempt ($reason)"
@@ -1463,6 +1489,38 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             )
                         }
                         runCatching { outputFile.delete() }
+                        if (perceptualPlan != null && retainOriginalAfterDiscardedAttempt(
+                                context = context,
+                                diagnostics = diagnostics,
+                                item = item,
+                                index = index,
+                                quality = quality,
+                                privacyMode = privacyMode,
+                                plan = perceptualPlan,
+                                resolvedMime = diagnosticResolvedMime,
+                                plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
+                                plannedDecisionReason = diagnosticDecisionReason,
+                                evidence = DiscardedAttemptEvidence(
+                                    fallbackReason = failureReason,
+                                    encoderFailed = false,
+                                    discardedVideoBitrate = diagnosticDiscardedVideoBitrate,
+                                    certWindowScores = diagnosticCertWindowScores,
+                                    certBandingDiag = diagnosticCertBandingDiag,
+                                    certV1Scores = diagnosticCertV1Scores,
+                                    certificationStatus = diagnosticCertStatus,
+                                    encoderConfig = encodeAttempt?.configDelta?.compact()
+                                ),
+                                itemStartedAt = itemStartedAt,
+                                thermalStart = thermalWindow,
+                                precedingCooldownMs = precedingHandoffCooldownMs
+                            )
+                        ) {
+                            candidateFiles.forEach { runCatching { it.delete() } }
+                            // A full encode DID run here, so the encoder's heat still earns its
+                            // cooldown before the next video, exactly as on the stream-copy path.
+                            precedingCooldownMs = applyPostItemCooldown(context, index, ranFullEncode = encodeAttempt != null)
+                            return@forEachIndexed
+                        }
                         candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
                         remuxResult = remuxOnlyOne(context, item, index, privacyMode)
                         outputFile = remuxResult.outputFile
@@ -1652,28 +1710,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     }
 
                     if (index < _uiState.value.items.lastIndex) {
-                        val cooldown = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
                         // Apply the thermal cooldown ONLY after an item that actually ran a full
                         // hardware encode (encodeAttempt != null). Stream-copy/remux and already-
                         // optimized items generate no encoder heat, so cooling down after them is
                         // pure idle time. Timing-only: no compression/verification/learning decision
                         // is affected. Skipped items already return before this block.
-                        val ranFullEncode = encodeAttempt != null
-                        val appliedCooldownMs = ThermalBatchGovernor.postItemCooldownMs(ranFullEncode, cooldown)
-                        precedingCooldownMs = appliedCooldownMs
-                        _uiState.update {
-                            it.copy(
-                                thermalStatus = cooldown.summary,
-                                statusMessage = if (appliedCooldownMs > 0L)
-                                    "Cooling down ${appliedCooldownMs / 1000}s before next video."
-                                else
-                                    "Preparing next video…"
-                            )
-                        }
-                        updateItem(index) {
-                            it.copy(metrics = it.metrics?.copy(cooldownMs = appliedCooldownMs))
-                        }
-                        if (appliedCooldownMs > 0L) delay(appliedCooldownMs)
+                        precedingCooldownMs = applyPostItemCooldown(context, index, ranFullEncode = encodeAttempt != null)
                     }
                     } catch (e: CancellationException) {
                         if (!itemOutputAccepted) candidateFiles.forEach { runCatching { it.delete() } }
@@ -1883,6 +1925,190 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
             _uiState.update { it.copy(statusMessage = "Saved $saved output cop${if (saved == 1) "y" else "ies"} to Movies/Compressor with ${privacyMode.summary}.") }
         }
+    }
+
+    /** What a discarded Perceptually Lossless attempt leaves behind for the item's record. */
+    private data class DiscardedAttemptEvidence(
+        val fallbackReason: String,
+        val encoderFailed: Boolean,
+        val discardedVideoBitrate: Int? = null,
+        val certWindowScores: String? = null,
+        val certBandingDiag: String? = null,
+        val certV1Scores: String? = null,
+        val certificationStatus: String? = null,
+        val encoderConfig: String? = null
+    )
+
+    /**
+     * After a Perceptually Lossless attempt was discarded, keep the untouched original instead of
+     * writing a full stream copy of it.
+     *
+     * The copy bought nothing. For a PL request it classifies as UNEXPECTED_REMUX, which may not
+     * replace the original, so the user got a byte-for-byte duplicate of a file they still had.
+     * Making it cost a full read and write of the source (gigabytes for 4K camera clips), a second
+     * verification pass, and the same amount of cache space. The keep-original fast path already
+     * avoids exactly this cost when the plan decides up front. This extends it to the decision
+     * made after an attempt, under the same audited [OriginalReusePolicy]: no privacy strip
+     * requested, an MP4-family container, and a source readable now. When any guard fails, this
+     * returns false and the caller writes the verified stream copy exactly as before.
+     *
+     * The label does not change: the terminal is still UNEXPECTED_REMUX ("Kept original —
+     * re-encode could not be verified"), never "already efficient", and nothing counts as
+     * compression.
+     *
+     * @return true when the original was retained and the item is fully recorded.
+     */
+    private suspend fun retainOriginalAfterDiscardedAttempt(
+        context: Context,
+        diagnostics: DiagnosticsRecorder,
+        item: BatchVideoItem,
+        index: Int,
+        quality: BatchQualityPreset,
+        privacyMode: MetadataPrivacyMode,
+        plan: PerceptualLosslessPlan,
+        resolvedMime: String?,
+        plannedTargetVideoBitrate: Int?,
+        plannedDecisionReason: String?,
+        evidence: DiscardedAttemptEvidence,
+        itemStartedAt: Long,
+        thermalStart: ThermalBatchSnapshot,
+        precedingCooldownMs: Long
+    ): Boolean {
+        val (containerMime, readable) = withContext(Dispatchers.IO) {
+            val mime = runCatching { context.contentResolver.getType(item.sourceUri) }.getOrNull()
+            val canRead = runCatching {
+                context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { true } == true
+            }.getOrDefault(false)
+            mime to canRead
+        }
+        val reuse = OriginalReusePolicy.evaluate(
+            isKeepOriginalDecision = true,
+            userRequestedRemuxOnly = false,
+            privacyMode = privacyMode,
+            resolvedContainerMime = containerMime,
+            sourceReadableNow = readable
+        )
+        if (reuse !is OriginalReuseDecision.Eligible) {
+            DiagLog.i(
+                "CompressorBatch",
+                "keep-original fallback blocked; job=${diagnosticJobId(item)}; " +
+                    "reason=${(reuse as OriginalReuseDecision.Blocked).reason}; writing a verified stream copy instead"
+            )
+            return false
+        }
+        val retention = OriginalReusePolicy.retainedSourceValidation(
+            sourceReadable = readable,
+            sourceSizeBytes = item.originalSize,
+            containerMime = reuse.containerMime,
+            nowEpochMs = System.currentTimeMillis()
+        )
+        val terminal = BatchTerminalClassifier.classify(
+            BatchTerminalInput(
+                requestedMode = quality.toMode(),
+                effectiveMode = BatchQualityMode.REMUX_ONLY,
+                wasStreamCopy = false,
+                verified = retention.readableAtDecisionTime,
+                replacementSafe = false,
+                sourceSize = item.originalSize,
+                outputSize = item.originalSize,
+                encoderFailed = evidence.encoderFailed,
+                retainedOriginalNoOutput = true,
+                retainedAfterFailedAttempt = true
+            )
+        )
+        val thermalEnd = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
+        val elapsedMs = System.currentTimeMillis() - itemStartedAt
+        DiagLog.i(
+            "CompressorBatch",
+            "keep-original fallback; job=${diagnosticJobId(item)}; materialization=REUSED_SOURCE; " +
+                "copyAvoidedBytes=${item.originalSize}; reason=${evidence.fallbackReason}; terminal=$terminal"
+        )
+        recordDiagnosticJob(
+            diagnostics = diagnostics,
+            item = item,
+            requestedQuality = quality,
+            effectiveQuality = BatchQualityPreset.REMUX_ONLY,
+            resolvedMime = resolvedMime,
+            plannedTargetRatio = plan.targetRatio,
+            plannedTargetVideoBitrate = plannedTargetVideoBitrate,
+            plannedDecisionReason = plannedDecisionReason,
+            wasStreamCopy = false,
+            verification = null,
+            retainedValidation = retention,
+            outputSize = item.originalSize,
+            terminal = terminal,
+            elapsedMs = elapsedMs,
+            fallbackReason = evidence.fallbackReason,
+            discardedVideoBitrate = evidence.discardedVideoBitrate,
+            probedRatios = plan.probedRatios,
+            pixelProvenRatio = plan.pixelProvenRatio,
+            probeDetail = plan.probeDetail,
+            probeWindowScores = plan.probeWindowScores,
+            probePairDiag = plan.probePairDiag,
+            probeV1Scores = plan.probeV1Scores,
+            certWindowScores = evidence.certWindowScores,
+            certBandingDiag = evidence.certBandingDiag,
+            certV1Scores = evidence.certV1Scores,
+            certificationStatus = evidence.certificationStatus,
+            encoderConfig = evidence.encoderConfig,
+            thermalStart = thermalStart.thermalLabel,
+            thermalEnd = thermalEnd.thermalLabel,
+            precedingCooldownMs = precedingCooldownMs,
+            materializationMode = "REUSED_SOURCE",
+            copyAvoidedBytes = item.originalSize
+        )
+        updateItem(index) {
+            it.copy(
+                status = if (terminal.isFailure) BatchItemStatus.Failed else BatchItemStatus.Done,
+                progress = 1f,
+                currentOutputSize = item.originalSize,
+                outputUri = if (terminal.isFailure) null else item.sourceUri,
+                outputPath = null,
+                outputSize = if (terminal.isFailure) 0L else item.originalSize,
+                outputMode = BatchQualityPreset.REMUX_ONLY.label,
+                verificationReport = null,
+                terminalResult = terminal,
+                metrics = BatchItemMetrics(
+                    operationLabel = "Retained",
+                    elapsedMs = elapsedMs,
+                    outputBytes = 0L,
+                    savedBytes = 0L,
+                    thermalStart = thermalStart.thermalLabel,
+                    thermalEnd = thermalEnd.thermalLabel,
+                    batteryStart = thermalStart.batteryPercent,
+                    batteryEnd = thermalEnd.batteryPercent,
+                    cooldownMs = 0L
+                ),
+                message = "Kept original — the Perceptually Lossless re-encode could not be verified " +
+                    "(${evidence.fallbackReason}). No copy was written; your original is untouched."
+            )
+        }
+        return true
+    }
+
+    /**
+     * The post-item thermal cooldown before the next video, as applied ms. Called at the end of
+     * an item, and from any early exit that follows a real encode, so that no path skips the
+     * cooldown the encoder's heat calls for.
+     */
+    private suspend fun applyPostItemCooldown(context: Context, index: Int, ranFullEncode: Boolean): Long {
+        if (index >= _uiState.value.items.lastIndex) return 0L
+        val cooldown = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
+        val appliedCooldownMs = ThermalBatchGovernor.postItemCooldownMs(ranFullEncode, cooldown)
+        _uiState.update {
+            it.copy(
+                thermalStatus = cooldown.summary,
+                statusMessage = if (appliedCooldownMs > 0L)
+                    "Cooling down ${appliedCooldownMs / 1000}s before next video."
+                else
+                    "Preparing next video…"
+            )
+        }
+        updateItem(index) {
+            it.copy(metrics = it.metrics?.copy(cooldownMs = appliedCooldownMs))
+        }
+        if (appliedCooldownMs > 0L) delay(appliedCooldownMs)
+        return appliedCooldownMs
     }
 
     private suspend fun waitForThermalWindow(context: Context, itemName: String): ThermalBatchSnapshot {
@@ -2115,7 +2341,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     private fun buildPerceptualLosslessPlan(
         item: BatchVideoItem,
-        outputMime: String
+        outputMime: String,
+        exhaustive: Boolean
     ): PerceptualLosslessPlan {
         val source = item.toSourceInfo()
         val profileKey = SmartPerceptualProfileEngine.profileKeyFor(
@@ -2184,9 +2411,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         //    what unlocks the pixel-proven "Perceptually Lossless Verified" label. It now reaches
         //    4K-class sources, which previously could never be pixel-proven at any ratio.
         //  - probeEligible: additionally worth spending the ladder's trial encodes on
-        //    (QualityProbePolicy.PROBE_LADDER_MAX_PIXELS). Above that bar the ladder cannot finish
-        //    inside the prober's budget, so the plan keeps its default/learned ratio and relies on
-        //    certification alone.
+        //    (QualityProbePolicy.PROBE_LADDER_MAX_PIXELS). Above that bar the full ladder cannot
+        //    finish inside the prober's budget. Outside exhaustive mode such a plan keeps its
+        //    default/learned ratio and relies on certification alone. In exhaustive mode it runs
+        //    the SHORT ladder instead, up to the 4K scoring cap
+        //    (ExhaustivePerceptualLosslessPolicy.probeLadderAllowed).
         val pixelCertifiable = !codecDowngrade && !source.isHdr && VmafNative.isAvailable &&
             QualityProbePolicy.isPixelScoreableGeometry(source.width, source.height)
         val pixelCertifiableBlockReason = CertificationStatus.blockReasonFor(
@@ -2196,7 +2425,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             geometryScoreable = QualityProbePolicy.isPixelScoreableGeometry(source.width, source.height)
         )
         val probeEligible = pixelCertifiable &&
-            QualityProbePolicy.isProbeLadderGeometry(source.width, source.height)
+            ExhaustivePerceptualLosslessPolicy.probeLadderAllowed(source.width, source.height, exhaustive)
+        val shortProbeLadder = probeEligible &&
+            ExhaustivePerceptualLosslessPolicy.needsShortLadder(source.width, source.height)
         DiagLog.i(
             "CompressorLearning",
             "plan; profileKey=${profileKey.asKey()}; defaultRatio=$defaultRatio; learnedRatio=$targetRatio; " +
@@ -2214,6 +2445,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             useCbrCeiling = useCbrCeiling,
             expectedOvershootFactor = expectedOvershootFactor,
             probeEligible = probeEligible,
+            shortProbeLadder = shortProbeLadder,
             pixelCertifiable = pixelCertifiable,
             pixelCertifiableBlockReason = pixelCertifiableBlockReason,
             defaultRatio = defaultRatio
@@ -2232,7 +2464,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     private suspend fun refinePlanWithPixelProbes(
         item: BatchVideoItem,
         outputMime: String,
-        plan: PerceptualLosslessPlan
+        plan: PerceptualLosslessPlan,
+        exhaustive: Boolean
     ): PerceptualLosslessPlan {
         if (!plan.probeEligible) return plan
         // HDR and codec-downgrade plans never probe; those gates are not inference.
@@ -2243,15 +2476,22 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // safest-rung pass would save less than measurement noise, so inference stands.
         val bpp = BatchQualityBitratePolicy.sourceBitsPerPixelPerFrame(source)
         val candidates = ExhaustivePerceptualLosslessPolicy.candidateRatios(
-            plan.defaultRatio, bpp, _uiState.value.exhaustivePerceptualLossless
+            plan.defaultRatio, bpp, exhaustive, shortLadder = plan.shortProbeLadder
         )
         if (candidates.isEmpty()) return plan
+        if (plan.shortProbeLadder) {
+            DiagLog.i(
+                "CompressorProbe",
+                "short ladder; job=${diagnosticJobId(item)}; ${item.originalWidth}x${item.originalHeight} is above " +
+                    "the full-ladder geometry; exhaustive mode probes ${candidates.joinToString { "%.2f".format(java.util.Locale.US, it) }} " +
+                    "with no bisection"
+            )
+        }
         // Decaying probe-skip latch: after repeated MEASURED safest-rung rejections for this
         // profile class, a few ladders are skipped to save probe encodes/battery — then the
         // next encounter re-probes so fresh pixels (never stale class history) keep the final
         // say. The skip is recorded in the structured trace so captures can tell "skipped by
         // recent measured evidence" apart from "never tried".
-        val exhaustive = _uiState.value.exhaustivePerceptualLossless
         if (ExhaustivePerceptualLosslessPolicy.honourProbeSkip(exhaustive) &&
             learningEngine.shouldSkipProbes(plan.profileKey)
         ) {
@@ -2282,7 +2522,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     pixelProvenRatioFloor = ratio
                 )
             },
-            audioBitrate = calculateAudioBitrate(item, BatchQualityPreset.ORIGINAL)
+            audioBitrate = calculateAudioBitrate(item, BatchQualityPreset.ORIGINAL),
+            allowDownwardRefinement = !plan.shortProbeLadder
         )
         DiagLog.i(
             "CompressorProbe",

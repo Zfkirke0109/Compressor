@@ -131,7 +131,15 @@ data class BatchTerminalInput(
      * verified 1-2 % saving away as "no meaningful size win; original kept". The quality evidence
      * is not touched: [verified] must still be true, and only the savings bar is lowered.
      */
-    val acceptAnyVerifiedSaving: Boolean = false
+    val acceptAnyVerifiedSaving: Boolean = false,
+    /**
+     * With [retainedOriginalNoOutput]: the original was kept AFTER a real re-encode attempt was
+     * discarded (verification rejected it, or the encoder failed), not because the plan chose to
+     * keep it up front. It must read as "re-encode could not be verified", never as "already
+     * efficient", because nothing established that the source was efficient. The encode was
+     * simply not accepted.
+     */
+    val retainedAfterFailedAttempt: Boolean = false
 ) {
     /**
      * Meaningful-savings threshold: at least [MIN_MEANINGFUL_SAVINGS] smaller to call it a size
@@ -166,6 +174,9 @@ object BatchTerminalClassifier {
         if (input.retainedOriginalNoOutput) {
             return when {
                 !input.verified -> BatchTerminalResult.OUTPUT_VALIDATION_FAILED
+                // Same terminal the full stream-copy fallback produced for these cases. Only the
+                // wasted copy is gone.
+                input.retainedAfterFailedAttempt || input.encoderFailed -> BatchTerminalResult.UNEXPECTED_REMUX
                 input.preEncodeEvidencePreferredRemux -> BatchTerminalResult.REMUX_PREFERRED_BY_EVIDENCE
                 else -> BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED
             }

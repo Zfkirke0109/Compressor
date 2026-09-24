@@ -675,12 +675,12 @@ private fun BatchSettingsCard(
             }
             Text(
                 if (state.exhaustivePerceptualLossless)
-                    "Every SDR video up to 1080p gets a real VMAF test before it is kept as-is, and any " +
-                        "verified saving is kept, however small. Same quality bar: a file is only " +
-                        "replaced when the test proves no visible loss. Slower and uses more battery. " +
-                        "HDR is always kept exactly (no validated HDR quality model). Above 1080p the " +
-                        "test is too slow to run before encoding, so those files are either encoded " +
-                        "and then checked, or kept as-is."
+                    "SDR videos up to 4K get a real VMAF test before being kept as-is (a shorter test " +
+                        "above 1080p), and any verified saving is kept, however small. Same quality bar: " +
+                        "a file is only replaced when the test proves no visible loss. Slower and uses " +
+                        "more battery, most of all on 4K. Never tested: HDR (no validated HDR quality " +
+                        "model), 8K, clips under 2 seconds, and files already in a more efficient codec " +
+                        "than the phone can encode (such as AV1)."
                 else
                     "Skips the VMAF test for files that look already compressed, or whose type " +
                         "failed recently. Faster, but some compressible files are never tried.",
