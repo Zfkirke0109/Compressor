@@ -93,6 +93,10 @@ object DiagnosticsExporter {
         // decision line behind them was gone. Logcat is still appended -- it carries lines from
         // outside a batch, and from builds predating DiagLog -- but it is no longer the only copy.
         val decisions = recordedDecisionLogs(context)
+        // Crash reports come before everything else. They are the one record a crash leaves that
+        // neither the session JSONL nor the decision log can hold, since both stop at the moment
+        // the process dies. See CrashRecorder.
+        val crashes = CrashRecorder.recordedReports(context)
         // Ask for every process this app has run in, not just the live one: a batch that crashed
         // logged its records under a pid that no longer exists, and those are the records worth
         // exporting. Falls back to the pid-scoped form only if the broader dump comes back empty,
@@ -102,10 +106,17 @@ object DiagnosticsExporter {
                 if (broad != null && broad.isNotBlank()) broad
                 else readLogcat(DiagnosticsExportPlan.logcatDumpArgs(Process.myPid())) ?: broad
             }
-        if (decisions.isEmpty() && logcat == null) {
+        if (crashes.isEmpty() && decisions.isEmpty() && logcat == null) {
             return ExportResult.Failed("Could not read this app's log.")
         }
         val output = buildString {
+            for (file in crashes) {
+                val text = runCatching { file.readText() }.getOrNull() ?: continue
+                if (text.isBlank()) continue
+                append("===== crash: ${file.name} =====\n")
+                append(text)
+                if (!text.endsWith("\n")) append('\n')
+            }
             for (file in decisions) {
                 val text = runCatching { file.readText() }.getOrNull() ?: continue
                 if (text.isBlank()) continue

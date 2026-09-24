@@ -43,7 +43,18 @@ object DiagnosticsExportPlan {
         // written the reason for every one of them — under this tag, which the export did not
         // collect. The capture therefore could not say whether the probe pipeline had failed to
         // line the streams up or the encode really had dropped frames.
-        "VmafPairScorer"
+        "VmafPairScorer",
+        // The foreground-service and wake-lock bracket around a batch. Build pr44-b158 died about
+        // 2 s after a 42 ms batch because stopService overtook startForeground, and neither of
+        // these tags was collected, so the export could not show the bracket at all.
+        "BatchFgs",
+        "BatchExecGuard",
+        // The platform's own FATAL EXCEPTION line and stack trace. The crashing process writes it
+        // under this app's UID, so an unprivileged reader can still see it. Without this tag, every
+        // crash so far has had to be inferred from a pid change in the export.
+        "AndroidRuntime",
+        // CrashRecorder's confirmation that a report was written to filesDir.
+        "CompressorCrash"
     )
 
     /**
