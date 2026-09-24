@@ -86,6 +86,18 @@ def test_a_batch_that_recorded_no_summary_is_flagged_as_unfinished():
     assert "did not finish" in render(s)
 
 
+def test_v1_shadow_scores_are_paired_with_the_verdict_scores_window_by_window():
+    s = summarize(write([
+        start(),
+        job("a", certWindowScores="99.0/98.0/97.0;90.0/85.0/80.0",
+            certV1Scores="98.0/97.0/96.5;88.0/82.0/75.0"),
+        job("b", certWindowScores="99.0/98.0/97.0", certV1Scores=None),
+        # Mismatched window counts are dropped, never guessed into alignment.
+        job("c", certWindowScores="99.0/98.0/97.0;90.0/85.0/80.0", certV1Scores="98.0/97.0/96.0"),
+    ]))
+    assert s["v1ShadowPairs"] == [(97.0, 96.5), (80.0, 75.0)]
+
+
 def test_failing_predicates_are_counted_and_shared_against_verified_jobs_only():
     # Three jobs carry verification, one is a retained source that never ran the verifier.
     s = summarize(write([

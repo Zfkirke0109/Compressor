@@ -191,8 +191,35 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "effectiveModes": dict(modes.most_common()),
         "materialization": dict(materialization.most_common()),
         "elapsedMs": (summary or {}).get("elapsedMs"),
+        "exhaustivePerceptualLossless": (start or {}).get("exhaustivePerceptualLossless"),
+        "buildTag": (start or {}).get("buildTag"),
+        "v1ShadowPairs": v1_shadow_pairs(jobs),
         "completed": summary is not None,
     }
+
+
+def v1_shadow_pairs(jobs: list[dict[str, Any]]) -> list[tuple[float, float]]:
+    """(v0.6.1 window min, v1 window min) for every certification window carrying both.
+
+    VMAF v1 is recorded as SHADOW evidence only (the verdict is v0.6.1). Pairing the two per
+    window is what a calibration round needs: whether v1 ranks the same windows as failing, and
+    where on its own scale the v0.6.1 bars fall. Windows are matched by position, which is how
+    the app writes them (one ";"-joined entry per certification window, in window order).
+    """
+    pairs: list[tuple[float, float]] = []
+    for j in jobs:
+        v0, v1 = j.get("certWindowScores"), j.get("certV1Scores")
+        if not v0 or not v1:
+            continue
+        a, b = str(v0).split(";"), str(v1).split(";")
+        if len(a) != len(b):
+            continue
+        for x, y in zip(a, b):
+            try:
+                pairs.append((float(x.split("/")[2]), float(y.split("/")[2])))
+            except (IndexError, ValueError):
+                continue
+    return pairs
 
 
 def render(s: dict[str, Any]) -> str:
@@ -213,6 +240,13 @@ def render(s: dict[str, Any]) -> str:
     ]
     if not s["completed"]:
         out.insert(1, "  !! NO session_summary — this batch did not finish; totals are a partial run")
+    if s.get("buildTag") or s.get("exhaustivePerceptualLossless") is not None:
+        out.append(f"  build tag      : {s.get('buildTag')}   exhaustive PL: {s.get('exhaustivePerceptualLossless')}")
+    pairs = s.get("v1ShadowPairs") or []
+    if pairs:
+        out.append(f"  VMAF v1 shadow : {len(pairs)} certification window(s) scored by both models (min score)")
+        for v0, v1 in pairs[:12]:
+            out.append(f"      v0.6.1 {v0:6.2f}   v1 {v1:6.2f}   delta {v1 - v0:+6.2f}")
     if s["jobsWithVerification"]:
         out.append(f"  failing checks : ({s['jobsWithVerification']} job(s) carry verification)")
         for name, n in s["failedCheckCounts"].items():
