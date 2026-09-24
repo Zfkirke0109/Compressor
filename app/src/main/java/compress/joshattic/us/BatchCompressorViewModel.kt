@@ -805,6 +805,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     var diagnosticDecisionReason: String? = null
                     var diagnosticSourceAlreadyEfficient = false
                     var diagnosticEvidencePreferredRemux = false
+                    // The item's plan, kept outside the try so the per-item catch can still retain
+                    // the original when the stream copy that should carry it turns out impossible.
+                    var diagnosticPlan: PerceptualLosslessPlan? = null
                     var diagnosticEncoderFailed = false
                     // When a PL encode is attempted then discarded for a remux, preserve WHY (and the
                     // discarded encode's measured video bitrate) so the structured record stays honest
@@ -877,6 +880,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             perceptualPlan?.pixelProvenRatio
                         )
                     }
+                    diagnosticPlan = perceptualPlan
                     diagnosticSourceAlreadyEfficient = perceptualPlan?.remuxWasSourceEfficient == true
                     diagnosticEvidencePreferredRemux = perceptualPlan?.remuxWasEvidencePreferred == true
                     if (perceptualPlan?.skipReason != null) {
@@ -1159,18 +1163,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 "CompressorBatch",
                                 "Perceptually lossless encode failed before verification for ${diagnosticJobId(item)}: $reason; falling back to remux"
                             )
-                            val learned = learningEngine.recordFailure(
-                                perceptualPlan.profileKey,
-                                perceptualPlan.targetRatio,
-                                reason,
-                                perceptualPlan.floorRatio
-                            )
+                            // An encoder or muxer failure says nothing about the ratio (see
+                            // LearningEvidencePolicy.Kind.PIPELINE), so it teaches nothing.
                             DiagLog.i(
                                 "CompressorLearning",
-                                "result=failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
-                                    "reason=$reason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
+                                "result=pipeline_failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
+                                    "reason=$reason; learned state unchanged"
                             )
-                            if (retainOriginalAfterDiscardedAttempt(
+                            if (retainOriginalInsteadOfCopy(
                                     context = context,
                                     diagnostics = diagnostics,
                                     item = item,
@@ -1473,23 +1473,34 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             DiagLog.w("CompressorVerification", "discarded PL attempt; $line")
                         }
                         perceptualPlan?.let { plan ->
-                            val learned = learningEngine.recordFailure(
-                                plan.profileKey,
-                                plan.targetRatio,
-                                failureReason,
-                                plan.floorRatio,
-                                measuredOvershoot
-                            )
-                            DiagLog.i(
-                                "CompressorLearning",
-                                "result=failure; profileKey=${plan.profileKey.asKey()}; usedRatio=${plan.targetRatio}; " +
-                                    "bitrateMode=${encodeAttempt?.requestedBitrateModeLabel ?: "unknown"}; encoderName=${encodeAttempt?.videoEncoderName ?: "unknown"}; " +
-                                    "measuredOvershoot=${measuredOvershoot ?: "unknown"}; learnedOvershoot=${learned.measuredOvershootFactor ?: "none"}; " +
-                                    "reason=$failureReason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
-                            )
+                            // Only a starved encode moves the ratio; see LearningEvidencePolicy.
+                            val evidence = LearningEvidencePolicy.classifyVerificationFailure(verification.failingChecks())
+                            if (evidence == LearningEvidencePolicy.Kind.PIPELINE) {
+                                DiagLog.i(
+                                    "CompressorLearning",
+                                    "result=pipeline_failure; profileKey=${plan.profileKey.asKey()}; usedRatio=${plan.targetRatio}; " +
+                                        "failing=${verification.failingChecks().joinToString(",")}; reason=$failureReason; learned state unchanged"
+                                )
+                            } else {
+                                val learned = learningEngine.recordFailure(
+                                    plan.profileKey,
+                                    plan.targetRatio,
+                                    failureReason,
+                                    plan.floorRatio,
+                                    measuredOvershoot,
+                                    stepUp = evidence == LearningEvidencePolicy.Kind.QUALITY
+                                )
+                                DiagLog.i(
+                                    "CompressorLearning",
+                                    "result=failure; evidence=$evidence; profileKey=${plan.profileKey.asKey()}; usedRatio=${plan.targetRatio}; " +
+                                        "bitrateMode=${encodeAttempt?.requestedBitrateModeLabel ?: "unknown"}; encoderName=${encodeAttempt?.videoEncoderName ?: "unknown"}; " +
+                                        "measuredOvershoot=${measuredOvershoot ?: "unknown"}; learnedOvershoot=${learned.measuredOvershootFactor ?: "none"}; " +
+                                        "reason=$failureReason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
+                                )
+                            }
                         }
                         runCatching { outputFile.delete() }
-                        if (perceptualPlan != null && retainOriginalAfterDiscardedAttempt(
+                        if (perceptualPlan != null && retainOriginalInsteadOfCopy(
                                 context = context,
                                 diagnostics = diagnostics,
                                 item = item,
@@ -1723,6 +1734,39 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     } catch (e: Exception) {
                         if (!itemOutputAccepted) candidateFiles.forEach { runCatching { it.delete() } }
                         val unsupported = e.message?.contains(Mp4MetadataRemuxer.REMUX_ONLY_UNSUPPORTED_MESSAGE) == true
+                        // A Perceptually Lossless item that was headed for "keep the original"
+                        // failed only because the stream copy carrying it is impossible for this
+                        // container. The original is untouched and was the decision, so retain it
+                        // rather than report a failure. Privacy stripping and unreadable sources
+                        // still fail as before (OriginalReusePolicy).
+                        val keepOriginalPlan = diagnosticPlan
+                        if (unsupported && quality == BatchQualityPreset.ORIGINAL &&
+                            diagnosticEffectiveQuality == BatchQualityPreset.REMUX_ONLY && keepOriginalPlan != null &&
+                            retainOriginalInsteadOfCopy(
+                                context = context,
+                                diagnostics = diagnostics,
+                                item = item,
+                                index = index,
+                                quality = quality,
+                                privacyMode = privacyMode,
+                                plan = keepOriginalPlan,
+                                resolvedMime = diagnosticResolvedMime,
+                                plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
+                                plannedDecisionReason = diagnosticDecisionReason,
+                                evidence = DiscardedAttemptEvidence(
+                                    fallbackReason = diagnosticFallbackReason
+                                        ?: "stream copy impossible: ${e.message ?: "unsupported container"}",
+                                    encoderFailed = diagnosticEncoderFailed
+                                ),
+                                itemStartedAt = itemStartedAt,
+                                thermalStart = thermalWindow,
+                                precedingCooldownMs = precedingHandoffCooldownMs,
+                                afterFailedAttempt = diagnosticFallbackReason != null,
+                                containerCannotBeCopied = true
+                            )
+                        ) {
+                            return@forEachIndexed
+                        }
                         val encoderFailure = diagnosticEncoderFailed || e is ExportException
                         val terminal = BatchTerminalClassifier.classify(
                             BatchTerminalInput(
@@ -1958,7 +2002,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
      *
      * @return true when the original was retained and the item is fully recorded.
      */
-    private suspend fun retainOriginalAfterDiscardedAttempt(
+    private suspend fun retainOriginalInsteadOfCopy(
         context: Context,
         diagnostics: DiagnosticsRecorder,
         item: BatchVideoItem,
@@ -1972,7 +2016,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         evidence: DiscardedAttemptEvidence,
         itemStartedAt: Long,
         thermalStart: ThermalBatchSnapshot,
-        precedingCooldownMs: Long
+        precedingCooldownMs: Long,
+        // False when there was no attempt: the plan decided up front to keep the original, and
+        // the stream copy that would have carried it was impossible (containerCannotBeCopied).
+        afterFailedAttempt: Boolean = true,
+        containerCannotBeCopied: Boolean = false
     ): Boolean {
         val (containerMime, readable) = withContext(Dispatchers.IO) {
             val mime = runCatching { context.contentResolver.getType(item.sourceUri) }.getOrNull()
@@ -1986,7 +2034,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             userRequestedRemuxOnly = false,
             privacyMode = privacyMode,
             resolvedContainerMime = containerMime,
-            sourceReadableNow = readable
+            sourceReadableNow = readable,
+            containerCannotBeCopied = containerCannotBeCopied
         )
         if (reuse !is OriginalReuseDecision.Eligible) {
             DiagLog.i(
@@ -2011,9 +2060,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 replacementSafe = false,
                 sourceSize = item.originalSize,
                 outputSize = item.originalSize,
+                preEncodeSourceAlreadyEfficient = plan.remuxWasSourceEfficient,
+                preEncodeEvidencePreferredRemux = plan.remuxWasEvidencePreferred,
                 encoderFailed = evidence.encoderFailed,
                 retainedOriginalNoOutput = true,
-                retainedAfterFailedAttempt = true
+                retainedAfterFailedAttempt = afterFailedAttempt
             )
         )
         val thermalEnd = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
@@ -2079,8 +2130,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     batteryEnd = thermalEnd.batteryPercent,
                     cooldownMs = 0L
                 ),
-                message = "Kept original — the Perceptually Lossless re-encode could not be verified " +
-                    "(${evidence.fallbackReason}). No copy was written; your original is untouched."
+                message = if (afterFailedAttempt) {
+                    "Kept original — the Perceptually Lossless re-encode could not be verified " +
+                        "(${evidence.fallbackReason}). No copy was written; your original is untouched."
+                } else {
+                    "Kept original, no copy written: Perceptually Lossless had already decided not to " +
+                        "re-encode this video, and its container cannot be stream-copied to MP4. Your " +
+                        "original is untouched."
+                }
             )
         }
         return true
@@ -2523,7 +2580,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 )
             },
             audioBitrate = calculateAudioBitrate(item, BatchQualityPreset.ORIGINAL),
-            allowDownwardRefinement = !plan.shortProbeLadder
+            allowDownwardRefinement = !plan.shortProbeLadder,
+            // Same mode as the real encode (compressOne), so a probe pass is evidence about it.
+            bitrateMode = if (plan.useCbrCeiling) {
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+            } else {
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+            }
         )
         DiagLog.i(
             "CompressorProbe",

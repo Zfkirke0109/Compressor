@@ -94,7 +94,10 @@ data class WindowPairingDiag(
     // Frames the aligner dropped to re-establish timestamp alignment before scoring
     // (measured misalignment, e.g. the Transformer clip's off-by-one window start).
     val refAlignDrops: Int = 0,
-    val distAlignDrops: Int = 0
+    val distAlignDrops: Int = 0,
+    // Probe windows only (ScoreWindow.alignFirstFrames): how far after the requested window
+    // start the source's first frame sat. Null for windows normalised by the requested start.
+    val leadUs: Long? = null
 ) {
     /**
      * Compact capture form: "ref=50,dist=52,extra=0/2,skewMs=first/maxAbs/meanAbs,drop=a/b".
@@ -106,11 +109,55 @@ data class WindowPairingDiag(
             refFrames, distFrames, refExtra, distExtra,
             skewFirstUs / 1000.0, skewMaxAbsUs / 1000.0, skewMeanAbsUs / 1000.0,
             refAlignDrops, distAlignDrops
-        )
+        ) + (leadUs?.let { ",leadMs=%.1f".format(java.util.Locale.US, it / 1000.0) } ?: "")
 }
 
-/** A comparison window in the REFERENCE file's timeline. */
-data class ScoreWindow(val startUs: Long, val endUs: Long, val distStartUs: Long = startUs)
+/**
+ * A comparison window in the REFERENCE file's timeline.
+ *
+ * [alignFirstFrames] is for probe clips, and only for them. A probe clip is exported with
+ * `setStartPositionUs(startUs)`, and its first frame is the source's first frame at or after
+ * `startUs`. The clip's single-track MP4 is written with that frame at time 0, so its timeline
+ * starts at the frame, not at the requested instant. The reference reader's first frame
+ * sits `lead` = (first frame pts - startUs) into the window, anywhere from 0 to one frame
+ * interval. Normalising the reference by `startUs` and the clip by 0 therefore leaves every
+ * pair `lead` apart.
+ *
+ * batch_1790263711162 (b161, 221 files) measured exactly that. All 715 probe clips reported
+ * firstSample=0 (ProbeClipGeometry). The aligner's 4 ms tolerance cannot absorb a sub-frame
+ * lead, and dropping whole frames cannot close one, so windows with lead > 4 ms failed as
+ * "leading offset not aligned": 142 of 201 ladders measured nothing. Windows with lead near
+ * one frame interval were worse. The aligner dropped one clip frame, closed the skew and paired
+ * source frame k with clip frame k+1. All 34 such windows scored mean VMAF 11.2-86.3, and they
+ * were recorded as MEASURED rejections: 34 of that batch's 58 "would visibly lose quality" skips
+ * rested on at least one of them. All 27 directly paired windows (lead <= 4 ms) scored 77.1-99.7.
+ * That split is the evidence that clip frame 0 IS the source's first frame at or after startUs,
+ * so the two first frames are the origins.
+ *
+ * Frames after the first are still paired by timestamp under the same 4 ms tolerance, so a
+ * frame dropped or retimed inside the clip still fails the window.
+ */
+data class ScoreWindow(
+    val startUs: Long,
+    val endUs: Long,
+    val distStartUs: Long = startUs,
+    val alignFirstFrames: Boolean = false
+)
+
+/**
+ * The origin one stream's timestamps are normalised against: fixed (a requested window start),
+ * or the stream's own first frame when [fixedUs] is null. See [ScoreWindow.alignFirstFrames].
+ */
+internal class StreamOrigin(fixedUs: Long?) {
+    var originUs: Long? = fixedUs
+        private set
+
+    /** [ptsUs] relative to the origin. The first call fixes a first-frame origin. */
+    fun normalize(ptsUs: Long): Long {
+        val origin = originUs ?: ptsUs.also { originUs = it }
+        return ptsUs - origin
+    }
+}
 
 /**
  * Tri-state scoring result. The distinction between the two failure cases is load-bearing:
@@ -329,6 +376,8 @@ object VmafPairScorer {
         // The aligner drops the earlier head (budgeted) until the heads agree within a FIXED
         // 4 ms tolerance; unalignable windows FAIL — misalignment is never scored.
         val aligner = PtsAligner()
+        val refOrigin = StreamOrigin(if (window.alignFirstFrames) null else window.startUs)
+        val distOrigin = StreamOrigin(if (window.alignFirstFrames) null else window.distStartUs)
         // Pairing telemetry accumulators (diagnostics only — no influence on scoring).
         var refSeen = 0
         var distSeen = 0
@@ -350,7 +399,7 @@ object VmafPairScorer {
                         refEnded = true
                     } else {
                         refSeen++
-                        aligner.onRefFrame(r.ptsUs - window.startUs)
+                        aligner.onRefFrame(refOrigin.normalize(r.ptsUs))
                         pendingRef = r
                     }
                 }
@@ -364,7 +413,7 @@ object VmafPairScorer {
                         distEnded = true
                     } else {
                         distSeen++
-                        aligner.onDistFrame(d.ptsUs - window.distStartUs)
+                        aligner.onDistFrame(distOrigin.normalize(d.ptsUs))
                         pendingDist = d
                     }
                 }
@@ -390,9 +439,9 @@ object VmafPairScorer {
                     error.compareAndSet(null, "frame geometry drift")
                     break
                 }
-                when (aligner.decide(r.ptsUs - window.startUs, d.ptsUs - window.distStartUs)) {
+                when (aligner.decide(refOrigin.normalize(r.ptsUs), distOrigin.normalize(d.ptsUs))) {
                     PtsAligner.Action.PAIR -> {
-                        val skewUs = (r.ptsUs - window.startUs) - (d.ptsUs - window.distStartUs)
+                        val skewUs = refOrigin.normalize(r.ptsUs) - distOrigin.normalize(d.ptsUs)
                         if (fed == 0) skewFirstUs = skewUs
                         val absSkew = kotlin.math.abs(skewUs)
                         if (absSkew > skewMaxAbsUs) skewMaxAbsUs = absSkew
@@ -476,7 +525,8 @@ object VmafPairScorer {
             skewMaxAbsUs = skewMaxAbsUs,
             skewMeanAbsUs = if (fed > 0) skewAbsSumUs / fed else 0L,
             refAlignDrops = aligner.refDropped,
-            distAlignDrops = aligner.distDropped
+            distAlignDrops = aligner.distDropped,
+            leadUs = if (window.alignFirstFrames) refOrigin.originUs?.let { it - window.startUs } else null
         )
         val result = WindowScore(
             comparedFrames = perFrame.size,

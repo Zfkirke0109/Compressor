@@ -126,7 +126,15 @@ object OriginalReusePolicy {
         /** True when the source URI opened for READ at decision time. */
         sourceReadableNow: Boolean,
         /** True when some caller explicitly requires a distinct new file regardless. */
-        distinctOutputRequired: Boolean = false
+        distinctOutputRequired: Boolean = false,
+        /**
+         * True once the stream copy has been TRIED and the remuxer could not carry the source
+         * (for example AV1 or VP9 with Opus in WebM). The container guard exists because a copy
+         * may be worth making to normalise an unusual container into MP4. When no copy can be
+         * made at all, that value does not exist, and blocking reuse only turns a keep-original
+         * decision into a reported failure. b161 did that to 2 WebM files.
+         */
+        containerCannotBeCopied: Boolean = false
     ): OriginalReuseDecision {
         if (!isKeepOriginalDecision) {
             return OriginalReuseDecision.Blocked(OriginalReuseBlockReason.NOT_KEEP_ORIGINAL_DECISION)
@@ -139,7 +147,7 @@ object OriginalReusePolicy {
             return OriginalReuseDecision.Blocked(OriginalReuseBlockReason.PRIVACY_STRIP_REQUIRED)
         }
         val normalizedMime = normalizeMime(resolvedContainerMime)
-        if (normalizedMime == null || normalizedMime !in COMPATIBLE_CONTAINER_MIMES) {
+        if (!containerCannotBeCopied && (normalizedMime == null || normalizedMime !in COMPATIBLE_CONTAINER_MIMES)) {
             // Unknown or non-MP4-family container: normalization may be the remux's real value.
             return OriginalReuseDecision.Blocked(OriginalReuseBlockReason.CONTAINER_NORMALIZATION_REQUIRED)
         }

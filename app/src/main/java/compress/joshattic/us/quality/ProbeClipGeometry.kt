@@ -30,6 +30,12 @@ import java.io.File
  *
  * Diagnostic only. Nothing here changes an acceptance decision — a mismatch is reported so a
  * capture can prove the cause, not used to reject or repair a measurement.
+ *
+ * ANSWERED by batch_1790263711162 (b161): firstSample=0 in 715 of 715 probe clips. The clip's
+ * first frame is the source's first frame at or after startUs, written at time 0. Pairing it
+ * against a reference normalised by the requested start left every pair a sub-frame lead apart.
+ * The scorer now pairs the two first frames (ScoreWindow.alignFirstFrames). This line stays so
+ * that a future Media3 or muxer change that breaks the premise shows up in a capture.
  */
 object ProbeClipGeometry {
 

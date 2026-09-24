@@ -78,6 +78,7 @@ class PerceptualQualityProber(private val context: Context) {
         private const val PROBE_EXPORT_TIMEOUT_MS =
             compress.joshattic.us.ExportWatchdogPolicy.PROBE_EXPORT_TIMEOUT_MS
         private const val TOTAL_BUDGET_MS = 150_000L
+        private const val EXPORT_TIMEOUT_PREFIX = "export timed out after"
     }
 
     /**
@@ -94,7 +95,12 @@ class PerceptualQualityProber(private val context: Context) {
         audioBitrate: Int,
         // False for the short above-1080p ladder (ExhaustivePerceptualLosslessPolicy): a passing
         // rung is returned as-is instead of spending one more 4K probe encode on a bisection.
-        allowDownwardRefinement: Boolean = true
+        allowDownwardRefinement: Boolean = true,
+        // The bitrate mode the REAL encode will use. A probe is evidence about that encode only
+        // if it is encoded the same way. Debug builds run the full encode in CBR (the experimental
+        // ceiling, ExperimentalEncoderControls) while probes were always VBR, so every probe pass
+        // in b161 vouched for an encode that was never shipped.
+        bitrateMode: Int = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
     ): ProbeDecision {
         if (!VmafNative.isAvailable) return ProbeDecision(null, emptyList(), null, "vmaf unavailable")
         val windows = QualityProbePolicy.probeWindows(durationMs * 1000L)
@@ -133,8 +139,20 @@ class PerceptualQualityProber(private val context: Context) {
                 )
             }
             probed += ratio
-            val rung = probeOneRatio(sourceUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows)
+            val rung = probeOneRatio(sourceUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows, bitrateMode)
             countRung(rung)
+            if (rung is RungResult.Unavailable && rung.reason.startsWith(EXPORT_TIMEOUT_PREFIX)) {
+                // Every rung exports the same windows, and a clip that took over a minute to cut
+                // at one bitrate will not cut faster at another. The two 30-minute sources in
+                // batch_1790263711162 spent 60 s on each of three rungs this way before the
+                // budget ran out. Stop at the first timeout; nothing was measured either way.
+                return ProbeDecision(
+                    null, probed, lastMeasuredScores,
+                    QualityProbePolicy.ladderExhaustedDetail(measured, misaligned, unavailable, unavailableReasons, misalignedReasons) +
+                        "; remaining rungs skipped after a probe export timeout",
+                    highestMeasuredRejected, measured, misaligned, unavailable
+                )
+            }
             val scores = scoresOf(rung)
             if (!scores.isNullOrEmpty()) lastMeasuredScores = scores
             if (QualityProbePolicy.windowsPass(scores)) {
@@ -151,7 +169,7 @@ class PerceptualQualityProber(private val context: Context) {
                 if (refined != null && System.currentTimeMillis() - startedAt <= TOTAL_BUDGET_MS) {
                     probed += refined
                     val refinedRung = probeOneRatio(
-                        sourceUri, outputMime, refined, targetBitrateForRatio(refined), audioBitrate, windows
+                        sourceUri, outputMime, refined, targetBitrateForRatio(refined), audioBitrate, windows, bitrateMode
                     )
                     countRung(refinedRung)
                     val refinedScores = scoresOf(refinedRung)
@@ -190,7 +208,7 @@ class PerceptualQualityProber(private val context: Context) {
             if (upward != null && upward !in probed) {
                 probed += upward
                 val upRung = probeOneRatio(
-                    sourceUri, outputMime, upward, targetBitrateForRatio(upward), audioBitrate, windows
+                    sourceUri, outputMime, upward, targetBitrateForRatio(upward), audioBitrate, windows, bitrateMode
                 )
                 countRung(upRung)
                 val upScores = scoresOf(upRung)
@@ -219,7 +237,8 @@ class PerceptualQualityProber(private val context: Context) {
         ratio: Double,
         videoBitrate: Int,
         audioBitrate: Int,
-        windows: List<ScoreWindow>
+        windows: List<ScoreWindow>,
+        bitrateMode: Int
     ): RungResult {
         val collected = mutableListOf<WindowScore>()
         for (window in windows) {
@@ -231,10 +250,10 @@ class PerceptualQualityProber(private val context: Context) {
                 // have been reported as timing out. The sealed result keeps the two apart by
                 // construction.
                 val exported = withTimeoutOrNull(PROBE_EXPORT_TIMEOUT_MS) {
-                    exportClip(sourceUri, probeFile, outputMime, videoBitrate, audioBitrate, window)
+                    exportClip(sourceUri, probeFile, outputMime, videoBitrate, audioBitrate, window, bitrateMode)
                 }
                 if (exported == null) {
-                    return RungResult.Unavailable("export timed out after ${PROBE_EXPORT_TIMEOUT_MS}ms")
+                    return RungResult.Unavailable("$EXPORT_TIMEOUT_PREFIX ${PROBE_EXPORT_TIMEOUT_MS}ms")
                 }
                 if (exported is ExportOutcome.Failed) return RungResult.Unavailable(exported.reason)
                 // Verify, rather than assume, that the clip holds the window we asked for. See
@@ -249,8 +268,12 @@ class PerceptualQualityProber(private val context: Context) {
                         context,
                         ref = sourceUri,
                         dist = Uri.fromFile(probeFile),
-                        // The probe file contains ONLY the window, starting at 0.
-                        windows = listOf(ScoreWindow(window.startUs, window.endUs, distStartUs = 0L))
+                        // The probe file contains ONLY the window, and its first frame is the
+                        // source's first frame at or after window.startUs, written at time 0.
+                        // Pair the two first frames; see ScoreWindow.alignFirstFrames.
+                        windows = listOf(
+                            ScoreWindow(window.startUs, window.endUs, distStartUs = 0L, alignFirstFrames = true)
+                        )
                     )
                 }
                 val scores = when (outcome) {
@@ -319,14 +342,19 @@ class PerceptualQualityProber(private val context: Context) {
         outputMime: String,
         videoBitrate: Int,
         audioBitrate: Int,
-        window: ScoreWindow
+        window: ScoreWindow,
+        bitrateMode: Int
     ): ExportOutcome = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
+            val cbr = bitrateMode == MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
             val encoderFactory = DefaultEncoderFactory.Builder(context)
+                // Mirrors compressOne: the CBR experiment disables Media3's format fallback so an
+                // encode is either exactly what was requested or fails.
+                .setEnableFallback(!cbr)
                 .setRequestedVideoEncoderSettings(
                     VideoEncoderSettings.Builder()
                         .setBitrate(videoBitrate)
-                        .setBitrateMode(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+                        .setBitrateMode(bitrateMode)
                         .build()
                 )
                 .build()

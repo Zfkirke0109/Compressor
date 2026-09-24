@@ -357,10 +357,14 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         usedTargetRatio: Double,
         reason: String,
         floorRatio: Double,
-        measuredOvershootFactor: Double? = null
+        measuredOvershootFactor: Double? = null,
+        // False for a SIZE failure (LearningEvidencePolicy.Kind.SIZE): the output was not smaller,
+        // so a higher ratio would only make the next one bigger. The ratio stays where it was;
+        // the failure still counts toward the keep-original latch.
+        stepUp: Boolean = true
     ): LearnedEncodeProfile {
         val current = profile(key)
-        val next = (usedTargetRatio + FAILURE_STEP_UP)
+        val next = (if (stepUp) usedTargetRatio + FAILURE_STEP_UP else current.nextTargetRatio ?: usedTargetRatio)
             .coerceIn(
                 floorRatio.coerceAtMost(BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO),
                 BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_MAX_TARGET_RATIO
@@ -398,7 +402,16 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         // applied a camera-class absolute bitrate floor to every source, which clamped
         // downloaded/low-bitrate videos' targets up to the source bitrate and stream-copied them;
         // v2 orphaned state calibrated against that bug.)
-        private const val PREFS_NAME = "smart_perceptual_profiles_v3"
+        //
+        // v4: every profile stored before b162 was trained on false evidence from two app bugs.
+        //  - The probe scorer paired source frame k with clip frame k+1 whenever a window's lead
+        //    was close to one frame interval (ScoreWindow.alignFirstFrames). Those windows scored
+        //    VMAF 11-86 and fed recordMeasuredProbeRejection as MEASURED rejections.
+        //  - The verifier rejected every bit-exact AAC pass-through below 256 kbps
+        //    (AudioTrackIdentity), and each rejection called recordFailure.
+        // Both are fixed in b162. The store name is bumped again, exactly as for v3, so no learned
+        // ratio, latch or skip trained on that evidence survives.
+        private const val PREFS_NAME = "smart_perceptual_profiles_v4"
 
         // Adaptation is safety-only since the 2026-07-14 VMAF evidence: NO step-down after
         // structural successes (the structural verifier cannot see perceptual damage, so success
