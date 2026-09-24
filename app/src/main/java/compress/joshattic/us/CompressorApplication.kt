@@ -11,5 +11,8 @@ class CompressorApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         CrashRecorder.install(this)
+        // Why did the last process end? Native crashes, ANRs and system kills bypass
+        // CrashRecorder entirely; the platform keeps the reason and this writes it down.
+        Thread({ ProcessExitRecorder.recordPreviousExits(this) }, "exit-reasons").start()
     }
 }
