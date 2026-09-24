@@ -52,6 +52,7 @@ import kotlinx.coroutines.withContext
 import compress.joshattic.us.quality.PairScoreOutcome
 import compress.joshattic.us.quality.PerceptualQualityProber
 import compress.joshattic.us.quality.QualityProbePolicy
+import compress.joshattic.us.quality.ExhaustivePerceptualLosslessPolicy
 import compress.joshattic.us.quality.WindowScore
 import compress.joshattic.us.quality.VmafNative
 import java.io.File
@@ -154,6 +155,10 @@ data class BatchCompressorUiState(
     val codecOption: String = BatchCodecOption.AUTO.label,
     val selectedPreset: String? = null,
     val metadataPrivacyMode: String = MetadataPrivacyMode.PRESERVE_ALL.label,
+    // Exhaustive Perceptually Lossless: measure every eligible file instead of skipping on
+    // class-level shortcuts. See quality.ExhaustivePerceptualLosslessPolicy. On by default —
+    // the quality bar is unchanged; it only spends more probe encodes to find real savings.
+    val exhaustivePerceptualLossless: Boolean = true,
     val thermalMode: String = ThermalBatchMode.BALANCED.label,
     val cooldownSeconds: Int = 10,
     val thermalStatus: String = "Thermal: not checked",
@@ -291,6 +296,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // certification never ran instead of leaving the reader to guess from a null field.
         val pixelCertifiableBlockReason: String? = null,
         val defaultRatio: Double = targetRatio,
+        // True when probes in exhaustive mode overturned a heuristic "keep original" decision.
+        // Such a plan must be certified by MEASURED windows; see ExhaustivePerceptualLosslessPolicy.
+        val requiresMeasuredCertification: Boolean = false,
         // Ratio proven by on-device VMAF probe windows for THIS clip. May sit ABOVE the
         // learned/default target when only a safer retreat rung passed its windows.
         val pixelProvenRatio: Double? = null,
@@ -468,6 +476,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     fun toggleShizukuFallback() {
         _uiState.update { it.copy(useShizukuFallback = !it.useShizukuFallback) }
+    }
+
+    fun setExhaustivePerceptualLossless(enabled: Boolean) {
+        _uiState.update { it.copy(exhaustivePerceptualLossless = enabled) }
     }
 
     fun setMetadataPrivacyMode(label: String) {
@@ -723,7 +735,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 selectedCount = _uiState.value.items.size,
                 // Captured BEFORE the batch mutates it, so the record describes the state the run
                 // actually started from rather than the state it ended in.
-                learnedStateIdentity = runCatching { learningEngine.learnedStateIdentity() }.getOrNull()
+                learnedStateIdentity = runCatching { learningEngine.learnedStateIdentity() }.getOrNull(),
+                exhaustivePerceptualLossless = _uiState.value.exhaustivePerceptualLossless
             )
             _uiState.value.items.filter { it.isAlreadyCompressed }.forEach { skippedItem ->
                 recordDiagnosticJob(
@@ -1273,7 +1286,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         val certScores = (certOutcome as? PairScoreOutcome.Scored)?.windows
                         diagnosticCertWindowScores = compactWindowScores(certScores)
                         diagnosticCertBandingDiag = compactBandingDiag(certScores)
-                        val certOk = if (perceptualPlan.probeEligible) {
+                        val certOk = if (perceptualPlan.requiresMeasuredCertification) {
+                            ExhaustivePerceptualLosslessPolicy.measuredCertificationPasses(certOutcome)
+                        } else if (perceptualPlan.probeEligible) {
                             QualityProbePolicy.certificationOutcomePasses(
                                 usedRatio = perceptualPlan.targetRatio,
                                 defaultRatio = perceptualPlan.defaultRatio,
@@ -2177,14 +2192,19 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // first-ever measured trials); far-below-gate sources get none — for them even a
         // safest-rung pass would save less than measurement noise, so inference stands.
         val bpp = BatchQualityBitratePolicy.sourceBitsPerPixelPerFrame(source)
-        val candidates = QualityProbePolicy.candidateRatiosForSource(plan.defaultRatio, bpp)
+        val candidates = ExhaustivePerceptualLosslessPolicy.candidateRatios(
+            plan.defaultRatio, bpp, _uiState.value.exhaustivePerceptualLossless
+        )
         if (candidates.isEmpty()) return plan
         // Decaying probe-skip latch: after repeated MEASURED safest-rung rejections for this
         // profile class, a few ladders are skipped to save probe encodes/battery — then the
         // next encounter re-probes so fresh pixels (never stale class history) keep the final
         // say. The skip is recorded in the structured trace so captures can tell "skipped by
         // recent measured evidence" apart from "never tried".
-        if (learningEngine.shouldSkipProbes(plan.profileKey)) {
+        val exhaustive = _uiState.value.exhaustivePerceptualLossless
+        if (ExhaustivePerceptualLosslessPolicy.honourProbeSkip(exhaustive) &&
+            learningEngine.shouldSkipProbes(plan.profileKey)
+        ) {
             val latched = learningEngine.noteProbeSkipped(plan.profileKey)
             DiagLog.i(
                 "CompressorProbe",
@@ -2253,7 +2273,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             expectedOvershootFactor = plan.expectedOvershootFactor,
             pixelProvenRatioFloor = proven
         )
-        if (!BatchQualityBitratePolicy.meetsMinimumUsefulSavings(item.originalSize, predicted)) {
+        if (!ExhaustivePerceptualLosslessPolicy.worthEncoding(
+                sourceBytes = item.originalSize,
+                predictedBytes = predicted,
+                exhaustive = exhaustive,
+                meetsNoiseThreshold = BatchQualityBitratePolicy.meetsMinimumUsefulSavings(item.originalSize, predicted)
+            )
+        ) {
             return probeTrace
         }
         // Adopt the proven ratio in BOTH directions: below the learned target it buys more
@@ -2265,7 +2291,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             remuxReason = null,
             remuxWasSourceEfficient = false,
             remuxWasEvidencePreferred = false,
-            pixelProvenRatio = proven
+            pixelProvenRatio = proven,
+            requiresMeasuredCertification = exhaustive && plan.preferRemux
         )
     }
 
@@ -2357,7 +2384,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // a Perceptually Lossless attempt must either encode exactly what was requested or
             // fail fast into the honest remux fallback, never silently change truth-critical
             // properties. Outside the experiment, production behavior is unchanged.
-            val encoderFactory = DefaultEncoderFactory.Builder(context)
+            // Requesting audio encoder settings forces Media3 to decode, mix and re-encode the
+            // audio track. For an AAC source that would only add a lossy generation — see
+            // BatchQualityBitratePolicy.shouldPassThroughAudio — so the audio request is left at
+            // its default and Media3 copies the track bit-exactly.
+            val passThroughAudio = BatchQualityBitratePolicy.shouldPassThroughAudio(
+                item.sourceAudioMime,
+                item.originalAudioBitrate,
+                quality.toMode()
+            )
+            val encoderFactoryBuilder = DefaultEncoderFactory.Builder(context)
                 .setEnableFallback(!useCbrCeiling)
                 .setRequestedVideoEncoderSettings(
                     VideoEncoderSettings.Builder()
@@ -2365,12 +2401,20 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         .setBitrateMode(bitrateMode)
                         .build()
                 )
-                .setRequestedAudioEncoderSettings(
+            if (!passThroughAudio) {
+                encoderFactoryBuilder.setRequestedAudioEncoderSettings(
                     AudioEncoderSettings.Builder()
                         .setBitrate(audioBitrate)
                         .build()
                 )
-                .build()
+            }
+            val encoderFactory = encoderFactoryBuilder.build()
+            DiagLog.i(
+                "CompressorEncoderPlan",
+                "audio; mode=${quality.label}; sourceMime=${item.sourceAudioMime}; " +
+                    "sourceBitrate=${item.originalAudioBitrate}; " +
+                    if (passThroughAudio) "action=passthrough" else "action=reencode; targetBitrate=$audioBitrate"
+            )
 
             var progressJob: Job? = null
             val transformer = Transformer.Builder(context)

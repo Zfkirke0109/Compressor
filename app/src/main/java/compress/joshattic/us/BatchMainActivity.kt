@@ -658,6 +658,33 @@ private fun BatchSettingsCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
+            Text("Perceptually Lossless search", style = MaterialTheme.typography.labelLarge)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Switch(
+                    checked = state.exhaustivePerceptualLossless,
+                    onCheckedChange = { viewModel.setExhaustivePerceptualLossless(it) },
+                    enabled = !state.isCompressing
+                )
+                Text(
+                    if (state.exhaustivePerceptualLossless) "Exhaustive: measure every file" else "Fast: skip likely failures",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+            Text(
+                if (state.exhaustivePerceptualLossless)
+                    "Every SDR video gets a real VMAF test before being kept as-is. Same quality bar — " +
+                        "a file is only replaced when the test proves no visible loss. Slower and uses " +
+                        "more battery. HDR is always kept exactly (no validated HDR quality model)."
+                else
+                    "Skips the VMAF test for files that look already compressed, or whose type " +
+                        "failed recently. Faster, but some compressible files are never tried.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
             Text("Metadata privacy", style = MaterialTheme.typography.labelLarge)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 listOf(

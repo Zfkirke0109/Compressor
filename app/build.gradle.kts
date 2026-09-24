@@ -62,10 +62,31 @@ val buildLabel: String = (System.getenv("COMPRESSOR_BUILD_LABEL") ?: "local")
 /** e.g. "pr44-b123" or "local". Recorded in every session_start; usually also in versionName. */
 val buildTag: String = if (buildNumber > 0) "$buildLabel-b$buildNumber" else buildLabel
 
-// A tagged release ships a clean "1.6.1" — a build suffix is for telling development builds
-// apart, and end users have no use for it. The tag is still recorded in BuildConfig, so a
-// release capture identifies itself just as precisely as a PR one.
-val versionSuffix: String = if (buildTag == "release") "" else "+$buildTag"
+// The version itself climbs with every CI build, so Android — not just a label — sees each new
+// APK as newer, and "which build is this?" is readable straight off Settings > Apps.
+//
+//   versionName  1.6.<run>  e.g. 1.6.155 for run 155; a local build stays 1.6.1-local, and a
+//                tagged release keeps its clean base version.
+//   versionCode  minutes since 2026-01-01 UTC, offset by 100 000. It must be monotonic across
+//                EVERY workflow that produces an installable APK, and run numbers are not: the
+//                PR-debug, CI and release workflows each count separately, so a run-number code
+//                could go backwards when the user installs from a different workflow, and
+//                Android refuses a downgrade. Build time only ever increases. Local builds keep
+//                the historical 26 so a developer install never outranks a CI one.
+val baseVersion = "1.6"
+val basePatch = 1
+val isTaggedRelease: Boolean = buildTag == "release"
+val versionNameComputed: String = when {
+    isTaggedRelease -> "$baseVersion.$basePatch"
+    buildNumber > 0 -> "$baseVersion.$buildNumber"
+    else -> "$baseVersion.$basePatch-local"
+}
+val versionCodeComputed: Int = if (buildNumber > 0 || isTaggedRelease) {
+    val epoch2026 = 1_767_225_600_000L // 2026-01-01T00:00:00Z
+    (100_000 + (System.currentTimeMillis() - epoch2026) / 60_000L).toInt()
+} else {
+    26
+}
 
 android {
     namespace = "compress.joshattic.us"
@@ -76,11 +97,9 @@ android {
         applicationId = "io.github.zfkirke0109.galaxycompressor"
         minSdk = 24
         targetSdk = 36
-        versionCode = 26
-        // "1.6.1+pr44-b123". The "+" segment is SemVer build metadata: Android treats
-        // versionName as an opaque display string, and the suffix is what makes the running app
-        // self-identify in the About screen, the APK filename, and every diagnostic record.
-        versionName = "1.6.1$versionSuffix"
+        versionCode = versionCodeComputed
+        // See versionNameComputed: 1.6.<ci run number>, climbing with every build.
+        versionName = versionNameComputed
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

@@ -75,7 +75,12 @@ class DiagnosticsRecorder private constructor(
      *   of the same corpus are NOT comparable unless this value matches. Recording it is what lets
      *   `compare_sessions.py` say whether a difference between runs was controlled for at all.
      */
-    fun sessionStart(mode: String, selectedCount: Int, learnedStateIdentity: String? = null) {
+    fun sessionStart(
+        mode: String,
+        selectedCount: Int,
+        learnedStateIdentity: String? = null,
+        exhaustivePerceptualLossless: Boolean? = null
+    ) {
         record(
             "session_start",
             fields = mapOf(
@@ -99,7 +104,8 @@ class DiagnosticsRecorder private constructor(
                 "sdkInt" to Build.VERSION.SDK_INT,
                 "mode" to mode,
                 "selectedCount" to selectedCount,
-                "learnedStateIdentity" to learnedStateIdentity,
+                "exhaustivePerceptualLossless" to exhaustivePerceptualLossless,
+            "learnedStateIdentity" to learnedStateIdentity,
                 "privacy" to "redacted-hashes"
             )
         )
@@ -383,14 +389,15 @@ class DiagnosticsRecorder private constructor(
             batchId: String,
             mode: String,
             selectedCount: Int,
-            learnedStateIdentity: String? = null
+            learnedStateIdentity: String? = null,
+            exhaustivePerceptualLossless: Boolean? = null
         ): DiagnosticsRecorder {
             val file = runCatching {
                 val dir = File(context.filesDir, "diagnostics/$batchId").apply { mkdirs() }
                 File(dir, "session.jsonl")
             }.getOrNull()
             return DiagnosticsRecorder(batchId, file, buildIdentity(context)).also {
-                it.sessionStart(mode, selectedCount, learnedStateIdentity)
+                it.sessionStart(mode, selectedCount, learnedStateIdentity, exhaustivePerceptualLossless)
             }
         }
 
