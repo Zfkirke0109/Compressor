@@ -14,6 +14,8 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 /**
  * Writes Compressor's own diagnostics to the public Downloads folder, and hands a live-capture
@@ -141,6 +143,97 @@ object DiagnosticsExporter {
         )
     }
 
+    /**
+     * One ZIP for a scope (see [DiagnosticsArchivePlan]): the raw `session.jsonl` and
+     * `decisions.log` of each included run under `runs/<batchId>/`, the crash and process-exit
+     * reports under `crashes/`, the device log buffer under `device/`, and a `manifest.json` that
+     * says which build and device produced it and what is inside. Built in the cache directory,
+     * then streamed into Downloads, so a failed write never leaves a half archive there.
+     */
+    fun exportArchive(context: Context, scope: DiagnosticsArchivePlan.Scope): ExportResult {
+        val runs = DiagnosticsArchivePlan.sortedNewestFirst(DiagnosticsRecorder.runDirectories(context).map { it.name })
+        val included = DiagnosticsArchivePlan.runsFor(scope, runs)
+        if (included.isEmpty() && scope != DiagnosticsArchivePlan.Scope.EVERYTHING) {
+            return ExportResult.Empty(
+                when (scope) {
+                    DiagnosticsArchivePlan.Scope.PREVIOUS_RUN -> "There is no run before the current one yet."
+                    else -> "No recorded runs yet — run a batch first."
+                }
+            )
+        }
+        val identity = DiagnosticsRecorder.identityMap(context)
+        val versionName = identity["appVersionName"]?.toString() ?: "unknown"
+        val stamp = timestamp()
+        val displayName = DiagnosticsArchivePlan.fileName(versionName, stamp, scope, included)
+        val crashDir = File(context.filesDir, "diagnostics/${CrashReportPlan.DIRECTORY}")
+        val crashNames = crashDir.list()?.toList().orEmpty()
+        val crashes = DiagnosticsArchivePlan.crashReportsFor(scope, included, runs, crashNames)
+        val logcat = readLogcat(DiagnosticsExportPlan.logcatDumpArgsAllProcesses())
+            ?.takeIf { it.isNotBlank() }
+        val learned = if (DiagnosticsArchivePlan.includesLearnedProfiles(scope)) {
+            runCatching {
+                SmartPerceptualProfileEngine(
+                    SmartPerceptualProfileEngine.SharedPreferencesProfileStore(context)
+                ).snapshotLearnedState()
+            }.getOrNull()
+        } else null
+
+        val staging = File(context.cacheDir, "diagnostics_export").apply { mkdirs() }
+        val archive = File(staging, displayName)
+        val entries = mutableListOf<DiagnosticsArchivePlan.Entry>()
+        val built = runCatching {
+            ZipOutputStream(archive.outputStream().buffered()).use { zip ->
+                fun add(path: String, file: File) {
+                    if (!file.isFile || file.length() == 0L) return
+                    zip.putNextEntry(ZipEntry(path).apply { time = file.lastModified() })
+                    file.inputStream().use { it.copyTo(zip) }
+                    zip.closeEntry()
+                    entries += DiagnosticsArchivePlan.Entry(path, file.length())
+                }
+                fun addText(path: String, text: String) {
+                    val bytes = text.toByteArray()
+                    zip.putNextEntry(ZipEntry(path))
+                    zip.write(bytes)
+                    zip.closeEntry()
+                    entries += DiagnosticsArchivePlan.Entry(path, bytes.size.toLong())
+                }
+                for (run in included) {
+                    val dir = File(context.filesDir, "diagnostics/${run.batchId}")
+                    add(DiagnosticsArchivePlan.runEntryPath(run.batchId, "session.jsonl"), File(dir, "session.jsonl"))
+                    add(DiagnosticsArchivePlan.runEntryPath(run.batchId, "decisions.log"), File(dir, "decisions.log"))
+                }
+                for (name in crashes) add(DiagnosticsArchivePlan.crashEntryPath(name), File(crashDir, name))
+                if (logcat != null) addText(DiagnosticsArchivePlan.LOGCAT_ENTRY, logcat)
+                if (learned != null) {
+                    addText(DiagnosticsArchivePlan.LEARNED_PROFILES_ENTRY, JsonText.render(learned))
+                }
+                // The manifest goes last so it can list everything above it, sizes included.
+                addText(
+                    DiagnosticsArchivePlan.MANIFEST_ENTRY,
+                    DiagnosticsArchivePlan.manifest(
+                        identity = identity,
+                        exportedAt = stamp,
+                        scope = scope,
+                        currentBatchId = runs.firstOrNull()?.batchId,
+                        previousBatchId = runs.getOrNull(1)?.batchId,
+                        includedRuns = included,
+                        entries = entries.toList()
+                    )
+                )
+            }
+        }
+        if (built.isFailure) {
+            runCatching { archive.delete() }
+            Log.w(TAG, "diagnostics archive build failed", built.exceptionOrNull())
+            return ExportResult.Failed("Could not build the archive: ${built.exceptionOrNull()?.message ?: "unknown error"}")
+        }
+        return try {
+            writeFile(context, displayName, "application/zip", archive)
+        } finally {
+            runCatching { archive.delete() }
+        }
+    }
+
     /** Every batch's durable decision log, newest first. See [DiagLog]. */
     private fun recordedDecisionLogs(context: Context): List<File> {
         val root = File(context.filesDir, "diagnostics")
@@ -187,6 +280,58 @@ object DiagnosticsExporter {
         } else {
             writeViaLegacyFile(displayName, content, bytes)
         }
+    }
+
+    /** Streams [source] into Downloads under [displayName] with the given MIME type. */
+    private fun writeFile(context: Context, displayName: String, mimeType: String, source: File): ExportResult {
+        val bytes = source.length()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, displayName)
+                put(MediaStore.Downloads.MIME_TYPE, mimeType)
+                put(
+                    MediaStore.Downloads.RELATIVE_PATH,
+                    Environment.DIRECTORY_DOWNLOADS + "/" + DiagnosticsExportPlan.EXPORT_SUBDIRECTORY
+                )
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            val uri = runCatching { context.contentResolver.insert(collection, values) }.getOrNull()
+                ?: return ExportResult.Failed("Downloads is not writable on this device profile.")
+            val wrote = runCatching {
+                context.contentResolver.openOutputStream(uri)?.use { out ->
+                    source.inputStream().use { it.copyTo(out) }
+                } ?: error("no output stream")
+            }
+            runCatching {
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                context.contentResolver.update(uri, values, null, null)
+            }
+            return wrote.fold(
+                onSuccess = { ExportResult.Written(displayName, bytes, uri) },
+                onFailure = {
+                    runCatching { context.contentResolver.delete(uri, null, null) }
+                    Log.w(TAG, "diagnostics archive write failed", it)
+                    ExportResult.Failed("Could not write to Downloads: ${it.message ?: "unknown error"}")
+                }
+            )
+        }
+        @Suppress("DEPRECATION")
+        val dir = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+            DiagnosticsExportPlan.EXPORT_SUBDIRECTORY
+        )
+        return runCatching {
+            dir.mkdirs()
+            File(dir, displayName).also { target -> source.inputStream().use { it.copyTo(target.outputStream()) } }
+        }.fold(
+            onSuccess = { ExportResult.Written(displayName, bytes, Uri.fromFile(it)) },
+            onFailure = {
+                Log.w(TAG, "legacy diagnostics archive export failed", it)
+                ExportResult.Failed("Could not write to Downloads: ${it.message ?: "unknown error"}")
+            }
+        )
     }
 
     private fun writeViaMediaStore(

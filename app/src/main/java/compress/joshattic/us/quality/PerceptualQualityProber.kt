@@ -103,8 +103,17 @@ class PerceptualQualityProber(private val context: Context) {
         bitrateMode: Int = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
     ): ProbeDecision {
         if (!VmafNative.isAvailable) return ProbeDecision(null, emptyList(), null, "vmaf unavailable")
-        val windows = QualityProbePolicy.probeWindows(durationMs * 1000L)
-        if (windows.isEmpty()) return ProbeDecision(null, emptyList(), null, "clip too short to probe")
+        if (QualityProbePolicy.probeWindows(durationMs * 1000L).isEmpty()) {
+            return ProbeDecision(null, emptyList(), null, "clip too short to probe")
+        }
+        val plan = planWindows(sourceUri, durationMs)
+        val windows = plan.windows
+        if (windows.isEmpty()) {
+            return ProbeDecision(
+                null, emptyList(), null,
+                "no probe window could be placed: " + plan.unplaceable.joinToString("; ") { it.reason }
+            )
+        }
 
         val startedAt = System.currentTimeMillis()
         val probed = mutableListOf<Double>()
@@ -142,6 +151,7 @@ class PerceptualQualityProber(private val context: Context) {
             val rung = probeOneRatio(sourceUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows, bitrateMode)
             countRung(rung)
             if (rung is RungResult.Unavailable && rung.reason.startsWith(EXPORT_TIMEOUT_PREFIX)) {
+                describeKeyframes(sourceUri)?.let { DiagLog.w(TAG, "probe export timed out; source $it") }
                 // Every rung exports the same windows, and a clip that took over a minute to cut
                 // at one bitrate will not cut faster at another. The two 30-minute sources in
                 // batch_1790263711162 spent 60 s on each of three rungs this way before the
@@ -237,7 +247,7 @@ class PerceptualQualityProber(private val context: Context) {
         ratio: Double,
         videoBitrate: Int,
         audioBitrate: Int,
-        windows: List<ScoreWindow>,
+        windows: List<ProbeWindowPlanner.PlannedWindow>,
         bitrateMode: Int
     ): RungResult {
         val collected = mutableListOf<WindowScore>()
@@ -261,19 +271,18 @@ class PerceptualQualityProber(private val context: Context) {
                 // scorer pairs correct timestamps against the wrong pixels and no downstream
                 // record can tell. Diagnostic only — this never changes a decision.
                 withContext(Dispatchers.IO) {
-                    ProbeClipGeometry.describe(probeFile, window.startUs, window.endUs)
-                }?.let { DiagLog.i(TAG, it) }
+                    ProbeClipGeometry.describe(probeFile, window.clipStartUs, window.endUs)
+                }?.let { DiagLog.i(TAG, "$it; leadInMs=${window.leadInUs / 1000}; anchor=${window.anchor}") }
                 val outcome = withContext(Dispatchers.IO) {
                     VmafPairScorer.score(
                         context,
                         ref = sourceUri,
                         dist = Uri.fromFile(probeFile),
-                        // The probe file contains ONLY the window, and its first frame is the
-                        // source's first frame at or after window.startUs, written at time 0.
-                        // Pair the two first frames; see ScoreWindow.alignFirstFrames.
-                        windows = listOf(
-                            ScoreWindow(window.startUs, window.endUs, distStartUs = 0L, alignFirstFrames = true)
-                        )
+                        // The clip starts at the planned keyframe (its first frame, written at
+                        // time 0) and runs through the window. The two first frames are paired
+                        // as origins, the lead-in is paired but not scored, and only the window
+                        // is fed to VMAF. See ProbeWindowPlanner and ScoreWindow.leadInUs.
+                        windows = listOf(window.scoreWindowForProbeClip())
                     )
                 }
                 val scores = when (outcome) {
@@ -342,7 +351,7 @@ class PerceptualQualityProber(private val context: Context) {
         outputMime: String,
         videoBitrate: Int,
         audioBitrate: Int,
-        window: ScoreWindow,
+        window: ProbeWindowPlanner.PlannedWindow,
         bitrateMode: Int
     ): ExportOutcome = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
@@ -373,9 +382,13 @@ class PerceptualQualityProber(private val context: Context) {
                     // This does NOT remove the larger residual that appears when the trimmed clip
                     // lands on a different frame than the requested instant; that is a separate
                     // mechanism and PtsAligner's tolerance still guards it.
+                    // The clip starts at the planned KEYFRAME, not at the window: the lead-in
+                    // between them is encoded so the scored frames come from steady-state rate
+                    // control, and starting on a keyframe means nothing before it is decoded.
                     MediaItem.ClippingConfiguration.Builder()
-                        .setStartPositionUs(window.startUs)
+                        .setStartPositionUs(window.clipStartUs)
                         .setEndPositionUs(window.endUs)
+                        .setStartsAtKeyFrame(window.anchor != ProbeWindowPlanner.Anchor.UNINDEXED)
                         .build()
                 )
                 .build()
@@ -437,6 +450,124 @@ class PerceptualQualityProber(private val context: Context) {
     }
 
     /**
+     * Plans the windows for [sourceUri] against its keyframes. Falls back to unindexed windows
+     * (clip starts MIN_LEAD_IN_US before the window) when the source cannot be indexed, so a
+     * source that cannot be seeked still gets a lead-in, just not a cheap one.
+     */
+    private suspend fun planWindows(sourceUri: Uri, durationMs: Long): ProbeWindowPlanner.Plan =
+        withContext(Dispatchers.IO) {
+            val index = MediaExtractorSyncIndex.open(context, sourceUri)
+            try {
+                val plan = ProbeWindowPlanner.plan(durationMs * 1000L, index)
+                DiagLog.i(
+                    TAG,
+                    "window plan; windows=" + plan.windows.joinToString(",") {
+                        "[${it.startUs / 1000}..${it.endUs / 1000}ms clip@${it.clipStartUs / 1000}ms ${it.anchor}]"
+                    } + (if (plan.unplaceable.isEmpty()) "" else "; unplaceable=" + plan.unplaceable.joinToString(",") {
+                        "${it.wantedStartUs / 1000}ms(${it.reason})"
+                    })
+                )
+                plan
+            } finally {
+                index?.close()
+            }
+        }
+
+    /**
+     * Keyframe structure of a source, for the record when an export times out. Both 30-minute
+     * sources in b163 timed out at 60 s exporting a 1.2 s clip and nothing in the capture said why.
+     */
+    suspend fun describeKeyframes(sourceUri: Uri): String? = withContext(Dispatchers.IO) {
+        MediaExtractorSyncIndex.open(context, sourceUri)?.use { it.structure()?.compact() }
+    }
+
+    /**
+     * Control tests for the measurement path itself, on one file. Three comparisons through the
+     * exact decode-and-pair path the ladder and certification use:
+     *
+     *  1. the source against ITSELF: every scored frame must be 100 (VMAF of identical frames).
+     *     Anything less is a defect in decoding, cropping, rotation or pairing, not in any encoder;
+     *  2. the source against a stream copy of itself (Remux Only): the same bits in a new
+     *     container, so again 100 on every frame. This exercises the container/edit-list and
+     *     timestamp path that a probe clip goes through;
+     *  3. the source against a generous encode of the first window (twice the source video
+     *     bitrate, with the same lead-in as a probe): a ceiling for what this encoder can reach on
+     *     this content. If the ladder's safest rung scores far below this, bitrate is the limit;
+     *     if this ceiling is itself low, the limit is the encoder or the measurement.
+     *
+     * The report is written to the decision log and returned for the screen. Nothing here changes
+     * a decision.
+     */
+    suspend fun selfCheck(
+        sourceUri: Uri,
+        durationMs: Long,
+        sourceVideoBitrate: Int,
+        outputMime: String
+    ): String {
+        if (!VmafNative.isAvailable) return "self-check: VMAF is not available on this device build"
+        val plan = planWindows(sourceUri, durationMs)
+        if (plan.windows.isEmpty()) return "self-check: no window could be placed (clip too short or no keyframe in reach)"
+        val certWindows = plan.windows.map { it.scoreWindowForCertification() }
+        val lines = mutableListOf<String>()
+        fun describe(label: String, outcome: PairScoreOutcome) {
+            val text = when (outcome) {
+                is PairScoreOutcome.Scored -> outcome.windows.joinToString("; ") { w ->
+                    "%.2f/%.2f/%.2f".format(java.util.Locale.US, w.mean, w.p5, w.min) +
+                        (w.frameDiag?.let { " frames[${it.compact()}]" } ?: "") +
+                        (w.pairing?.let { " pairing[${it.compact()}]" } ?: "")
+                }
+                is PairScoreOutcome.MisalignmentRejected -> "misaligned: ${outcome.reason}"
+                PairScoreOutcome.Unavailable -> "unavailable"
+            }
+            lines += "$label: $text"
+            DiagLog.i(TAG, "self-check $label: $text")
+        }
+        describe("source vs itself (expect 100 on every frame)", withContext(Dispatchers.IO) {
+            VmafPairScorer.score(context, sourceUri, sourceUri, certWindows)
+        })
+        val remux = File.createTempFile("selfcheck_remux_", ".mp4", context.cacheDir)
+        try {
+            val remuxed = withContext(Dispatchers.IO) {
+                runCatching {
+                    compress.joshattic.us.Mp4MetadataRemuxer.remuxSourceWithoutReencode(
+                        context, sourceUri, remux, compress.joshattic.us.VideoMetadataSnapshot()
+                    )
+                }
+            }
+            if (remuxed.isSuccess) {
+                describe("source vs stream copy (expect 100 on every frame)", withContext(Dispatchers.IO) {
+                    VmafPairScorer.score(context, sourceUri, Uri.fromFile(remux), certWindows)
+                })
+            } else {
+                lines += "source vs stream copy: remux not possible for this container (${remuxed.exceptionOrNull()?.message})"
+            }
+        } finally {
+            runCatching { remux.delete() }
+        }
+        val window = plan.windows.first()
+        val clip = File.createTempFile("selfcheck_ceiling_", ".mp4", context.cacheDir)
+        try {
+            val generous = (sourceVideoBitrate.toLong() * 2L).coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+            val exported = withTimeoutOrNull(PROBE_EXPORT_TIMEOUT_MS) {
+                exportClip(sourceUri, clip, outputMime, generous, 0, window, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+            }
+            when (exported) {
+                null -> lines += "source vs 2x-bitrate encode: export timed out"
+                is ExportOutcome.Failed -> lines += "source vs 2x-bitrate encode: ${exported.reason}"
+                ExportOutcome.Success -> describe(
+                    "source vs 2x-bitrate encode of window 1 (encoder ceiling; ratio 2.00, lead-in ${window.leadInUs / 1000} ms)",
+                    withContext(Dispatchers.IO) {
+                        VmafPairScorer.score(context, sourceUri, Uri.fromFile(clip), listOf(window.scoreWindowForProbeClip()))
+                    }
+                )
+            }
+        } finally {
+            runCatching { clip.delete() }
+        }
+        return lines.joinToString("\n")
+    }
+
+    /**
      * Sampled pixel certification of a completed full encode against its source.
      * The tri-state outcome is load-bearing for the caller: [PairScoreOutcome.Unavailable]
      * keeps the legacy structural fallback at the default ratio, while
@@ -445,7 +576,11 @@ class PerceptualQualityProber(private val context: Context) {
      */
     suspend fun certify(sourceUri: Uri, outputFile: File, durationMs: Long): PairScoreOutcome {
         if (!VmafNative.isAvailable) return PairScoreOutcome.Unavailable
-        val windows = QualityProbePolicy.probeWindows(durationMs * 1000L)
+        if (QualityProbePolicy.probeWindows(durationMs * 1000L).isEmpty()) return PairScoreOutcome.Unavailable
+        // The SAME windows the ladder scored, so probe and certification scores of one file
+        // compare frame for frame; and each window follows a source keyframe, so the reference
+        // decode does not have to run from a keyframe minutes earlier.
+        val windows = planWindows(sourceUri, durationMs).windows.map { it.scoreWindowForCertification() }
         if (windows.isEmpty()) return PairScoreOutcome.Unavailable
         return withContext(Dispatchers.IO) {
             // Banding telemetry is collected on certification only, never on ladder rungs: it is

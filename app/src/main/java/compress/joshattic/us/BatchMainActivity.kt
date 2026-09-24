@@ -180,7 +180,7 @@ private fun BatchCompressorScreen(
             }
 
             item { BatchSettingsCard(state, viewModel, context, requestOriginalMediaAccess) }
-            item { DiagnosticsExportCard(context, state.isCompressing) }
+            item { DiagnosticsExportCard(context, state.isCompressing, state.items.any { !it.isAlreadyCompressed }, viewModel::runScorerSelfCheck) }
             if (state.items.isNotEmpty()) {
                 item { BatchSummaryCard(state) }
                 item { PreservationReportCard(state) }
@@ -319,7 +319,12 @@ private fun HighQualityRetryCard(count: Int, onRetry: () -> Unit) {
  * every state.
  */
 @Composable
-private fun DiagnosticsExportCard(context: Context, isCompressing: Boolean) {
+private fun DiagnosticsExportCard(
+    context: Context,
+    isCompressing: Boolean,
+    hasSelection: Boolean,
+    onRunScorerSelfCheck: (Context) -> Unit
+) {
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
@@ -383,29 +388,64 @@ private fun DiagnosticsExportCard(context: Context, isCompressing: Boolean) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
+            var scope by remember { mutableStateOf(DiagnosticsArchivePlan.Scope.CURRENT_RUN) }
+            Text("What to include", style = MaterialTheme.typography.labelLarge)
+            @OptIn(ExperimentalLayoutApi::class)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                DiagnosticsArchivePlan.Scope.entries.forEach { option ->
+                    FilterChip(
+                        selected = scope == option,
+                        onClick = { scope = option },
+                        label = { Text(option.label) },
+                        enabled = !busy
+                    )
+                }
+            }
             Button(
-                onClick = { runExport { DiagnosticsExporter.exportSessions(context) } },
+                onClick = { runExport { DiagnosticsExporter.exportArchive(context, scope) } },
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !busy
-            ) { Text("Save batch records to Downloads") }
+            ) { Text("Save diagnostics ZIP to Downloads") }
             Text(
-                "The structured per-job records (session.jsonl) for every batch this app has run.",
+                when (scope) {
+                    DiagnosticsArchivePlan.Scope.CURRENT_RUN ->
+                        "The newest run: its batch records and decision log, any crash or process-exit " +
+                            "report written since it started, and the device log buffer."
+                    DiagnosticsArchivePlan.Scope.PREVIOUS_RUN ->
+                        "The run before the newest one, with the crash reports from its time."
+                    DiagnosticsArchivePlan.Scope.ALL_RUNS ->
+                        "Every retained run (the newest ${DiagnosticsRetention.MAX_RUNS}), every crash report, and the device log buffer."
+                    DiagnosticsArchivePlan.Scope.EVERYTHING ->
+                        "All runs, all crash reports, the device log buffer and the learned profiles. " +
+                            "The file is named Compressor-v<version>-<time>-Everything.zip."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                "One archive with a manifest.json; each run keeps its raw session.jsonl and " +
+                    "decisions.log under runs/<batchId>/. Export soon after a batch: the device log " +
+                    "buffer is small and overwrites itself, though the app's own records do not.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            OutlinedButton(
-                onClick = { runExport { DiagnosticsExporter.exportLogcat(context) } },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !busy
-            ) { Text("Save log to Downloads") }
+            HorizontalDivider()
+
+            Text("Scorer self-check", style = MaterialTheme.typography.labelLarge)
             Text(
-                "This app's own log lines only — including the per-check verification detail that " +
-                    "the batch records do not carry. Export soon after a batch: the system log " +
-                    "buffer is small and overwrites itself.",
+                "Control tests of the measurement itself on the first selected video: the source " +
+                    "against itself and against a stream copy must score 100 on every frame; a " +
+                    "2x-bitrate encode of one window shows this encoder's ceiling. The result appears " +
+                    "in the status line and in the next diagnostics ZIP.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            OutlinedButton(
+                onClick = { onRunScorerSelfCheck(context) },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !busy && !isCompressing && hasSelection
+            ) { Text("Run scorer self-check") }
 
             HorizontalDivider()
 

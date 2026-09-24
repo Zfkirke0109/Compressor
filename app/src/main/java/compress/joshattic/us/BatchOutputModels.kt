@@ -110,6 +110,10 @@ data class OutputVerificationReport(
     val criticalFieldsComplete: Boolean = false,
     val verified: Boolean = false,
     val durationParity: String = "",
+    // What happened to the audio, stated separately from the video verdict: see AudioPreservation.
+    // A Perceptually Lossless verdict is a claim about the pixels; the audio is either a proven
+    // bit-identical copy, or it was re-encoded and NOT validated as perceptually lossless.
+    val audioBasis: String? = null,
     // True only when a Perceptually Lossless output failed SOLELY on the inferred video
     // bitrate floor — every structural, color, audio, timing, and metadata check passed.
     // That one case may be re-judged by sampled pixel certification (measured pixels
@@ -210,7 +214,8 @@ data class OutputVerificationReport(
             "Location: $location",
             "Rotation: $rotation",
             "Size: $fileSize"
-        ) + (if (durationParity.isNotBlank()) listOf("Duration/frames: $durationParity") else emptyList())
+        ) + (if (durationParity.isNotBlank()) listOf("Duration/frames: $durationParity") else emptyList()) +
+            (audioBasis?.let { listOf("Audio preservation: $it") } ?: emptyList())
 
     /**
      * Records whether sampled pixel scoring ACTUALLY certified this output, and qualifies the

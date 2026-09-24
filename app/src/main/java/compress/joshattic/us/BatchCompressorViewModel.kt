@@ -663,6 +663,37 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         startCompression(context)
     }
 
+    /**
+     * Runs the measurement-path control tests (PerceptualQualityProber.selfCheck) on the first
+     * selected video and shows the result. Writes to a decision log of its own so the numbers are
+     * in the next export. Never runs alongside a batch.
+     */
+    fun runScorerSelfCheck(callerContext: Context) {
+        val context = callerContext.applicationContext
+        val current = _uiState.value
+        if (current.isCompressing || compressionJob?.isCompleted == false) return
+        val item = current.items.firstOrNull { !it.isAlreadyCompressed } ?: run {
+            _uiState.update { it.copy(statusMessage = "Select a video first, then run the scorer self-check.") }
+            return
+        }
+        viewModelScope.launch(Dispatchers.Main) {
+            _uiState.update { it.copy(statusMessage = "Scorer self-check running on ${item.originalName}…") }
+            val stamp = System.currentTimeMillis()
+            DiagLog.attach(context, "selfcheck_$stamp")
+            val report = try {
+                val mime = runCatching { chooseOutputMime(BatchCodecOption.AUTO, item, BatchQualityPreset.ORIGINAL) }
+                    .getOrDefault(MimeTypes.VIDEO_H265)
+                DiagLog.i("CompressorProbe", "self-check start; job=${diagnosticJobId(item)}; source=${item.originalWidth}x${item.originalHeight}@${item.originalFps}; mime=${item.sourceVideoMime}")
+                qualityProber.selfCheck(item.sourceUri, item.durationMs, item.toSourceInfo().videoBitrate, mime)
+            } catch (e: Exception) {
+                "self-check failed: ${e.message ?: e.javaClass.simpleName}"
+            } finally {
+                DiagLog.detach()
+            }
+            _uiState.update { it.copy(statusMessage = "Scorer self-check (${item.originalName}):\n$report") }
+        }
+    }
+
     fun startCompression(callerContext: Context) {
         // The batch outlives the screen that started it: it keeps running through rotation, a
         // theme change, or the activity being recreated in the background. Holding the caller's
@@ -677,1247 +708,1479 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         }
 
         compressionJob = viewModelScope.launch(Dispatchers.Main + compressionExceptionHandler) {
-            val batchStartedAt = System.currentTimeMillis()
+            runBatch(context)
+        }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // The batch run, one stage per function.
+    //
+    // Until b163 the whole run was one suspend lambda. Kotlin compiles a suspend lambda into a
+    // single state machine, and this one had grown to 215,736 dex code units, 27x the next
+    // largest method in the app and 20x ART's "huge method" threshold, above which ART never
+    // JIT-compiles a method and always interprets it. On Android 17 that method died with
+    //   Check failed: throw_dex_pc < accessor.InsnsSizeInCodeUnits()
+    //   (throw_dex_pc=404595, accessor.InsnsSizeInCodeUnits()=215736)
+    // inside ART's interpreter while it tried to raise a NullPointerException from the method:
+    // the dex pc ART computed lay outside the method's own code, so instead of a catchable
+    // exception the process aborted, and whatever the NullPointerException was is lost.
+    //
+    // Each stage below is its own method with its own, much smaller, state machine. The state
+    // that used to live in the lambda's locals lives in [ItemRun], where it can be read by
+    // every stage and by tests. Behaviour is unchanged; only the shape is.
+    // ---------------------------------------------------------------------------------------
+
+    /** What one batch run holds constant from start to finish. */
+    private class BatchRun(
+        val context: Context,
+        val diagnostics: DiagnosticsRecorder,
+        val batchStartedAt: Long,
+        val quality: BatchQualityPreset,
+        val frameRate: BatchFrameRateOption,
+        val codec: BatchCodecOption,
+        val privacyMode: MetadataPrivacyMode,
+        val exhaustivePerceptualLossless: Boolean
+    )
+
+    /**
+     * The state of one item as it moves through the stages. The `diagnostic*` fields are what
+     * the structured record and the failure handler need to stay honest after a fallback: they
+     * remember what was planned and why it was discarded, even when verification is re-run on a
+     * stream copy.
+     */
+    private class ItemRun(
+        val run: BatchRun,
+        val index: Int,
+        val item: BatchVideoItem,
+        val thermalWindow: ThermalBatchSnapshot,
+        val itemStartedAt: Long,
+        // The cooldown applied after the PREVIOUS item, for this item's record. Timing only.
+        val precedingHandoffCooldownMs: Long,
+        val plannedFps: Int?
+    ) {
+        var diagnosticEffectiveQuality: BatchQualityPreset = run.quality
+        var diagnosticResolvedMime: String? = null
+        var diagnosticTargetRatio: Double? = null
+        var diagnosticTargetVideoBitrate: Int? = null
+        var diagnosticDecisionReason: String? = null
+        var diagnosticSourceAlreadyEfficient = false
+        var diagnosticEvidencePreferredRemux = false
+        // The plan, kept so the failure handler can still retain the original when the stream
+        // copy that should carry it turns out impossible.
+        var diagnosticPlan: PerceptualLosslessPlan? = null
+        var diagnosticEncoderFailed = false
+        // When a PL encode is attempted then discarded, WHY (and the discarded encode's measured
+        // video bitrate), so the record stays honest after verification is re-run on the remux.
+        var diagnosticFallbackReason: String? = null
+        var diagnosticDiscardedVideoBitrate: Int? = null
+        // Why the keep-original fast path declined to reuse the source (enum name).
+        var diagnosticReuseBlockReason: String? = null
+        // Compact per-window scores of the final output's certification, pass OR fail.
+        var diagnosticCertWindowScores: String? = null
+        var diagnosticCertBandingDiag: String? = null
+        var diagnosticCertV1Scores: String? = null
+        // Why certification did or did not run. Never left null on a PL job.
+        var diagnosticCertStatus: String? = null
+        // True ONLY once sampled VMAF has measured this output and passed.
+        var pixelCertifiedThisRun = false
+        val candidateFiles = linkedSetOf<File>()
+        var itemOutputAccepted = false
+
+        // Planning stage.
+        var resolvedMime: String? = null
+        var codecLabel: String = "H.264"
+        var perceptualPlan: PerceptualLosslessPlan? = null
+        var effectiveQuality: BatchQualityPreset = run.quality
+        var preEncodeRemuxNote: String? = null
+
+        // Output stage.
+        var encodeAttempt: EncodeAttemptResult? = null
+        var remuxResult: Mp4MetadataRemuxResult? = null
+        var outputFile: File? = null
+        var outputUri: Uri? = null
+        var outputSize: Long = 0L
+
+        // Verification stage.
+        var verification: OutputVerificationReport? = null
+        var measuredOvershoot: Double? = null
+        var floorRecoveryCertScores: List<WindowScore>? = null
+        var failedFloorRecoveryStatus: String? = null
+
+        /** The cooldown applied after this item, carried into the next item's record. */
+        var cooldownForNextItemMs = 0L
+
+        val elapsedMs: Long get() = System.currentTimeMillis() - itemStartedAt
+
+        fun deleteCandidatesUnlessAccepted() {
+            if (!itemOutputAccepted) candidateFiles.forEach { runCatching { it.delete() } }
+        }
+    }
+
+    private suspend fun runBatch(context: Context) {
+        val batchStartedAt = System.currentTimeMillis()
+        _uiState.update {
+            it.copy(
+                isCompressing = true,
+                errorMessage = null,
+                batchMetrics = null,
+                highQualityRetryCandidates = emptyList(),
+                statusMessage = "Compressing with thermal-safe batch pacing."
+            )
+        }
+
+        val quality = qualityFromLabel(_uiState.value.qualityPreset)
+        val frameRate = frameRateFromLabel(_uiState.value.frameRateOption)
+        val codec = codecFromLabel(_uiState.value.codecOption)
+        val privacyMode = MetadataPrivacyMode.fromLabel(_uiState.value.metadataPrivacyMode)
+        val exhaustivePerceptualLossless = _uiState.value.exhaustivePerceptualLossless
+        // Reclaim orphaned cache files, but keep anything the CURRENT results still reference:
+        // re-running while previous results are still on screen must not delete files that
+        // share/save are still offering. Those entries are replaced by this run's own outputs.
+        clearBatchCache(preservePaths = _uiState.value.items.mapNotNull { it.outputPath }.toSet())
+        resetItemsForRun(quality, codec, frameRate)
+
+        // Package, version, build commit, Android user id, and profile kind are resolved inside
+        // start() from the context + BuildConfig so every record self-identifies its environment.
+        // Mirror the decision lines into a file this app owns. See DiagLog: the structured
+        // records survive every capture because they are written to filesDir, while the
+        // human-readable "why" lines lived only in a device-wide ring buffer that has now
+        // been evicted out from under three consecutive rounds of evidence.
+        DiagLog.attach(context, "batch_$batchStartedAt")
+        val diagnostics = DiagnosticsRecorder.start(
+            context = context,
+            batchId = "batch_$batchStartedAt",
+            mode = quality.label,
+            selectedCount = _uiState.value.items.size,
+            // Captured BEFORE the batch mutates it, so the record describes the state the run
+            // actually started from rather than the state it ended in.
+            learnedStateIdentity = runCatching { learningEngine.learnedStateIdentity() }.getOrNull(),
+            exhaustivePerceptualLossless = exhaustivePerceptualLossless
+        )
+        val run = BatchRun(
+            context = context,
+            diagnostics = diagnostics,
+            batchStartedAt = batchStartedAt,
+            quality = quality,
+            frameRate = frameRate,
+            codec = codec,
+            privacyMode = privacyMode,
+            exhaustivePerceptualLossless = exhaustivePerceptualLossless
+        )
+        _uiState.value.items.filter { it.isAlreadyCompressed }.forEach { skippedItem ->
+            recordDiagnosticJob(
+                diagnostics = diagnostics,
+                item = skippedItem,
+                requestedQuality = quality,
+                effectiveQuality = quality,
+                resolvedMime = null,
+                plannedTargetRatio = null,
+                plannedTargetVideoBitrate = null,
+                wasStreamCopy = false,
+                verification = null,
+                outputSize = 0L,
+                terminal = BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED,
+                elapsedMs = 0L
+            )
+        }
+        var runCancelled = false
+        var runFailed = false
+        var sessionFailReason = "unknown"
+
+        try {
+            // Enter foreground protection + CPU wake lock as the FIRST action inside the try, so
+            // begin() and the end() in this try's finally are a symmetric bracket that no setup or
+            // encode throw can leak. The app is foreground here (the user just tapped Start), which
+            // satisfies the Android 12+ background-start restriction; the guard is idempotent and
+            // its effects are best-effort, so this can never abort the batch. Only cheap pre-try
+            // setup (cache clear, state init) runs before this — never an encode.
+            batchGuard.begin()
             // Post-item thermal cooldown that was applied BEFORE the current item started (i.e. the
             // cooldown after the previous item). Carried across iterations so each item's structured
             // record shows the handoff delay that preceded it. Timing telemetry only.
             var precedingCooldownMs = 0L
-            _uiState.update {
-                it.copy(
-                    isCompressing = true,
-                    errorMessage = null,
-                    batchMetrics = null,
-                    highQualityRetryCandidates = emptyList(),
-                    statusMessage = "Compressing with thermal-safe batch pacing."
-                )
+            val items = _uiState.value.items
+            for ((index, item) in items.withIndex()) {
+                if (item.isAlreadyCompressed) continue
+                precedingCooldownMs = processItem(run, index, item, precedingCooldownMs)
             }
-
-            val quality = qualityFromLabel(_uiState.value.qualityPreset)
-            val frameRate = frameRateFromLabel(_uiState.value.frameRateOption)
-            val codec = codecFromLabel(_uiState.value.codecOption)
-            val privacyMode = MetadataPrivacyMode.fromLabel(_uiState.value.metadataPrivacyMode)
-            val exhaustivePerceptualLossless = _uiState.value.exhaustivePerceptualLossless
-            // Reclaim orphaned cache files, but keep anything the CURRENT results still reference:
-            // re-running while previous results are still on screen must not delete files that
-            // share/save are still offering. Those entries are replaced by this run's own outputs.
-            clearBatchCache(preservePaths = _uiState.value.items.mapNotNull { it.outputPath }.toSet())
-
-            _uiState.update { state ->
-                state.copy(
-                    items = state.items.map { item ->
-                        if (item.isAlreadyCompressed) {
-                            item.copy(
-                                status = BatchItemStatus.Skipped,
-                                progress = 1f,
-                                currentOutputSize = 0L,
-                                targetOutputSize = 0L,
-                                outputUri = null,
-                                outputPath = null,
-                                outputSize = 0L,
-                                outputMode = null,
-                                verificationReport = null,
-                                metrics = null,
-                                terminalResult = BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED,
-                                message = "Already compressed by Compressor — skipped."
-                            )
-                        } else {
-                            item.copy(
-                                status = BatchItemStatus.Pending,
-                                progress = 0f,
-                                currentOutputSize = 0L,
-                                targetOutputSize = estimateOutputSize(item, quality, codec, frameRate),
-                                outputUri = null,
-                                outputPath = null,
-                                outputSize = 0L,
-                                outputMode = null,
-                                verificationReport = null,
-                                metrics = null,
-                                terminalResult = null,
-                                message = null
-                            )
-                        }
-                    }
-                )
+            publishBatchFinished(batchStartedAt)
+        } catch (e: CancellationException) {
+            runCancelled = true
+            throw e
+        } catch (e: Throwable) {
+            runFailed = true
+            sessionFailReason = e.message ?: e.javaClass.simpleName
+            throw e
+        } finally {
+            // Release foreground protection + wake lock FIRST, before any other finally work, so a
+            // throw in the rest of this block cannot leak them. Idempotent — safe even if begin()
+            // never fired (e.g. a pre-try setup failure).
+            batchGuard.end()
+            DiagLog.detach()
+            if (runCancelled) publishBatchCancelled(run)
+            // Emit the honest session terminal record: cancelled batches get session_cancelled,
+            // a completed run gets session_summary. A hard-failure path is reported below.
+            val sessionElapsed = System.currentTimeMillis() - batchStartedAt
+            when {
+                runCancelled -> diagnostics.sessionCancelled(sessionElapsed, reason = "user_cancelled")
+                runFailed -> diagnostics.sessionFailed(sessionElapsed, reason = sessionFailReason)
+                else -> diagnostics.sessionSummary(sessionElapsed)
             }
+            activeTransformer = null
+            compressionJob = null
+        }
+    }
 
-            // Package, version, build commit, Android user id, and profile kind are resolved inside
-            // start() from the context + BuildConfig so every record self-identifies its environment.
-            // Mirror the decision lines into a file this app owns. See DiagLog: the structured
-            // records survive every capture because they are written to filesDir, while the
-            // human-readable "why" lines lived only in a device-wide ring buffer that has now
-            // been evicted out from under three consecutive rounds of evidence.
-            DiagLog.attach(context, "batch_$batchStartedAt")
-            val diagnostics = DiagnosticsRecorder.start(
-                context = context,
-                batchId = "batch_$batchStartedAt",
-                mode = quality.label,
-                selectedCount = _uiState.value.items.size,
-                // Captured BEFORE the batch mutates it, so the record describes the state the run
-                // actually started from rather than the state it ended in.
-                learnedStateIdentity = runCatching { learningEngine.learnedStateIdentity() }.getOrNull(),
-                exhaustivePerceptualLossless = exhaustivePerceptualLossless
-            )
-            _uiState.value.items.filter { it.isAlreadyCompressed }.forEach { skippedItem ->
-                recordDiagnosticJob(
-                    diagnostics = diagnostics,
-                    item = skippedItem,
-                    requestedQuality = quality,
-                    effectiveQuality = quality,
-                    resolvedMime = null,
-                    plannedTargetRatio = null,
-                    plannedTargetVideoBitrate = null,
-                    wasStreamCopy = false,
-                    verification = null,
-                    outputSize = 0L,
-                    terminal = BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED,
-                    elapsedMs = 0L
-                )
-            }
-            var runCancelled = false
-            var runFailed = false
-            var sessionFailReason = "unknown"
-
-            try {
-                // Enter foreground protection + CPU wake lock as the FIRST action inside the try, so
-                // begin() and the end() in this try's finally are a symmetric bracket that no setup or
-                // encode throw can leak. The app is foreground here (the user just tapped Start), which
-                // satisfies the Android 12+ background-start restriction; the guard is idempotent and
-                // its effects are best-effort, so this can never abort the batch. Only cheap pre-try
-                // setup (cache clear, state init) runs before this — never an encode.
-                batchGuard.begin()
-                _uiState.value.items.forEachIndexed { index, item ->
+    private fun resetItemsForRun(quality: BatchQualityPreset, codec: BatchCodecOption, frameRate: BatchFrameRateOption) {
+        _uiState.update { state ->
+            state.copy(
+                items = state.items.map { item ->
                     if (item.isAlreadyCompressed) {
-                        return@forEachIndexed
-                    }
-
-                    val thermalWindow = waitForThermalWindow(context, item.originalName)
-                    val itemStartedAt = System.currentTimeMillis()
-                    // The cooldown applied after the PREVIOUS item (0 after a no-encode item or a
-                    // skip). Snapshot for this item's structured record, then clear so a following
-                    // early-returning item correctly reports 0.
-                    val precedingHandoffCooldownMs = precedingCooldownMs
-                    precedingCooldownMs = 0L
-                    val plannedFps = outputFpsFor(item, frameRate, quality)
-                    var diagnosticEffectiveQuality = quality
-                    var diagnosticResolvedMime: String? = null
-                    var diagnosticTargetRatio: Double? = null
-                    var diagnosticTargetVideoBitrate: Int? = null
-                    var diagnosticDecisionReason: String? = null
-                    var diagnosticSourceAlreadyEfficient = false
-                    var diagnosticEvidencePreferredRemux = false
-                    // The item's plan, kept outside the try so the per-item catch can still retain
-                    // the original when the stream copy that should carry it turns out impossible.
-                    var diagnosticPlan: PerceptualLosslessPlan? = null
-                    var diagnosticEncoderFailed = false
-                    // When a PL encode is attempted then discarded for a remux, preserve WHY (and the
-                    // discarded encode's measured video bitrate) so the structured record stays honest
-                    // even after verification is re-run on the remux.
-                    var diagnosticFallbackReason: String? = null
-                    var diagnosticDiscardedVideoBitrate: Int? = null
-                    // Why the keep-original fast path declined to reuse the source (enum name),
-                    // recorded on the full-remux record so captures show the guard that fired.
-                    var diagnosticReuseBlockReason: String? = null
-                    // Compact per-window scores of the final output's sampled certification —
-                    // recorded pass OR fail so captures carry the real numbers behind verdicts.
-                    var diagnosticCertWindowScores: String? = null
-                    var diagnosticCertBandingDiag: String? = null
-                    var diagnosticCertV1Scores: String? = null
-                    // Why certification did or did not run. An unexplained absence of evidence is
-                    // indistinguishable from a bug, so this is never left null on a PL job.
-                    var diagnosticCertStatus: String? = null
-                    // True ONLY once sampled VMAF has actually measured this output and passed. Stays
-                    // false when certification never ran (not probe-eligible) or returned no measured
-                    // evidence (Unavailable/misaligned) and the encode was accepted structurally.
-                    var pixelCertifiedThisRun = false
-                    val candidateFiles = linkedSetOf<File>()
-                    var itemOutputAccepted = false
-                    updateItem(index) {
-                        it.copy(
-                            status = BatchItemStatus.Compressing,
-                            progress = 0f,
-                            currentOutputSize = 0L,
-                            targetOutputSize = estimateOutputSize(it, quality, codec, frameRate),
-                            message = if (quality == BatchQualityPreset.REMUX_ONLY) {
-                                "Remuxing: video/audio copied unchanged • no re-encode • ${thermalWindow.thermalLabel}"
-                            } else {
-                                "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality, codec, frameRate))} • ${codec.label}${plannedFps?.let { fps -> " • ${fps}fps" } ?: " • source FPS"} • ${thermalWindow.thermalLabel}"
-                            }
-                        )
-                    }
-                    try {
-                    val resolvedMime = if (quality == BatchQualityPreset.REMUX_ONLY) {
-                        null
-                    } else {
-                        chooseOutputMime(codec, item, quality)
-                    }
-                    diagnosticResolvedMime = resolvedMime
-                    val codecLabel = when (resolvedMime) {
-                        MimeTypes.VIDEO_H265 -> "HEVC"
-                        MimeTypes.VIDEO_AV1 -> "AV1"
-                        else -> "H.264"
-                    }
-                    var effectiveQuality = quality
-                    var preEncodeRemuxNote: String? = null
-                    val perceptualPlan = if (quality == BatchQualityPreset.ORIGINAL && resolvedMime != null) {
-                        val basePlan = buildPerceptualLosslessPlan(item, resolvedMime, exhaustivePerceptualLossless)
-                        if (basePlan.probeEligible) {
-                            updateItem(index) {
-                                it.copy(message = "Probing quality: sampling windows with on-device VMAF…")
-                            }
-                            refinePlanWithPixelProbes(item, resolvedMime, basePlan, exhaustivePerceptualLossless)
-                        } else {
-                            basePlan
-                        }
-                    } else {
-                        null
-                    }
-                    diagnosticTargetRatio = perceptualPlan?.targetRatio
-                    diagnosticDecisionReason = perceptualPlan?.skipReason ?: perceptualPlan?.remuxReason
-                    diagnosticTargetVideoBitrate = resolvedMime?.let {
-                        calculateVideoBitrate(
-                            item, quality, it,
-                            perceptualPlan?.targetRatio,
-                            perceptualPlan?.pixelProvenRatio
-                        )
-                    }
-                    diagnosticPlan = perceptualPlan
-                    diagnosticSourceAlreadyEfficient = perceptualPlan?.remuxWasSourceEfficient == true
-                    diagnosticEvidencePreferredRemux = perceptualPlan?.remuxWasEvidencePreferred == true
-                    if (perceptualPlan?.skipReason != null) {
-                        // Positive pixel evidence says compression would visibly degrade this
-                        // clip: leave the original untouched and write nothing.
-                        recordDiagnosticJob(
-                            diagnostics = diagnostics,
-                            item = item,
-                            requestedQuality = quality,
-                            effectiveQuality = quality,
-                            resolvedMime = resolvedMime,
-                            plannedTargetRatio = perceptualPlan.targetRatio,
-                            plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
-                            plannedDecisionReason = perceptualPlan.skipReason,
-                            wasStreamCopy = false,
-                            verification = null,
-                            outputSize = 0L,
-                            terminal = BatchTerminalResult.SKIPPED_WOULD_DEGRADE,
-                            elapsedMs = System.currentTimeMillis() - itemStartedAt,
-                            probedRatios = perceptualPlan.probedRatios,
-                            pixelProvenRatio = perceptualPlan.pixelProvenRatio,
-                            probeDetail = perceptualPlan.probeDetail,
-                            probeWindowScores = perceptualPlan.probeWindowScores,
-                            probePairDiag = perceptualPlan.probePairDiag,
-                            probeV1Scores = perceptualPlan.probeV1Scores,
-                            precedingCooldownMs = precedingHandoffCooldownMs
-                        )
-                        updateItem(index) {
-                            it.copy(
-                                status = BatchItemStatus.Skipped,
-                                progress = 1f,
-                                currentOutputSize = 0L,
-                                targetOutputSize = 0L,
-                                terminalResult = BatchTerminalResult.SKIPPED_WOULD_DEGRADE,
-                                message = perceptualPlan.skipReason
-                            )
-                        }
-                        return@forEachIndexed
-                    }
-                    if (perceptualPlan?.preferRemux == true) {
-                        effectiveQuality = BatchQualityPreset.REMUX_ONLY
-                        preEncodeRemuxNote = perceptualPlan.remuxReason
-                    }
-                    // Doomed-encode guard for the LOSSY modes. When the source already sits at or
-                    // below its resolution's bitrate floor, the floor clamps the target back up to
-                    // the source bitrate, so the encode cannot produce a smaller file — it burns
-                    // full encode time and yields a same-or-larger output that is then discarded.
-                    // Reaching that same honest verdict up front keeps the original and skips the
-                    // wasted work (measured: 11 clips, 7.9 min, +25 MB of discarded output on the
-                    // 2026-07-31 S23 batch). Fails open on unknown bitrate; PL/Remux are excluded
-                    // inside the policy, so this can never divert a Perceptually Lossless decision.
-                    // Only a PURE BITRATE re-encode may be skipped. If the user explicitly chose an
-                    // output codec, the transcode itself is the thing they asked for and its output
-                    // is delivered to them as a copy even when it is not smaller — so skipping it
-                    // would silently withhold a requested result. Under Auto the app picks the codec
-                    // itself, so nothing the user asked for is lost. (FPS caps and resolution changes
-                    // are excluded inside lossyTargetHasNoHeadroom for the same reason.)
-                    if (codec == BatchCodecOption.AUTO &&
-                        effectiveQuality != BatchQualityPreset.REMUX_ONLY && resolvedMime != null &&
-                        BatchQualityBitratePolicy.lossyTargetHasNoHeadroom(
-                            source = item.toSourceInfo(),
-                            mode = effectiveQuality.toMode(),
-                            outputMimeType = resolvedMime,
-                            outputFps = plannedFps,
-                            outputHeight = targetHeightFor(item, effectiveQuality)
-                        )
-                    ) {
-                        // Keep the original and write NOTHING — deliberately the same
-                        // no-output shape as the SKIPPED_WOULD_DEGRADE path above, NOT a
-                        // switch to Remux Only. Routing these into the remux stream copy would
-                        // expose non-MP4 sources (e.g. the MKV/AV1 clips in real libraries) to a
-                        // muxer that cannot carry them, turning a merely-wasteful encode into an
-                        // outright failure. Nothing is re-encoded, copied, or replaced here.
-                        val skipMessage =
-                            "Already efficient for ${quality.label}: this video's bitrate is already at or " +
-                                "below the quality floor for its resolution, so re-encoding could not make it " +
-                                "smaller. Original kept unchanged."
-                        DiagLog.i(
-                            "CompressorBatch",
-                            "doomed-encode skip; job=${diagnosticJobId(item)}; mode=${quality.label}; " +
-                                "sourceVideoBitrate=${item.toSourceInfo().videoBitrate}; encode skipped, original kept"
-                        )
-                        recordDiagnosticJob(
-                            diagnostics = diagnostics,
-                            item = item,
-                            requestedQuality = quality,
-                            effectiveQuality = quality,
-                            resolvedMime = resolvedMime,
-                            plannedTargetRatio = null,
-                            plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
-                            plannedDecisionReason = "lossy target has no headroom below the source bitrate",
-                            wasStreamCopy = false,
-                            verification = null,
-                            outputSize = 0L,
-                            terminal = BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED,
-                            elapsedMs = System.currentTimeMillis() - itemStartedAt,
-                            precedingCooldownMs = precedingHandoffCooldownMs
-                        )
-                        updateItem(index) {
-                            it.copy(
-                                status = BatchItemStatus.Skipped,
-                                progress = 1f,
-                                currentOutputSize = 0L,
-                                targetOutputSize = 0L,
-                                outputSize = 0L,
-                                terminalResult = BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED,
-                                message = skipMessage
-                            )
-                        }
-                        return@forEachIndexed
-                    }
-                    // Keep-original remux FAST PATH (perf/remux-keep-original-fast-path): when the
-                    // pipeline has already DECIDED to keep the original bytes, and the audited
-                    // policy proves the copy would be a pure no-op (no privacy strip, compatible
-                    // container, readable source, user did not choose Remux Only), surface the
-                    // original directly — no copy written, no copy verified, original never opened
-                    // for write. Any guard failing falls through to the unchanged full remux.
-                    // Evidence: 40.3 min/172-file batch spent stream-copying keep-original items
-                    // (max 267 s to save 0 bytes) — docs/pr23/REMUX_ACCELERATION_INVESTIGATION.md.
-                    if (perceptualPlan?.preferRemux == true && quality != BatchQualityPreset.REMUX_ONLY) {
-                        val resolvedContainerMime = runCatching {
-                            context.contentResolver.getType(item.sourceUri)
-                        }.getOrNull()
-                        val sourceReadableNow = runCatching {
-                            context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { true } == true
-                        }.getOrDefault(false)
-                        val reuse = OriginalReusePolicy.evaluate(
-                            isKeepOriginalDecision = true,
-                            userRequestedRemuxOnly = false,
-                            privacyMode = privacyMode,
-                            resolvedContainerMime = resolvedContainerMime,
-                            sourceReadableNow = sourceReadableNow
-                        )
-                        if (reuse is OriginalReuseDecision.Eligible) {
-                            // Honest typed validation: records ONLY what was actually checked
-                            // (read-open at decision time). Never an OutputVerificationReport —
-                            // no output exists and no output verification ran.
-                            val retention = OriginalReusePolicy.retainedSourceValidation(
-                                sourceReadable = sourceReadableNow,
-                                sourceSizeBytes = item.originalSize,
-                                containerMime = reuse.containerMime,
-                                nowEpochMs = System.currentTimeMillis()
-                            )
-                            val terminal = BatchTerminalClassifier.classify(
-                                BatchTerminalInput(
-                                    requestedMode = quality.toMode(),
-                                    effectiveMode = BatchQualityMode.REMUX_ONLY,
-                                    wasStreamCopy = false,
-                                    verified = retention.readableAtDecisionTime,
-                                    replacementSafe = false,
-                                    sourceSize = item.originalSize,
-                                    outputSize = item.originalSize,
-                                    preEncodeSourceAlreadyEfficient = perceptualPlan.remuxWasSourceEfficient,
-                                    preEncodeEvidencePreferredRemux = perceptualPlan.remuxWasEvidencePreferred,
-                                    retainedOriginalNoOutput = true
-                                )
-                            )
-                            DiagLog.i(
-                                "CompressorBatch",
-                                "keep-original fast path; job=${diagnosticJobId(item)}; " +
-                                    "materialization=REUSED_SOURCE; copyAvoidedBytes=${item.originalSize}; " +
-                                    "container=$resolvedContainerMime; terminal=$terminal"
-                            )
-                            recordDiagnosticJob(
-                                diagnostics = diagnostics,
-                                item = item,
-                                requestedQuality = quality,
-                                effectiveQuality = BatchQualityPreset.REMUX_ONLY,
-                                resolvedMime = null,
-                                plannedTargetRatio = perceptualPlan.targetRatio,
-                                plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
-                                plannedDecisionReason = perceptualPlan.remuxReason,
-                                wasStreamCopy = false,
-                                verification = null,
-                                retainedValidation = retention,
-                                outputSize = item.originalSize,
-                                terminal = terminal,
-                                elapsedMs = System.currentTimeMillis() - itemStartedAt,
-                                probedRatios = perceptualPlan.probedRatios,
-                                pixelProvenRatio = perceptualPlan.pixelProvenRatio,
-                                probeDetail = perceptualPlan.probeDetail,
-                                probeWindowScores = perceptualPlan.probeWindowScores,
-                                probePairDiag = perceptualPlan.probePairDiag,
-                                probeV1Scores = perceptualPlan.probeV1Scores,
-                                precedingCooldownMs = precedingHandoffCooldownMs,
-                                materializationMode = "REUSED_SOURCE",
-                                copyAvoidedBytes = item.originalSize
-                            )
-                            updateItem(index) {
-                                it.copy(
-                                    status = if (terminal.isFailure) BatchItemStatus.Failed else BatchItemStatus.Done,
-                                    progress = 1f,
-                                    currentOutputSize = item.originalSize,
-                                    outputUri = if (terminal.isFailure) null else item.sourceUri,
-                                    outputPath = null,
-                                    outputSize = if (terminal.isFailure) 0L else item.originalSize,
-                                    outputMode = BatchQualityPreset.REMUX_ONLY.label,
-                                    // No OutputVerificationReport exists for a retained source —
-                                    // the honest record is the typed RetainedSourceValidation in
-                                    // diagnostics; the item message carries the user-facing truth.
-                                    verificationReport = null,
-                                    terminalResult = terminal,
-                                    metrics = BatchItemMetrics(
-                                        operationLabel = "Retained",
-                                        elapsedMs = System.currentTimeMillis() - itemStartedAt,
-                                        outputBytes = 0L,
-                                        savedBytes = 0L,
-                                        thermalStart = thermalWindow.thermalLabel,
-                                        thermalEnd = thermalWindow.thermalLabel,
-                                        batteryStart = thermalWindow.batteryPercent,
-                                        batteryEnd = thermalWindow.batteryPercent,
-                                        cooldownMs = 0L
-                                    ),
-                                    message = if (terminal.isFailure) {
-                                        "Original retention failed: source became unreadable — nothing was modified."
-                                    } else {
-                                        "Already optimal — original retained (no copy written)." +
-                                            (preEncodeRemuxNote?.let { note -> " $note" } ?: "")
-                                    }
-                                )
-                            }
-                            return@forEachIndexed
-                        } else if (reuse is OriginalReuseDecision.Blocked) {
-                            DiagLog.i(
-                                "CompressorBatch",
-                                "keep-original fast path blocked; job=${diagnosticJobId(item)}; " +
-                                    "reason=${reuse.reason}; falling through to full remux"
-                            )
-                            diagnosticReuseBlockReason = reuse.reason.name
-                        }
-                    }
-                    diagnosticEffectiveQuality = effectiveQuality
-                    logEncoderPlan(
-                        item,
-                        effectiveQuality,
-                        codec,
-                        if (effectiveQuality == BatchQualityPreset.REMUX_ONLY) null else resolvedMime,
-                        plannedFps,
-                        perceptualPlan?.takeIf { !it.preferRemux }?.targetRatio
-                    )
-                    var encodeAttempt: EncodeAttemptResult? = null
-                    var remuxResult = if (effectiveQuality == BatchQualityPreset.REMUX_ONLY) {
-                        candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
-                        remuxOnlyOne(context, item, index, privacyMode)
-                    } else {
-                        val safeResolvedMime = resolvedMime
-                            ?: throw IllegalStateException("Encoder selection failed before export planning. Use Remux Only or choose a different codec.")
-                        try {
-                            candidateFiles += item.cacheOutputFile(context, quality)
-                            val attempt = compressOne(
-                                context,
-                                item,
-                                index,
-                                quality,
-                                frameRate,
-                                safeResolvedMime,
-                                perceptualPlan?.targetRatio,
-                                perceptualPlan?.useCbrCeiling == true,
-                                perceptualPlan?.pixelProvenRatio
-                            )
-                            encodeAttempt = attempt
-                            withContext(Dispatchers.IO) {
-                                val remuxContext = currentCoroutineContext()
-                                Mp4MetadataRemuxer.remuxWithSourceMetadata(
-                                    context,
-                                    attempt.file,
-                                    item.metadataSnapshot.filteredForPrivacy(privacyMode),
-                                    cancellationCheck = { remuxContext.ensureActive() }
-                                )
-                            }
-                        } catch (e: ExportException) {
-                            diagnosticEncoderFailed = true
-                            // A rejected encoder configuration or export failure must never strand
-                            // a Perceptually Lossless item as "Failed": the honest production
-                            // answer is the verified stream copy.
-                            if (perceptualPlan == null) throw e
-                            val reason = "encoder export failed (${e.errorCodeName})"
-                            diagnosticFallbackReason = reason
-                            DiagLog.w(
-                                "CompressorBatch",
-                                "Perceptually lossless encode failed before verification for ${diagnosticJobId(item)}: $reason; falling back to remux"
-                            )
-                            // An encoder or muxer failure says nothing about the ratio (see
-                            // LearningEvidencePolicy.Kind.PIPELINE), so it teaches nothing.
-                            DiagLog.i(
-                                "CompressorLearning",
-                                "result=pipeline_failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
-                                    "reason=$reason; learned state unchanged"
-                            )
-                            if (retainOriginalInsteadOfCopy(
-                                    context = context,
-                                    diagnostics = diagnostics,
-                                    item = item,
-                                    index = index,
-                                    quality = quality,
-                                    privacyMode = privacyMode,
-                                    plan = perceptualPlan,
-                                    resolvedMime = diagnosticResolvedMime,
-                                    plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
-                                    plannedDecisionReason = diagnosticDecisionReason,
-                                    evidence = DiscardedAttemptEvidence(fallbackReason = reason, encoderFailed = true),
-                                    itemStartedAt = itemStartedAt,
-                                    thermalStart = thermalWindow,
-                                    precedingCooldownMs = precedingHandoffCooldownMs
-                                )
-                            ) {
-                                candidateFiles.forEach { runCatching { it.delete() } }
-                                // The encoder failed without producing an output (encodeAttempt is
-                                // null), so no cooldown is owed. That matches the stream-copy path
-                                // this replaces.
-                                return@forEachIndexed
-                            }
-                            effectiveQuality = BatchQualityPreset.REMUX_ONLY
-                            diagnosticEffectiveQuality = effectiveQuality
-                            preEncodeRemuxNote = "Remux Fallback Kept: the encoder rejected the perceptually lossless attempt ($reason)"
-                            candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
-                            remuxOnlyOne(context, item, index, privacyMode)
-                        }
-                    }
-                    var outputFile = remuxResult.outputFile
-                    var outputUri = Uri.fromFile(outputFile)
-                    var outputSize = outputFile.length()
-                    // A pixel-proven ratio replaces the class-level verification floor with the
-                    // proven one minus the encoder-undershoot tolerance measured in the field
-                    // (requests land within ~6% on this device class); certification below
-                    // re-checks the real pixels regardless.
-                    val pixelProvenVerifierFloor = perceptualPlan?.pixelProvenRatio?.let { proven ->
-                        ((proven - PIXEL_PROVEN_UNDERSHOOT_TOLERANCE) *
-                            item.toSourceInfo().videoBitrate).toInt().coerceAtLeast(1)
-                    }
-                    var verification = withContext(Dispatchers.IO) {
-                        OutputVerifier.verify(
-                            context, item, outputFile, effectiveQuality.label, privacyMode,
-                            pixelProvenVideoBitrateFloor = pixelProvenVerifierFloor
-                        )
-                    }
-                    // Measured request-vs-actual encoder behavior for this attempt. Prefer Media3's
-                    // own reported average; fall back to the size/duration measurement.
-                    val measuredOvershoot = encodeAttempt?.let { attempt ->
-                        when {
-                            attempt.requestedVideoBitrate <= 0 -> null
-                            attempt.reportedAverageVideoBitrate > 0 ->
-                                attempt.reportedAverageVideoBitrate.toDouble() / attempt.requestedVideoBitrate
-                            item.durationMs > 0 && outputSize > 0 ->
-                                ((outputSize * 8000.0 / item.durationMs) - item.originalAudioBitrate.coerceAtLeast(0)) /
-                                    attempt.requestedVideoBitrate
-                            else -> null
-                        }
-                    }
-                    // Floor recovery: when the ONLY verification failure is the inferred video
-                    // bitrate floor (structure, color, audio, timing, metadata all passed) and
-                    // the output is strictly smaller, sampled pixel certification gets the final
-                    // word — a VBR encoder undershooting its request on easy content is quality
-                    // saturation, not necessarily degradation, and only pixels can tell which.
-                    // A measured PASS re-verifies with the certified bitrate as the pixel-proven
-                    // floor, so OutputVerifier remains the sole source of the final verdict; a
-                    // failed or unmeasurable certification changes nothing and the encode falls
-                    // back exactly as before.
-                    var floorRecoveryCertScores: List<WindowScore>? = null
-                    // Set only when recovery ran and failed to recover the encode. It wins over the
-                    // skip-reason gate evaluated below, which describes a certification that never
-                    // started — claiming that while certWindowScores is populated makes the record
-                    // contradict itself.
-                    var failedFloorRecoveryStatus: String? = null
-                    if (effectiveQuality == BatchQualityPreset.ORIGINAL &&
-                        perceptualPlan != null && perceptualPlan.pixelCertifiable &&
-                        verification.failedOnlyOnVideoBitrateFloor &&
-                        item.originalSize > 0L && outputSize in 1 until item.originalSize
-                    ) {
-                        updateItem(index) {
-                            it.copy(message = "Certifying pixels: encoder undershot the bitrate floor, checking real quality…")
-                        }
-                        val recoveryOutcome = qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
-                        val recoveryScores = (recoveryOutcome as? PairScoreOutcome.Scored)?.windows
-                        diagnosticCertWindowScores = compactWindowScores(recoveryScores)
-                        diagnosticCertBandingDiag = compactBandingDiag(recoveryScores)
-                        if (QualityProbePolicy.windowsPass(recoveryScores)) {
-                            floorRecoveryCertScores = recoveryScores
-                            val certifiedVideoBitrate = encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
-                                ?: if (item.durationMs > 0 && outputSize > 0) {
-                                    ((outputSize * 8000.0 / item.durationMs) - item.originalAudioBitrate.coerceAtLeast(0))
-                                        .toInt().coerceAtLeast(1)
-                                } else {
-                                    1
-                                }
-                            DiagLog.i(
-                                "CompressorProbe",
-                                "floor recovery; job=${diagnosticJobId(item)}; sampled windows passed; " +
-                                    "re-verifying with pixel-certified floor $certifiedVideoBitrate"
-                            )
-                            verification = withContext(Dispatchers.IO) {
-                                OutputVerifier.verify(
-                                    context, item, outputFile, effectiveQuality.label, privacyMode,
-                                    pixelProvenVideoBitrateFloor = certifiedVideoBitrate
-                                )
-                            }
-                        } else {
-                            val cause = when (recoveryOutcome) {
-                                is PairScoreOutcome.Scored -> "failed"
-                                is PairScoreOutcome.MisalignmentRejected -> "rejected (output frames not time-alignable)"
-                                PairScoreOutcome.Unavailable -> "unavailable"
-                            }
-                            failedFloorRecoveryStatus = CertificationStatus.forFailedRecoveryOutcome(recoveryOutcome)
-                            DiagLog.i(
-                                "CompressorProbe",
-                                "floor recovery; job=${diagnosticJobId(item)}; certification $cause; fallback proceeds"
-                            )
-                        }
-                    }
-                    // Sampled pixel certification of the full output (any SDR, non-downgrade encode
-                    // whose geometry the scorer can handle — NOT just ladder-eligible ones).
-                    // Measured-bad always fails; a certification failure SKIPS the item — pixel
-                    // evidence just proved the encode degrades this clip, so the honest outcome is
-                    // the untouched original, not a stream-copy that saves nothing.
-                    //
-                    // Unmeasurable evidence is handled by two different rules depending on what
-                    // justified the target. When a ladder ran, a sub-default ratio rests on pixel
-                    // evidence alone and must fail closed without it. When no ladder ran (4K-class),
-                    // the target never depended on pixels, so the structural verdict stands exactly
-                    // as it does today — certification can only ADD proof for these sources.
-                    // Record WHY certification will not run before the gate, so a null
-                    // certWindowScores is never unexplained. Two 219-job captures had null
-                    // certification fields for all 438 jobs with nothing saying which gate closed.
-                    // Overwritten with the real outcome below when it does run.
-                    diagnosticCertStatus = when {
-                        // A recovery attempt that ran and measured windows outranks every skip
-                        // reason below: those describe certification that never started.
-                        failedFloorRecoveryStatus != null -> failedFloorRecoveryStatus
-                        effectiveQuality != BatchQualityPreset.ORIGINAL ->
-                            CertificationStatus.SKIPPED_NOT_PL_MODE
-                        perceptualPlan == null -> CertificationStatus.SKIPPED_NO_PLAN
-                        !perceptualPlan.pixelCertifiable ->
-                            perceptualPlan.pixelCertifiableBlockReason ?: CertificationStatus.SKIPPED_NO_PLAN
-                        PerceptualLosslessVerifier.shouldFallbackToRemux(
-                            verification, item.originalSize, outputSize
-                        ) -> CertificationStatus.SKIPPED_FELL_BACK_TO_REMUX
-                        else -> null
-                    }
-                    if (effectiveQuality == BatchQualityPreset.ORIGINAL &&
-                        perceptualPlan != null && perceptualPlan.pixelCertifiable &&
-                        !PerceptualLosslessVerifier.shouldFallbackToRemux(verification, item.originalSize, outputSize)
-                    ) {
-                        updateItem(index) {
-                            it.copy(message = "Certifying pixels: sampled VMAF check of the final output…")
-                        }
-                        val certOutcome = floorRecoveryCertScores?.let { PairScoreOutcome.Scored(it) }
-                            ?: qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
-                        val certScores = (certOutcome as? PairScoreOutcome.Scored)?.windows
-                        diagnosticCertWindowScores = compactWindowScores(certScores)
-                        diagnosticCertBandingDiag = compactBandingDiag(certScores)
-                        diagnosticCertV1Scores = compactV1Scores(certScores)
-                        val certOk = if (perceptualPlan.requiresMeasuredCertification) {
-                            ExhaustivePerceptualLosslessPolicy.measuredCertificationPasses(certOutcome)
-                        } else if (perceptualPlan.probeEligible) {
-                            QualityProbePolicy.certificationOutcomePasses(
-                                usedRatio = perceptualPlan.targetRatio,
-                                defaultRatio = perceptualPlan.defaultRatio,
-                                outcome = certOutcome
-                            )
-                        } else {
-                            QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(certOutcome)
-                        }
-                        // Pixel proof requires BOTH a pass AND measured windows — see
-                        // QualityProbePolicy.isPixelCertified (pure + unit-tested) for why certOk
-                        // alone is insufficient.
-                        diagnosticCertStatus = CertificationStatus.forOutcome(certOutcome)
-                        pixelCertifiedThisRun = QualityProbePolicy.isPixelCertified(certOk, certOutcome)
-                        DiagLog.i(
-                            "CompressorProbe",
-                            "certification; job=${diagnosticJobId(item)}; usedRatio=${perceptualPlan.targetRatio}; " +
-                                "windows=${certScores?.size ?: 0}; pass=$certOk; " +
-                                "scores=${certScores?.joinToString { "%.1f/%.1f/%.1f".format(java.util.Locale.US, it.mean, it.p5, it.min) } ?: "unmeasured"}"
-                        )
-                        if (!certOk) {
-                            // Only a certification that produced evidence may say the encode loses
-                            // quality. Scored windows below the bar, and frames that could not be
-                            // time-aligned, are both measurements of THIS output. "Unavailable" is
-                            // the absence of a measurement: the original is still kept (the plan
-                            // needed pixel proof and did not get it), but it is not labelled
-                            // "would visibly lose quality" and it does not count against the
-                            // profile in the learning engine.
-                            val certMeasured = certOutcome !is PairScoreOutcome.Unavailable
-                            val certReason = when {
-                                certOutcome is PairScoreOutcome.MisalignmentRejected ->
-                                    "pixel certification rejected: output frames could not be " +
-                                        "time-aligned with the source (frame loss or retiming)"
-                                certScores == null && perceptualPlan.requiresMeasuredCertification ->
-                                    "pixel certification could not measure this output, and this encode " +
-                                        "overturned a keep-original decision, so it needs measured proof"
-                                certScores == null ->
-                                    "pixel certification unavailable for a sub-default-ratio encode"
-                                else ->
-                                    "pixel certification failed (sampled VMAF below thresholds)"
-                            }
-                            val certTerminal = if (certMeasured) {
-                                BatchTerminalResult.SKIPPED_WOULD_DEGRADE
-                            } else {
-                                // "Kept original — re-encode could not be verified".
-                                BatchTerminalResult.UNEXPECTED_REMUX
-                            }
-                            diagnosticFallbackReason = certReason
-                            diagnosticDiscardedVideoBitrate = encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
-                            if (certMeasured) {
-                                val learned = learningEngine.recordFailure(
-                                    perceptualPlan.profileKey,
-                                    perceptualPlan.targetRatio,
-                                    certReason,
-                                    perceptualPlan.floorRatio,
-                                    measuredOvershoot
-                                )
-                                DiagLog.i(
-                                    "CompressorLearning",
-                                    "result=failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
-                                        "reason=$certReason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
-                                )
-                            } else {
-                                DiagLog.i(
-                                    "CompressorLearning",
-                                    "result=unmeasured; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
-                                        "reason=$certReason; learned state unchanged (no evidence)"
-                                )
-                            }
-                            runCatching { outputFile.delete() }
-                            recordDiagnosticJob(
-                                diagnostics = diagnostics,
-                                item = item,
-                                requestedQuality = quality,
-                                effectiveQuality = quality,
-                                resolvedMime = diagnosticResolvedMime,
-                                plannedTargetRatio = diagnosticTargetRatio,
-                                plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
-                                plannedDecisionReason = certReason,
-                                wasStreamCopy = false,
-                                verification = verification,
-                                outputSize = 0L,
-                                terminal = certTerminal,
-                                elapsedMs = System.currentTimeMillis() - itemStartedAt,
-                                fallbackReason = certReason,
-                                discardedVideoBitrate = diagnosticDiscardedVideoBitrate,
-                                probedRatios = perceptualPlan.probedRatios,
-                                pixelProvenRatio = perceptualPlan.pixelProvenRatio,
-                                probeDetail = perceptualPlan.probeDetail,
-                                probeWindowScores = perceptualPlan.probeWindowScores,
-                                probePairDiag = perceptualPlan.probePairDiag,
-                                probeV1Scores = perceptualPlan.probeV1Scores,
-                                certWindowScores = diagnosticCertWindowScores,
-                                certBandingDiag = diagnosticCertBandingDiag,
-                                certV1Scores = diagnosticCertV1Scores,
-                                certificationStatus = diagnosticCertStatus,
-                                encoderConfig = encodeAttempt?.configDelta?.compact(),
-                                precedingCooldownMs = precedingHandoffCooldownMs
-                            )
-                            updateItem(index) {
-                                it.copy(
-                                    status = BatchItemStatus.Skipped,
-                                    progress = 1f,
-                                    currentOutputSize = 0L,
-                                    outputUri = null,
-                                    outputPath = null,
-                                    outputSize = 0L,
-                                    terminalResult = certTerminal,
-                                    message = "Skipped: $certReason — original left untouched."
-                                )
-                            }
-                            return@forEachIndexed
-                        }
-                    }
-                    if (effectiveQuality == BatchQualityPreset.ORIGINAL &&
-                        PerceptualLosslessVerifier.shouldFallbackToRemux(verification, item.originalSize, outputSize)
-                    ) {
-                        val failureReason = verification.replacementBlockReason ?: verification.verdict
-                        diagnosticFallbackReason = failureReason
-                        // Measured video bitrate of the DISCARDED encode (Media3's own report, else
-                        // size/duration), captured before the file is deleted, so the structured record
-                        // shows whether the encode undershot the floor or simply was not smaller.
-                        diagnosticDiscardedVideoBitrate = encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
-                            ?: if (item.durationMs > 0 && outputSize > 0) {
-                                ((outputSize * 8000.0 / item.durationMs) - item.originalAudioBitrate.coerceAtLeast(0))
-                                    .toInt().coerceAtLeast(0)
-                            } else {
-                                null
-                            }
-                        DiagLog.w(
-                            "CompressorBatch",
-                            "Perceptually lossless fallback to remux for ${diagnosticJobId(item)}: $failureReason"
-                        )
-                        // Log the full field-by-field report of the discarded attempt so device
-                        // logs show exactly which check failed or which field was not exposed.
-                        verification.summaryLines.forEach { line ->
-                            DiagLog.w("CompressorVerification", "discarded PL attempt; $line")
-                        }
-                        perceptualPlan?.let { plan ->
-                            // Only a starved encode moves the ratio; see LearningEvidencePolicy.
-                            val evidence = LearningEvidencePolicy.classifyVerificationFailure(verification.failingChecks())
-                            if (evidence == LearningEvidencePolicy.Kind.PIPELINE) {
-                                DiagLog.i(
-                                    "CompressorLearning",
-                                    "result=pipeline_failure; profileKey=${plan.profileKey.asKey()}; usedRatio=${plan.targetRatio}; " +
-                                        "failing=${verification.failingChecks().joinToString(",")}; reason=$failureReason; learned state unchanged"
-                                )
-                            } else {
-                                val learned = learningEngine.recordFailure(
-                                    plan.profileKey,
-                                    plan.targetRatio,
-                                    failureReason,
-                                    plan.floorRatio,
-                                    measuredOvershoot,
-                                    stepUp = evidence == LearningEvidencePolicy.Kind.QUALITY
-                                )
-                                DiagLog.i(
-                                    "CompressorLearning",
-                                    "result=failure; evidence=$evidence; profileKey=${plan.profileKey.asKey()}; usedRatio=${plan.targetRatio}; " +
-                                        "bitrateMode=${encodeAttempt?.requestedBitrateModeLabel ?: "unknown"}; encoderName=${encodeAttempt?.videoEncoderName ?: "unknown"}; " +
-                                        "measuredOvershoot=${measuredOvershoot ?: "unknown"}; learnedOvershoot=${learned.measuredOvershootFactor ?: "none"}; " +
-                                        "reason=$failureReason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
-                                )
-                            }
-                        }
-                        runCatching { outputFile.delete() }
-                        if (perceptualPlan != null && retainOriginalInsteadOfCopy(
-                                context = context,
-                                diagnostics = diagnostics,
-                                item = item,
-                                index = index,
-                                quality = quality,
-                                privacyMode = privacyMode,
-                                plan = perceptualPlan,
-                                resolvedMime = diagnosticResolvedMime,
-                                plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
-                                plannedDecisionReason = diagnosticDecisionReason,
-                                evidence = DiscardedAttemptEvidence(
-                                    fallbackReason = failureReason,
-                                    encoderFailed = false,
-                                    discardedVideoBitrate = diagnosticDiscardedVideoBitrate,
-                                    certWindowScores = diagnosticCertWindowScores,
-                                    certBandingDiag = diagnosticCertBandingDiag,
-                                    certV1Scores = diagnosticCertV1Scores,
-                                    certificationStatus = diagnosticCertStatus,
-                                    encoderConfig = encodeAttempt?.configDelta?.compact()
-                                ),
-                                itemStartedAt = itemStartedAt,
-                                thermalStart = thermalWindow,
-                                precedingCooldownMs = precedingHandoffCooldownMs
-                            )
-                        ) {
-                            candidateFiles.forEach { runCatching { it.delete() } }
-                            // A full encode DID run here, so the encoder's heat still earns its
-                            // cooldown before the next video, exactly as on the stream-copy path.
-                            precedingCooldownMs = applyPostItemCooldown(context, index, ranFullEncode = encodeAttempt != null)
-                            return@forEachIndexed
-                        }
-                        candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
-                        remuxResult = remuxOnlyOne(context, item, index, privacyMode)
-                        outputFile = remuxResult.outputFile
-                        outputUri = Uri.fromFile(outputFile)
-                        outputSize = outputFile.length()
-                        effectiveQuality = BatchQualityPreset.REMUX_ONLY
-                        diagnosticEffectiveQuality = effectiveQuality
-                        preEncodeRemuxNote = "Remux Fallback Kept: perceptually lossless could not be verified ($failureReason)"
-                        verification = withContext(Dispatchers.IO) {
-                            OutputVerifier.verify(context, item, outputFile, effectiveQuality.label, privacyMode)
-                        }
-                    } else if (effectiveQuality == BatchQualityPreset.ORIGINAL && verification.verified) {
-                        perceptualPlan?.let { plan ->
-                            val sizeRatio = if (item.originalSize > 0L) {
-                                outputSize.toDouble() / item.originalSize.toDouble()
-                            } else {
-                                1.0
-                            }
-                            val learned = learningEngine.recordVerifiedSuccess(
-                                plan.profileKey,
-                                plan.targetRatio,
-                                sizeRatio,
-                                plan.floorRatio,
-                                measuredOvershoot,
-                                // Only a pixel-certified success may lower the next target. A
-                                // structural-only pass keeps the strict no-step-down behavior,
-                                // because the structural verifier cannot see perceptual damage.
-                                pixelCertified = pixelCertifiedThisRun
-                            )
-                            DiagLog.i(
-                                "CompressorLearning",
-                                "result=verified; profileKey=${plan.profileKey.asKey()}; usedRatio=${plan.targetRatio}; " +
-                                    "pixelCertified=$pixelCertifiedThisRun; " +
-                                    "bitrateMode=${encodeAttempt?.requestedBitrateModeLabel ?: "unknown"}; encoderName=${encodeAttempt?.videoEncoderName ?: "unknown"}; " +
-                                    "measuredOvershoot=${measuredOvershoot ?: "unknown"}; learnedOvershoot=${learned.measuredOvershootFactor ?: "none"}; " +
-                                    "sizeRatio=$sizeRatio; nextRatio=${learned.nextTargetRatio}"
-                            )
-                        }
-                    }
-                    // QUAL-001 — label honesty. OutputVerifier decides "Perceptually Lossless Verified"
-                    // from STRUCTURAL checks alone, and it runs BEFORE pixel certification, so on its own
-                    // that wording would imply pixel proof even when no pixels were ever scored (source
-                    // above the VMAF geometry cap, VMAF unavailable, HDR/codec-downgrade, or a
-                    // certification that returned no measured evidence and was accepted structurally).
-                    // Record what was actually proven and qualify the wording when it was structural only.
-                    // Nothing here relaxes acceptance: a measured cert FAILURE already skipped this item.
-                    verification = verification.withCertificationBasis(pixelCertifiedThisRun)
-                    logVerificationResult(item, effectiveQuality, verification, outputSize)
-                    val thermalEnd = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
-                    val terminal = BatchTerminalClassifier.classify(
-                        BatchTerminalInput(
-                            requestedMode = quality.toMode(),
-                            effectiveMode = effectiveQuality.toMode(),
-                            wasStreamCopy = effectiveQuality == BatchQualityPreset.REMUX_ONLY,
-                            verified = verification.verified,
-                            replacementSafe = verification.replacementSafe,
-                            sourceSize = item.originalSize,
-                            outputSize = outputSize,
-                            preEncodeSourceAlreadyEfficient = diagnosticSourceAlreadyEfficient,
-                            preEncodeEvidencePreferredRemux = diagnosticEvidencePreferredRemux,
-                            encoderFailed = diagnosticEncoderFailed,
-                            acceptAnyVerifiedSaving = exhaustivePerceptualLossless
-                        )
-                    )
-                    val terminalSavedBytes = BatchTerminalAccounting.savedBytes(
-                        BatchTerminalAccountingEntry(terminal, item.originalSize, outputSize)
-                    )
-                    val metrics = BatchItemMetrics(
-                        operationLabel = if (effectiveQuality == BatchQualityPreset.REMUX_ONLY) "Remux" else "Encode",
-                        elapsedMs = System.currentTimeMillis() - itemStartedAt,
-                        outputBytes = outputSize,
-                        savedBytes = terminalSavedBytes,
-                        thermalStart = thermalWindow.thermalLabel,
-                        thermalEnd = thermalEnd.thermalLabel,
-                        batteryStart = thermalWindow.batteryPercent,
-                        batteryEnd = thermalEnd.batteryPercent,
-                        cooldownMs = 0L
-                    )
-
-                    recordDiagnosticJob(
-                        diagnostics = diagnostics,
-                        item = item,
-                        requestedQuality = quality,
-                        effectiveQuality = effectiveQuality,
-                        resolvedMime = diagnosticResolvedMime,
-                        plannedTargetRatio = diagnosticTargetRatio,
-                        plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
-                        plannedDecisionReason = diagnosticDecisionReason,
-                        wasStreamCopy = effectiveQuality == BatchQualityPreset.REMUX_ONLY,
-                        verification = verification,
-                        outputSize = outputSize,
-                        terminal = terminal,
-                        elapsedMs = metrics.elapsedMs,
-                        fallbackReason = diagnosticFallbackReason,
-                        discardedVideoBitrate = diagnosticDiscardedVideoBitrate,
-                        probedRatios = perceptualPlan?.probedRatios ?: emptyList(),
-                        pixelProvenRatio = perceptualPlan?.pixelProvenRatio,
-                        probeDetail = perceptualPlan?.probeDetail,
-                        probeWindowScores = perceptualPlan?.probeWindowScores,
-                        probePairDiag = perceptualPlan?.probePairDiag,
-                        probeV1Scores = perceptualPlan?.probeV1Scores,
-                        certWindowScores = diagnosticCertWindowScores,
-                        certBandingDiag = diagnosticCertBandingDiag,
-                        certV1Scores = diagnosticCertV1Scores,
-                        certificationStatus = diagnosticCertStatus,
-                        encoderConfig = encodeAttempt?.configDelta?.compact(),
-                        thermalStart = metrics.thermalStart,
-                        thermalEnd = metrics.thermalEnd,
-                        precedingCooldownMs = precedingHandoffCooldownMs,
-                        materializationMode = "GENERATED_FILE",
-                        originalReuseBlockReason = diagnosticReuseBlockReason
-                    )
-
-                    if (terminal.isFailure) {
-                        // An unverified remux/encode is evidence, not an output. Keep its measured
-                        // size in diagnostics, then remove the cache file and expose no share/save/
-                        // replacement path to the UI.
-                        runCatching { outputFile.delete() }
-                        updateItem(index) {
-                            it.copy(
-                                status = BatchItemStatus.Failed,
-                                progress = 1f,
-                                currentOutputSize = 0L,
-                                outputUri = null,
-                                outputPath = null,
-                                outputSize = 0L,
-                                outputMode = effectiveQuality.label,
-                                verificationReport = verification,
-                                metrics = metrics,
-                                terminalResult = terminal,
-                                message = buildString {
-                                    append(terminal.label)
-                                    verification.replacementBlockReason?.let { append(": ").append(it) }
-                                }
-                            )
-                        }
-                    } else {
-                        updateItem(index) {
-                            it.copy(
-                                status = BatchItemStatus.Done,
-                                progress = 1f,
-                                currentOutputSize = outputSize,
-                                outputUri = outputUri,
-                                outputPath = outputFile.absolutePath,
-                                outputSize = outputSize,
-                                outputMode = effectiveQuality.label,
-                                verificationReport = verification,
-                                metrics = metrics,
-                                terminalResult = terminal,
-                                message = completionMessage(
-                                    it,
-                                    effectiveQuality,
-                                    outputSize,
-                                    plannedFps,
-                                    codecLabel,
-                                    preEncodeRemuxNote?.let { note -> "${remuxResult.message} • $note" } ?: remuxResult.message,
-                                    verification,
-                                    privacyMode
-                                )
-                            )
-                        }
-                        itemOutputAccepted = true
-                    }
-
-                    if (terminal.allowsOriginalReplacement && _uiState.value.replaceOriginals) {
-                        // Once destructive replacement starts, finish it and publish its disposition
-                        // atomically before honoring cancellation. This prevents an original from
-                        // changing while the UI remains stuck at a pre-replacement Done state.
-                        withContext(NonCancellable) {
-                            val replacement = replaceOriginalSafely(
-                                context = context,
-                                item = item,
-                                outputFile = outputFile,
-                                useShizukuFallback = _uiState.value.useShizukuFallback,
-                                quality = effectiveQuality,
-                                verification = verification,
-                                backupBeforeReplace = _uiState.value.backupBeforeReplace,
-                                privacyMode = privacyMode
-                            )
-                            updateItem(index) {
-                                it.copy(
-                                    status = if (replacement.success) BatchItemStatus.Replaced else BatchItemStatus.SavedCopy,
-                                    message = replacement.message
-                                )
-                            }
-                        }
-                    }
-
-                    if (index < _uiState.value.items.lastIndex) {
-                        // Apply the thermal cooldown ONLY after an item that actually ran a full
-                        // hardware encode (encodeAttempt != null). Stream-copy/remux and already-
-                        // optimized items generate no encoder heat, so cooling down after them is
-                        // pure idle time. Timing-only: no compression/verification/learning decision
-                        // is affected. Skipped items already return before this block.
-                        precedingCooldownMs = applyPostItemCooldown(context, index, ranFullEncode = encodeAttempt != null)
-                    }
-                    } catch (e: CancellationException) {
-                        if (!itemOutputAccepted) candidateFiles.forEach { runCatching { it.delete() } }
-                        throw e
-                    } catch (e: Exception) {
-                        if (!itemOutputAccepted) candidateFiles.forEach { runCatching { it.delete() } }
-                        val unsupported = e.message?.contains(Mp4MetadataRemuxer.REMUX_ONLY_UNSUPPORTED_MESSAGE) == true
-                        // A Perceptually Lossless item that was headed for "keep the original"
-                        // failed only because the stream copy carrying it is impossible for this
-                        // container. The original is untouched and was the decision, so retain it
-                        // rather than report a failure. Privacy stripping and unreadable sources
-                        // still fail as before (OriginalReusePolicy).
-                        val keepOriginalPlan = diagnosticPlan
-                        if (unsupported && quality == BatchQualityPreset.ORIGINAL &&
-                            diagnosticEffectiveQuality == BatchQualityPreset.REMUX_ONLY && keepOriginalPlan != null &&
-                            retainOriginalInsteadOfCopy(
-                                context = context,
-                                diagnostics = diagnostics,
-                                item = item,
-                                index = index,
-                                quality = quality,
-                                privacyMode = privacyMode,
-                                plan = keepOriginalPlan,
-                                resolvedMime = diagnosticResolvedMime,
-                                plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
-                                plannedDecisionReason = diagnosticDecisionReason,
-                                evidence = DiscardedAttemptEvidence(
-                                    fallbackReason = diagnosticFallbackReason
-                                        ?: "stream copy impossible: ${e.message ?: "unsupported container"}",
-                                    encoderFailed = diagnosticEncoderFailed
-                                ),
-                                itemStartedAt = itemStartedAt,
-                                thermalStart = thermalWindow,
-                                precedingCooldownMs = precedingHandoffCooldownMs,
-                                afterFailedAttempt = diagnosticFallbackReason != null,
-                                containerCannotBeCopied = true
-                            )
-                        ) {
-                            return@forEachIndexed
-                        }
-                        val encoderFailure = diagnosticEncoderFailed || e is ExportException
-                        val terminal = BatchTerminalClassifier.classify(
-                            BatchTerminalInput(
-                                requestedMode = quality.toMode(),
-                                effectiveMode = diagnosticEffectiveQuality.toMode(),
-                                wasStreamCopy = false,
-                                verified = false,
-                                replacementSafe = false,
-                                sourceSize = item.originalSize,
-                                outputSize = 0L,
-                                hardFailure = !unsupported && !encoderFailure,
-                                unsupportedContainer = unsupported,
-                                encoderFailed = encoderFailure
-                            )
-                        )
-                        val elapsedMs = System.currentTimeMillis() - itemStartedAt
-                    updateItem(index) {
-                        it.copy(
-                            status = BatchItemStatus.Failed,
+                        item.copy(
+                            status = BatchItemStatus.Skipped,
                             progress = 1f,
                             currentOutputSize = 0L,
+                            targetOutputSize = 0L,
                             outputUri = null,
                             outputPath = null,
                             outputSize = 0L,
-                                terminalResult = terminal,
-                            message = e.message ?: "Compression failed"
+                            outputMode = null,
+                            verificationReport = null,
+                            metrics = null,
+                            terminalResult = BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED,
+                            message = "Already compressed by Compressor — skipped."
                         )
-                    }
-                        recordDiagnosticJob(
-                            diagnostics = diagnostics,
-                            item = item,
-                            requestedQuality = quality,
-                            effectiveQuality = diagnosticEffectiveQuality,
-                            resolvedMime = diagnosticResolvedMime,
-                            plannedTargetRatio = diagnosticTargetRatio,
-                            plannedTargetVideoBitrate = diagnosticTargetVideoBitrate,
-                            plannedDecisionReason = diagnosticDecisionReason,
-                            wasStreamCopy = false,
-                            verification = null,
+                    } else {
+                        item.copy(
+                            status = BatchItemStatus.Pending,
+                            progress = 0f,
+                            currentOutputSize = 0L,
+                            targetOutputSize = estimateOutputSize(item, quality, codec, frameRate),
+                            outputUri = null,
+                            outputPath = null,
                             outputSize = 0L,
-                            terminal = terminal,
-                            elapsedMs = elapsedMs
+                            outputMode = null,
+                            verificationReport = null,
+                            metrics = null,
+                            terminalResult = null,
+                            message = null
                         )
                     }
                 }
+            )
+        }
+    }
 
-                _uiState.update {
-                    val accounting = it.terminalAccounting
-                    val metrics = BatchMetricsSummary(
-                        totalElapsedMs = System.currentTimeMillis() - batchStartedAt,
-                        totalCooldownMs = it.items.sumOf { item -> item.metrics?.cooldownMs ?: 0L },
-                        processedCount = accounting.processedCount,
-                        realCompressionCount = accounting.realCompressionCount,
-                        nonCompressionCount = accounting.nonCompressionCount,
-                        failedCount = accounting.failedCount,
-                        skippedCount = accounting.skippedCount,
-                        cancelledCount = accounting.cancelledCount,
-                        totalSavedBytes = accounting.totalBytesSaved
+    private fun publishBatchFinished(batchStartedAt: Long) {
+        _uiState.update {
+            val accounting = it.terminalAccounting
+            val metrics = BatchMetricsSummary(
+                totalElapsedMs = System.currentTimeMillis() - batchStartedAt,
+                totalCooldownMs = it.items.sumOf { item -> item.metrics?.cooldownMs ?: 0L },
+                processedCount = accounting.processedCount,
+                realCompressionCount = accounting.realCompressionCount,
+                nonCompressionCount = accounting.nonCompressionCount,
+                failedCount = accounting.failedCount,
+                skippedCount = accounting.skippedCount,
+                cancelledCount = accounting.cancelledCount,
+                totalSavedBytes = accounting.totalBytesSaved
+            )
+            it.copy(
+                isCompressing = false,
+                batchMetrics = metrics,
+                highQualityRetryCandidates = highQualityRetryCandidatesFor(it),
+                statusMessage = "Finished ${it.doneCount} output${if (it.doneCount == 1) "" else "s"}. " +
+                    "Real compressions: ${accounting.realCompressionCount}. " +
+                    "Saved ${formatFileSize(accounting.totalBytesSaved)} by real compression.",
+                errorMessage = if (accounting.failedCount > 0) {
+                    "${accounting.failedCount} item${if (accounting.failedCount == 1) "" else "s"} failed. Tap each item for details."
+                } else {
+                    null
+                }
+            )
+        }
+    }
+
+    private fun publishBatchCancelled(run: BatchRun) {
+        val cancelledItems = _uiState.value.items.filter { it.terminalResult == null }
+        _uiState.update { state ->
+            state.copy(
+                items = state.items.map { item ->
+                    if (item.terminalResult == null) {
+                        item.copy(
+                            status = BatchItemStatus.Cancelled,
+                            terminalResult = BatchTerminalResult.CANCELLED,
+                            message = "Cancelled — no compression result accepted."
+                        )
+                    } else {
+                        item
+                    }
+                }
+            )
+        }
+        cancelledItems.forEach { item ->
+            recordDiagnosticJob(
+                diagnostics = run.diagnostics,
+                item = item,
+                requestedQuality = run.quality,
+                effectiveQuality = run.quality,
+                resolvedMime = null,
+                plannedTargetRatio = null,
+                plannedTargetVideoBitrate = null,
+                wasStreamCopy = false,
+                verification = null,
+                outputSize = 0L,
+                terminal = BatchTerminalResult.CANCELLED,
+                elapsedMs = 0L
+            )
+        }
+        _uiState.update {
+            val accounting = it.terminalAccounting
+            it.copy(
+                isCompressing = false,
+                batchMetrics = BatchMetricsSummary(
+                    totalElapsedMs = System.currentTimeMillis() - run.batchStartedAt,
+                    totalCooldownMs = it.items.sumOf { item -> item.metrics?.cooldownMs ?: 0L },
+                    processedCount = accounting.processedCount,
+                    realCompressionCount = accounting.realCompressionCount,
+                    nonCompressionCount = accounting.nonCompressionCount,
+                    failedCount = accounting.failedCount,
+                    skippedCount = accounting.skippedCount,
+                    cancelledCount = accounting.cancelledCount,
+                    totalSavedBytes = accounting.totalBytesSaved
+                ),
+                statusMessage = "Compression canceled. ${accounting.cancelledCount} item${if (accounting.cancelledCount == 1) "" else "s"} canceled.",
+                errorMessage = null
+            )
+        }
+    }
+
+    /**
+     * One item, start to finish. Returns the cooldown applied after it, for the next item's
+     * record (0 when no cooldown was owed).
+     */
+    private suspend fun processItem(
+        run: BatchRun,
+        index: Int,
+        item: BatchVideoItem,
+        precedingHandoffCooldownMs: Long
+    ): Long {
+        val thermalWindow = waitForThermalWindow(run.context, item.originalName)
+        val s = ItemRun(
+            run = run,
+            index = index,
+            item = item,
+            thermalWindow = thermalWindow,
+            itemStartedAt = System.currentTimeMillis(),
+            precedingHandoffCooldownMs = precedingHandoffCooldownMs,
+            plannedFps = outputFpsFor(item, run.frameRate, run.quality)
+        )
+        val quality = run.quality
+        val codec = run.codec
+        updateItem(index) {
+            it.copy(
+                status = BatchItemStatus.Compressing,
+                progress = 0f,
+                currentOutputSize = 0L,
+                targetOutputSize = estimateOutputSize(it, quality, codec, run.frameRate),
+                message = if (quality == BatchQualityPreset.REMUX_ONLY) {
+                    "Remuxing: video/audio copied unchanged • no re-encode • ${thermalWindow.thermalLabel}"
+                } else {
+                    "Compressing: 0 MB / est ${formatFileSize(estimateOutputSize(it, quality, codec, run.frameRate))} • ${codec.label}${s.plannedFps?.let { fps -> " • ${fps}fps" } ?: " • source FPS"} • ${thermalWindow.thermalLabel}"
+                }
+            )
+        }
+        try {
+            if (!planItem(s)) return s.cooldownForNextItemMs
+            if (!produceOutput(s)) return s.cooldownForNextItemMs
+            if (!verifyOutput(s)) return s.cooldownForNextItemMs
+            finalizeItem(s)
+        } catch (e: CancellationException) {
+            s.deleteCandidatesUnlessAccepted()
+            throw e
+        } catch (e: Exception) {
+            s.deleteCandidatesUnlessAccepted()
+            handleItemFailure(s, e)
+        }
+        return s.cooldownForNextItemMs
+    }
+
+    /**
+     * Stage 1: choose the codec, build (and probe) the Perceptually Lossless plan, and act on
+     * every decision that ends the item before anything is written. Returns false when the item
+     * is finished.
+     */
+    private suspend fun planItem(s: ItemRun): Boolean {
+        val run = s.run
+        val item = s.item
+        val quality = run.quality
+        val resolvedMime = if (quality == BatchQualityPreset.REMUX_ONLY) {
+            null
+        } else {
+            chooseOutputMime(run.codec, item, quality)
+        }
+        s.resolvedMime = resolvedMime
+        s.diagnosticResolvedMime = resolvedMime
+        s.codecLabel = when (resolvedMime) {
+            MimeTypes.VIDEO_H265 -> "HEVC"
+            MimeTypes.VIDEO_AV1 -> "AV1"
+            else -> "H.264"
+        }
+        val perceptualPlan = if (quality == BatchQualityPreset.ORIGINAL && resolvedMime != null) {
+            val basePlan = buildPerceptualLosslessPlan(item, resolvedMime, run.exhaustivePerceptualLossless)
+            if (basePlan.probeEligible) {
+                updateItem(s.index) {
+                    it.copy(message = "Probing quality: sampling windows with on-device VMAF…")
+                }
+                refinePlanWithPixelProbes(item, resolvedMime, basePlan, run.exhaustivePerceptualLossless)
+            } else {
+                basePlan
+            }
+        } else {
+            null
+        }
+        s.perceptualPlan = perceptualPlan
+        s.diagnosticTargetRatio = perceptualPlan?.targetRatio
+        s.diagnosticDecisionReason = perceptualPlan?.skipReason ?: perceptualPlan?.remuxReason
+        s.diagnosticTargetVideoBitrate = resolvedMime?.let {
+            calculateVideoBitrate(
+                item, quality, it,
+                perceptualPlan?.targetRatio,
+                perceptualPlan?.pixelProvenRatio
+            )
+        }
+        s.diagnosticPlan = perceptualPlan
+        s.diagnosticSourceAlreadyEfficient = perceptualPlan?.remuxWasSourceEfficient == true
+        s.diagnosticEvidencePreferredRemux = perceptualPlan?.remuxWasEvidencePreferred == true
+        if (perceptualPlan?.skipReason != null) {
+            skipWouldDegrade(s, perceptualPlan)
+            return false
+        }
+        if (perceptualPlan?.preferRemux == true) {
+            s.effectiveQuality = BatchQualityPreset.REMUX_ONLY
+            s.preEncodeRemuxNote = perceptualPlan.remuxReason
+        }
+        if (skipDoomedLossyEncode(s)) return false
+        if (perceptualPlan?.preferRemux == true && quality != BatchQualityPreset.REMUX_ONLY &&
+            retainOriginalUpFront(s, perceptualPlan)
+        ) {
+            return false
+        }
+        s.diagnosticEffectiveQuality = s.effectiveQuality
+        logEncoderPlan(
+            item,
+            s.effectiveQuality,
+            run.codec,
+            if (s.effectiveQuality == BatchQualityPreset.REMUX_ONLY) null else resolvedMime,
+            s.plannedFps,
+            perceptualPlan?.takeIf { !it.preferRemux }?.targetRatio
+        )
+        return true
+    }
+
+    /** Positive pixel evidence says compression would visibly degrade this clip: write nothing. */
+    private fun skipWouldDegrade(s: ItemRun, plan: PerceptualLosslessPlan) {
+        val skipReason = checkNotNull(plan.skipReason) { "skipWouldDegrade without a skip reason" }
+        recordDiagnosticJob(
+            diagnostics = s.run.diagnostics,
+            item = s.item,
+            requestedQuality = s.run.quality,
+            effectiveQuality = s.run.quality,
+            resolvedMime = s.resolvedMime,
+            plannedTargetRatio = plan.targetRatio,
+            plannedTargetVideoBitrate = s.diagnosticTargetVideoBitrate,
+            plannedDecisionReason = skipReason,
+            wasStreamCopy = false,
+            verification = null,
+            outputSize = 0L,
+            terminal = BatchTerminalResult.SKIPPED_WOULD_DEGRADE,
+            elapsedMs = s.elapsedMs,
+            probedRatios = plan.probedRatios,
+            pixelProvenRatio = plan.pixelProvenRatio,
+            probeDetail = plan.probeDetail,
+            probeWindowScores = plan.probeWindowScores,
+            probePairDiag = plan.probePairDiag,
+            probeV1Scores = plan.probeV1Scores,
+            precedingCooldownMs = s.precedingHandoffCooldownMs
+        )
+        updateItem(s.index) {
+            it.copy(
+                status = BatchItemStatus.Skipped,
+                progress = 1f,
+                currentOutputSize = 0L,
+                targetOutputSize = 0L,
+                terminalResult = BatchTerminalResult.SKIPPED_WOULD_DEGRADE,
+                message = skipReason
+            )
+        }
+    }
+
+    /**
+     * Doomed-encode guard for the LOSSY modes. When the source already sits at or below its
+     * resolution's bitrate floor, the floor clamps the target back up to the source bitrate, so
+     * the encode cannot produce a smaller file — it burns full encode time and yields a
+     * same-or-larger output that is then discarded. Reaching that same honest verdict up front
+     * keeps the original and skips the wasted work (measured: 11 clips, 7.9 min, +25 MB of
+     * discarded output on the 2026-07-31 S23 batch). Fails open on unknown bitrate; PL/Remux are
+     * excluded inside the policy, so this can never divert a Perceptually Lossless decision.
+     * Only a PURE BITRATE re-encode may be skipped. If the user explicitly chose an output
+     * codec, the transcode itself is the thing they asked for and its output is delivered to
+     * them as a copy even when it is not smaller — so skipping it would silently withhold a
+     * requested result. Under Auto the app picks the codec itself, so nothing the user asked for
+     * is lost. (FPS caps and resolution changes are excluded inside lossyTargetHasNoHeadroom for
+     * the same reason.)
+     */
+    private fun skipDoomedLossyEncode(s: ItemRun): Boolean {
+        val run = s.run
+        val item = s.item
+        val resolvedMime = s.resolvedMime
+        val doomed = run.codec == BatchCodecOption.AUTO &&
+            s.effectiveQuality != BatchQualityPreset.REMUX_ONLY && resolvedMime != null &&
+            BatchQualityBitratePolicy.lossyTargetHasNoHeadroom(
+                source = item.toSourceInfo(),
+                mode = s.effectiveQuality.toMode(),
+                outputMimeType = resolvedMime,
+                outputFps = s.plannedFps,
+                outputHeight = targetHeightFor(item, s.effectiveQuality)
+            )
+        if (!doomed) return false
+        // Keep the original and write NOTHING — deliberately the same no-output shape as the
+        // SKIPPED_WOULD_DEGRADE path, NOT a switch to Remux Only. Routing these into the remux
+        // stream copy would expose non-MP4 sources (e.g. the MKV/AV1 clips in real libraries) to
+        // a muxer that cannot carry them, turning a merely-wasteful encode into an outright
+        // failure. Nothing is re-encoded, copied, or replaced here.
+        val skipMessage =
+            "Already efficient for ${run.quality.label}: this video's bitrate is already at or " +
+                "below the quality floor for its resolution, so re-encoding could not make it " +
+                "smaller. Original kept unchanged."
+        DiagLog.i(
+            "CompressorBatch",
+            "doomed-encode skip; job=${diagnosticJobId(item)}; mode=${run.quality.label}; " +
+                "sourceVideoBitrate=${item.toSourceInfo().videoBitrate}; encode skipped, original kept"
+        )
+        recordDiagnosticJob(
+            diagnostics = run.diagnostics,
+            item = item,
+            requestedQuality = run.quality,
+            effectiveQuality = run.quality,
+            resolvedMime = resolvedMime,
+            plannedTargetRatio = null,
+            plannedTargetVideoBitrate = s.diagnosticTargetVideoBitrate,
+            plannedDecisionReason = "lossy target has no headroom below the source bitrate",
+            wasStreamCopy = false,
+            verification = null,
+            outputSize = 0L,
+            terminal = BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED,
+            elapsedMs = s.elapsedMs,
+            precedingCooldownMs = s.precedingHandoffCooldownMs
+        )
+        updateItem(s.index) {
+            it.copy(
+                status = BatchItemStatus.Skipped,
+                progress = 1f,
+                currentOutputSize = 0L,
+                targetOutputSize = 0L,
+                outputSize = 0L,
+                terminalResult = BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED,
+                message = skipMessage
+            )
+        }
+        return true
+    }
+
+    /**
+     * Keep-original remux FAST PATH (perf/remux-keep-original-fast-path): when the pipeline has
+     * already DECIDED to keep the original bytes, and the audited policy proves the copy would
+     * be a pure no-op (no privacy strip, compatible container, readable source, user did not
+     * choose Remux Only), surface the original directly — no copy written, no copy verified,
+     * original never opened for write. Any guard failing falls through to the unchanged full
+     * remux. Evidence: 40.3 min/172-file batch spent stream-copying keep-original items (max
+     * 267 s to save 0 bytes) — docs/pr23/REMUX_ACCELERATION_INVESTIGATION.md.
+     *
+     * @return true when the original was retained and the item is finished.
+     */
+    private fun retainOriginalUpFront(s: ItemRun, plan: PerceptualLosslessPlan): Boolean {
+        val run = s.run
+        val item = s.item
+        val context = run.context
+        val resolvedContainerMime = runCatching {
+            context.contentResolver.getType(item.sourceUri)
+        }.getOrNull()
+        val sourceReadableNow = runCatching {
+            context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { true } == true
+        }.getOrDefault(false)
+        val reuse = OriginalReusePolicy.evaluate(
+            isKeepOriginalDecision = true,
+            userRequestedRemuxOnly = false,
+            privacyMode = run.privacyMode,
+            resolvedContainerMime = resolvedContainerMime,
+            sourceReadableNow = sourceReadableNow
+        )
+        if (reuse is OriginalReuseDecision.Blocked) {
+            DiagLog.i(
+                "CompressorBatch",
+                "keep-original fast path blocked; job=${diagnosticJobId(item)}; " +
+                    "reason=${reuse.reason}; falling through to full remux"
+            )
+            s.diagnosticReuseBlockReason = reuse.reason.name
+            return false
+        }
+        reuse as OriginalReuseDecision.Eligible
+        // Honest typed validation: records ONLY what was actually checked (read-open at decision
+        // time). Never an OutputVerificationReport — no output exists and no output verification
+        // ran.
+        val retention = OriginalReusePolicy.retainedSourceValidation(
+            sourceReadable = sourceReadableNow,
+            sourceSizeBytes = item.originalSize,
+            containerMime = reuse.containerMime,
+            nowEpochMs = System.currentTimeMillis()
+        )
+        val terminal = BatchTerminalClassifier.classify(
+            BatchTerminalInput(
+                requestedMode = run.quality.toMode(),
+                effectiveMode = BatchQualityMode.REMUX_ONLY,
+                wasStreamCopy = false,
+                verified = retention.readableAtDecisionTime,
+                replacementSafe = false,
+                sourceSize = item.originalSize,
+                outputSize = item.originalSize,
+                preEncodeSourceAlreadyEfficient = plan.remuxWasSourceEfficient,
+                preEncodeEvidencePreferredRemux = plan.remuxWasEvidencePreferred,
+                retainedOriginalNoOutput = true
+            )
+        )
+        DiagLog.i(
+            "CompressorBatch",
+            "keep-original fast path; job=${diagnosticJobId(item)}; " +
+                "materialization=REUSED_SOURCE; copyAvoidedBytes=${item.originalSize}; " +
+                "container=$resolvedContainerMime; terminal=$terminal"
+        )
+        recordDiagnosticJob(
+            diagnostics = run.diagnostics,
+            item = item,
+            requestedQuality = run.quality,
+            effectiveQuality = BatchQualityPreset.REMUX_ONLY,
+            resolvedMime = null,
+            plannedTargetRatio = plan.targetRatio,
+            plannedTargetVideoBitrate = s.diagnosticTargetVideoBitrate,
+            plannedDecisionReason = plan.remuxReason,
+            wasStreamCopy = false,
+            verification = null,
+            retainedValidation = retention,
+            outputSize = item.originalSize,
+            terminal = terminal,
+            elapsedMs = s.elapsedMs,
+            probedRatios = plan.probedRatios,
+            pixelProvenRatio = plan.pixelProvenRatio,
+            probeDetail = plan.probeDetail,
+            probeWindowScores = plan.probeWindowScores,
+            probePairDiag = plan.probePairDiag,
+            probeV1Scores = plan.probeV1Scores,
+            precedingCooldownMs = s.precedingHandoffCooldownMs,
+            materializationMode = "REUSED_SOURCE",
+            copyAvoidedBytes = item.originalSize
+        )
+        val elapsed = s.elapsedMs
+        val thermalWindow = s.thermalWindow
+        updateItem(s.index) {
+            it.copy(
+                status = if (terminal.isFailure) BatchItemStatus.Failed else BatchItemStatus.Done,
+                progress = 1f,
+                currentOutputSize = item.originalSize,
+                outputUri = if (terminal.isFailure) null else item.sourceUri,
+                outputPath = null,
+                outputSize = if (terminal.isFailure) 0L else item.originalSize,
+                outputMode = BatchQualityPreset.REMUX_ONLY.label,
+                // No OutputVerificationReport exists for a retained source — the honest record is
+                // the typed RetainedSourceValidation in diagnostics; the item message carries the
+                // user-facing truth.
+                verificationReport = null,
+                terminalResult = terminal,
+                metrics = BatchItemMetrics(
+                    operationLabel = "Retained",
+                    elapsedMs = elapsed,
+                    outputBytes = 0L,
+                    savedBytes = 0L,
+                    thermalStart = thermalWindow.thermalLabel,
+                    thermalEnd = thermalWindow.thermalLabel,
+                    batteryStart = thermalWindow.batteryPercent,
+                    batteryEnd = thermalWindow.batteryPercent,
+                    cooldownMs = 0L
+                ),
+                message = if (terminal.isFailure) {
+                    "Original retention failed: source became unreadable — nothing was modified."
+                } else {
+                    KeepOriginalMessages.upFront(
+                        reason = plan.remuxReason,
+                        evidencePreferred = plan.remuxWasEvidencePreferred,
+                        probedRatios = plan.probedRatios,
+                        probeDetail = plan.probeDetail,
+                        pixelCertifiableBlockReason = plan.pixelCertifiableBlockReason
                     )
-                    it.copy(
-                        isCompressing = false,
-                        batchMetrics = metrics,
-                        highQualityRetryCandidates = highQualityRetryCandidatesFor(it),
-                        statusMessage = "Finished ${it.doneCount} output${if (it.doneCount == 1) "" else "s"}. " +
-                            "Real compressions: ${accounting.realCompressionCount}. " +
-                            "Saved ${formatFileSize(accounting.totalBytesSaved)} by real compression.",
-                        errorMessage = if (accounting.failedCount > 0) {
-                            "${accounting.failedCount} item${if (accounting.failedCount == 1) "" else "s"} failed. Tap each item for details."
-                        } else {
-                            null
-                        }
+                }
+            )
+        }
+        return true
+    }
+
+    /**
+     * Stage 2: produce the output file — a stream copy for Remux, otherwise the encode plus the
+     * metadata remux. Returns false when the item finished here (an encoder failure whose
+     * original was retained).
+     */
+    private suspend fun produceOutput(s: ItemRun): Boolean {
+        val run = s.run
+        val item = s.item
+        val context = run.context
+        val remuxResult = if (s.effectiveQuality == BatchQualityPreset.REMUX_ONLY) {
+            s.candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
+            remuxOnlyOne(context, item, s.index, run.privacyMode)
+        } else {
+            val safeResolvedMime = s.resolvedMime
+                ?: throw IllegalStateException("Encoder selection failed before export planning. Use Remux Only or choose a different codec.")
+            try {
+                s.candidateFiles += item.cacheOutputFile(context, run.quality)
+                val attempt = compressOne(
+                    context,
+                    item,
+                    s.index,
+                    run.quality,
+                    run.frameRate,
+                    safeResolvedMime,
+                    s.perceptualPlan?.targetRatio,
+                    s.perceptualPlan?.useCbrCeiling == true,
+                    s.perceptualPlan?.pixelProvenRatio
+                )
+                s.encodeAttempt = attempt
+                withContext(Dispatchers.IO) {
+                    val remuxContext = currentCoroutineContext()
+                    Mp4MetadataRemuxer.remuxWithSourceMetadata(
+                        context,
+                        attempt.file,
+                        item.metadataSnapshot.filteredForPrivacy(run.privacyMode),
+                        cancellationCheck = { remuxContext.ensureActive() }
                     )
                 }
-            } catch (e: CancellationException) {
-                runCancelled = true
-                throw e
-            } catch (e: Throwable) {
-                runFailed = true
-                sessionFailReason = e.message ?: e.javaClass.simpleName
-                throw e
-            } finally {
-                // Release foreground protection + wake lock FIRST, before any other finally work, so a
-                // throw in the rest of this block cannot leak them. Idempotent — safe even if begin()
-                // never fired (e.g. a pre-try setup failure).
-                batchGuard.end()
-                DiagLog.detach()
-                if (runCancelled) {
-                    val cancelledItems = _uiState.value.items.filter { it.terminalResult == null }
-                    _uiState.update { state ->
-                        state.copy(
-                            items = state.items.map { item ->
-                                if (item.terminalResult == null) {
-                                    item.copy(
-                                        status = BatchItemStatus.Cancelled,
-                                        terminalResult = BatchTerminalResult.CANCELLED,
-                                        message = "Cancelled — no compression result accepted."
-                                    )
-                                } else {
-                                    item
-                                }
-                            }
-                        )
-                    }
-                    cancelledItems.forEach { item ->
-                        recordDiagnosticJob(
-                            diagnostics = diagnostics,
-                            item = item,
-                            requestedQuality = quality,
-                            effectiveQuality = quality,
-                            resolvedMime = null,
-                            plannedTargetRatio = null,
-                            plannedTargetVideoBitrate = null,
-                            wasStreamCopy = false,
-                            verification = null,
-                            outputSize = 0L,
-                            terminal = BatchTerminalResult.CANCELLED,
-                            elapsedMs = 0L
-                        )
-                    }
-                    _uiState.update {
-                        val accounting = it.terminalAccounting
-                        it.copy(
-                            isCompressing = false,
-                            batchMetrics = BatchMetricsSummary(
-                                totalElapsedMs = System.currentTimeMillis() - batchStartedAt,
-                                totalCooldownMs = it.items.sumOf { item -> item.metrics?.cooldownMs ?: 0L },
-                                processedCount = accounting.processedCount,
-                                realCompressionCount = accounting.realCompressionCount,
-                                nonCompressionCount = accounting.nonCompressionCount,
-                                failedCount = accounting.failedCount,
-                                skippedCount = accounting.skippedCount,
-                                cancelledCount = accounting.cancelledCount,
-                                totalSavedBytes = accounting.totalBytesSaved
-                            ),
-                            statusMessage = "Compression canceled. ${accounting.cancelledCount} item${if (accounting.cancelledCount == 1) "" else "s"} canceled.",
-                            errorMessage = null
-                        )
+            } catch (e: ExportException) {
+                s.diagnosticEncoderFailed = true
+                // A rejected encoder configuration or export failure must never strand a
+                // Perceptually Lossless item as "Failed": the honest production answer is the
+                // untouched original (or, when that cannot be reused, the verified stream copy).
+                val perceptualPlan = s.perceptualPlan ?: throw e
+                val reason = "encoder export failed (${e.errorCodeName})"
+                s.diagnosticFallbackReason = reason
+                DiagLog.w(
+                    "CompressorBatch",
+                    "Perceptually lossless encode failed before verification for ${diagnosticJobId(item)}: $reason; falling back to remux"
+                )
+                if (e.errorCode == ExportException.ERROR_CODE_MUXING_TIMEOUT) {
+                    // The two 30-minute sources in b161/b163 timed out here with nothing in the
+                    // record to explain it. The keyframe structure is the first thing to know.
+                    qualityProber.describeKeyframes(item.sourceUri)?.let {
+                        DiagLog.w("CompressorBatch", "muxing timeout; job=${diagnosticJobId(item)}; source $it")
                     }
                 }
-                // Emit the honest session terminal record: cancelled batches get session_cancelled,
-                // a completed run gets session_summary. A hard-failure path is reported below.
-                val sessionElapsed = System.currentTimeMillis() - batchStartedAt
-                when {
-                    runCancelled -> diagnostics.sessionCancelled(sessionElapsed, reason = "user_cancelled")
-                    runFailed -> diagnostics.sessionFailed(sessionElapsed, reason = sessionFailReason)
-                    else -> diagnostics.sessionSummary(sessionElapsed)
+                // An encoder or muxer failure says nothing about the ratio (see
+                // LearningEvidencePolicy.Kind.PIPELINE), so it teaches nothing.
+                DiagLog.i(
+                    "CompressorLearning",
+                    "result=pipeline_failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
+                        "reason=$reason; learned state unchanged"
+                )
+                if (retainOriginalInsteadOfCopy(
+                        context = context,
+                        diagnostics = run.diagnostics,
+                        item = item,
+                        index = s.index,
+                        quality = run.quality,
+                        privacyMode = run.privacyMode,
+                        plan = perceptualPlan,
+                        resolvedMime = s.diagnosticResolvedMime,
+                        plannedTargetVideoBitrate = s.diagnosticTargetVideoBitrate,
+                        plannedDecisionReason = s.diagnosticDecisionReason,
+                        evidence = DiscardedAttemptEvidence(fallbackReason = reason, encoderFailed = true),
+                        itemStartedAt = s.itemStartedAt,
+                        thermalStart = s.thermalWindow,
+                        precedingCooldownMs = s.precedingHandoffCooldownMs
+                    )
+                ) {
+                    s.candidateFiles.forEach { runCatching { it.delete() } }
+                    // The encoder failed without producing an output (encodeAttempt is null), so
+                    // no cooldown is owed. That matches the stream-copy path this replaces.
+                    return false
                 }
-                activeTransformer = null
-                compressionJob = null
+                s.effectiveQuality = BatchQualityPreset.REMUX_ONLY
+                s.diagnosticEffectiveQuality = s.effectiveQuality
+                s.preEncodeRemuxNote = "Remux Fallback Kept: the encoder rejected the perceptually lossless attempt ($reason)"
+                s.candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
+                remuxOnlyOne(context, item, s.index, run.privacyMode)
             }
         }
+        s.remuxResult = remuxResult
+        s.outputFile = remuxResult.outputFile
+        s.outputUri = Uri.fromFile(remuxResult.outputFile)
+        s.outputSize = remuxResult.outputFile.length()
+        return true
+    }
+
+    /**
+     * Stage 3: structural verification, floor recovery, sampled pixel certification and the
+     * Perceptually Lossless fallback. Returns false when the item finished here.
+     */
+    private suspend fun verifyOutput(s: ItemRun): Boolean {
+        verifyStructurally(s)
+        if (!certifyPixels(s)) return false
+        if (!applyPerceptualVerdict(s)) return false
+        return true
+    }
+
+    private suspend fun verifyStructurally(s: ItemRun) {
+        val run = s.run
+        val item = s.item
+        val context = run.context
+        val outputFile = checkNotNull(s.outputFile) { "verification before an output exists" }
+        val perceptualPlan = s.perceptualPlan
+        // A pixel-proven ratio replaces the class-level verification floor with the proven one
+        // minus the encoder-undershoot tolerance measured in the field (requests land within ~6%
+        // on this device class); certification below re-checks the real pixels regardless.
+        val pixelProvenVerifierFloor = perceptualPlan?.pixelProvenRatio?.let { proven ->
+            ((proven - PIXEL_PROVEN_UNDERSHOOT_TOLERANCE) *
+                item.toSourceInfo().videoBitrate).toInt().coerceAtLeast(1)
+        }
+        var verification = withContext(Dispatchers.IO) {
+            OutputVerifier.verify(
+                context, item, outputFile, s.effectiveQuality.label, run.privacyMode,
+                pixelProvenVideoBitrateFloor = pixelProvenVerifierFloor
+            )
+        }
+        // Measured request-vs-actual encoder behavior for this attempt. Prefer Media3's own
+        // reported average; fall back to the size/duration measurement.
+        val outputSize = s.outputSize
+        s.measuredOvershoot = s.encodeAttempt?.let { attempt ->
+            when {
+                attempt.requestedVideoBitrate <= 0 -> null
+                attempt.reportedAverageVideoBitrate > 0 ->
+                    attempt.reportedAverageVideoBitrate.toDouble() / attempt.requestedVideoBitrate
+                item.durationMs > 0 && outputSize > 0 ->
+                    ((outputSize * 8000.0 / item.durationMs) - item.originalAudioBitrate.coerceAtLeast(0)) /
+                        attempt.requestedVideoBitrate
+                else -> null
+            }
+        }
+        // Floor recovery: when the ONLY verification failure is the inferred video bitrate floor
+        // (structure, color, audio, timing, metadata all passed) and the output is strictly
+        // smaller, sampled pixel certification gets the final word — a VBR encoder undershooting
+        // its request on easy content is quality saturation, not necessarily degradation, and
+        // only pixels can tell which. A measured PASS re-verifies with the certified bitrate as
+        // the pixel-proven floor, so OutputVerifier remains the sole source of the final verdict;
+        // a failed or unmeasurable certification changes nothing and the encode falls back
+        // exactly as before.
+        if (s.effectiveQuality == BatchQualityPreset.ORIGINAL &&
+            perceptualPlan != null && perceptualPlan.pixelCertifiable &&
+            verification.failedOnlyOnVideoBitrateFloor &&
+            item.originalSize > 0L && outputSize in 1 until item.originalSize
+        ) {
+            updateItem(s.index) {
+                it.copy(message = "Certifying pixels: encoder undershot the bitrate floor, checking real quality…")
+            }
+            val recoveryOutcome = qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+            val recoveryScores = (recoveryOutcome as? PairScoreOutcome.Scored)?.windows
+            s.diagnosticCertWindowScores = compactWindowScores(recoveryScores)
+            s.diagnosticCertBandingDiag = compactBandingDiag(recoveryScores)
+            if (QualityProbePolicy.windowsPass(recoveryScores)) {
+                s.floorRecoveryCertScores = recoveryScores
+                val certifiedVideoBitrate = s.encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
+                    ?: if (item.durationMs > 0 && outputSize > 0) {
+                        ((outputSize * 8000.0 / item.durationMs) - item.originalAudioBitrate.coerceAtLeast(0))
+                            .toInt().coerceAtLeast(1)
+                    } else {
+                        1
+                    }
+                DiagLog.i(
+                    "CompressorProbe",
+                    "floor recovery; job=${diagnosticJobId(item)}; sampled windows passed; " +
+                        "re-verifying with pixel-certified floor $certifiedVideoBitrate"
+                )
+                verification = withContext(Dispatchers.IO) {
+                    OutputVerifier.verify(
+                        context, item, outputFile, s.effectiveQuality.label, run.privacyMode,
+                        pixelProvenVideoBitrateFloor = certifiedVideoBitrate
+                    )
+                }
+            } else {
+                val cause = when (recoveryOutcome) {
+                    is PairScoreOutcome.Scored -> "failed"
+                    is PairScoreOutcome.MisalignmentRejected -> "rejected (output frames not time-alignable)"
+                    PairScoreOutcome.Unavailable -> "unavailable"
+                }
+                s.failedFloorRecoveryStatus = CertificationStatus.forFailedRecoveryOutcome(recoveryOutcome)
+                DiagLog.i(
+                    "CompressorProbe",
+                    "floor recovery; job=${diagnosticJobId(item)}; certification $cause; fallback proceeds"
+                )
+            }
+        }
+        s.verification = verification
+        // Record WHY certification will not run before the gate, so a null certWindowScores is
+        // never unexplained. Two 219-job captures had null certification fields for all 438 jobs
+        // with nothing saying which gate closed. Overwritten with the real outcome when it runs.
+        s.diagnosticCertStatus = when {
+            // A recovery attempt that ran and measured windows outranks every skip reason
+            // below: those describe certification that never started.
+            s.failedFloorRecoveryStatus != null -> s.failedFloorRecoveryStatus
+            s.effectiveQuality != BatchQualityPreset.ORIGINAL ->
+                CertificationStatus.SKIPPED_NOT_PL_MODE
+            perceptualPlan == null -> CertificationStatus.SKIPPED_NO_PLAN
+            !perceptualPlan.pixelCertifiable ->
+                perceptualPlan.pixelCertifiableBlockReason ?: CertificationStatus.SKIPPED_NO_PLAN
+            PerceptualLosslessVerifier.shouldFallbackToRemux(
+                verification, item.originalSize, outputSize
+            ) -> CertificationStatus.SKIPPED_FELL_BACK_TO_REMUX
+            else -> null
+        }
+    }
+
+    /**
+     * Sampled pixel certification of the full output (any SDR, non-downgrade encode whose
+     * geometry the scorer can handle — NOT just ladder-eligible ones). Measured-bad always fails;
+     * a certification failure SKIPS the item — pixel evidence just proved the encode degrades
+     * this clip, so the honest outcome is the untouched original, not a stream-copy that saves
+     * nothing.
+     *
+     * Unmeasurable evidence is handled by two different rules depending on what justified the
+     * target. When a ladder ran, a sub-default ratio rests on pixel evidence alone and must fail
+     * closed without it. When no ladder ran (4K-class), the target never depended on pixels, so
+     * the structural verdict stands exactly as it does today — certification can only ADD proof
+     * for these sources.
+     *
+     * @return false when the item finished here.
+     */
+    private suspend fun certifyPixels(s: ItemRun): Boolean {
+        val run = s.run
+        val item = s.item
+        val perceptualPlan = s.perceptualPlan
+        val verification = checkNotNull(s.verification) { "certification before verification" }
+        val outputFile = checkNotNull(s.outputFile) { "certification before an output exists" }
+        if (!(s.effectiveQuality == BatchQualityPreset.ORIGINAL &&
+                perceptualPlan != null && perceptualPlan.pixelCertifiable &&
+                !PerceptualLosslessVerifier.shouldFallbackToRemux(verification, item.originalSize, s.outputSize))
+        ) {
+            return true
+        }
+        updateItem(s.index) {
+            it.copy(message = "Certifying pixels: sampled VMAF check of the final output…")
+        }
+        val certOutcome = s.floorRecoveryCertScores?.let { PairScoreOutcome.Scored(it) }
+            ?: qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+        val certScores = (certOutcome as? PairScoreOutcome.Scored)?.windows
+        s.diagnosticCertWindowScores = compactWindowScores(certScores)
+        s.diagnosticCertBandingDiag = compactBandingDiag(certScores)
+        s.diagnosticCertV1Scores = compactV1Scores(certScores)
+        val certOk = if (perceptualPlan.requiresMeasuredCertification) {
+            ExhaustivePerceptualLosslessPolicy.measuredCertificationPasses(certOutcome)
+        } else if (perceptualPlan.probeEligible) {
+            QualityProbePolicy.certificationOutcomePasses(
+                usedRatio = perceptualPlan.targetRatio,
+                defaultRatio = perceptualPlan.defaultRatio,
+                outcome = certOutcome
+            )
+        } else {
+            QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(certOutcome)
+        }
+        // Pixel proof requires BOTH a pass AND measured windows — see
+        // QualityProbePolicy.isPixelCertified (pure + unit-tested) for why certOk alone is
+        // insufficient.
+        s.diagnosticCertStatus = CertificationStatus.forOutcome(certOutcome)
+        s.pixelCertifiedThisRun = QualityProbePolicy.isPixelCertified(certOk, certOutcome)
+        DiagLog.i(
+            "CompressorProbe",
+            "certification; job=${diagnosticJobId(item)}; usedRatio=${perceptualPlan.targetRatio}; " +
+                "windows=${certScores?.size ?: 0}; pass=$certOk; " +
+                "scores=${certScores?.joinToString { "%.1f/%.1f/%.1f".format(java.util.Locale.US, it.mean, it.p5, it.min) } ?: "unmeasured"}"
+        )
+        if (certOk) return true
+        // Only a certification that produced evidence may say the encode loses quality. Scored
+        // windows below the bar, and frames that could not be time-aligned, are both
+        // measurements of THIS output. "Unavailable" is the absence of a measurement: the
+        // original is still kept (the plan needed pixel proof and did not get it), but it is not
+        // labelled "would visibly lose quality" and it does not count against the profile in the
+        // learning engine.
+        val certMeasured = certOutcome !is PairScoreOutcome.Unavailable
+        val certReason = when {
+            certOutcome is PairScoreOutcome.MisalignmentRejected ->
+                "pixel certification rejected: output frames could not be " +
+                    "time-aligned with the source (frame loss or retiming)"
+            certScores == null && perceptualPlan.requiresMeasuredCertification ->
+                "pixel certification could not measure this output, and this encode " +
+                    "overturned a keep-original decision, so it needs measured proof"
+            certScores == null ->
+                "pixel certification unavailable for a sub-default-ratio encode"
+            else ->
+                "pixel certification failed (sampled VMAF below thresholds)"
+        }
+        val certTerminal = if (certMeasured) {
+            BatchTerminalResult.SKIPPED_WOULD_DEGRADE
+        } else {
+            // "Kept original — re-encode could not be verified".
+            BatchTerminalResult.UNEXPECTED_REMUX
+        }
+        s.diagnosticFallbackReason = certReason
+        s.diagnosticDiscardedVideoBitrate = s.encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
+        if (certMeasured) {
+            val learned = learningEngine.recordFailure(
+                perceptualPlan.profileKey,
+                perceptualPlan.targetRatio,
+                certReason,
+                perceptualPlan.floorRatio,
+                s.measuredOvershoot
+            )
+            DiagLog.i(
+                "CompressorLearning",
+                "result=failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
+                    "reason=$certReason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
+            )
+        } else {
+            DiagLog.i(
+                "CompressorLearning",
+                "result=unmeasured; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
+                    "reason=$certReason; learned state unchanged (no evidence)"
+            )
+        }
+        runCatching { outputFile.delete() }
+        recordDiagnosticJob(
+            diagnostics = run.diagnostics,
+            item = item,
+            requestedQuality = run.quality,
+            effectiveQuality = run.quality,
+            resolvedMime = s.diagnosticResolvedMime,
+            plannedTargetRatio = s.diagnosticTargetRatio,
+            plannedTargetVideoBitrate = s.diagnosticTargetVideoBitrate,
+            plannedDecisionReason = certReason,
+            wasStreamCopy = false,
+            verification = verification,
+            outputSize = 0L,
+            terminal = certTerminal,
+            elapsedMs = s.elapsedMs,
+            fallbackReason = certReason,
+            discardedVideoBitrate = s.diagnosticDiscardedVideoBitrate,
+            probedRatios = perceptualPlan.probedRatios,
+            pixelProvenRatio = perceptualPlan.pixelProvenRatio,
+            probeDetail = perceptualPlan.probeDetail,
+            probeWindowScores = perceptualPlan.probeWindowScores,
+            probePairDiag = perceptualPlan.probePairDiag,
+            probeV1Scores = perceptualPlan.probeV1Scores,
+            certWindowScores = s.diagnosticCertWindowScores,
+            certBandingDiag = s.diagnosticCertBandingDiag,
+            certV1Scores = s.diagnosticCertV1Scores,
+            certificationStatus = s.diagnosticCertStatus,
+            encoderConfig = s.encodeAttempt?.configDelta?.compact(),
+            precedingCooldownMs = s.precedingHandoffCooldownMs
+        )
+        updateItem(s.index) {
+            it.copy(
+                status = BatchItemStatus.Skipped,
+                progress = 1f,
+                currentOutputSize = 0L,
+                outputUri = null,
+                outputPath = null,
+                outputSize = 0L,
+                terminalResult = certTerminal,
+                message = "Skipped: $certReason — original left untouched."
+            )
+        }
+        return false
+    }
+
+    /**
+     * The Perceptually Lossless verdict on a structurally verified output: fall back to the
+     * original (or a stream copy) when verification rejected the encode, otherwise let the
+     * learning engine record the verified success. Returns false when the item finished here.
+     */
+    private suspend fun applyPerceptualVerdict(s: ItemRun): Boolean {
+        val run = s.run
+        val item = s.item
+        val context = run.context
+        val perceptualPlan = s.perceptualPlan
+        val verification = checkNotNull(s.verification) { "verdict before verification" }
+        val outputFile = checkNotNull(s.outputFile) { "verdict before an output exists" }
+        val outputSize = s.outputSize
+        if (s.effectiveQuality != BatchQualityPreset.ORIGINAL) return true
+        if (!PerceptualLosslessVerifier.shouldFallbackToRemux(verification, item.originalSize, outputSize)) {
+            if (verification.verified && perceptualPlan != null) {
+                val sizeRatio = if (item.originalSize > 0L) {
+                    outputSize.toDouble() / item.originalSize.toDouble()
+                } else {
+                    1.0
+                }
+                val learned = learningEngine.recordVerifiedSuccess(
+                    perceptualPlan.profileKey,
+                    perceptualPlan.targetRatio,
+                    sizeRatio,
+                    perceptualPlan.floorRatio,
+                    s.measuredOvershoot,
+                    // Only a pixel-certified success may lower the next target. A structural-only
+                    // pass keeps the strict no-step-down behavior, because the structural verifier
+                    // cannot see perceptual damage.
+                    pixelCertified = s.pixelCertifiedThisRun
+                )
+                DiagLog.i(
+                    "CompressorLearning",
+                    "result=verified; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
+                        "pixelCertified=${s.pixelCertifiedThisRun}; " +
+                        "bitrateMode=${s.encodeAttempt?.requestedBitrateModeLabel ?: "unknown"}; encoderName=${s.encodeAttempt?.videoEncoderName ?: "unknown"}; " +
+                        "measuredOvershoot=${s.measuredOvershoot ?: "unknown"}; learnedOvershoot=${learned.measuredOvershootFactor ?: "none"}; " +
+                        "sizeRatio=$sizeRatio; nextRatio=${learned.nextTargetRatio}"
+                )
+            }
+            return true
+        }
+        val failureReason = verification.replacementBlockReason ?: verification.verdict
+        s.diagnosticFallbackReason = failureReason
+        // Measured video bitrate of the DISCARDED encode (Media3's own report, else size/duration),
+        // captured before the file is deleted, so the structured record shows whether the encode
+        // undershot the floor or simply was not smaller.
+        s.diagnosticDiscardedVideoBitrate = s.encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
+            ?: if (item.durationMs > 0 && outputSize > 0) {
+                ((outputSize * 8000.0 / item.durationMs) - item.originalAudioBitrate.coerceAtLeast(0))
+                    .toInt().coerceAtLeast(0)
+            } else {
+                null
+            }
+        DiagLog.w(
+            "CompressorBatch",
+            "Perceptually lossless fallback to remux for ${diagnosticJobId(item)}: $failureReason"
+        )
+        // Log the full field-by-field report of the discarded attempt so device logs show exactly
+        // which check failed or which field was not exposed.
+        verification.summaryLines.forEach { line ->
+            DiagLog.w("CompressorVerification", "discarded PL attempt; $line")
+        }
+        if (perceptualPlan != null) {
+            // Only a starved encode moves the ratio; see LearningEvidencePolicy.
+            val evidence = LearningEvidencePolicy.classifyVerificationFailure(verification.failingChecks())
+            if (evidence == LearningEvidencePolicy.Kind.PIPELINE) {
+                DiagLog.i(
+                    "CompressorLearning",
+                    "result=pipeline_failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
+                        "failing=${verification.failingChecks().joinToString(",")}; reason=$failureReason; learned state unchanged"
+                )
+            } else {
+                val learned = learningEngine.recordFailure(
+                    perceptualPlan.profileKey,
+                    perceptualPlan.targetRatio,
+                    failureReason,
+                    perceptualPlan.floorRatio,
+                    s.measuredOvershoot,
+                    stepUp = evidence == LearningEvidencePolicy.Kind.QUALITY
+                )
+                DiagLog.i(
+                    "CompressorLearning",
+                    "result=failure; evidence=$evidence; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
+                        "bitrateMode=${s.encodeAttempt?.requestedBitrateModeLabel ?: "unknown"}; encoderName=${s.encodeAttempt?.videoEncoderName ?: "unknown"}; " +
+                        "measuredOvershoot=${s.measuredOvershoot ?: "unknown"}; learnedOvershoot=${learned.measuredOvershootFactor ?: "none"}; " +
+                        "reason=$failureReason; nextRatio=${learned.nextTargetRatio}; preferRemux=${learned.preferRemux}"
+                )
+            }
+        }
+        runCatching { outputFile.delete() }
+        if (perceptualPlan != null && retainOriginalInsteadOfCopy(
+                context = context,
+                diagnostics = run.diagnostics,
+                item = item,
+                index = s.index,
+                quality = run.quality,
+                privacyMode = run.privacyMode,
+                plan = perceptualPlan,
+                resolvedMime = s.diagnosticResolvedMime,
+                plannedTargetVideoBitrate = s.diagnosticTargetVideoBitrate,
+                plannedDecisionReason = s.diagnosticDecisionReason,
+                evidence = DiscardedAttemptEvidence(
+                    fallbackReason = failureReason,
+                    encoderFailed = false,
+                    discardedVideoBitrate = s.diagnosticDiscardedVideoBitrate,
+                    certWindowScores = s.diagnosticCertWindowScores,
+                    certBandingDiag = s.diagnosticCertBandingDiag,
+                    certV1Scores = s.diagnosticCertV1Scores,
+                    certificationStatus = s.diagnosticCertStatus,
+                    encoderConfig = s.encodeAttempt?.configDelta?.compact()
+                ),
+                itemStartedAt = s.itemStartedAt,
+                thermalStart = s.thermalWindow,
+                precedingCooldownMs = s.precedingHandoffCooldownMs
+            )
+        ) {
+            s.candidateFiles.forEach { runCatching { it.delete() } }
+            // A full encode DID run here, so the encoder's heat still earns its cooldown before
+            // the next video, exactly as on the stream-copy path.
+            s.cooldownForNextItemMs = applyPostItemCooldown(context, s.index, ranFullEncode = s.encodeAttempt != null)
+            return false
+        }
+        s.candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
+        val remuxResult = remuxOnlyOne(context, item, s.index, run.privacyMode)
+        s.remuxResult = remuxResult
+        s.outputFile = remuxResult.outputFile
+        s.outputUri = Uri.fromFile(remuxResult.outputFile)
+        s.outputSize = remuxResult.outputFile.length()
+        s.effectiveQuality = BatchQualityPreset.REMUX_ONLY
+        s.diagnosticEffectiveQuality = s.effectiveQuality
+        s.preEncodeRemuxNote = "Remux Fallback Kept: perceptually lossless could not be verified ($failureReason)"
+        s.verification = withContext(Dispatchers.IO) {
+            OutputVerifier.verify(context, item, remuxResult.outputFile, s.effectiveQuality.label, run.privacyMode)
+        }
+        return true
+    }
+
+    /** Stage 4: classify, record, publish, replace the original if asked, and cool down. */
+    private suspend fun finalizeItem(s: ItemRun) {
+        val run = s.run
+        val item = s.item
+        val context = run.context
+        val outputFile = checkNotNull(s.outputFile) { "finalize before an output exists" }
+        val outputUri = checkNotNull(s.outputUri) { "finalize before an output exists" }
+        val remuxResult = checkNotNull(s.remuxResult) { "finalize before an output exists" }
+        val outputSize = s.outputSize
+        // QUAL-001 — label honesty. OutputVerifier decides "Perceptually Lossless Verified" from
+        // STRUCTURAL checks alone, and it runs BEFORE pixel certification, so on its own that
+        // wording would imply pixel proof even when no pixels were ever scored (source above the
+        // VMAF geometry cap, VMAF unavailable, HDR/codec-downgrade, or a certification that
+        // returned no measured evidence and was accepted structurally). Record what was actually
+        // proven and qualify the wording when it was structural only. Nothing here relaxes
+        // acceptance: a measured cert FAILURE already skipped this item.
+        val verification = checkNotNull(s.verification) { "finalize before verification" }
+            .withCertificationBasis(s.pixelCertifiedThisRun)
+        s.verification = verification
+        logVerificationResult(item, s.effectiveQuality, verification, outputSize)
+        val thermalEnd = ThermalBatchGovernor.snapshot(context, _uiState.value.thermalMode, _uiState.value.cooldownSeconds)
+        val terminal = BatchTerminalClassifier.classify(
+            BatchTerminalInput(
+                requestedMode = run.quality.toMode(),
+                effectiveMode = s.effectiveQuality.toMode(),
+                wasStreamCopy = s.effectiveQuality == BatchQualityPreset.REMUX_ONLY,
+                verified = verification.verified,
+                replacementSafe = verification.replacementSafe,
+                sourceSize = item.originalSize,
+                outputSize = outputSize,
+                preEncodeSourceAlreadyEfficient = s.diagnosticSourceAlreadyEfficient,
+                preEncodeEvidencePreferredRemux = s.diagnosticEvidencePreferredRemux,
+                encoderFailed = s.diagnosticEncoderFailed,
+                acceptAnyVerifiedSaving = run.exhaustivePerceptualLossless
+            )
+        )
+        val terminalSavedBytes = BatchTerminalAccounting.savedBytes(
+            BatchTerminalAccountingEntry(terminal, item.originalSize, outputSize)
+        )
+        val metrics = BatchItemMetrics(
+            operationLabel = if (s.effectiveQuality == BatchQualityPreset.REMUX_ONLY) "Remux" else "Encode",
+            elapsedMs = s.elapsedMs,
+            outputBytes = outputSize,
+            savedBytes = terminalSavedBytes,
+            thermalStart = s.thermalWindow.thermalLabel,
+            thermalEnd = thermalEnd.thermalLabel,
+            batteryStart = s.thermalWindow.batteryPercent,
+            batteryEnd = thermalEnd.batteryPercent,
+            cooldownMs = 0L
+        )
+        val perceptualPlan = s.perceptualPlan
+        recordDiagnosticJob(
+            diagnostics = run.diagnostics,
+            item = item,
+            requestedQuality = run.quality,
+            effectiveQuality = s.effectiveQuality,
+            resolvedMime = s.diagnosticResolvedMime,
+            plannedTargetRatio = s.diagnosticTargetRatio,
+            plannedTargetVideoBitrate = s.diagnosticTargetVideoBitrate,
+            plannedDecisionReason = s.diagnosticDecisionReason,
+            wasStreamCopy = s.effectiveQuality == BatchQualityPreset.REMUX_ONLY,
+            verification = verification,
+            outputSize = outputSize,
+            terminal = terminal,
+            elapsedMs = metrics.elapsedMs,
+            fallbackReason = s.diagnosticFallbackReason,
+            discardedVideoBitrate = s.diagnosticDiscardedVideoBitrate,
+            probedRatios = perceptualPlan?.probedRatios ?: emptyList(),
+            pixelProvenRatio = perceptualPlan?.pixelProvenRatio,
+            probeDetail = perceptualPlan?.probeDetail,
+            probeWindowScores = perceptualPlan?.probeWindowScores,
+            probePairDiag = perceptualPlan?.probePairDiag,
+            probeV1Scores = perceptualPlan?.probeV1Scores,
+            certWindowScores = s.diagnosticCertWindowScores,
+            certBandingDiag = s.diagnosticCertBandingDiag,
+            certV1Scores = s.diagnosticCertV1Scores,
+            certificationStatus = s.diagnosticCertStatus,
+            encoderConfig = s.encodeAttempt?.configDelta?.compact(),
+            thermalStart = metrics.thermalStart,
+            thermalEnd = metrics.thermalEnd,
+            precedingCooldownMs = s.precedingHandoffCooldownMs,
+            materializationMode = "GENERATED_FILE",
+            originalReuseBlockReason = s.diagnosticReuseBlockReason
+        )
+
+        if (terminal.isFailure) {
+            // An unverified remux/encode is evidence, not an output. Keep its measured size in
+            // diagnostics, then remove the cache file and expose no share/save/replacement path
+            // to the UI.
+            runCatching { outputFile.delete() }
+            updateItem(s.index) {
+                it.copy(
+                    status = BatchItemStatus.Failed,
+                    progress = 1f,
+                    currentOutputSize = 0L,
+                    outputUri = null,
+                    outputPath = null,
+                    outputSize = 0L,
+                    outputMode = s.effectiveQuality.label,
+                    verificationReport = verification,
+                    metrics = metrics,
+                    terminalResult = terminal,
+                    message = buildString {
+                        append(terminal.label)
+                        verification.replacementBlockReason?.let { append(": ").append(it) }
+                    }
+                )
+            }
+        } else {
+            val muxerMessage = s.preEncodeRemuxNote?.let { note -> "${remuxResult.message} • $note" } ?: remuxResult.message
+            updateItem(s.index) {
+                it.copy(
+                    status = BatchItemStatus.Done,
+                    progress = 1f,
+                    currentOutputSize = outputSize,
+                    outputUri = outputUri,
+                    outputPath = outputFile.absolutePath,
+                    outputSize = outputSize,
+                    outputMode = s.effectiveQuality.label,
+                    verificationReport = verification,
+                    metrics = metrics,
+                    terminalResult = terminal,
+                    message = completionMessage(
+                        it,
+                        s.effectiveQuality,
+                        outputSize,
+                        s.plannedFps,
+                        s.codecLabel,
+                        muxerMessage,
+                        verification,
+                        run.privacyMode
+                    )
+                )
+            }
+            s.itemOutputAccepted = true
+        }
+
+        if (terminal.allowsOriginalReplacement && _uiState.value.replaceOriginals) {
+            // Once destructive replacement starts, finish it and publish its disposition
+            // atomically before honoring cancellation. This prevents an original from changing
+            // while the UI remains stuck at a pre-replacement Done state.
+            withContext(NonCancellable) {
+                val replacement = replaceOriginalSafely(
+                    context = context,
+                    item = item,
+                    outputFile = outputFile,
+                    useShizukuFallback = _uiState.value.useShizukuFallback,
+                    quality = s.effectiveQuality,
+                    verification = verification,
+                    backupBeforeReplace = _uiState.value.backupBeforeReplace,
+                    privacyMode = run.privacyMode
+                )
+                updateItem(s.index) {
+                    it.copy(
+                        status = if (replacement.success) BatchItemStatus.Replaced else BatchItemStatus.SavedCopy,
+                        message = replacement.message
+                    )
+                }
+            }
+        }
+
+        if (s.index < _uiState.value.items.lastIndex) {
+            // Apply the thermal cooldown ONLY after an item that actually ran a full hardware
+            // encode (encodeAttempt != null). Stream-copy/remux and already-optimized items
+            // generate no encoder heat, so cooling down after them is pure idle time.
+            // Timing-only: no compression/verification/learning decision is affected.
+            s.cooldownForNextItemMs = applyPostItemCooldown(context, s.index, ranFullEncode = s.encodeAttempt != null)
+        }
+    }
+
+    /** The per-item failure handler: record the failure and let the batch continue. */
+    private suspend fun handleItemFailure(s: ItemRun, e: Exception) {
+        val run = s.run
+        val item = s.item
+        val unsupported = e.message?.contains(Mp4MetadataRemuxer.REMUX_ONLY_UNSUPPORTED_MESSAGE) == true
+        // A Perceptually Lossless item that was headed for "keep the original" failed only because
+        // the stream copy carrying it is impossible for this container. The original is untouched
+        // and was the decision, so retain it rather than report a failure. Privacy stripping and
+        // unreadable sources still fail as before (OriginalReusePolicy).
+        val keepOriginalPlan = s.diagnosticPlan
+        if (unsupported && run.quality == BatchQualityPreset.ORIGINAL &&
+            s.diagnosticEffectiveQuality == BatchQualityPreset.REMUX_ONLY && keepOriginalPlan != null &&
+            retainOriginalInsteadOfCopy(
+                context = run.context,
+                diagnostics = run.diagnostics,
+                item = item,
+                index = s.index,
+                quality = run.quality,
+                privacyMode = run.privacyMode,
+                plan = keepOriginalPlan,
+                resolvedMime = s.diagnosticResolvedMime,
+                plannedTargetVideoBitrate = s.diagnosticTargetVideoBitrate,
+                plannedDecisionReason = s.diagnosticDecisionReason,
+                evidence = DiscardedAttemptEvidence(
+                    fallbackReason = s.diagnosticFallbackReason
+                        ?: "stream copy impossible: ${e.message ?: "unsupported container"}",
+                    encoderFailed = s.diagnosticEncoderFailed
+                ),
+                itemStartedAt = s.itemStartedAt,
+                thermalStart = s.thermalWindow,
+                precedingCooldownMs = s.precedingHandoffCooldownMs,
+                afterFailedAttempt = s.diagnosticFallbackReason != null,
+                containerCannotBeCopied = true
+            )
+        ) {
+            return
+        }
+        val encoderFailure = s.diagnosticEncoderFailed || e is ExportException
+        val terminal = BatchTerminalClassifier.classify(
+            BatchTerminalInput(
+                requestedMode = run.quality.toMode(),
+                effectiveMode = s.diagnosticEffectiveQuality.toMode(),
+                wasStreamCopy = false,
+                verified = false,
+                replacementSafe = false,
+                sourceSize = item.originalSize,
+                outputSize = 0L,
+                hardFailure = !unsupported && !encoderFailure,
+                unsupportedContainer = unsupported,
+                encoderFailed = encoderFailure
+            )
+        )
+        DiagLog.w("CompressorBatch", "item failed; job=${diagnosticJobId(item)}; terminal=$terminal", e)
+        val elapsedMs = s.elapsedMs
+        updateItem(s.index) {
+            it.copy(
+                status = BatchItemStatus.Failed,
+                progress = 1f,
+                currentOutputSize = 0L,
+                outputUri = null,
+                outputPath = null,
+                outputSize = 0L,
+                terminalResult = terminal,
+                message = e.message ?: "Compression failed"
+            )
+        }
+        recordDiagnosticJob(
+            diagnostics = run.diagnostics,
+            item = item,
+            requestedQuality = run.quality,
+            effectiveQuality = s.diagnosticEffectiveQuality,
+            resolvedMime = s.diagnosticResolvedMime,
+            plannedTargetRatio = s.diagnosticTargetRatio,
+            plannedTargetVideoBitrate = s.diagnosticTargetVideoBitrate,
+            plannedDecisionReason = s.diagnosticDecisionReason,
+            wasStreamCopy = false,
+            verification = null,
+            outputSize = 0L,
+            terminal = terminal,
+            elapsedMs = elapsedMs
+        )
     }
 
     override fun onCleared() {
@@ -3182,6 +3445,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             certV1Scores = certV1Scores,
             probeV1Scores = probeV1Scores,
             certificationStatus = certificationStatus,
+            audioPreservation = verification?.audioBasis,
             encoderConfig = encoderConfig,
             thermalStart = thermalStart,
             thermalEnd = thermalEnd,
@@ -3248,7 +3512,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         } else {
             "${quality.label}: ${item.originalWidth}x${item.originalHeight} • ${plannedFps ?: item.originalFps.toInt()}fps • $codecLabel"
         }
-        return "$modeSummary • $sizeSummary • ${verification.verdict} • ${privacyMode.summary} • $muxerMessage"
+        val audio = verification.audioBasis?.let { " • audio: $it" } ?: ""
+        return "$modeSummary • $sizeSummary • ${verification.verdict}$audio • ${privacyMode.summary} • $muxerMessage"
     }
 
     private fun recommendFor(item: BatchVideoItem): CompressionRecommendation {

@@ -71,7 +71,9 @@ object OutputVerifier {
         val pixelProvenVideoBitrateFloor: Int? = null,
         // True only when AudioTrackIdentity proved the output's audio packets byte-identical to
         // the source's. Proof of a pass-through copy, which no bitrate label can give.
-        val audioPacketsIdentical: Boolean = false
+        val audioPacketsIdentical: Boolean = false,
+        // How many packets that proof compared (0 when it was not made).
+        val audioPacketsCompared: Int = 0
     )
 
     fun verify(
@@ -95,6 +97,13 @@ object OutputVerifier {
         val outputMetadata = runCatching {
             VideoMetadataPreserver.capture(context, Uri.fromFile(outputFile))
         }.getOrDefault(VideoMetadataSnapshot())
+        val audioIdentity = if (BatchQualityMode.fromLabel(modeLabel) == BatchQualityMode.PERCEPTUAL_LOSSLESS &&
+            sourceTracks.audioCodec != null && sourceTracks.audioCodec == outputTracks.audioCodec
+        ) {
+            AudioTrackIdentity.compare(context, source.sourceUri, outputFile)
+        } else {
+            null
+        }
         val sourceInfo = VideoSourceInfo(
             width = source.originalWidth,
             height = source.originalHeight,
@@ -131,11 +140,8 @@ object OutputVerifier {
                 pixelProvenVideoBitrateFloor = pixelProvenVideoBitrateFloor,
                 // Only worth reading packets when a copy is possible at all: a Perceptually
                 // Lossless output whose audio codec matches the source's.
-                audioPacketsIdentical = BatchQualityMode.fromLabel(modeLabel) == BatchQualityMode.PERCEPTUAL_LOSSLESS &&
-                    sourceTracks.audioCodec != null &&
-                    sourceTracks.audioCodec == outputTracks.audioCodec &&
-                    AudioTrackIdentity.compare(context, source.sourceUri, outputFile) ==
-                    AudioTrackIdentity.Result.IDENTICAL
+                audioPacketsIdentical = audioIdentity?.result == AudioTrackIdentity.Result.IDENTICAL,
+                audioPacketsCompared = audioIdentity?.packets ?: 0
             )
         )
     }
@@ -462,6 +468,13 @@ object OutputVerifier {
             audioCodec = "${codecLabel(input.sourceTrackProbe.audioCodec)} -> ${codecLabel(input.outputTrackProbe.audioCodec)} ${statusSuffix(audioCodecMatches)}",
             audioDetails = "${sampleRateLabel(input.sourceTrackProbe.audioSampleRate)}/${channelLabel(input.sourceTrackProbe.audioChannelCount)} -> ${sampleRateLabel(input.outputTrackProbe.audioSampleRate)}/${channelLabel(input.outputTrackProbe.audioChannelCount)} ${statusSuffix(audioShapeMatches)}",
             audioBitrate = "${bitrateLabel(input.sourceTrackProbe.audioBitrate)} -> ${bitrateLabel(effectiveOutputAudioBitrate)}${if (audioLooksStreamCopied) " (stream copied)" else ""} ${statusSuffix(audioBitratePass)}",
+            audioBasis = AudioPreservation.describe(
+                mode = input.mode,
+                sourceHasAudio = input.sourceTrackProbe.audioCodec != null,
+                packetsIdentical = input.audioPacketsIdentical,
+                packetsCompared = input.audioPacketsCompared,
+                inferredStreamCopy = audioLooksStreamCopied && !input.audioPacketsIdentical
+            ),
             hdr = "${input.sourceTrackProbe.hdrLabel} -> ${input.outputTrackProbe.hdrLabel}" +
                 if (colorComparison.basis == ColorMatchBasis.MEDIA3_ASSUMED_SDR) {
                     " (Media3 assumed SDR default) ${statusSuffix(hdrMatches)}"

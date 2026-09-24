@@ -176,6 +176,8 @@ class DiagnosticsRecorder private constructor(
         // Why sampled pixel certification did or did not run (see CertificationStatus). A null
         // certWindowScores is ambiguous on its own; this disambiguates it.
         certificationStatus: String? = null,
+        // See AudioPreservation: bit-identical copy / inferred copy / re-encoded, per job.
+        audioPreservation: String? = null,
         // Requested vs actual encoder configuration (see EncoderConfigDelta). Media3 format
         // fallback can substitute MIME or resolution and still report success; without this a
         // later verification rejection is inexplicable from a capture alone.
@@ -254,6 +256,7 @@ class DiagnosticsRecorder private constructor(
                 "certV1Scores" to certV1Scores,
                 "probeV1Scores" to probeV1Scores,
                 "certificationStatus" to certificationStatus,
+                "audioPreservation" to audioPreservation,
                 "encoderConfig" to encoderConfig,
                 "thermalStart" to thermalStart,
                 "thermalEnd" to thermalEnd,
@@ -389,6 +392,40 @@ class DiagnosticsRecorder private constructor(
             )
         }
 
+        /**
+         * The identity every session record carries, as a map for the diagnostics archive
+         * manifest. Technical identifiers only.
+         */
+        fun identityMap(context: Context): Map<String, Any?> {
+            val id = buildIdentity(context)
+            return linkedMapOf(
+                "packageName" to id.packageName,
+                "appVersionName" to id.appVersionName,
+                "appVersionCode" to id.appVersionCode,
+                "buildCommit" to id.buildCommit,
+                "buildTag" to id.buildTag,
+                "buildNumber" to id.buildNumber,
+                "buildType" to id.buildType,
+                "androidUserId" to id.androidUserId,
+                "profileKind" to id.profileKind,
+                "deviceModel" to Build.MODEL,
+                "manufacturer" to Build.MANUFACTURER,
+                "androidRelease" to Build.VERSION.RELEASE,
+                "sdkInt" to Build.VERSION.SDK_INT,
+                "schemaVersion" to SCHEMA_VERSION
+            )
+        }
+
+        /** Every run directory under `diagnostics/` that holds a session or decision log. */
+        fun runDirectories(context: Context): List<File> {
+            val root = File(context.filesDir, "diagnostics")
+            if (!root.isDirectory) return emptyList()
+            return root.listFiles().orEmpty().filter { dir ->
+                dir.isDirectory && dir.name.startsWith("batch_") &&
+                    (File(dir, "session.jsonl").isFile || File(dir, "decisions.log").isFile)
+            }
+        }
+
         fun start(
             context: Context,
             batchId: String,
@@ -397,6 +434,15 @@ class DiagnosticsRecorder private constructor(
             learnedStateIdentity: String? = null,
             exhaustivePerceptualLossless: Boolean? = null
         ): DiagnosticsRecorder {
+            // Retention: keep the newest runs, so the export stays one archive a phone can send
+            // and the folder cannot grow without bound. Older runs have been exported already or
+            // are no longer wanted.
+            runCatching {
+                val names = runDirectories(context).map { it.name }
+                DiagnosticsRetention.runsToPrune(names).forEach { name ->
+                    File(context.filesDir, "diagnostics/$name").deleteRecursively()
+                }
+            }
             val file = runCatching {
                 val dir = File(context.filesDir, "diagnostics/$batchId").apply { mkdirs() }
                 File(dir, "session.jsonl")

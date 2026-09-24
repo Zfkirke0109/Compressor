@@ -26,39 +26,45 @@ object AudioTrackIdentity {
 
     enum class Result { IDENTICAL, DIFFERENT, UNAVAILABLE }
 
+    /** The result plus how many packets were compared, for the record ("bit-identical, N packets"). */
+    data class Outcome(val result: Result, val packets: Int)
+
     private const val DEFAULT_SAMPLE_CAPACITY = 1 shl 20
 
     /**
      * Pure core: compares two ordered packet streams. Both must end together, every packet must
      * match byte for byte, and at least one packet must exist.
      */
-    internal fun compare(source: Iterator<ByteArray>, output: Iterator<ByteArray>): Result {
+    internal fun compare(source: Iterator<ByteArray>, output: Iterator<ByteArray>): Result =
+        compareCounted(source, output).result
+
+    internal fun compareCounted(source: Iterator<ByteArray>, output: Iterator<ByteArray>): Outcome {
         var packets = 0
         while (true) {
             val a = source.hasNext()
             val b = output.hasNext()
-            if (!a && !b) return if (packets > 0) Result.IDENTICAL else Result.UNAVAILABLE
-            if (a != b) return Result.DIFFERENT
-            if (!source.next().contentEquals(output.next())) return Result.DIFFERENT
+            if (!a && !b) return Outcome(if (packets > 0) Result.IDENTICAL else Result.UNAVAILABLE, packets)
+            if (a != b) return Outcome(Result.DIFFERENT, packets)
+            if (!source.next().contentEquals(output.next())) return Outcome(Result.DIFFERENT, packets)
             packets++
         }
     }
 
     /** Compares the first audio track of [sourceUri] with the first audio track of [outputFile]. */
-    fun compare(context: Context, sourceUri: Uri, outputFile: File): Result {
+    fun compare(context: Context, sourceUri: Uri, outputFile: File): Outcome {
         val sourceExtractor = MediaExtractor()
         val outputExtractor = MediaExtractor()
         return try {
             sourceExtractor.setDataSource(context, sourceUri, null)
             outputExtractor.setDataSource(outputFile.absolutePath)
-            val sourceTrack = selectAudio(sourceExtractor) ?: return Result.UNAVAILABLE
-            val outputTrack = selectAudio(outputExtractor) ?: return Result.UNAVAILABLE
-            compare(
+            val sourceTrack = selectAudio(sourceExtractor) ?: return Outcome(Result.UNAVAILABLE, 0)
+            val outputTrack = selectAudio(outputExtractor) ?: return Outcome(Result.UNAVAILABLE, 0)
+            compareCounted(
                 packets(sourceExtractor, capacityOf(sourceExtractor.getTrackFormat(sourceTrack))),
                 packets(outputExtractor, capacityOf(outputExtractor.getTrackFormat(outputTrack)))
             )
         } catch (_: Throwable) {
-            Result.UNAVAILABLE
+            Outcome(Result.UNAVAILABLE, 0)
         } finally {
             runCatching { sourceExtractor.release() }
             runCatching { outputExtractor.release() }

@@ -25,7 +25,7 @@ import sys
 from collections import Counter, OrderedDict
 from typing import Any
 
-from session_records import read_records
+from session_records import read_records, read_manifest
 
 
 def load_sessions(path: str) -> "OrderedDict[str, dict[str, Any]]":
@@ -302,6 +302,14 @@ def main() -> int:
         summaries = [summarize(p, args.batch) for p in args.sessions]
     for s in summaries:
         print(f"\n=== {s['path']} ===")
+        manifest = read_manifest(s["path"])
+        if manifest:
+            print(
+                f"  archive        : {manifest.get('scopeLabel')} · app {manifest.get('appVersionName')}"
+                f" ({manifest.get('buildTag')}, {manifest.get('buildCommit')}) · {manifest.get('deviceModel')}"
+                f" Android {manifest.get('androidRelease')} · exported {manifest.get('exportedAt')}"
+                f" · {len(manifest.get('files') or [])} files"
+            )
         print(render(s))
 
     if len(summaries) == 2 and not args.all:

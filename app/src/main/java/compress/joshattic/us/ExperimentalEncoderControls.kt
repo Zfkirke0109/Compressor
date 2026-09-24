@@ -31,7 +31,15 @@ object ExperimentalEncoderControls {
      * Master switch for the Tier-1 encoder-ceiling experiment. Even when true, the experiment is
      * active only in debuggable builds (see [isEnabled]) so release behavior stays untouched.
      */
-    const val ENABLE_EXPERIMENTAL_ENCODER_CEILING_DIAGNOSTICS = true
+    // OFF since b164. Every debug build the user has run made its real Perceptually Lossless
+    // encodes in CBR under this flag, which was written as a diagnostic, not as the production
+    // mode. CBR spends bits evenly across frames, so the hardest frames of a window get the
+    // least help exactly where the per-frame minimum gate looks; VBR lets the encoder move bits
+    // to those frames, which is what Perceptually Lossless needs at a given size. The size risk
+    // the flag guarded against (VBR overshoot) is already handled by measured overshoot and by
+    // verification requiring a strictly smaller output. Set to true only for a deliberate
+    // encoder-ceiling experiment, and record it in the capture.
+    const val ENABLE_EXPERIMENTAL_ENCODER_CEILING_DIAGNOSTICS = false
 
     fun isEnabled(context: Context): Boolean {
         if (!ENABLE_EXPERIMENTAL_ENCODER_CEILING_DIAGNOSTICS) return false

@@ -24,7 +24,9 @@ data class WindowScore(
     val banding: WindowBandingDiag? = null,
     // VMAF v1 shadow score for the same frame pairs (see VmafNativeV1). Telemetry only — never
     // consulted by any pass/fail decision; the verdict is mean/p5/min above (vmaf_v0.6.1).
-    val v1: WindowV1Diag? = null
+    val v1: WindowV1Diag? = null,
+    // Where the low scores sit (see WindowFrameDiag). Telemetry only.
+    val frameDiag: WindowFrameDiag? = null
 )
 
 /** VMAF v1 shadow scores for one window. See [VmafNativeV1]: evidence, never a gate. */
@@ -97,7 +99,9 @@ data class WindowPairingDiag(
     val distAlignDrops: Int = 0,
     // Probe windows only (ScoreWindow.alignFirstFrames): how far after the requested window
     // start the source's first frame sat. Null for windows normalised by the requested start.
-    val leadUs: Long? = null
+    val leadUs: Long? = null,
+    // Pairs consumed in the lead-in before the window and not scored (ScoreWindow.leadInUs).
+    val leadInPairsSkipped: Int = 0
 ) {
     /**
      * Compact capture form: "ref=50,dist=52,extra=0/2,skewMs=first/maxAbs/meanAbs,drop=a/b".
@@ -109,7 +113,44 @@ data class WindowPairingDiag(
             refFrames, distFrames, refExtra, distExtra,
             skewFirstUs / 1000.0, skewMaxAbsUs / 1000.0, skewMeanAbsUs / 1000.0,
             refAlignDrops, distAlignDrops
-        ) + (leadUs?.let { ",leadMs=%.1f".format(java.util.Locale.US, it / 1000.0) } ?: "")
+        ) + (leadUs?.let { ",leadMs=%.1f".format(java.util.Locale.US, it / 1000.0) } ?: "") +
+            (if (leadInPairsSkipped > 0) ",leadIn=$leadInPairsSkipped" else "")
+}
+
+/**
+ * WHERE the low scores sit inside a scored window. Recorded so a capture can tell a warm-up or
+ * boundary artefact (minimum at the first or last scored frame) from a genuinely hard frame in
+ * the middle. The b163 capture could not: it carried only mean/p5/min, and 140 of 175 windows had
+ * a minimum that was identical across bitrates with no way to say which frame it was.
+ */
+data class WindowFrameDiag(
+    val frames: Int,
+    val minIndex: Int,
+    val first: Double,
+    val last: Double,
+    /** The three lowest (index, score) pairs, lowest first. */
+    val lowest: List<Pair<Int, Double>>
+) {
+    /** Compact capture form: "n=36,minAt=0,first=77.5,last=97.2,low=0:77.5|1:79.0|35:88.2". */
+    fun compact(): String =
+        "n=%d,minAt=%d,first=%.1f,last=%.1f,low=%s".format(
+            java.util.Locale.US, frames, minIndex, first, last,
+            lowest.joinToString("|") { "%d:%.1f".format(java.util.Locale.US, it.first, it.second) }
+        )
+
+    companion object {
+        fun fromPerFrame(perFrame: DoubleArray): WindowFrameDiag? {
+            if (perFrame.isEmpty()) return null
+            val indexed = perFrame.withIndex().sortedBy { it.value }
+            return WindowFrameDiag(
+                frames = perFrame.size,
+                minIndex = indexed.first().index,
+                first = perFrame.first(),
+                last = perFrame.last(),
+                lowest = indexed.take(3).map { it.index to it.value }
+            )
+        }
+    }
 }
 
 /**
@@ -141,7 +182,14 @@ data class ScoreWindow(
     val startUs: Long,
     val endUs: Long,
     val distStartUs: Long = startUs,
-    val alignFirstFrames: Boolean = false
+    val alignFirstFrames: Boolean = false,
+    /**
+     * Frames decoded and PAIRED before [startUs] but never scored. The probe clip begins
+     * `leadInUs` before the window so its scored frames come from the encoder's steady state;
+     * see ProbeWindowPlanner. Pairing (and first-frame alignment) covers the lead-in too, so a
+     * frame dropped anywhere in the clip still fails the window.
+     */
+    val leadInUs: Long = 0L
 )
 
 /**
@@ -345,12 +393,14 @@ object VmafPairScorer {
         val refQueue = ArrayBlockingQueue<I420Frame>(queueCapacity)
         val distQueue = ArrayBlockingQueue<I420Frame>(queueCapacity)
         val error = AtomicReference<String?>(null)
-        val windowLenUs = window.endUs - window.startUs
+        // Both readers decode the lead-in as well as the window; only pairs whose reference frame
+        // lies inside the window are scored (see the PAIR branch below).
+        val decodeLenUs = window.leadInUs + (window.endUs - window.startUs)
 
         fun reader(uri: Uri, startUs: Long, queue: ArrayBlockingQueue<I420Frame>, label: String) =
             thread(name = "vmaf-$label") {
                 try {
-                    YuvFrameReader(context, uri, startUs, startUs + windowLenUs) { frame ->
+                    YuvFrameReader(context, uri, startUs, startUs + decodeLenUs) { frame ->
                         queue.put(frame)
                         error.get() == null
                     }.run()
@@ -361,8 +411,9 @@ object VmafPairScorer {
                 }
             }
 
-        val refThread = reader(ref, window.startUs, refQueue, "ref")
+        val refThread = reader(ref, window.startUs - window.leadInUs, refQueue, "ref")
         val distThread = reader(dist, window.distStartUs, distQueue, "dist")
+        var leadInPairsSkipped = 0
 
         var fed = 0
         var refEnded = false
@@ -441,6 +492,13 @@ object VmafPairScorer {
                 }
                 when (aligner.decide(refOrigin.normalize(r.ptsUs), distOrigin.normalize(d.ptsUs))) {
                     PtsAligner.Action.PAIR -> {
+                        if (r.ptsUs < window.startUs) {
+                            // Lead-in: aligned and consumed, never scored.
+                            leadInPairsSkipped++
+                            pendingRef = null
+                            pendingDist = null
+                            continue
+                        }
                         val skewUs = refOrigin.normalize(r.ptsUs) - distOrigin.normalize(d.ptsUs)
                         if (fed == 0) skewFirstUs = skewUs
                         val absSkew = kotlin.math.abs(skewUs)
@@ -526,8 +584,12 @@ object VmafPairScorer {
             skewMeanAbsUs = if (fed > 0) skewAbsSumUs / fed else 0L,
             refAlignDrops = aligner.refDropped,
             distAlignDrops = aligner.distDropped,
-            leadUs = if (window.alignFirstFrames) refOrigin.originUs?.let { it - window.startUs } else null
+            leadUs = if (window.alignFirstFrames) {
+                refOrigin.originUs?.let { it - (window.startUs - window.leadInUs) }
+            } else null,
+            leadInPairsSkipped = leadInPairsSkipped
         )
+        val frameDiag = WindowFrameDiag.fromPerFrame(perFrame)
         val result = WindowScore(
             comparedFrames = perFrame.size,
             mean = perFrame.average(),
@@ -535,13 +597,15 @@ object VmafPairScorer {
             min = sorted.first(),
             pairing = pairing,
             banding = summarizeBanding(perFrameCambi),
-            v1 = v1Diag
+            v1 = v1Diag,
+            frameDiag = frameDiag
         )
         DiagLog.i(
             TAG,
             "window [${window.startUs / 1000}ms..${window.endUs / 1000}ms] frames=${result.comparedFrames} " +
                 "mean=%.2f p5=%.2f min=%.2f".format(java.util.Locale.US, result.mean, result.p5, result.min) +
                 " pairing[${pairing.compact()}]" +
+                (frameDiag?.let { " frames[${it.compact()}]" } ?: "") +
                 (result.banding?.let { " banding[${it.compact()}]" } ?: "") +
                 (result.v1?.let { " v1shadow[${it.compact()} ms=${v1Nanos / 1_000_000}]" } ?: "")
         )
