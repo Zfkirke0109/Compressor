@@ -23,6 +23,11 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        # The action's default package list includes the legacy "tools" package, which
+        # Google's SDK repository no longer serves (sdkmanager: "Failed to find package
+        # 'tools'"), failing every run before anything builds. Request only what is used.
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android API 36
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
@@ -94,6 +99,11 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        # The action's default package list includes the legacy "tools" package, which
+        # Google's SDK repository no longer serves (sdkmanager: "Failed to find package
+        # 'tools'"), failing every run before anything builds. Request only what is used.
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android API 36
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
