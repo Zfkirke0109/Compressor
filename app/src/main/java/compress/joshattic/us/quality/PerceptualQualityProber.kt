@@ -417,7 +417,7 @@ class PerceptualQualityProber(private val context: Context) {
             // extra native work per frame, and certification runs once per output while the ladder
             // runs up to four times. Recorded for calibration; no verdict reads it.
             VmafPairScorer.score(
-                context, sourceUri, Uri.fromFile(outputFile), windows, collectBanding = true
+                context, sourceUri, Uri.fromFile(outputFile), windows, collectBanding = true, shadowV1 = true
             )
         }
     }

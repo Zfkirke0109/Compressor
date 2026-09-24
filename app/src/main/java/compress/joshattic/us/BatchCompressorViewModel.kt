@@ -299,6 +299,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // True when probes in exhaustive mode overturned a heuristic "keep original" decision.
         // Such a plan must be certified by MEASURED windows; see ExhaustivePerceptualLosslessPolicy.
         val requiresMeasuredCertification: Boolean = false,
+        // VMAF v1 shadow scores of the probe windows (telemetry only; see VmafNativeV1).
+        val probeV1Scores: String? = null,
         // Ratio proven by on-device VMAF probe windows for THIS clip. May sit ABOVE the
         // learned/default target when only a safer retreat rung passed its windows.
         val pixelProvenRatio: Double? = null,
@@ -799,6 +801,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // recorded pass OR fail so captures carry the real numbers behind verdicts.
                     var diagnosticCertWindowScores: String? = null
                     var diagnosticCertBandingDiag: String? = null
+                    var diagnosticCertV1Scores: String? = null
                     // Why certification did or did not run. An unexplained absence of evidence is
                     // indistinguishable from a bug, so this is never left null on a PL job.
                     var diagnosticCertStatus: String? = null
@@ -881,6 +884,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             probeDetail = perceptualPlan.probeDetail,
                             probeWindowScores = perceptualPlan.probeWindowScores,
                             probePairDiag = perceptualPlan.probePairDiag,
+                            probeV1Scores = perceptualPlan.probeV1Scores,
                             precedingCooldownMs = precedingHandoffCooldownMs
                         )
                         updateItem(index) {
@@ -1039,6 +1043,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 probeDetail = perceptualPlan.probeDetail,
                                 probeWindowScores = perceptualPlan.probeWindowScores,
                                 probePairDiag = perceptualPlan.probePairDiag,
+                                probeV1Scores = perceptualPlan.probeV1Scores,
                                 precedingCooldownMs = precedingHandoffCooldownMs,
                                 materializationMode = "REUSED_SOURCE",
                                 copyAvoidedBytes = item.originalSize
@@ -1286,6 +1291,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         val certScores = (certOutcome as? PairScoreOutcome.Scored)?.windows
                         diagnosticCertWindowScores = compactWindowScores(certScores)
                         diagnosticCertBandingDiag = compactBandingDiag(certScores)
+                        diagnosticCertV1Scores = compactV1Scores(certScores)
                         val certOk = if (perceptualPlan.requiresMeasuredCertification) {
                             ExhaustivePerceptualLosslessPolicy.measuredCertificationPasses(certOutcome)
                         } else if (perceptualPlan.probeEligible) {
@@ -1354,8 +1360,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                 probeDetail = perceptualPlan.probeDetail,
                                 probeWindowScores = perceptualPlan.probeWindowScores,
                                 probePairDiag = perceptualPlan.probePairDiag,
+                                probeV1Scores = perceptualPlan.probeV1Scores,
                                 certWindowScores = diagnosticCertWindowScores,
                                 certBandingDiag = diagnosticCertBandingDiag,
+                                certV1Scores = diagnosticCertV1Scores,
                                 certificationStatus = diagnosticCertStatus,
                                 encoderConfig = encodeAttempt?.configDelta?.compact(),
                                 precedingCooldownMs = precedingHandoffCooldownMs
@@ -1515,8 +1523,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         probeDetail = perceptualPlan?.probeDetail,
                         probeWindowScores = perceptualPlan?.probeWindowScores,
                         probePairDiag = perceptualPlan?.probePairDiag,
+                        probeV1Scores = perceptualPlan?.probeV1Scores,
                         certWindowScores = diagnosticCertWindowScores,
                         certBandingDiag = diagnosticCertBandingDiag,
+                        certV1Scores = diagnosticCertV1Scores,
                         certificationStatus = diagnosticCertStatus,
                         encoderConfig = encodeAttempt?.configDelta?.compact(),
                         thermalStart = metrics.thermalStart,
@@ -2243,7 +2253,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probedRatios = decision.probedRatios,
             probeDetail = decision.detail,
             probeWindowScores = compactWindowScores(decision.windowScores),
-            probePairDiag = compactPairingDiag(decision.windowScores)
+            probePairDiag = compactPairingDiag(decision.windowScores),
+            probeV1Scores = compactV1Scores(decision.windowScores)
         )
         val proven = decision.provenRatio ?: run {
             // Measured rejection at the SAFEST candidate ratio is positive pixel evidence
@@ -2747,6 +2758,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         probePairDiag: String? = null,
         certWindowScores: String? = null,
         certBandingDiag: String? = null,
+        certV1Scores: String? = null,
+        probeV1Scores: String? = null,
         certificationStatus: String? = null,
         encoderConfig: String? = null,
         thermalStart: String? = null,
@@ -2822,6 +2835,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probePairDiag = probePairDiag,
             certWindowScores = certWindowScores,
             certBandingDiag = certBandingDiag,
+            certV1Scores = certV1Scores,
+            probeV1Scores = probeV1Scores,
             certificationStatus = certificationStatus,
             encoderConfig = encoderConfig,
             thermalStart = thermalStart,
@@ -2845,6 +2860,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     // "improvement" turned out to be one such artifact (research/perceptual_calibration/
     // REVIEW_FINDINGS.md), and NEXT_ROUND_INSTRUMENTATION.md item 1 asks for exactly this widening.
     // Logging precision only: every decision still reads the unrounded doubles.
+    // Compact VMAF v1 shadow scores, ";"-joined. Null when v1 was unavailable. Telemetry only.
+    private fun compactV1Scores(scores: List<WindowScore>?): String? =
+        scores?.mapNotNull { it.v1?.compact() }?.takeIf { it.isNotEmpty() }?.joinToString(";")
+
     private fun compactWindowScores(scores: List<WindowScore>?): String? =
         scores?.takeIf { it.isNotEmpty() }
             ?.joinToString(";") { "%.3f/%.3f/%.3f".format(java.util.Locale.US, it.mean, it.p5, it.min) }

@@ -171,6 +171,8 @@ class DiagnosticsRecorder private constructor(
         // VMAF. Recorded so a capture round can establish what banding real perceptually-lossless
         // outputs actually produce; NO acceptance decision reads it (see WindowBandingDiag).
         certBandingDiag: String? = null,
+        certV1Scores: String? = null,
+        probeV1Scores: String? = null,
         // Why sampled pixel certification did or did not run (see CertificationStatus). A null
         // certWindowScores is ambiguous on its own; this disambiguates it.
         certificationStatus: String? = null,
@@ -248,6 +250,9 @@ class DiagnosticsRecorder private constructor(
                 "probePairDiag" to probePairDiag,
                 "certWindowScores" to certWindowScores,
                 "certBandingDiag" to certBandingDiag,
+                // VMAF v1 shadow scores (mean/p5/min per window, ";"-joined). Telemetry only.
+                "certV1Scores" to certV1Scores,
+                "probeV1Scores" to probeV1Scores,
                 "certificationStatus" to certificationStatus,
                 "encoderConfig" to encoderConfig,
                 "thermalStart" to thermalStart,

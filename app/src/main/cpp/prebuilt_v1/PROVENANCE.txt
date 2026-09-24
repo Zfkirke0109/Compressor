@@ -1,0 +1,13 @@
+86da14d0306a138fd3f01319860b905169746516
+libvmaf 3.2.0 — Netflix/vmaf upstream commit above (2026-09-16), cross-compiled for
+arm64-v8a with NDK 27.2.12479018 (aarch64-linux-android24-clang), meson + ninja:
+
+  (xxd MUST be on PATH: without it meson silently embeds NO models)
+  meson setup build-a64 --cross-file android-arm64.ini --buildtype=release \
+    --default-library=static -Denable_tests=false -Denable_docs=false \
+    -Denable_tools=false -Dbuilt_in_models=true -Denable_float=false
+  c_args = ['-fPIC', '-fvisibility=hidden', '-O2']
+
+Built-in models include vmaf_v1.0.16_{3d0h,5d0h,3d0h_2160,1d5h_2160} and the _hfr set.
+Used ONLY by libcompressorvmafv1.so for shadow scoring. The Perceptually Lossless verdict
+still comes from prebuilt/ (libvmaf 3.0.0, vmaf_v0.6.1), whose thresholds were calibrated.

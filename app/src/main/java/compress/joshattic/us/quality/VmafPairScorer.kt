@@ -21,8 +21,28 @@ data class WindowScore(
     // Banding diagnostics for the window (null when banding was not collected, or when the
     // native feature could not be registered). Telemetry only: never consulted by any pass/fail
     // decision — see [WindowBandingDiag] for why it is not a gate yet.
-    val banding: WindowBandingDiag? = null
+    val banding: WindowBandingDiag? = null,
+    // VMAF v1 shadow score for the same frame pairs (see VmafNativeV1). Telemetry only — never
+    // consulted by any pass/fail decision; the verdict is mean/p5/min above (vmaf_v0.6.1).
+    val v1: WindowV1Diag? = null
 )
+
+/** VMAF v1 shadow scores for one window. See [VmafNativeV1]: evidence, never a gate. */
+data class WindowV1Diag(val mean: Double, val p5: Double, val min: Double) {
+    fun compact(): String = "%.3f/%.3f/%.3f".format(java.util.Locale.US, mean, p5, min)
+
+    companion object {
+        fun fromPerFrame(perFrame: DoubleArray?): WindowV1Diag? {
+            if (perFrame == null || perFrame.isEmpty() || perFrame.any { it < 0 || it.isNaN() }) return null
+            val sorted = perFrame.sortedArray()
+            return WindowV1Diag(
+                mean = perFrame.average(),
+                p5 = sorted[((sorted.size - 1) * 0.05).toInt()],
+                min = sorted.first()
+            )
+        }
+    }
+}
 
 /**
  * Per-window CAMBI (Contrast Aware Multiscale Banding Index) summary of the DISTORTED frames.
@@ -207,7 +227,11 @@ object VmafPairScorer {
         ref: Uri,
         dist: Uri,
         windows: List<ScoreWindow>,
-        collectBanding: Boolean = false
+        collectBanding: Boolean = false,
+        // Also score each window with the VMAF v1 shadow model (VmafNativeV1). Certification
+        // only: a second VMAF pass on every probe rung would spend the ladder's time budget, and
+        // a ladder that runs out of budget cannot pass — shadow data must never cost a saving.
+        shadowV1: Boolean = false
     ): PairScoreOutcome {
         if (!VmafNative.isAvailable) return PairScoreOutcome.Unavailable
         val refGeom = YuvFrameReader.displayGeometry(context, ref) ?: return PairScoreOutcome.Unavailable
@@ -225,7 +249,7 @@ object VmafPairScorer {
 
         val results = mutableListOf<WindowScore>()
         for (window in windows) {
-            when (val outcome = scoreWindow(context, ref, dist, window, width, height, collectBanding)) {
+            when (val outcome = scoreWindow(context, ref, dist, window, width, height, collectBanding, shadowV1)) {
                 is WindowOutcome.Scored -> results += outcome.score
                 WindowOutcome.Unavailable -> return PairScoreOutcome.Unavailable
                 is WindowOutcome.Misaligned -> return PairScoreOutcome.MisalignmentRejected(outcome.reason)
@@ -247,7 +271,8 @@ object VmafPairScorer {
         window: ScoreWindow,
         width: Int,
         height: Int,
-        collectBanding: Boolean
+        collectBanding: Boolean,
+        shadowV1: Boolean
     ): WindowOutcome {
         // Plain vmaf_v0.6.1 (no phone transform): every threshold in QualityProbePolicy was
         // calibrated against the PC harness's default-model scores, and mixing models would
@@ -256,6 +281,15 @@ object VmafPairScorer {
             width, height, phoneModel = false, threads = 2, collectBanding = collectBanding
         )
         if (handle == 0L) return WindowOutcome.Unavailable
+        // Shadow v1 session over the SAME frame pairs. Zero when unavailable; every failure on
+        // this path just drops the v1 diagnostic and never touches the verdict session.
+        var v1Handle = if (shadowV1) VmafNativeV1.open(width, height) else 0L
+        fun closeV1() {
+            if (v1Handle != 0L) {
+                runCatching { VmafNativeV1.close(v1Handle) }
+                v1Handle = 0L
+            }
+        }
         val queueCapacity = queueCapacityFor(width, height)
         val refQueue = ArrayBlockingQueue<I420Frame>(queueCapacity)
         val distQueue = ArrayBlockingQueue<I420Frame>(queueCapacity)
@@ -364,6 +398,12 @@ object VmafPairScorer {
                             error.compareAndSet(null, "vmaf read_frames error $rc")
                             break
                         }
+                        if (v1Handle != 0L) {
+                            val v1rc = runCatching {
+                                VmafNativeV1.readFrames(v1Handle, r.data, d.data, width, height)
+                            }.getOrDefault(-1)
+                            if (v1rc < 0) closeV1()
+                        }
                         fed++
                         pendingRef = null
                         pendingDist = null
@@ -399,6 +439,7 @@ object VmafPairScorer {
         if (err != null || fed == 0) {
             DiagLog.w(TAG, "window [${window.startUs}..${window.endUs}] failed: ${err ?: "no frames"}")
             VmafNative.close(handle)
+            closeV1()
             // Measured misalignment is positive evidence, not mere absence of evidence.
             return if (misaligned) WindowOutcome.Misaligned(aligner.failureReason) else WindowOutcome.Unavailable
         }
@@ -408,6 +449,10 @@ object VmafPairScorer {
         // window's outcome.
         val perFrameCambi = if (collectBanding) VmafNative.cambiScores(handle) else null
         VmafNative.close(handle)
+        val v1Diag = if (v1Handle != 0L) {
+            WindowV1Diag.fromPerFrame(runCatching { VmafNativeV1.flush(v1Handle) }.getOrNull())
+        } else null
+        closeV1()
         if (perFrame == null || perFrame.isEmpty() || perFrame.any { it < 0 }) {
             DiagLog.w(TAG, "vmaf flush failed for window")
             return WindowOutcome.Unavailable
@@ -431,14 +476,16 @@ object VmafPairScorer {
             p5 = sorted[p5Index],
             min = sorted.first(),
             pairing = pairing,
-            banding = summarizeBanding(perFrameCambi)
+            banding = summarizeBanding(perFrameCambi),
+            v1 = v1Diag
         )
         DiagLog.i(
             TAG,
             "window [${window.startUs / 1000}ms..${window.endUs / 1000}ms] frames=${result.comparedFrames} " +
                 "mean=%.2f p5=%.2f min=%.2f".format(java.util.Locale.US, result.mean, result.p5, result.min) +
                 " pairing[${pairing.compact()}]" +
-                (result.banding?.let { " banding[${it.compact()}]" } ?: "")
+                (result.banding?.let { " banding[${it.compact()}]" } ?: "") +
+                (result.v1?.let { " v1shadow[${it.compact()}]" } ?: "")
         )
         return WindowOutcome.Scored(result)
     }
