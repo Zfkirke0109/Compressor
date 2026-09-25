@@ -273,6 +273,12 @@ object VmafPairScorer {
      * from frame size rather than fixed, so 1080p keeps its original 4-deep queues while 4K drops
      * to 2 and stays inside the same memory envelope (~50 MB) instead of scaling to ~100 MB.
      */
+    // libvmaf feature extraction runs in its own thread pool; VMAF is deterministic per frame,
+    // so the count changes only wall time. Two threads left most of the S23 Ultra's eight cores
+    // idle while a 4K rung took three minutes (b165, job_965e925705f2). Four for the verdict
+    // model, two for the shadow model that runs after it on the same frames.
+    private const val SCORER_THREADS = 4
+    private const val SHADOW_THREADS = 2
     private const val QUEUE_BYTE_BUDGET = 64L * 1024 * 1024
 
     /**
@@ -373,12 +379,12 @@ object VmafPairScorer {
         // calibrated against the PC harness's default-model scores, and mixing models would
         // silently loosen the bar (the phone transform maps scores upward).
         val handle = VmafNative.open(
-            width, height, phoneModel = false, threads = 2, collectBanding = collectBanding
+            width, height, phoneModel = false, threads = SCORER_THREADS, collectBanding = collectBanding
         )
         if (handle == 0L) return WindowOutcome.Unavailable
         // Shadow v1 session over the SAME frame pairs. Zero when unavailable; every failure on
         // this path just drops the v1 diagnostic and never touches the verdict session.
-        var v1Handle = if (shadowV1) VmafNativeV1.open(width, height) else 0L
+        var v1Handle = if (shadowV1) VmafNativeV1.open(width, height, threads = SHADOW_THREADS) else 0L
         // Wall time spent in the shadow model, logged per window. v1 adds CAMBI and SpEED passes
         // on every certification frame, including 4K60 outputs, and that cost has never been
         // measured on the device. Shadow evidence has to justify its battery bill with a number.

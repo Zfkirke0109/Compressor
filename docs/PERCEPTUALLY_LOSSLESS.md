@@ -39,6 +39,29 @@ The video verdict requires **all** of:
    never a pass and never a rejection of the content. Only a scored window may reject a file as
    "would visibly lose quality", and only a scored window may certify it.
 
+### 2.0 How the probe ladder chooses a ratio
+
+The ladder encodes the three windows at each candidate ratio and scores them against the source.
+It does **not** select a ratio the moment it clears the bar above. A full encode lands slightly
+below its probe on the same frames: in b165, 63 windows scored on both showed the full encode
+lower by (10th percentile / worst) 0.52 / 1.16 on the mean, 1.25 / 1.76 on the 5th percentile and
+0.89 / 3.62 on the minimum. Seven of 23 certified encodes failed, every one after a probe that had
+cleared some gate by less than 0.5.
+
+So a rung is **selected** only when it clears the bar by the 10th-percentile drift
+(`QualityProbePolicy.PROBE_SELECTION`: +0.5 mean, +1.25 5th percentile, +1.0 minimum). A rung that
+clears the bar but not the margin is *marginal*: the ladder tries the next, safer rung. If no rung
+clears the margin, the highest marginal rung is still attempted, labelled "by only X, below the
+selection margin; certification decides", and certification judges the real output against the
+unchanged bar. The margin changes which encode is attempted, never what is accepted. The session
+summariser prints the drift and the marginal attempts of every capture (`probe->cert`,
+`marginal passes`), so the margin is re-measured each run rather than trusted.
+
+The encoder request is the same for probes and the full encode: bitrate mode, keyframe interval
+(matched to the source's own, 1 to 5 s; see `KeyframeIntervalPolicy`) and the opt-in B-frame
+experiment. Media3's default of one keyframe per second spent roughly three times the source's
+share of bits on intra frames for every b165 source, all of which had 3 s keyframe intervals.
+
 The thresholds were set from an offline calibration suite on a PC (`scripts/diagnostics/
 measure_quality.py`) and have not been changed since. They are deliberately strict; whether they
 are *right* for the definition above is exactly what Section 4 is for. **They must not be moved to
@@ -143,7 +166,9 @@ enough to defend.
 | Probe clip scores encoder warm-up | every probe clip starts at a source keyframe ≥ 2 s before the window; the lead-in is decoded and paired but not scored |
 | Decoder output not 8-bit 4:2:0 | any other format fails closed to "unavailable" |
 | Rotation/crop mismatch | both sides are converted to display orientation with the crop rectangle applied; a geometry mismatch is "unavailable" |
-| A defect in the scorer itself | the self-check: source vs itself and source vs stream copy must score 100 on every frame |
+| A defect in the scorer itself | the self-check: source vs itself and source vs stream copy must score 100 on every frame; its log is exported with the batch it ran next to |
+| Probe passes that the full encode then fails | selection margin from measured probe-to-encode drift; re-measured in every capture |
+| Probe clip encoded differently from the full encode | one request shape (mode, keyframe interval, B-frames) for both |
 | A metric that is not the definition | Section 4 |
 
 ## 6. What the label means on screen

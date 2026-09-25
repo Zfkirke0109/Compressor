@@ -183,6 +183,27 @@ def _main():
     return 1 if fails else 0
 
 
+def test_probe_to_certification_drift_and_marginal_attempts_are_reported():
+    path = write([
+        {"type": "session_start", "batchId": "b1"},
+        job("a", certificationStatus="ran_scored", pixelCertified=True,
+            probeWindowScores="97.0/93.0/88.0;96.0/92.0/86.0", certWindowScores="96.5/92.0/87.5;96.0/91.0/85.0",
+            probeDetail="windows passed at 0.70"),
+        job("b", certificationStatus="ran_scored", pixelCertified=False,
+            probeWindowScores="95.8/91.2/84.3", certWindowScores="95.0/90.0/83.0",
+            probeDetail="windows passed at 0.90 by only 0.20, below the selection margin (0.5/1.25/1.0); certification decides"),
+        job("c", decisionBasis="Basis: heuristic. This file cannot be pixel-measured on this device: its resolution is above the 4K scoring limit."),
+        job("d", decisionBasis="Basis: earlier measured failures for this device and content class (learned), not a measurement of this file."),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["probeCertDrift"]["windows"] == 3
+    assert abs(s["probeCertDrift"]["mean"]["worst"] - (-0.8)) < 1e-9
+    assert abs(s["probeCertDrift"]["p5"]["worst"] - (-1.2)) < 1e-9
+    assert s["marginalAttempts"] == {"attempted": 1, "certified": 0}
+    assert s["decisionBasis"] == {"cannot be measured": 1, "learned": 1}
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
 

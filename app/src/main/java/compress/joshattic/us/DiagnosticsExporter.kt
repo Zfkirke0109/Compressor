@@ -214,8 +214,8 @@ object DiagnosticsExporter {
                         identity = identity,
                         exportedAt = stamp,
                         scope = scope,
-                        currentBatchId = runs.firstOrNull()?.batchId,
-                        previousBatchId = runs.getOrNull(1)?.batchId,
+                        currentBatchId = DiagnosticsArchivePlan.batchesNewestFirst(runs).firstOrNull()?.batchId,
+                        previousBatchId = DiagnosticsArchivePlan.batchesNewestFirst(runs).getOrNull(1)?.batchId,
                         includedRuns = included,
                         entries = entries.toList()
                     )

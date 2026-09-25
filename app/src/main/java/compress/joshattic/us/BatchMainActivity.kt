@@ -426,10 +426,11 @@ private fun DiagnosticsExportCard(
             Text(
                 when (scope) {
                     DiagnosticsArchivePlan.Scope.CURRENT_RUN ->
-                        "The newest run: its batch records and decision log, any crash or process-exit " +
-                            "report written since it started, and the device log buffer."
+                        "The newest batch: its records and decision log, any scorer self-check run " +
+                            "just before or after it, any crash or process-exit report written since it " +
+                            "started, and the device log buffer."
                     DiagnosticsArchivePlan.Scope.PREVIOUS_RUN ->
-                        "The run before the newest one, with the crash reports from its time."
+                        "The batch before the newest one, with its self-checks and the crash reports from its time."
                     DiagnosticsArchivePlan.Scope.ALL_RUNS ->
                         "Every retained run (the newest ${DiagnosticsRetention.MAX_RUNS}), every crash report, and the device log buffer."
                     DiagnosticsArchivePlan.Scope.EVERYTHING ->
@@ -484,6 +485,31 @@ private fun DiagnosticsExportCard(
                     modifier = Modifier.fillMaxWidth(),
                     enabled = !isCompressing
                 ) { Text("Arm trace for next batch") }
+            }
+
+            HorizontalDivider()
+
+            var bFrames by remember { mutableStateOf(EncoderExperiments.isBFramesEnabled(context)) }
+            Text("Encoder experiment: B-frames", style = MaterialTheme.typography.labelLarge)
+            Text(
+                "Off by default. When on, probes and encodes ask the HEVC encoder for " +
+                    "${EncoderExperiments.B_FRAMES_WHEN_ENABLED} B-frames (max-bframes). The same gates judge " +
+                    "the result, and encodeResult lines carry bframes= so runs can be compared. Whether " +
+                    "this device's encoder honours the request is not yet known.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = bFrames,
+                    onCheckedChange = { on -> EncoderExperiments.setBFramesEnabled(context, on); bFrames = on },
+                    enabled = !isCompressing
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (bFrames) "B-frames requested for the next batch" else "B-frames off",
+                    style = MaterialTheme.typography.bodySmall
+                )
             }
 
             HorizontalDivider()

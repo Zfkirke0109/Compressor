@@ -25,6 +25,8 @@ import androidx.media3.effect.Presentation
 import androidx.media3.transformer.AudioEncoderSettings
 import androidx.media3.transformer.Composition
 import androidx.media3.transformer.DefaultAssetLoaderFactory
+import androidx.media3.transformer.ExoPlayerAssetLoader
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.transformer.DefaultDecoderFactory
 import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
@@ -53,6 +55,8 @@ import compress.joshattic.us.quality.PairScoreOutcome
 import compress.joshattic.us.quality.PerceptualQualityProber
 import compress.joshattic.us.quality.QualityProbePolicy
 import compress.joshattic.us.quality.ExhaustivePerceptualLosslessPolicy
+import compress.joshattic.us.quality.KeyframeIntervalPolicy
+import compress.joshattic.us.quality.ProbeEncodeShape
 import compress.joshattic.us.quality.WindowScore
 import compress.joshattic.us.quality.VmafNative
 import java.io.File
@@ -304,6 +308,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val requiresMeasuredCertification: Boolean = false,
         // VMAF v1 shadow scores of the probe windows (telemetry only; see VmafNativeV1).
         val probeV1Scores: String? = null,
+        // Probe clip bitrate model per rung (telemetry only; see ProbeClipBitrate).
+        val probeRateDiag: String? = null,
         // Ratio proven by on-device VMAF probe windows for THIS clip. May sit ABOVE the
         // learned/default target when only a safer retreat rung passed its windows.
         val pixelProvenRatio: Double? = null,
@@ -792,6 +798,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         var perceptualPlan: PerceptualLosslessPlan? = null
         var effectiveQuality: BatchQualityPreset = run.quality
         var preEncodeRemuxNote: String? = null
+        // Keyframe interval both the probes and the encode request for this source
+        // (KeyframeIntervalPolicy). Set in planItem for every item that may be encoded.
+        var iFrameIntervalSeconds: Float = KeyframeIntervalPolicy.WHEN_UNKNOWN_SECONDS
 
         // Output stage.
         var encodeAttempt: EncodeAttemptResult? = null
@@ -1126,13 +1135,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             MimeTypes.VIDEO_AV1 -> "AV1"
             else -> "H.264"
         }
+        if (resolvedMime != null) {
+            s.iFrameIntervalSeconds = qualityProber.sourceKeyframeIntervalSeconds(item.sourceUri)
+        }
         val perceptualPlan = if (quality == BatchQualityPreset.ORIGINAL && resolvedMime != null) {
             val basePlan = buildPerceptualLosslessPlan(item, resolvedMime, run.exhaustivePerceptualLossless)
             if (basePlan.probeEligible) {
                 updateItem(s.index) {
                     it.copy(message = "Probing quality: sampling windows with on-device VMAF…")
                 }
-                refinePlanWithPixelProbes(item, resolvedMime, basePlan, run.exhaustivePerceptualLossless)
+                refinePlanWithPixelProbes(item, resolvedMime, basePlan, run.exhaustivePerceptualLossless, s.iFrameIntervalSeconds)
             } else {
                 basePlan
             }
@@ -1201,6 +1213,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probeWindowScores = plan.probeWindowScores,
             probePairDiag = plan.probePairDiag,
             probeV1Scores = plan.probeV1Scores,
+            probeRateDiag = plan.probeRateDiag,
             precedingCooldownMs = s.precedingHandoffCooldownMs
         )
         updateItem(s.index) {
@@ -1364,6 +1377,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             plannedTargetRatio = plan.targetRatio,
             plannedTargetVideoBitrate = s.diagnosticTargetVideoBitrate,
             plannedDecisionReason = plan.remuxReason,
+            decisionBasis = KeepOriginalMessages.basis(
+                evidencePreferred = plan.remuxWasEvidencePreferred,
+                probedRatios = plan.probedRatios,
+                probeDetail = plan.probeDetail,
+                pixelCertifiableBlockReason = plan.pixelCertifiableBlockReason
+            ),
             wasStreamCopy = false,
             verification = null,
             retainedValidation = retention,
@@ -1376,6 +1395,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probeWindowScores = plan.probeWindowScores,
             probePairDiag = plan.probePairDiag,
             probeV1Scores = plan.probeV1Scores,
+            probeRateDiag = plan.probeRateDiag,
             precedingCooldownMs = s.precedingHandoffCooldownMs,
             materializationMode = "REUSED_SOURCE",
             copyAvoidedBytes = item.originalSize
@@ -1449,7 +1469,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     safeResolvedMime,
                     s.perceptualPlan?.targetRatio,
                     s.perceptualPlan?.useCbrCeiling == true,
-                    s.perceptualPlan?.pixelProvenRatio
+                    s.perceptualPlan?.pixelProvenRatio,
+                    iFrameIntervalSeconds = s.iFrameIntervalSeconds
                 )
                 s.encodeAttempt = attempt
                 withContext(Dispatchers.IO) {
@@ -1769,6 +1790,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probeWindowScores = perceptualPlan.probeWindowScores,
             probePairDiag = perceptualPlan.probePairDiag,
             probeV1Scores = perceptualPlan.probeV1Scores,
+            probeRateDiag = perceptualPlan.probeRateDiag,
             certWindowScores = s.diagnosticCertWindowScores,
             certBandingDiag = s.diagnosticCertBandingDiag,
             certV1Scores = s.diagnosticCertV1Scores,
@@ -2003,6 +2025,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probeWindowScores = perceptualPlan?.probeWindowScores,
             probePairDiag = perceptualPlan?.probePairDiag,
             probeV1Scores = perceptualPlan?.probeV1Scores,
+            probeRateDiag = perceptualPlan?.probeRateDiag,
             certWindowScores = s.diagnosticCertWindowScores,
             certBandingDiag = s.diagnosticCertBandingDiag,
             certV1Scores = s.diagnosticCertV1Scores,
@@ -2360,6 +2383,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probeWindowScores = plan.probeWindowScores,
             probePairDiag = plan.probePairDiag,
             probeV1Scores = plan.probeV1Scores,
+            probeRateDiag = plan.probeRateDiag,
             certWindowScores = evidence.certWindowScores,
             certBandingDiag = evidence.certBandingDiag,
             certV1Scores = evidence.certV1Scores,
@@ -2785,7 +2809,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         item: BatchVideoItem,
         outputMime: String,
         plan: PerceptualLosslessPlan,
-        exhaustive: Boolean
+        exhaustive: Boolean,
+        iFrameIntervalSeconds: Float
     ): PerceptualLosslessPlan {
         if (!plan.probeEligible) return plan
         // HDR and codec-downgrade plans never probe; those gates are not inference.
@@ -2828,6 +2853,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     "(skip ${latched.probeSkipsSinceLastProbe}/${SmartPerceptualProfileEngine.PROBE_SKIPS_BETWEEN_REPROBES}, then re-probes)"
             )
         }
+        // Same request shape as the real encode (compressOne), so a probe pass is evidence about it.
+        val shape = ProbeEncodeShape(
+            bitrateMode = if (plan.useCbrCeiling) {
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+            } else {
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+            },
+            iFrameIntervalSeconds = iFrameIntervalSeconds,
+            maxBFrames = EncoderExperiments.maxBFrames(getApplication())
+        )
         val decision = qualityProber.runLadder(
             sourceUri = item.sourceUri,
             durationMs = item.durationMs,
@@ -2844,24 +2879,22 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             },
             audioBitrate = calculateAudioBitrate(item, BatchQualityPreset.ORIGINAL),
             allowDownwardRefinement = !plan.shortProbeLadder,
-            // Same mode as the real encode (compressOne), so a probe pass is evidence about it.
-            bitrateMode = if (plan.useCbrCeiling) {
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
-            } else {
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
-            }
+            shape = shape,
+            budgetMs = ExhaustivePerceptualLosslessPolicy.probeBudgetMs(plan.shortProbeLadder),
+            sourceFps = item.originalFps.toDouble()
         )
         DiagLog.i(
             "CompressorProbe",
             "probe result; job=${diagnosticJobId(item)}; probed=${decision.probedRatios}; " +
-                "proven=${decision.provenRatio ?: "none"}; detail=${decision.detail}"
+                "proven=${decision.provenRatio ?: "none"}; marginal=${decision.marginal}; shape=${shape.compact()}; detail=${decision.detail}"
         )
         val probeTrace = plan.copy(
             probedRatios = decision.probedRatios,
             probeDetail = decision.detail,
             probeWindowScores = compactWindowScores(decision.windowScores),
             probePairDiag = compactPairingDiag(decision.windowScores),
-            probeV1Scores = compactV1Scores(decision.windowScores)
+            probeV1Scores = compactV1Scores(decision.windowScores),
+            probeRateDiag = decision.rateDiag
         )
         val proven = decision.provenRatio ?: run {
             // Measured rejection at the SAFEST candidate ratio is positive pixel evidence
@@ -2971,7 +3004,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         videoMimeType: String,
         learnedTargetRatio: Double? = null,
         useCbrCeiling: Boolean = false,
-        pixelProvenRatioFloor: Double? = null
+        pixelProvenRatioFloor: Double? = null,
+        iFrameIntervalSeconds: Float = KeyframeIntervalPolicy.WHEN_UNKNOWN_SECONDS
     ): EncodeAttemptResult = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
             val outputFile = item.cacheOutputFile(context, quality)
@@ -3011,14 +3045,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 item.originalAudioBitrate,
                 quality.toMode()
             )
+            val maxBFrames = EncoderExperiments.maxBFrames(context)
+            val videoSettings = VideoEncoderSettings.Builder()
+                .setBitrate(targetBitrate)
+                .setBitrateMode(bitrateMode)
+                // Keyframes as far apart as the source's (KeyframeIntervalPolicy), not Media3's
+                // 1 s default, so intra frames do not take the bits the P-frames are judged on.
+                .setiFrameIntervalSeconds(iFrameIntervalSeconds)
+            if (maxBFrames > 0) videoSettings.setMaxBFrames(maxBFrames)
             val encoderFactoryBuilder = DefaultEncoderFactory.Builder(context)
                 .setEnableFallback(!useCbrCeiling)
-                .setRequestedVideoEncoderSettings(
-                    VideoEncoderSettings.Builder()
-                        .setBitrate(targetBitrate)
-                        .setBitrateMode(bitrateMode)
-                        .build()
-                )
+                .setRequestedVideoEncoderSettings(videoSettings.build())
             if (!passThroughAudio) {
                 encoderFactoryBuilder.setRequestedAudioEncoderSettings(
                     AudioEncoderSettings.Builder()
@@ -3034,6 +3071,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     if (passThroughAudio) "action=passthrough" else "action=reencode; targetBitrate=$audioBitrate"
             )
 
+            // Counts what the asset loader reads from the source, so an export error can say
+            // whether the INPUT side was still delivering (ExportInputProbeReport).
+            val inputProbe = ExportInputProbe(DefaultDataSource.Factory(context))
             var progressJob: Job? = null
             val transformer = Transformer.Builder(context)
                 // See ExportWatchdogPolicy: the limit is a hang bound — not sized from total
@@ -3041,7 +3081,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 // 120 s was a wedged export, not a slow healthy encode.
                 .setMaxDelayBetweenMuxerSamplesMs(ExportWatchdogPolicy.MAX_DELAY_BETWEEN_MUXER_SAMPLES_MS)
                 .setVideoMimeType(videoMimeType)
-                .setAssetLoaderFactory(DefaultAssetLoaderFactory(context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT, null))
+                .setAssetLoaderFactory(
+                    ExoPlayerAssetLoader.Factory(
+                        context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT, inputProbe.mediaSourceFactory()
+                    )
+                )
                 .setEncoderFactory(encoderFactory)
                 .addListener(object : Transformer.Listener {
                     override fun onCompleted(composition: Composition, exportResult: ExportResult) {
@@ -3064,7 +3108,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             "encodeResult; mode=${quality.label}; requestedVideoBitrate=$targetBitrate; requestedBitrateMode=$bitrateModeLabel; " +
                                 "encoderName=${exportResult.videoEncoderName ?: "unknown"}; reportedAverageVideoBitrate=${exportResult.averageVideoBitrate}; " +
                                 "overshootFactor=${if (targetBitrate > 0 && exportResult.averageVideoBitrate > 0) "%.3f".format(exportResult.averageVideoBitrate.toDouble() / targetBitrate) else "unknown"}; " +
-                                "outputBytes=$finalSize; config[${configDelta.compact()}]"
+                                "outputBytes=$finalSize; config[${configDelta.compact()};gop=${KeyframeIntervalPolicy.describe(iFrameIntervalSeconds)}${EncoderExperiments.describe(maxBFrames)}]"
                         )
                         if (configDelta.formatFellBack) {
                             // Loud on purpose: a silent substitution is exactly the kind of thing
@@ -3098,6 +3142,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
                     override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {
                         progressJob?.cancel()
+                        DiagLog.w(
+                            "CompressorBatch",
+                            "export failed; job=${diagnosticJobId(item)}; code=${exportException.errorCodeName}; ${inputProbe.snapshot()}"
+                        )
                         runCatching { outputFile.delete() }
                         if (continuation.isActive) continuation.resumeWithException(exportException)
                     }
@@ -3367,7 +3415,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         certBandingDiag: String? = null,
         certV1Scores: String? = null,
         probeV1Scores: String? = null,
+        probeRateDiag: String? = null,
         certificationStatus: String? = null,
+        // For a kept original: the basis sentence the user saw (KeepOriginalMessages.basis).
+        decisionBasis: String? = null,
         encoderConfig: String? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
@@ -3444,6 +3495,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             certBandingDiag = certBandingDiag,
             certV1Scores = certV1Scores,
             probeV1Scores = probeV1Scores,
+            probeRateDiag = probeRateDiag,
+            decisionBasis = decisionBasis,
             certificationStatus = certificationStatus,
             audioPreservation = verification?.audioBasis,
             encoderConfig = encoderConfig,

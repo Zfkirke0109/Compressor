@@ -15,7 +15,7 @@ object DiagnosticsRetention {
     /** Run directory names to delete: everything past the newest [keep], oldest first. */
     fun runsToPrune(runDirectoryNames: Collection<String>, keep: Int = MAX_RUNS): List<String> {
         require(keep >= 0) { "keep must be non-negative, was $keep" }
-        val runs = DiagnosticsArchivePlan.sortedNewestFirst(runDirectoryNames.filter { it.startsWith("batch_") })
+        val runs = DiagnosticsArchivePlan.sortedNewestFirst(runDirectoryNames.filter(DiagnosticsArchivePlan::isRunDirectoryName))
         return if (runs.size <= keep) emptyList() else runs.drop(keep).map { it.batchId }.reversed()
     }
 }

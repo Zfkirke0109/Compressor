@@ -173,11 +173,16 @@ class DiagnosticsRecorder private constructor(
         certBandingDiag: String? = null,
         certV1Scores: String? = null,
         probeV1Scores: String? = null,
+        probeRateDiag: String? = null,
         // Why sampled pixel certification did or did not run (see CertificationStatus). A null
         // certWindowScores is ambiguous on its own; this disambiguates it.
         certificationStatus: String? = null,
         // See AudioPreservation: bit-identical copy / inferred copy / re-encoded, per job.
         audioPreservation: String? = null,
+        // For a kept original: on what basis (measured, learned, heuristic, cannot be measured),
+        // in the same words the user saw. plannedDecisionReason keeps the plan's raw reason, which
+        // may be a heuristic prediction; this field says so.
+        decisionBasis: String? = null,
         // Requested vs actual encoder configuration (see EncoderConfigDelta). Media3 format
         // fallback can substitute MIME or resolution and still report success; without this a
         // later verification rejection is inexplicable from a capture alone.
@@ -255,8 +260,10 @@ class DiagnosticsRecorder private constructor(
                 // VMAF v1 shadow scores (mean/p5/min per window, ";"-joined). Telemetry only.
                 "certV1Scores" to certV1Scores,
                 "probeV1Scores" to probeV1Scores,
+                "probeRateDiag" to probeRateDiag,
                 "certificationStatus" to certificationStatus,
                 "audioPreservation" to audioPreservation,
+                "decisionBasis" to decisionBasis,
                 "encoderConfig" to encoderConfig,
                 "thermalStart" to thermalStart,
                 "thermalEnd" to thermalEnd,
@@ -421,7 +428,7 @@ class DiagnosticsRecorder private constructor(
             val root = File(context.filesDir, "diagnostics")
             if (!root.isDirectory) return emptyList()
             return root.listFiles().orEmpty().filter { dir ->
-                dir.isDirectory && dir.name.startsWith("batch_") &&
+                dir.isDirectory && DiagnosticsArchivePlan.isRunDirectoryName(dir.name) &&
                     (File(dir, "session.jsonl").isFile || File(dir, "decisions.log").isFile)
             }
         }

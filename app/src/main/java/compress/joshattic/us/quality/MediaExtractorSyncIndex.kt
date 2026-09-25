@@ -23,6 +23,24 @@ class MediaExtractorSyncIndex private constructor(
 
     override fun nextSyncUs(targetUs: Long): Long? = seek(targetUs, MediaExtractor.SEEK_TO_NEXT_SYNC)
 
+    /**
+     * The first [maxGaps] gaps between consecutive keyframes, found by seeking from one sync
+     * sample to the next. A seek reads the sample table only, so this costs milliseconds even on
+     * a 30-minute file, unlike [structure], which walks every sample. Feeds
+     * [KeyframeIntervalPolicy.typicalGapUs].
+     */
+    fun keyframeGapsUs(maxGaps: Int = 24): List<Long> {
+        val gaps = mutableListOf<Long>()
+        var previous = nextSyncUs(0L) ?: return gaps
+        while (gaps.size < maxGaps) {
+            val next = nextSyncUs(previous + 1L) ?: break
+            if (next <= previous) break
+            gaps += next - previous
+            previous = next
+        }
+        return gaps
+    }
+
     private fun seek(targetUs: Long, mode: Int): Long? = runCatching {
         extractor.seekTo(targetUs.coerceIn(0L, durationUs.coerceAtLeast(0L)), mode)
         val t = extractor.sampleTime

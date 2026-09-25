@@ -194,8 +194,77 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "exhaustivePerceptualLossless": (start or {}).get("exhaustivePerceptualLossless"),
         "buildTag": (start or {}).get("buildTag"),
         "v1ShadowPairs": v1_shadow_pairs(jobs),
+        "probeCertDrift": probe_cert_drift(jobs),
+        "marginalAttempts": marginal_attempts(jobs),
+        "decisionBasis": dict(Counter(basis_kind(j.get("decisionBasis")) for j in jobs if j.get("decisionBasis")).most_common()),
         "completed": summary is not None,
     }
+
+
+def _scores(field: Any) -> list[tuple[float, float, float]]:
+    out: list[tuple[float, float, float]] = []
+    for w in str(field or "").split(";"):
+        parts = w.split("/")
+        if len(parts) != 3:
+            continue
+        try:
+            out.append((float(parts[0]), float(parts[1]), float(parts[2])))
+        except ValueError:
+            continue
+    return out
+
+
+def probe_cert_drift(jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """How far the finished encode landed from its probe, window by window, per gate.
+
+    A certified job records the probe windows of the rung it used and the certification windows
+    of the full output at the same positions. The drift between them is what the probe selection
+    margin (QualityProbePolicy.PROBE_SELECTION) was calibrated from in b165; this re-measures it
+    on every capture, so the margin can be checked rather than trusted.
+    """
+    deltas: list[tuple[float, float, float]] = []
+    for j in jobs:
+        if j.get("certificationStatus") != "ran_scored":
+            continue
+        p, c = _scores(j.get("probeWindowScores")), _scores(j.get("certWindowScores"))
+        if not p or len(p) != len(c):
+            continue
+        deltas += [(b[0] - a[0], b[1] - a[1], b[2] - a[2]) for a, b in zip(p, c)]
+    if not deltas:
+        return None
+
+    def q(values: list[float], frac: float) -> float:
+        v = sorted(values)
+        return v[max(0, min(len(v) - 1, round(frac * (len(v) - 1))))]
+
+    out: dict[str, Any] = {"windows": len(deltas)}
+    for i, name in enumerate(("mean", "p5", "min")):
+        col = [d[i] for d in deltas]
+        out[name] = {"median": q(col, 0.5), "p10": q(col, 0.1), "worst": min(col)}
+    return out
+
+
+def marginal_attempts(jobs: list[dict[str, Any]]) -> dict[str, int]:
+    """Encodes attempted on a probe that cleared the bar but not the selection margin, and how
+    they fared. If these certify as often as ordinary passes, the margin is too strict."""
+    marginal = [j for j in jobs if "below the selection margin" in str(j.get("probeDetail") or "")]
+    return {
+        "attempted": len(marginal),
+        "certified": sum(1 for j in marginal if j.get("pixelCertified")),
+    }
+
+
+def basis_kind(text: Any) -> str:
+    t = str(text or "")
+    if "(learned)" in t:
+        return "learned"
+    if "cannot be pixel-measured" in t:
+        return "cannot be measured"
+    if "not pixel-measured" in t:
+        return "not probed"
+    if "Probes at" in t:
+        return "probed, undecided"
+    return "other"
 
 
 def v1_shadow_pairs(jobs: list[dict[str, Any]]) -> list[tuple[float, float]]:
@@ -242,6 +311,17 @@ def render(s: dict[str, Any]) -> str:
         out.insert(1, "  !! NO session_summary — this batch did not finish; totals are a partial run")
     if s.get("buildTag") or s.get("exhaustivePerceptualLossless") is not None:
         out.append(f"  build tag      : {s.get('buildTag')}   exhaustive PL: {s.get('exhaustivePerceptualLossless')}")
+    drift = s.get("probeCertDrift")
+    if drift:
+        out.append(f"  probe->cert    : {drift['windows']} window(s) scored on both (full encode minus probe)")
+        for name in ("mean", "p5", "min"):
+            d = drift[name]
+            out.append(f"      {name:<4}  median {d['median']:+.2f}   p10 {d['p10']:+.2f}   worst {d['worst']:+.2f}")
+    marginal = s.get("marginalAttempts") or {}
+    if marginal.get("attempted"):
+        out.append(f"  marginal passes: {marginal['attempted']} attempted, {marginal['certified']} certified")
+    if s.get("decisionBasis"):
+        out.append(f"  keep-original basis: {s['decisionBasis']}")
     pairs = s.get("v1ShadowPairs") or []
     if pairs:
         out.append(f"  VMAF v1 shadow : {len(pairs)} certification window(s) scored by both models (min score)")

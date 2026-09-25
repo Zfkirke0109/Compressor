@@ -38,6 +38,21 @@ package compress.joshattic.us.quality
  */
 object ExhaustivePerceptualLosslessPolicy {
 
+    /** Wall-clock budget of a full probe ladder (up to 1080p). */
+    const val PROBE_BUDGET_MS = 150_000L
+
+    /**
+     * Wall-clock budget of the short ladder. A 4K rung costs about three minutes on the S23 Ultra:
+     * in b165, job_965e925705f2 (2160x3840, 250 s) spent 180 s on its single rung, then hit
+     * "probe budget exhausted" with the retreat rung never tried, although the failing window had
+     * missed the mean by one point. Three rungs need ten minutes, which is still less than the
+     * full encode of a long 4K file that a wrong guess would waste.
+     */
+    const val SHORT_LADDER_PROBE_BUDGET_MS = 600_000L
+
+    fun probeBudgetMs(shortLadder: Boolean): Long =
+        if (shortLadder) SHORT_LADDER_PROBE_BUDGET_MS else PROBE_BUDGET_MS
+
     /**
      * Probe rungs for a source. Outside exhaustive mode this is exactly
      * [QualityProbePolicy.candidateRatiosForSource]. In exhaustive mode a source the bpp gate

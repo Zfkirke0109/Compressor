@@ -48,6 +48,52 @@ object QualityProbePolicy {
         label = "Perceptually Lossless"
     )
 
+    // ---- Probe selection margin ---------------------------------------------------------------
+    //
+    // How far above the certification bar a PROBE must land before the ladder selects its ratio.
+    //
+    // Calibrated from b165 (batch_1790280254600, S23 Ultra): 63 windows were scored twice on the
+    // same frames, once on the probe clip and once on the finished full encode at the same
+    // requested ratio. The full encode landed below the probe by (10th percentile / worst):
+    // mean 0.52 / 1.16, 5th percentile 1.25 / 1.76, minimum 0.89 / 3.62 points. Of 23 certified
+    // encodes 7 failed, and every one of them had passed its probe by under 0.5 points on some
+    // gate, interleaved with passes down to 0.01. A probe pass inside the drift is a coin toss,
+    // and a lost toss costs a full encode of a 20-minute file and leaves the original untouched.
+    //
+    // The margins are the 10th-percentile drift. They are NOT a change to the acceptance bar:
+    // certification still judges the real output against PERCEPTUAL_LOSSLESS, unchanged. They
+    // change which rung the ladder SELECTS: a rung that clears the bar but not the margin is
+    // "marginal", the ladder moves on to the next, safer rung, and only when no rung clears the
+    // margin is the highest marginal rung attempted, labelled as such, for certification to decide.
+    const val PROBE_SELECTION_MARGIN_MEAN = 0.5
+    const val PROBE_SELECTION_MARGIN_P5 = 1.25
+    const val PROBE_SELECTION_MARGIN_MIN = 1.0
+
+    val PROBE_SELECTION = QualityBar(
+        meanMin = WINDOW_MEAN_MIN + PROBE_SELECTION_MARGIN_MEAN,
+        p5Min = WINDOW_P5_MIN + PROBE_SELECTION_MARGIN_P5,
+        minMin = WINDOW_MIN_MIN + PROBE_SELECTION_MARGIN_MIN,
+        label = "Perceptually Lossless, probe selection margin"
+    )
+
+    enum class RungVerdict { UNMEASURED, FAILED, MARGINAL, PASSED }
+
+    /** How a measured rung stands: clears bar and margin, clears only the bar, or fails the bar. */
+    fun rungVerdict(scores: List<WindowScore>?): RungVerdict = when {
+        scores.isNullOrEmpty() -> RungVerdict.UNMEASURED
+        windowsPass(scores, PROBE_SELECTION) -> RungVerdict.PASSED
+        windowsPass(scores) -> RungVerdict.MARGINAL
+        else -> RungVerdict.FAILED
+    }
+
+    /**
+     * The smallest amount, over every window and gate, by which the scores clear the
+     * Perceptually Lossless bar. Negative when a gate fails. For log lines: "passed by 0.31".
+     */
+    fun barMargin(scores: List<WindowScore>): Double = scores.minOf { w ->
+        minOf(w.mean - WINDOW_MEAN_MIN, w.p5 - WINDOW_P5_MIN, w.min - WINDOW_MIN_MIN)
+    }
+
     /**
      * The High Quality bar: an explicitly LOSSY target, deliberately below transparency.
      *
@@ -214,6 +260,14 @@ object QualityProbePolicy {
      * non-saving or degrading re-encode into a claimed win — only recover a genuine near-transparent
      * saving (typically a cross-codec H.264 -> HEVC clip) that the fixed ladder stopped just short of.
      */
+    /**
+     * When the safest probed rung was MARGINAL (cleared the bar, not the selection margin), one
+     * probe at [SAFEST_RATIO_CEILING] is the best chance of a pass that clears the margin too.
+     * Null when the rung is already at the ceiling.
+     */
+    fun upwardMarginCandidate(highestMarginalRatio: Double): Double? =
+        if (highestMarginalRatio >= SAFEST_RATIO_CEILING - 1e-9) null else SAFEST_RATIO_CEILING
+
     fun upwardRefinementCandidate(highestFailedRatio: Double, highestFailedScores: List<WindowScore>?): Double? {
         if (highestFailedRatio >= SAFEST_RATIO_CEILING - 1e-9) return null
         val shortfall = worstWindowShortfall(highestFailedScores) ?: return null

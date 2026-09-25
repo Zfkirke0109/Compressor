@@ -35,14 +35,41 @@ object DiagnosticsArchivePlan {
     fun sortedNewestFirst(batchIds: Collection<String>): List<Run> =
         batchIds.map { Run(it, startedAtOf(it)) }.sortedByDescending { it.startedAtMs }
 
-    fun startedAtOf(batchId: String): Long =
-        batchId.substringAfter("batch_", "").toLongOrNull() ?: -1L
+    /**
+     * Directory names under `diagnostics/` that are runs: batches, and the scorer self-checks
+     * (`selfcheck_<epochMs>`, DiagLog only). The b165 export carried no self-check because only
+     * `batch_` names were collected.
+     */
+    val RUN_PREFIXES: List<String> = listOf("batch_", "selfcheck_")
 
-    /** Which runs the scope covers, newest first. Empty when the scope has nothing to say. */
-    fun runsFor(scope: Scope, newestFirst: List<Run>): List<Run> = when (scope) {
-        Scope.CURRENT_RUN -> newestFirst.take(1)
-        Scope.PREVIOUS_RUN -> newestFirst.drop(1).take(1)
-        Scope.ALL_RUNS, Scope.EVERYTHING -> newestFirst
+    fun isRunDirectoryName(name: String): Boolean = RUN_PREFIXES.any { name.startsWith(it) }
+
+    fun startedAtOf(batchId: String): Long =
+        RUN_PREFIXES.firstNotNullOfOrNull { prefix ->
+            if (batchId.startsWith(prefix)) batchId.removePrefix(prefix).toLongOrNull() else null
+        } ?: -1L
+
+    fun isBatch(run: Run): Boolean = run.batchId.startsWith("batch_")
+
+    /** The batch runs only, newest first: what "current" and "previous" count. */
+    fun batchesNewestFirst(newestFirst: List<Run>): List<Run> = newestFirst.filter(::isBatch)
+
+    /**
+     * Which runs the scope covers. A single-run scope picks a BATCH (the newest, or the one
+     * before it) and adds the scorer self-checks that ran between the batch before it and the
+     * batch after it, so a self-check run just before or just after a batch travels with it.
+     * The batch comes first; the file name and the crash-report window are taken from it.
+     * Empty when the scope has nothing to say.
+     */
+    fun runsFor(scope: Scope, newestFirst: List<Run>): List<Run> {
+        if (scope == Scope.ALL_RUNS || scope == Scope.EVERYTHING) return newestFirst
+        val batches = batchesNewestFirst(newestFirst)
+        val index = if (scope == Scope.CURRENT_RUN) 0 else 1
+        val batch = batches.getOrNull(index) ?: return emptyList()
+        val after = batches.getOrNull(index - 1)?.startedAtMs ?: Long.MAX_VALUE
+        val before = batches.getOrNull(index + 1)?.startedAtMs ?: Long.MIN_VALUE
+        val selfChecks = newestFirst.filter { !isBatch(it) && it.startedAtMs > before && it.startedAtMs < after }
+        return listOf(batch) + selfChecks
     }
 
     /**
@@ -58,8 +85,8 @@ object DiagnosticsArchivePlan {
     ): List<String> {
         val reports = crashReportNames.filter(CrashReportPlan::isReportName).sorted()
         if (scope == Scope.ALL_RUNS || scope == Scope.EVERYTHING) return reports
-        val run = runs.singleOrNull() ?: return emptyList()
-        val next = newestFirst.lastOrNull { it.startedAtMs > run.startedAtMs }?.startedAtMs ?: Long.MAX_VALUE
+        val run = runs.firstOrNull(::isBatch) ?: return emptyList()
+        val next = batchesNewestFirst(newestFirst).lastOrNull { it.startedAtMs > run.startedAtMs }?.startedAtMs ?: Long.MAX_VALUE
         return reports.filter { name ->
             val at = crashEpochOf(name)
             at >= run.startedAtMs && at < next
