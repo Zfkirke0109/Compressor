@@ -57,6 +57,10 @@ unchanged bar. The margin changes which encode is attempted, never what is accep
 summariser prints the drift and the marginal attempts of every capture (`probe->cert`,
 `marginal passes`), so the margin is re-measured each run rather than trusted.
 
+A ladder that runs past its time budget skips the rungs in between and still measures the safest
+one, so a file is never re-encoded at the default ratio on no evidence after its lower rungs
+failed (b166 wasted three full encodes that way).
+
 The encoder request is the same for probes and the full encode: bitrate mode, keyframe interval
 (matched to the source's own, 1 to 5 s; see `KeyframeIntervalPolicy`) and the opt-in B-frame
 experiment. Media3's default of one keyframe per second spent roughly three times the source's
@@ -166,7 +170,8 @@ enough to defend.
 | Probe clip scores encoder warm-up | every probe clip starts at a source keyframe ≥ 2 s before the window; the lead-in is decoded and paired but not scored |
 | Decoder output not 8-bit 4:2:0 | any other format fails closed to "unavailable" |
 | Rotation/crop mismatch | both sides are converted to display orientation with the crop rectangle applied; a geometry mismatch is "unavailable" |
-| A defect in the scorer itself | the self-check: source vs itself and source vs stream copy must score 100 on every frame; its log is exported with the batch it ran next to |
+| A defect in the scorer itself | the self-check: source vs itself and source vs stream copy must score 100 on every frame, and it prints PASS or FAIL; its log is exported with the batch it ran next to. It caught one in b166 (next row) |
+| Every window's first frame scored with zero motion | libvmaf gives the first frame of a session zero motion, and `vmaf_v0.6.1` then scores even an identical frame 97.43. Each window now feeds one pre-window pair as motion context and drops its score (`MotionContext`); the offline calibration scored whole clips, so this makes the device match it |
 | Probe passes that the full encode then fails | selection margin from measured probe-to-encode drift; re-measured in every capture |
 | Probe clip encoded differently from the full encode | one request shape (mode, keyframe interval, B-frames) for both |
 | A metric that is not the definition | Section 4 |

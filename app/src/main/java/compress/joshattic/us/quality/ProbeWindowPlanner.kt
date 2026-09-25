@@ -47,7 +47,8 @@ object ProbeWindowPlanner {
         val anchor: Anchor
     ) {
         val leadInUs: Long get() = startUs - clipStartUs
-        fun scoreWindowForCertification(): ScoreWindow = ScoreWindow(startUs, endUs)
+        fun scoreWindowForCertification(): ScoreWindow =
+            ScoreWindow(startUs, endUs, contextUs = MotionContext.CERTIFICATION_CONTEXT_US)
         fun scoreWindowForProbeClip(): ScoreWindow =
             ScoreWindow(startUs, endUs, distStartUs = 0L, alignFirstFrames = true, leadInUs = leadInUs)
     }

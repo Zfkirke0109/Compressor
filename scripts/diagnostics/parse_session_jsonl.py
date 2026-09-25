@@ -196,6 +196,7 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "v1ShadowPairs": v1_shadow_pairs(jobs),
         "probeCertDrift": probe_cert_drift(jobs),
         "marginalAttempts": marginal_attempts(jobs),
+        "budgetExhausted": budget_exhausted(jobs),
         "decisionBasis": dict(Counter(basis_kind(j.get("decisionBasis")) for j in jobs if j.get("decisionBasis")).most_common()),
         "completed": summary is not None,
     }
@@ -251,6 +252,16 @@ def marginal_attempts(jobs: list[dict[str, Any]]) -> dict[str, int]:
     return {
         "attempted": len(marginal),
         "certified": sum(1 for j in marginal if j.get("pixelCertified")),
+    }
+
+
+def budget_exhausted(jobs: list[dict[str, Any]]) -> dict[str, int]:
+    """Ladders that ran out of time, and how many of those files were then encoded anyway and
+    failed certification (a full encode spent with no probe evidence behind it)."""
+    out = [j for j in jobs if str(j.get("probeDetail") or "").startswith("probe budget exhausted")]
+    return {
+        "ladders": len(out),
+        "encodedThenFailed": sum(1 for j in out if j.get("certificationStatus") == "ran_scored" and not j.get("pixelCertified")),
     }
 
 
@@ -320,6 +331,9 @@ def render(s: dict[str, Any]) -> str:
     marginal = s.get("marginalAttempts") or {}
     if marginal.get("attempted"):
         out.append(f"  marginal passes: {marginal['attempted']} attempted, {marginal['certified']} certified")
+    budget = s.get("budgetExhausted") or {}
+    if budget.get("ladders"):
+        out.append(f"  budget exhausted: {budget['ladders']} ladder(s), {budget['encodedThenFailed']} then encoded and failed certification")
     if s.get("decisionBasis"):
         out.append(f"  keep-original basis: {s['decisionBasis']}")
     pairs = s.get("v1ShadowPairs") or []

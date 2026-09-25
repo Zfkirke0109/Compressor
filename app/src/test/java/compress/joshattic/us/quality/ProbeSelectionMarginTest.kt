@@ -78,4 +78,18 @@ class ProbeSelectionMarginTest {
         assertEquals(QualityProbePolicy.SAFEST_RATIO_CEILING, QualityProbePolicy.upwardMarginCandidate(0.95)!!, 0.0)
         assertEquals(null, QualityProbePolicy.upwardMarginCandidate(QualityProbePolicy.SAFEST_RATIO_CEILING))
     }
+
+    @Test
+    fun anOverBudgetLadderStillMeasuresTheSafestRungInsteadOfEncodingBlind() {
+        val budget = ExhaustivePerceptualLosslessPolicy.PROBE_BUDGET_MS
+        val over = budget + 1
+        assertEquals(ExhaustivePerceptualLosslessPolicy.OverBudget.SKIP_TO_SAFEST,
+            ExhaustivePerceptualLosslessPolicy.overBudgetAction(0.90, 0.97, over, budget))
+        assertEquals(ExhaustivePerceptualLosslessPolicy.OverBudget.PROBE_SAFEST,
+            ExhaustivePerceptualLosslessPolicy.overBudgetAction(0.97, 0.97, over, budget))
+        assertEquals(ExhaustivePerceptualLosslessPolicy.OverBudget.STOP,
+            ExhaustivePerceptualLosslessPolicy.overBudgetAction(0.97, 0.97, 2 * budget + 1, budget))
+        assertEquals(ExhaustivePerceptualLosslessPolicy.OverBudget.STOP,
+            ExhaustivePerceptualLosslessPolicy.overBudgetAction(0.90, null, over, budget))
+    }
 }

@@ -38,8 +38,30 @@ package compress.joshattic.us.quality
  */
 object ExhaustivePerceptualLosslessPolicy {
 
-    /** Wall-clock budget of a full probe ladder (up to 1080p). */
-    const val PROBE_BUDGET_MS = 150_000L
+    /**
+     * Wall-clock budget of a full probe ladder (up to 1080p). Was 150 s. The selection margin
+     * (QualityProbePolicy.PROBE_SELECTION) sends a marginal rung on to the next one, so ladders
+     * now measure more rungs; in b166 two 1080p ladders ran out of budget part-way.
+     */
+    const val PROBE_BUDGET_MS = 240_000L
+
+    enum class OverBudget { SKIP_TO_SAFEST, PROBE_SAFEST, STOP }
+
+    /**
+     * What the ladder does with [ratio] once [elapsedMs] has passed [budgetMs].
+     *
+     * It used to stop and fall back to the plan, which in exhaustive mode meant a full encode at
+     * the default ratio with no measurement behind it. In b166 three files went that way after
+     * measured failures on the lower rungs, and all three failed certification after full encodes
+     * of up to 8.6 minutes of video. So an over-budget ladder skips the rungs in between and still
+     * measures the safest one: a measured pass encodes with proof, and a measured failure skips the
+     * file. The safest rung may run up to twice the budget; past that the ladder stops.
+     */
+    fun overBudgetAction(ratio: Double, highestCandidate: Double?, elapsedMs: Long, budgetMs: Long): OverBudget = when {
+        highestCandidate == null || elapsedMs > 2 * budgetMs -> OverBudget.STOP
+        ratio < highestCandidate - 1e-9 -> OverBudget.SKIP_TO_SAFEST
+        else -> OverBudget.PROBE_SAFEST
+    }
 
     /**
      * Wall-clock budget of the short ladder. A 4K rung costs about three minutes on the S23 Ultra:

@@ -218,7 +218,19 @@ class PerceptualQualityProber(private val context: Context) {
             )
         }
         for (ratio in candidateRatios) {
-            if (overBudget()) return marginalFallback() ?: exhausted("probe budget exhausted")
+            if (overBudget()) {
+                val elapsed = System.currentTimeMillis() - startedAt
+                when (ExhaustivePerceptualLosslessPolicy.overBudgetAction(ratio, highestCandidate, elapsed, budgetMs)) {
+                    ExhaustivePerceptualLosslessPolicy.OverBudget.SKIP_TO_SAFEST -> {
+                        DiagLog.i(TAG, "probe budget spent after ${elapsed / 1000}s; skipping %.2f to measure the safest rung".format(ratio))
+                        continue
+                    }
+                    ExhaustivePerceptualLosslessPolicy.OverBudget.PROBE_SAFEST ->
+                        DiagLog.i(TAG, "probe budget spent after ${elapsed / 1000}s; measuring the safest rung %.2f so the decision rests on a measurement".format(ratio))
+                    ExhaustivePerceptualLosslessPolicy.OverBudget.STOP ->
+                        return marginalFallback() ?: exhausted("probe budget exhausted")
+                }
+            }
             probed += ratio
             val rung = probeOneRatio(sourceUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows, shape, sourceFps)
             countRung(ratio, rung)
@@ -666,12 +678,25 @@ class PerceptualQualityProber(private val context: Context) {
         if (plan.windows.isEmpty()) return "self-check: no window could be placed (clip too short or no keyframe in reach)"
         val certWindows = plan.windows.map { it.scoreWindowForCertification() }
         val lines = mutableListOf<String>()
-        fun describe(label: String, outcome: PairScoreOutcome) {
+        fun describe(label: String, outcome: PairScoreOutcome, expectIdentical: Boolean = false) {
             val text = when (outcome) {
-                is PairScoreOutcome.Scored -> outcome.windows.joinToString("; ") { w ->
-                    "%.2f/%.2f/%.2f".format(java.util.Locale.US, w.mean, w.p5, w.min) +
-                        (w.frameDiag?.let { " frames[${it.compact()}]" } ?: "") +
-                        (w.pairing?.let { " pairing[${it.compact()}]" } ?: "")
+                is PairScoreOutcome.Scored -> {
+                    // A control that must be identical states its own verdict, so a capture cannot
+                    // read 97.43 as a pass. Identical frames with real motion score 100; VMAF v0.6.1
+                    // scores identical STATIC frames 97.43 on every frame, which names itself.
+                    val verdict = if (!expectIdentical) "" else {
+                        val worst = outcome.windows.minOf { it.min }
+                        when {
+                            worst >= 99.95 -> "PASS "
+                            outcome.windows.all { it.mean < 99.0 } -> "STATIC? (VMAF scores identical static frames ~97.43) "
+                            else -> "FAIL (min %.2f; a scorer or pairing defect) ".format(java.util.Locale.US, worst)
+                        }
+                    }
+                    verdict + outcome.windows.joinToString("; ") { w ->
+                        "%.2f/%.2f/%.2f".format(java.util.Locale.US, w.mean, w.p5, w.min) +
+                            (w.frameDiag?.let { " frames[${it.compact()}]" } ?: "") +
+                            (w.pairing?.let { " pairing[${it.compact()}]" } ?: "")
+                    }
                 }
                 is PairScoreOutcome.MisalignmentRejected -> "misaligned: ${outcome.reason}"
                 PairScoreOutcome.Unavailable -> "unavailable"
@@ -681,7 +706,7 @@ class PerceptualQualityProber(private val context: Context) {
         }
         describe("source vs itself (expect 100 on every frame)", withContext(Dispatchers.IO) {
             VmafPairScorer.score(context, sourceUri, sourceUri, certWindows)
-        })
+        }, expectIdentical = true)
         val remux = File.createTempFile("selfcheck_remux_", ".mp4", context.cacheDir)
         try {
             val remuxed = withContext(Dispatchers.IO) {
@@ -694,7 +719,7 @@ class PerceptualQualityProber(private val context: Context) {
             if (remuxed.isSuccess) {
                 describe("source vs stream copy (expect 100 on every frame)", withContext(Dispatchers.IO) {
                     VmafPairScorer.score(context, sourceUri, Uri.fromFile(remux), certWindows)
-                })
+                }, expectIdentical = true)
             } else {
                 lines += "source vs stream copy: remux not possible for this container (${remuxed.exceptionOrNull()?.message})"
             }

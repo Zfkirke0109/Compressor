@@ -204,6 +204,17 @@ def test_probe_to_certification_drift_and_marginal_attempts_are_reported():
     assert s["decisionBasis"] == {"cannot be measured": 1, "learned": 1}
 
 
+def test_ladders_that_ran_out_of_budget_are_counted_with_their_blind_encodes():
+    path = write([
+        {"type": "session_start", "batchId": "b1"},
+        job("a", probeDetail="probe budget exhausted", certificationStatus="ran_scored", pixelCertified=False),
+        job("b", probeDetail="probe budget exhausted"),
+        job("c", probeDetail="windows passed at 0.90", certificationStatus="ran_scored", pixelCertified=True),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    assert summarize(path)["budgetExhausted"] == {"ladders": 2, "encodedThenFailed": 1}
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
 
