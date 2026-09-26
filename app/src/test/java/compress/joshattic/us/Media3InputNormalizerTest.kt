@@ -78,4 +78,40 @@ class Media3InputNormalizerTest {
         assertTrue(Media3InputNormalizer.isComplete(declared - 33_000L, declared))
         assertFalse(Media3InputNormalizer.isSubstantial(400_000_000L, 1_000_000_000L))
     }
+
+    @Test
+    fun copiesLeftByADeadProcessAreClearedAtBatchStartAndNothingElseIs() {
+        val cache = java.nio.file.Files.createTempDirectory("cache").toFile()
+        try {
+            val work = Media3InputNormalizer.workDir(cache)
+            java.io.File(work, "media3input_1.mp4").writeBytes(ByteArray(1000))
+            java.io.File(work, "media3input_2.mp4").writeBytes(ByteArray(500))
+            // An older build wrote copies into the cache root.
+            java.io.File(cache, "media3input_3.mp4").writeBytes(ByteArray(250))
+            // Unrelated cache files must survive: outputs, other temp files.
+            val outputs = java.io.File(cache, "batch_compressed_videos").apply { mkdirs() }
+            val output = java.io.File(outputs, "clip_compressed.mp4").apply { writeBytes(ByteArray(10)) }
+            val other = java.io.File(cache, "selfcheck_remux_1.mp4").apply { writeBytes(ByteArray(10)) }
+
+            assertEquals(1750L, Media3InputNormalizer.clearLeftovers(cache))
+            assertTrue(work.listFiles().orEmpty().isEmpty())
+            assertFalse(java.io.File(cache, "media3input_3.mp4").exists())
+            assertTrue(output.exists())
+            assertTrue(other.exists())
+            assertEquals(0L, Media3InputNormalizer.clearLeftovers(cache))
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun newCopiesAreWrittenIntoTheClearedFolder() {
+        val cache = java.nio.file.Files.createTempDirectory("cache").toFile()
+        try {
+            assertEquals(java.io.File(cache, Media3InputNormalizer.CACHE_SUBDIR), Media3InputNormalizer.workDir(cache))
+            assertTrue(Media3InputNormalizer.workDir(cache).isDirectory)
+        } finally {
+            cache.deleteRecursively()
+        }
+    }
 }

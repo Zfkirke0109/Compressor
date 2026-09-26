@@ -748,7 +748,7 @@ class PerceptualQualityProber(private val context: Context) {
         windowUs: Long = QualityProbePolicy.BASE_WINDOW_US
     ): ProbeWindowPlanner.Plan =
         withContext(Dispatchers.IO) {
-            val index = MediaExtractorSyncIndex.open(context, sourceUri)
+            val index = MediaExtractorSyncIndex.open(context, sourceUri, fallbackDurationUs = durationMs * 1000L)
             try {
                 val plan = ProbeWindowPlanner.plan(durationMs * 1000L, index, windowUs)
                 DiagLog.i(

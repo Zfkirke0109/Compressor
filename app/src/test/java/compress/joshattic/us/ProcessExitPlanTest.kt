@@ -40,4 +40,41 @@ class ProcessExitPlanTest {
         assertEquals(listOf(30L, 40L), ProcessExitPlan.unseen(records, { it }, lastSeenTimestamp = 20L))
         assertTrue(ProcessExitPlan.unseen(records, { it }, lastSeenTimestamp = 40L).isEmpty())
     }
+
+    @Test
+    fun onlyCrashesAnrsAndStartFailuresAreFailures() {
+        // CRASH, CRASH_NATIVE, ANR, INITIALIZATION_FAILURE.
+        listOf(4, 5, 6, 7).forEach { assertTrue(ProcessExitPlan.reasonName(it), ProcessExitPlan.isFailure(it)) }
+        // LOW_MEMORY, USER_REQUESTED, USER_STOPPED, PACKAGE_UPDATED, SIGNALED, EXIT_SELF, OTHER.
+        listOf(3, 10, 11, 16, 2, 1, 13).forEach { assertFalse(ProcessExitPlan.reasonName(it), ProcessExitPlan.isFailure(it)) }
+    }
+
+    @Test
+    fun routineExitsCanNoLongerPushARealCrashOut() {
+        // One real crash, then 30 ordinary exits (background kills, swipes, updates).
+        val crash = CrashReportPlan.fileName(1_000L)
+        val exits = (1..30).map { CrashReportPlan.exitRecordName(2_000L + it) }
+        val names = listOf(crash) + exits
+        assertTrue(CrashReportPlan.reportsToPrune(names).isEmpty())
+        // Exit records are capped on their own, oldest first.
+        val prunedExits = CrashReportPlan.exitRecordsToPrune(names)
+        assertEquals(10, prunedExits.size)
+        assertEquals(exits.take(10), prunedExits)
+        assertFalse(crash in prunedExits)
+    }
+
+    @Test
+    fun exitRecordsTravelWithACaptureAndKeepTheirTime() {
+        val name = CrashReportPlan.exitRecordName(1_790_423_201_187L)
+        assertEquals("exit-1790423201187.log", name)
+        assertTrue(CrashReportPlan.isExitRecordName(name))
+        assertFalse(CrashReportPlan.isReportName(name))
+        assertEquals(1_790_423_201_187L, DiagnosticsArchivePlan.crashEpochOf(name))
+        assertEquals(1_790_423_201_187L, DiagnosticsArchivePlan.crashEpochOf("crash-1790423201187.log"))
+        val all = DiagnosticsArchivePlan.crashReportsFor(
+            DiagnosticsArchivePlan.Scope.EVERYTHING, emptyList(), emptyList(),
+            listOf(name, "crash-0000000001000.log", ".last-exit-timestamp")
+        )
+        assertEquals(listOf("crash-0000000001000.log", name), all)
+    }
 }

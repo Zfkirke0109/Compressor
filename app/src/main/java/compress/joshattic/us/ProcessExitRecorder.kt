@@ -56,6 +56,13 @@ object ProcessExitPlan {
         return if (out.length > maxChars) out.substring(0, maxChars) else out.toString()
     }
 
+    /**
+     * Whether an exit is a failure worth a crash report (and a place in its limited history):
+     * a Java or native crash, an ANR, or a failure to start. Every other exit (low memory, user
+     * stop or swipe, update, background kill) is recorded as an exit record instead.
+     */
+    fun isFailure(reason: Int): Boolean = reason in setOf(4, 5, 6, 7)
+
     /** Only records newer than the last one already written, oldest first. */
     fun <T> unseen(records: List<T>, timestampOf: (T) -> Long, lastSeenTimestamp: Long): List<T> =
         records.filter { timestampOf(it) > lastSeenTimestamp }.sortedBy(timestampOf)
@@ -93,12 +100,19 @@ object ProcessExitRecorder {
         val fresh = ProcessExitPlan.unseen(am.getHistoricalProcessExitReasons(null, 0, 16), { it.timestamp }, lastSeen)
         if (fresh.isEmpty()) return
         for (info in fresh) {
-            File(dir, CrashReportPlan.fileName(info.timestamp)).writeText(render(info))
-            Log.e(TAG, "previous process exit recorded: ${ProcessExitPlan.reasonName(info.reason)}")
+            val failure = ProcessExitPlan.isFailure(info.reason)
+            val name = if (failure) CrashReportPlan.fileName(info.timestamp) else CrashReportPlan.exitRecordName(info.timestamp)
+            File(dir, name).writeText(render(info))
+            if (failure) {
+                Log.e(TAG, "previous process failed: ${ProcessExitPlan.reasonName(info.reason)}")
+            } else {
+                Log.i(TAG, "previous process exit recorded: ${ProcessExitPlan.reasonName(info.reason)}")
+            }
         }
         marker.writeText(fresh.maxOf { it.timestamp }.toString())
         dir.list()?.let { names ->
-            CrashReportPlan.reportsToPrune(names.toList()).forEach { File(dir, it).delete() }
+            (CrashReportPlan.reportsToPrune(names.toList()) + CrashReportPlan.exitRecordsToPrune(names.toList()))
+                .forEach { File(dir, it).delete() }
         }
     }
 

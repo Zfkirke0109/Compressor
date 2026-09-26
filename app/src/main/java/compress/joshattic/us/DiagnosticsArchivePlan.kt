@@ -83,7 +83,8 @@ object DiagnosticsArchivePlan {
         newestFirst: List<Run>,
         crashReportNames: Collection<String>
     ): List<String> {
-        val reports = crashReportNames.filter(CrashReportPlan::isReportName).sorted()
+        // Crash reports and routine exit records (ProcessExitRecorder) both travel with a capture.
+        val reports = crashReportNames.filter { CrashReportPlan.isReportName(it) || CrashReportPlan.isExitRecordName(it) }.sorted()
         if (scope == Scope.ALL_RUNS || scope == Scope.EVERYTHING) return reports
         val run = runs.firstOrNull(::isBatch) ?: return emptyList()
         val next = batchesNewestFirst(newestFirst).lastOrNull { it.startedAtMs > run.startedAtMs }?.startedAtMs ?: Long.MAX_VALUE
@@ -93,8 +94,7 @@ object DiagnosticsArchivePlan {
         }
     }
 
-    fun crashEpochOf(reportName: String): Long =
-        reportName.removePrefix("crash-").removeSuffix(".log").toLongOrNull() ?: -1L
+    fun crashEpochOf(reportName: String): Long = CrashReportPlan.epochOf(reportName)
 
     /**
      * `Compressor-v<version>-<timestamp>-<scope>.zip`, where the scope part is the batch id for a

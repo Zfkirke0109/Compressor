@@ -42,7 +42,7 @@ class MediaExtractorSyncIndex private constructor(
     }
 
     private fun seek(targetUs: Long, mode: Int): Long? = runCatching {
-        extractor.seekTo(targetUs.coerceIn(0L, durationUs.coerceAtLeast(0L)), mode)
+        extractor.seekTo(seekTargetUs(targetUs, durationUs), mode)
         val t = extractor.sampleTime
         if (t < 0L) null else t
     }.getOrNull()
@@ -125,8 +125,20 @@ class MediaExtractorSyncIndex private constructor(
     }
 
     companion object {
-        /** Null when the source has no video track or cannot be opened. */
-        fun open(context: Context, uri: Uri): MediaExtractorSyncIndex? {
+        /**
+         * Where to seek for [targetUs]. The track's duration only bounds the target when it is
+         * known: a track without KEY_DURATION (fragmented MP4 from screen recorders, some
+         * MKV/WebM) used to clamp every target into [0, 0], so every window snapped to the first
+         * keyframe and a long file was certified on its opening seconds alone.
+         */
+        internal fun seekTargetUs(targetUs: Long, durationUs: Long): Long =
+            if (durationUs > 0L) targetUs.coerceIn(0L, durationUs) else targetUs.coerceAtLeast(0L)
+
+        /**
+         * Null when the source has no video track or cannot be opened. [fallbackDurationUs] (the
+         * item's container duration) stands in when the video track does not record its own.
+         */
+        fun open(context: Context, uri: Uri, fallbackDurationUs: Long = 0L): MediaExtractorSyncIndex? {
             val extractor = MediaExtractor()
             return runCatching {
                 extractor.setDataSource(context, uri, null)
@@ -141,6 +153,7 @@ class MediaExtractorSyncIndex private constructor(
                     }
                 }
                 if (track < 0) error("no video track")
+                if (durationUs <= 0L) durationUs = fallbackDurationUs.coerceAtLeast(0L)
                 extractor.selectTrack(track)
                 MediaExtractorSyncIndex(extractor, durationUs)
             }.getOrElse {

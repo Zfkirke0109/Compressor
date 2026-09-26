@@ -40,15 +40,40 @@ object CrashReportPlan {
         return PREFIX + epochMs.toString().padStart(13, '0') + SUFFIX
     }
 
-    fun isReportName(name: String): Boolean =
-        name.startsWith(PREFIX) && name.endsWith(SUFFIX) &&
-            name.removePrefix(PREFIX).removeSuffix(SUFFIX).let { it.isNotEmpty() && it.all(Char::isDigit) }
+    fun isReportName(name: String): Boolean = hasEpochName(name, PREFIX)
 
     /** Report names past [keep], oldest first. Names that are not crash reports are never returned. */
-    fun reportsToPrune(names: Collection<String>, keep: Int = MAX_REPORTS): List<String> {
+    fun reportsToPrune(names: Collection<String>, keep: Int = MAX_REPORTS): List<String> =
+        prune(names.filter(::isReportName), keep)
+
+    // Routine process exits (low-memory kills, user stops, updates, background kills): recorded,
+    // but under their own name and cap, so they can never push a real crash's stack trace out
+    // of the MAX_REPORTS window (review of PR 44: every exit used to be a crash-*.log).
+    const val MAX_EXIT_RECORDS = 20
+    private const val EXIT_PREFIX = "exit-"
+
+    fun exitRecordName(epochMs: Long): String {
+        require(epochMs >= 0) { "epochMs must be non-negative, was $epochMs" }
+        return EXIT_PREFIX + epochMs.toString().padStart(13, '0') + SUFFIX
+    }
+
+    fun isExitRecordName(name: String): Boolean = hasEpochName(name, EXIT_PREFIX)
+
+    fun exitRecordsToPrune(names: Collection<String>, keep: Int = MAX_EXIT_RECORDS): List<String> =
+        prune(names.filter(::isExitRecordName), keep)
+
+    /** Epoch of a crash report or exit record name, or -1. */
+    fun epochOf(name: String): Long =
+        name.removePrefix(PREFIX).removePrefix(EXIT_PREFIX).removeSuffix(SUFFIX).toLongOrNull() ?: -1L
+
+    private fun hasEpochName(name: String, prefix: String): Boolean =
+        name.startsWith(prefix) && name.endsWith(SUFFIX) &&
+            name.removePrefix(prefix).removeSuffix(SUFFIX).let { it.isNotEmpty() && it.all(Char::isDigit) }
+
+    private fun prune(matching: List<String>, keep: Int): List<String> {
         require(keep >= 0) { "keep must be non-negative, was $keep" }
-        val reports = names.filter(::isReportName).sorted()
-        return if (reports.size <= keep) emptyList() else reports.take(reports.size - keep)
+        val sorted = matching.sorted()
+        return if (sorted.size <= keep) emptyList() else sorted.take(sorted.size - keep)
     }
 
     /**

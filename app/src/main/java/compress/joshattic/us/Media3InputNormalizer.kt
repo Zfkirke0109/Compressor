@@ -23,6 +23,36 @@ import java.util.Locale
  */
 object Media3InputNormalizer {
 
+    /**
+     * Where normalised copies are written, under the app cache. A copy is deleted when its item
+     * ends, but a process that dies mid-encode leaves it behind: each such death used to strand a
+     * multi-GB file in the cache root, and the lower free space then made later normalisations and
+     * original replacements refuse to run. They live in their own folder, cleared at batch start.
+     */
+    const val CACHE_SUBDIR = "media3_input"
+
+    /** The pre-subfolder name, for clearing copies left behind by older builds. */
+    private const val LEGACY_PREFIX = "media3input_"
+
+    fun workDir(cacheDir: File): File = File(cacheDir, CACHE_SUBDIR).apply { mkdirs() }
+
+    /**
+     * Deletes every leftover copy: the whole [CACHE_SUBDIR] and any legacy `media3input_*.mp4` in
+     * the cache root. Call only when no item is running (batch start). Returns the bytes freed.
+     */
+    fun clearLeftovers(cacheDir: File): Long {
+        var freed = 0L
+        val candidates = File(cacheDir, CACHE_SUBDIR).listFiles().orEmpty().toList() +
+            cacheDir.listFiles().orEmpty().filter { it.isFile && it.name.startsWith(LEGACY_PREFIX) && it.name.endsWith(".mp4") }
+        for (f in candidates) {
+            if (!f.isFile) continue
+            val size = f.length()
+            if (f.delete()) freed += size
+        }
+        return freed
+    }
+
+
     sealed interface Result {
         data class Normalised(
             val file: File,

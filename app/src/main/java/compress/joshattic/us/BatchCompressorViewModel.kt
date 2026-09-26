@@ -965,6 +965,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // re-running while previous results are still on screen must not delete files that
         // share/save are still offering. Those entries are replaced by this run's own outputs.
         clearBatchCache(preservePaths = _uiState.value.items.mapNotNull { it.outputPath }.toSet())
+        // Normalised copies a previous process died holding (Media3InputNormalizer.CACHE_SUBDIR).
+        runCatching { Media3InputNormalizer.clearLeftovers(context.cacheDir) }
+            .getOrNull()?.takeIf { it > 0L }
+            ?.let { DiagLog.i("CompressorBatch", "cleared leftover normalised copies; bytes=$it") }
         resetItemsForRun(quality, codec, frameRate)
 
         // Package, version, build commit, Android user id, and profile kind are resolved inside
@@ -1799,7 +1803,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             return false
         }
         s.phases.message("The encoder cannot read this file as stored; rewriting its container (no re-encode)…")
-        val target = File(context.cacheDir, "media3input_${System.nanoTime()}.mp4")
+        val target = File(Media3InputNormalizer.workDir(context.cacheDir), "media3input_${System.nanoTime()}.mp4")
         val result = withContext(Dispatchers.IO) {
             val ioContext = currentCoroutineContext()
             Media3InputNormalizer.normalise(
