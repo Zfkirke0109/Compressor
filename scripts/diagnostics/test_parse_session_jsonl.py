@@ -305,6 +305,70 @@ def test_damaged_sources_and_frame_limited_ladders_are_counted_apart():
     assert s["framesUndecided"] == 1
 
 
+
+def test_a_discarded_candidate_claiming_a_verified_replaceable_output_is_flagged_not_counted():
+    # b169 job_478c2fa19100: SKIPPED_WOULD_DEGRADE, outputSize=0, yet verdict/verified/replacementSafe
+    # carried the structural pass. It must be flagged, and never counted as an accepted output.
+    path = write([
+        start(batchId="b1"),
+        job("a", schemaVersion=2, terminal="SKIPPED_WOULD_DEGRADE", outputSize=0, sourceSize=16753345,
+            verified=True, replacementSafe=True, failedChecks=[], pixelCertified=False,
+            verdict="Perceptually Lossless Verified",
+            fallbackReason="pixel certification failed (sampled VMAF below thresholds)"),
+        job("b", terminal="TRANSCODED_SMALLER", outputSize=246118100, sourceSize=322388270,
+            countsAsRealCompression=True, verified=True, replacementSafe=True, failedChecks=[]),
+        # Schema v3 writes the same rejection truthfully: nothing to flag.
+        job("c", schemaVersion=3, terminal="SKIPPED_WOULD_DEGRADE", outputSize=0, verified=False,
+            replacementSafe=False, failedChecks=[], finalAccepted=False, structuralVerified=True,
+            verdict="Rejected — Skipped — compression would visibly lose quality",
+            fallbackReason="pixel certification failed (sampled VMAF below thresholds)",
+            certificationDecision="measured_below_bar", candidateBytes=15123456),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["acceptanceContradictions"]["count"] == 1
+    assert s["acceptanceContradictions"]["jobs"][0]["schemaVersion"] == 2
+    assert s["realCompressions"] == 1
+    assert s["savedBytes"] == 322388270 - 246118100
+    # An explained rejection is not a silent one.
+    assert s["silentRejections"] == 0
+    assert s["certificationDecisions"] == {"measured_below_bar": 1}
+    from parse_session_jsonl import render
+    assert "contradictory acceptance: 1 record(s)" in render(s)
+
+
+def test_safer_rung_retries_are_counted_with_their_attempts():
+    path = write([
+        start(batchId="b1"),
+        job("a", terminal="TRANSCODED_SMALLER", countsAsRealCompression=True, outputSize=15000000, sourceSize=16753345,
+            attempts="0.85:measured_below_bar:cand=15123456:encodeMs=9000;0.90:accepted:cand=15600000:encodeMs=9400"),
+        job("b", terminal="SKIPPED_WOULD_DEGRADE", outputSize=0,
+            attempts="0.97:measured_below_bar:cand=270000000:encodeMs=60000"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["saferRungRetries"]["retried"] == 1
+    assert s["saferRungRetries"]["certifiedAfterRetry"] == 1
+
+
+
+def test_a_v3_capture_reports_its_learned_snapshot_and_stage_events():
+    path = write([
+        start(batchId="b1"),
+        {"type": "learned_state_snapshot", "batchId": "b1", "sha256": "ab" * 32, "profileCount": 27},
+        {"type": "learned_state_update", "batchId": "b1", "profileKey": "k", "before": None, "after": "x"},
+        {"type": "stage", "batchId": "b1", "stage": "certify", "reasonCode": "cert_passed"},
+        {"type": "stage", "batchId": "b1", "stage": "certify", "reasonCode": "cert_passed"},
+        job("a", terminal="TRANSCODED_SMALLER", countsAsRealCompression=True, outputSize=5, sourceSize=9),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["learnedSnapshot"] == {"sha256": "ab" * 32, "profiles": 27, "updates": 1}
+    assert s["stageReasons"] == {"certify:cert_passed": 2}
+    from parse_session_jsonl import render
+    assert "snapshot sha256=abababababababab" in render(s)
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
 

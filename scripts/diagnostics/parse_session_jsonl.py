@@ -51,7 +51,8 @@ def load_sessions(path: str) -> "OrderedDict[str, dict[str, Any]]":
     def bucket(batch_id: Any) -> dict[str, Any]:
         key = str(batch_id)
         if key not in sessions:
-            sessions[key] = {"batchId": key, "start": None, "summary": None, "jobs": []}
+            sessions[key] = {"batchId": key, "start": None, "summary": None, "jobs": [],
+                             "stages": [], "learnedSnapshot": None, "learnedUpdates": 0}
         return sessions[key]
 
     # Records are attributed by their own batchId where they carry one, and otherwise to the
@@ -69,6 +70,13 @@ def load_sessions(path: str) -> "OrderedDict[str, dict[str, Any]]":
             bucket(rec.get("batchId") or current)["terminal"] = rec
         elif kind == "job":
             bucket(rec.get("batchId") or current)["jobs"].append(rec)
+        # Schema v3: stage events and the learned state the batch started from, with its updates.
+        elif kind == "stage":
+            bucket(rec.get("batchId") or current)["stages"].append(rec)
+        elif kind == "learned_state_snapshot":
+            bucket(rec.get("batchId") or current)["learnedSnapshot"] = rec
+        elif kind == "learned_state_update":
+            bucket(rec.get("batchId") or current)["learnedUpdates"] += 1
     return sessions
 
 
@@ -153,9 +161,13 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
     check_counts = Counter(
         c for j in verified_jobs for c in j["failedChecks"] if isinstance(c, str)
     )
+    # A rejection that names nothing. From schema v3, a candidate discarded by pixel certification
+    # carries verified=false with an empty structural failure list but a fallbackReason (and its
+    # structuralVerified=true): that is explained, not silent.
     silent_rejections = [
         j for j in verified_jobs
         if j.get("verified") is False and not j["failedChecks"]
+        and not j.get("fallbackReason") and not j.get("blockReason")
     ]
 
     return {
@@ -203,8 +215,59 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         # quality result, and never allowed to read as "would visibly lose quality".
         "framesUndecided": sum(1 for j in jobs if "a window held fewer than" in str(j.get("probeDetail") or "")),
         "overshootPrediction": overshoot_prediction(jobs),
+        "acceptanceContradictions": acceptance_contradictions(jobs),
+        "certificationDecisions": dict(Counter(
+            str(j.get("certificationDecision")) for j in jobs if j.get("certificationDecision")).most_common()),
+        "saferRungRetries": safer_rung_retries(jobs),
+        "stageReasons": dict(Counter(
+            f"{r.get('stage')}:{r.get('reasonCode')}" for r in session.get("stages", [])).most_common()),
+        "learnedSnapshot": (
+            {"sha256": session["learnedSnapshot"].get("sha256"),
+             "profiles": session["learnedSnapshot"].get("profileCount"),
+             "updates": session.get("learnedUpdates", 0)}
+            if session.get("learnedSnapshot") else None),
         "completed": summary is not None,
         "sessionEnd": session_end(summary, session.get("terminal")),
+    }
+
+
+_ACCEPTING_TERMINALS = {"TRANSCODED_SMALLER", "LOSSY_SMALLER", "EXPLICIT_REMUX"}
+
+
+def acceptance_contradictions(jobs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Records whose final fields claim an accepted, replaceable output that the job did not keep.
+
+    Before schema v3 the pixel-certification rejection path wrote the structural verifier's report
+    as the job's verdict: b169 job_478c2fa19100 and job_c92a4ca7e1be read SKIPPED_WOULD_DEGRADE,
+    outputSize=0, pixelCertified=false AND verdict="Perceptually Lossless Verified", verified=true,
+    replacementSafe=true. Such a record is flagged here, never counted as an accepted output (the
+    savings total already requires a real compression with a smaller kept output).
+    """
+    flagged = []
+    for j in jobs:
+        kept = isinstance(j.get("outputSize"), (int, float)) and j["outputSize"] > 0
+        accepting = str(j.get("terminal")) in _ACCEPTING_TERMINALS
+        claims = j.get("replacementSafe") is True or (
+            j.get("verified") is True and j.get("materializationMode") != "REUSED_SOURCE")
+        if claims and (not kept or not accepting and j.get("replacementSafe") is True):
+            flagged.append({
+                "jobId": j.get("jobId") or j.get("id"),
+                "terminal": j.get("terminal"),
+                "schemaVersion": j.get("schemaVersion"),
+            })
+    return {"count": len(flagged), "jobs": flagged}
+
+
+def safer_rung_retries(jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Jobs with more than one full-encode attempt (the opt-in SaferRungRetry), and how they ended."""
+    retried = [j for j in jobs if len([a for a in str(j.get("attempts") or "").split(";") if a]) > 1]
+    if not retried:
+        return None
+    return {
+        "retried": len(retried),
+        "certifiedAfterRetry": sum(1 for j in retried if j.get("countsAsRealCompression") is True),
+        "terminals": dict(Counter(str(j.get("terminal")) for j in retried).most_common()),
+        "jobs": [{"jobId": j.get("jobId") or j.get("id"), "attempts": j.get("attempts")} for j in retried],
     }
 
 
@@ -412,7 +475,9 @@ def render(s: dict[str, Any]) -> str:
         f"  copy avoided   : {s['copyAvoidedBytes']:,}",
         f"  generated bytes: {s['generatedOutputBytes']:,}",
         f"  validation fail: {s['validationFailures']}   unexplained={s['unexplainedFailures']}",
-        f"  learned state  : {s['learnedStateIdentity'] or 'NOT RECORDED (runs are not comparable)'}",
+        f"  learned state  : {s['learnedStateIdentity'] or 'NOT RECORDED (runs are not comparable)'}"
+        + (f"   snapshot sha256={s['learnedSnapshot']['sha256'][:16]}… ({s['learnedSnapshot']['profiles']} profiles,"
+           f" {s['learnedSnapshot']['updates']} updates)" if s.get("learnedSnapshot") else "   (no snapshot: identity only)"),
         f"  probe ladders  : {s['laddersRun']}   measured nothing: {s['laddersWithNoMeasurement']}",
         f"  terminals      : {s['terminals']}",
         f"  effective modes: {s['effectiveModes']}",
@@ -454,6 +519,23 @@ def render(s: dict[str, Any]) -> str:
             out.append(f"      {kind:<22} {entry['files']:3} file(s)  {entry['terminals']}")
     if s.get("framesUndecided"):
         out.append(f"  frames-limited : {s['framesUndecided']} ladder(s) undecided on too few frames per window (not a quality result)")
+    contra = s.get("acceptanceContradictions") or {}
+    if contra.get("count"):
+        out.append(
+            f"  !! contradictory acceptance: {contra['count']} record(s) claim a verified/replaceable output"
+            " the job did not keep (flagged, not counted): "
+            + ", ".join(f"{c['jobId']}({c['terminal']})" for c in contra["jobs"][:8])
+        )
+    if s.get("stageReasons"):
+        out.append(f"  stage events   : {s['stageReasons']}")
+    if s.get("certificationDecisions"):
+        out.append(f"  cert decisions : {s['certificationDecisions']}")
+    retries = s.get("saferRungRetries")
+    if retries:
+        out.append(
+            f"  safer-rung retry: {retries['retried']} job(s) retried, {retries['certifiedAfterRetry']} certified after retry;"
+            f" {retries['terminals']}"
+        )
     over = s.get("overshootPrediction")
     if over:
         out.append(
