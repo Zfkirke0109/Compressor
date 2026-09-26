@@ -30,14 +30,46 @@ The video verdict requires **all** of:
    rotation, HDR/colour metadata, audio codec/channels/sample rate, and metadata survive intact;
    the output is strictly smaller than the source. A failure here is terminal.
 2. **Sampled pixel measurement** (`VmafPairScorer`, libvmaf 3.0.0, model `vmaf_v0.6.1`, luma,
-   8-bit, native resolution, no rescaling): three 1.2 s windows of the *final output* are decoded
-   and paired frame-for-frame with the source by presentation time. Every window must pass
-   `mean ≥ 95.5`, `5th percentile ≥ 91`, `minimum frame ≥ 84` (`QualityProbePolicy`).
+   8-bit, native resolution, no rescaling, **no phone transform**: `VmafPairScorer` passes
+   `phoneModel = false` explicitly, pinned by `VmafPairScorer.PRODUCTION_PHONE_MODEL` and a unit
+   test, because `VmafNative.open` defaults to true): up to three 1.2 s windows of the *final
+   output* (longer below ~12 fps, so each holds at least 12 frames) are decoded and paired
+   frame-for-frame with the source by presentation time. Every window must hold at least 12
+   compared frames and pass `mean ≥ 95.5`, `5th percentile ≥ 91`, `minimum frame ≥ 84`
+   (`QualityProbePolicy`).
+   **Coverage is a sample, not the file.** A clip too short for three separate windows gets fewer:
+   in b169, 21 of the 23 accepted outputs were certified on three windows and 2 on one. No claim is
+   made about anything outside the windows (Section 2.1); the job record carries the window count
+   and scores, so a reader can see how much of each file was looked at.
    The same windows, at the same positions, are used by the probe ladder that chose the bitrate,
    so probe and certification are comparable frame for frame.
 3. **Measured evidence only.** A window that could not be decoded or aligned is "unavailable",
    never a pass and never a rejection of the content. Only a scored window may reject a file as
-   "would visibly lose quality", and only a scored window may certify it.
+   "would visibly lose quality", and only a scored window may certify it. A window with fewer than
+   12 compared frames is **insufficient evidence** (`CertificationDecision.INSUFFICIENT_EVIDENCE`):
+   the output is not accepted, the original is kept as "re-encode could not be verified", and the
+   learned profile is not told anything. One adequately sampled window below the bar is a measured
+   failure whatever the other windows hold. Frames that cannot be time-aligned stay a measured
+   rejection (frame loss or retiming), distinct from "unavailable".
+
+### 2.0.1 Two protocols, two sets of numbers
+
+The app and the offline harness do not apply the same test, and one must never stand in for the
+other:
+
+| | **App PL certification** (`QualityProbePolicy`) | **Offline whole-clip audit** (`measure_quality.py`) |
+|---|---|---|
+| What is scored | up to 3 sampled windows, each after a decoded, unscored lead-in, one motion-context pair | every frame of the clip |
+| Gates | window mean ≥ 95.5, 5th percentile ≥ 91, minimum ≥ 84, ≥ 12 frames per window | clip mean ≥ 95, 1st percentile ≥ 90, minimum ≥ 80, plus SSIM (mean ≥ 0.990, min ≥ 0.950) and PSNR (mean ≥ 40 dB, min ≥ 30 dB) |
+| Model | libvmaf 3.0.0 `vmaf_v0.6.1`, no phone transform, 8-bit 4:2:0 luma, native resolution | libvmaf `vmaf_v0.6.1` default model, native resolution |
+| Probe selection | + 0.5 / + 1.25 / + 1.0 margins (probe only) | none |
+
+An offline label is not an app decision. A **parity measurement** that could settle whether the
+two agree on the same frames must match: the model and library version, the transform flag, the
+decoded pixel format and range, PTS alignment, the context frame, the exact window bounds, the
+quantile definition (the app's p5 is the value at index `floor((n − 1) × 0.05)` of the sorted
+frames) and the actual frame counts. That parity mode does not exist yet; until it does, a
+disagreement is a question, not evidence that either threshold is wrong.
 
 ### 2.0 How the probe ladder chooses a ratio
 
@@ -112,12 +144,27 @@ make more files pass.** They may be moved only with the evidence Section 4 produ
 ### 2.2 The shadow score
 
 Every certification window is also scored with **VMAF v1** (`vmaf_v1.0.16_5d0h`, libvmaf 3.2.0,
-10-bit input by bit replication). This is the model Netflix (June 2026) recommends for phone
+10-bit input by bit replication). **Shadow only: no acceptance decision reads it, and a lower v1
+score is not, by itself, evidence that a v0-certified output fails anything.** This is the model Netflix (June 2026) recommends for phone
 viewing at about 5H; it drops VIF, adds CAMBI and chroma awareness, and replaces the v0 phone
 polynomial with a viewing-distance model. It is recorded next to the v0.6.1 score for the same
 frame pairs (`v1shadow[...]`, and `certV1Scores` in the job record) so that, once Section 4 has
 produced ground truth, the two models can be compared on the same frames and the gate re-based on
 whichever predicts the human result better. It is not a gate today, and probes do not run it.
+
+Before v1 scores are used for any calibration, three things in how they are produced need their
+own parity evidence (b169 review; none has been shown to cause a score error):
+
+- **One model for every source.** `vmaf_v1.0.16_5d0h` (phone, about 5 screen heights) is used for
+  every resolution and frame rate, including 4K and 60 fps; Netflix publishes separate viewing
+  conditions and high-frame-rate variants.
+- **8 → 10-bit conversion.** `to10` replicates bits (`(v << 2) | (v >> 6)`), which maps 0 → 0 and
+  255 → 1023 but limited-range white 235 → 943, where a left shift gives 940. Which convention the
+  model was trained on is not established here.
+- **CAMBI's source bit depth.** The v1 model's CAMBI feature is fed the expanded 10-bit frames
+  with no encode-side bit-depth hint, although the encode was 8-bit.
+
+Each is a separate, staged change with parity evidence, never bundled with a verdict change.
 
 ## 3. Audio
 
@@ -165,11 +212,22 @@ enough to defend.
 
 ### 4.3 Decision rule
 
-- For a candidate to be *validated as perceptually lossless* under **V**, the pooled correct rate
-  across viewers must be **statistically indistinguishable from 50 %**: with 60 trials (3 viewers ×
-  20), 39 or more correct is significant at p < 0.01 (one-sided binomial), so a candidate with
-  ≥ 39/60 is *detected* and fails; below that it is not detected. Report the count and the exact
+- **Detection.** With 60 pooled trials (3 viewers × 20) at chance (p = 0.5), the exact one-sided
+  binomial tail is P(X ≥ 39) = 0.0136700669 and P(X ≥ 40) = 0.0067446469. So at α = 0.01 a
+  candidate is *detected* at **40 or more correct out of 60**, not 39 (an earlier version of this
+  document said 39, which is significant only at p < 0.014). Report the count and the exact
   binomial p, not just pass/fail.
+- **Not detected is not equivalent.** Failing to reject chance says the test did not detect a
+  difference; it does not demonstrate that none exists (NIST TN 2106, section 5). A claim of
+  equivalence under **V** needs a prespecified practical margin (for example, a true correct rate
+  of at most 0.60 counts as "not reliably told apart"), a sample size with enough power to exclude
+  rates above that margin, and a one-sided upper confidence bound on the correct rate that falls
+  below it. Until such a study is run, results are reported as "not detected in this test (n, k,
+  p, upper bound)".
+- **Repeated trials within a viewer are not independent.** Pooling 3 × 20 trials treats one
+  viewer's 20 answers as 20 people. Report per-viewer results, and analyse the pooled rate with a
+  model that allows viewer-level variation (or require the criterion per viewer), and fix the
+  analysis before the trials are run.
 - A viewer's results on a clip are discarded if that viewer did not detect the visibly-worse anchor
   on the same clip (≥ 15/20).
 - Do not pool across clips to rescue a clip: the claim is per file.
@@ -190,6 +248,25 @@ enough to defend.
   scorer and the offline scorer on the same frames is a measurement defect and blocks any
   threshold change until it is explained.
 
+## 4.5 Opt-in experiment: safer-rung retry
+
+Off by default (Settings → Experiment: safer-rung retry). When a full encode fails certification
+on **adequately measured** windows, and the same probe ladder had also passed a **higher** ratio
+with the selection margin (it then refined below it), the item is encoded once more at that higher
+ratio. The retry is a new attempt through every check: structural verification, audio, metadata,
+the actual-size rule and the unchanged pixel bar. It runs only with a fresh size check predicting a
+useful saving, on the original source with the planned codec, within the item's 20-minute budget,
+below severe thermal status, with free space for the output, and at most once per file and five
+times per batch (`SaferRungRetry`). Both attempts are recorded (`attempts` in the job record,
+`retry` stage events with the reason a retry was allowed or denied). The first attempt's measured
+failure is learned once; the retry's outcome is learned as its own attempt at its own ratio.
+
+The motivating case is b169 `job_478c2fa19100` (10 fps): 0.90 passed the probes, 0.85 was selected
+by refinement, and the 0.85 full encode's third window scored mean 95.423 against 95.5. Whether a
+0.90 full encode certifies is **not known**: it has never been encoded. `job_c92a4ca7e1be` failed
+at 0.97 with nothing measured above it and is never retried. Wider ladders (0.98/0.99), smaller
+margins or new overshoot constants are not part of this experiment.
+
 ## 5. Where measurement can still go wrong, and how each is guarded
 
 | Risk | Guard |
@@ -206,6 +283,24 @@ enough to defend.
 | A metric that is not the definition | Section 4 |
 
 ## 6. What the label means on screen
+
+- **Progress is a phase, not a percentage of the item.** A row shows the phase it is in:
+  Preparing, Measuring quality, Encoding N % (Media3's own fraction, shown indeterminate when
+  Media3 has none), Finalizing output, Verifying output, Certifying pixels *k* of *n* windows,
+  Saving. The encoder reaching 100 % is not the item finishing: b169's recorded row 110 read
+  "Compressing … 100%" 16 s before certification decided it. The batch fraction counts finished
+  items only. While the muxer writes, the size shown is the live file, labelled temporary (it can
+  shrink when the file is closed); after that the closed file is a *candidate* until verification
+  and certification accept it; savings are computed from accepted outputs only. The estimate is
+  marked provisional until the probes have chosen a ratio, and afterwards it is the same number
+  the size gate predicted. Sizes are shown in binary units (MiB, GiB).
+- **A rejected candidate never carries a success verdict.** The job record's `verdict`,
+  `verified` and `replacementSafe` are the *final* outcome (`FinalAcceptance`); the structural
+  verifier's own verdict is kept as `structuralVerdict` / `structuralVerified`, and a discarded
+  candidate's size as `candidateBytes`. Records from before schema 3 can carry the structural
+  verdict on a discarded candidate; the summariser flags those as contradictory and never counts
+  them as outputs.
+
 
 - **Perceptually Lossless Verified** — structural parity and sampled pixel measurement both passed
   on this output. Audio is stated separately.
