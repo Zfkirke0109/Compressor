@@ -35,6 +35,19 @@ This engine exists to make repeated encodes on the same device/content class sma
 - **Clamped above safety floors, always.** Known floors from this codebase: HDR 120fps ≥ 0.90, HDR 4K60 ≥ 0.80, SDR 120fps ≥ 0.88 (120fps floors are intentionally stricter than 60fps — don't collapse these into one ">50fps" bucket), plus absolute floors (8K ≥ 100 Mbps, 4K ≥ 48 Mbps). A corrupted or tampered stored value must not be able to push a recommendation below its floor — the clamp has to be enforced at read time, not just at write time.
 - **Never bypasses verification.** The learning engine only ever picks a *target*, it does not and must not decide "verified." `OutputVerifier` is the only source of truth for that word, always, for every encode it touches.
 
+## Pixel certification and the probe ladder (added after b161–b169)
+
+The PL verdict now also needs measured pixels, not just structure. Read `docs/PERCEPTUALLY_LOSSLESS.md` before changing any of this.
+
+- **The bar** (`QualityProbePolicy`): every sampled window must hold ≥ 12 compared frames and score `vmaf_v0.6.1` mean ≥ 95.5, 5th percentile ≥ 91, minimum ≥ 84. Scoring is native libvmaf with `phoneModel = false` (`VmafPairScorer.PRODUCTION_PHONE_MODEL`). VMAF v1 is shadow telemetry only.
+- **Probe selection margins** (+0.5 / +1.25 / +1.0) apply only to choosing a probe rung, never to certification. They were calibrated from measured probe→encode drift; re-measure it (`probe->cert` in the summariser) before touching them.
+- **Evidence types** (`CertificationDecision`): passed, measured failure, insufficient (a window under 12 frames), unavailable, misaligned. Only a measured failure or misalignment may say "would visibly lose quality" or teach the learning engine. Insufficient/unavailable keeps the original as "could not be verified".
+- **Final verdict ≠ structural verdict** (`FinalAcceptance`): a candidate discarded by certification must be recorded as rejected, never verified or replaceable.
+- **Size gate**: a file's own probe overshoot bound outranks the learned bucket value (`MeasuredOvershoot`); never restore `max(learned, bound)`.
+- **One plan** (`ResolvedEncodePlan`): the encoder request, the estimate and the plan log must come from the same resolved value.
+- **Experiments** (`EncoderExperiments`: B-frames, safer-rung retry) stay opt-in until a device run shows what they do.
+- Evidence rules: a threshold or margin moves only with measured device evidence (captures, ABX), never to raise the pass count. A counterfactual ("0.98 would have passed") is not a win until it is encoded and certified.
+
 ## Validation to run before calling any of this done
 
 - 4K60 HEVC HDR source around ~120 Mbps (the realistic Samsung camera case) — confirm honest remux-preferred behavior when re-encoding wouldn't help.

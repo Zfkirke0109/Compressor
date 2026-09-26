@@ -19,6 +19,33 @@ object QualityProbePolicy {
     const val WINDOW_MIN_MIN = 84.0
     const val MIN_COMPARED_FRAMES_PER_WINDOW = 12
 
+    // ---- Window duration ------------------------------------------------------------------------
+    //
+    // A window must hold both the calibrated amount of time (1.2 s) and enough frames for its p5 and
+    // minimum to mean anything (MIN_COMPARED_FRAMES_PER_WINDOW). At 30 fps 1.2 s is 36 frames; at
+    // 10 fps it is 12 at best, and b168 job_478c2fa19100 (1356x760, 10 fps) scored 11 in one window
+    // while every window cleared the bar and the selection margin (0.95: 99.24/97.25/97.25,
+    // 98.19/95.43/95.43, 97.51/95.08/95.08). The frame count, not the pixels, rejected it, and the
+    // ladder then reported that as "no candidate ratio passed" and the file as "would visibly lose
+    // quality". The requirement is now met by the window's length: below ~11.7 fps it grows to hold
+    // MIN_COMPARED_FRAMES_PER_WINDOW plus two frames of headroom (edge frames and VFR jitter).
+
+    /** The calibrated window length, and the one used whenever the frame rate is unknown. */
+    const val BASE_WINDOW_US = 1_200_000L
+
+    /** Frames added above the minimum when a window is sized from the frame rate. */
+    const val WINDOW_FRAME_HEADROOM = 2
+
+    /** Longest window: a 3.5 fps time-lapse still gets 14 frames; slower material stays undecided. */
+    const val MAX_WINDOW_US = 4_000_000L
+
+    /** Window length for a source of [fps] frames per second; [BASE_WINDOW_US] when unknown. */
+    fun windowDurationUs(fps: Double): Long {
+        if (!fps.isFinite() || fps <= 0.0) return BASE_WINDOW_US
+        val needed = Math.ceil((MIN_COMPARED_FRAMES_PER_WINDOW + WINDOW_FRAME_HEADROOM) * 1_000_000.0 / fps).toLong()
+        return needed.coerceIn(BASE_WINDOW_US, MAX_WINDOW_US)
+    }
+
     /**
      * A per-window acceptance bar: the three VMAF thresholds a window must clear.
      *
@@ -47,6 +74,62 @@ object QualityProbePolicy {
         minMin = WINDOW_MIN_MIN,
         label = "Perceptually Lossless"
     )
+
+    // ---- Probe selection margin ---------------------------------------------------------------
+    //
+    // How far above the certification bar a PROBE must land before the ladder selects its ratio.
+    //
+    // Calibrated from b165 (batch_1790280254600, S23 Ultra): 63 windows were scored twice on the
+    // same frames, once on the probe clip and once on the finished full encode at the same
+    // requested ratio. The full encode landed below the probe by (10th percentile / worst):
+    // mean 0.52 / 1.16, 5th percentile 1.25 / 1.76, minimum 0.89 / 3.62 points. Of 23 certified
+    // encodes 7 failed, and every one of them had passed its probe by under 0.5 points on some
+    // gate, interleaved with passes down to 0.01. A probe pass inside the drift is a coin toss,
+    // and a lost toss costs a full encode of a 20-minute file and leaves the original untouched.
+    //
+    // The margins are the 10th-percentile drift. They are NOT a change to the acceptance bar:
+    // certification still judges the real output against PERCEPTUAL_LOSSLESS, unchanged. They
+    // change which rung the ladder SELECTS: a rung that clears the bar but not the margin is
+    // "marginal", the ladder moves on to the next, safer rung, and only when no rung clears the
+    // margin is the highest marginal rung attempted, labelled as such, for certification to decide.
+    const val PROBE_SELECTION_MARGIN_MEAN = 0.5
+    const val PROBE_SELECTION_MARGIN_P5 = 1.25
+    const val PROBE_SELECTION_MARGIN_MIN = 1.0
+
+    val PROBE_SELECTION = QualityBar(
+        meanMin = WINDOW_MEAN_MIN + PROBE_SELECTION_MARGIN_MEAN,
+        p5Min = WINDOW_P5_MIN + PROBE_SELECTION_MARGIN_P5,
+        minMin = WINDOW_MIN_MIN + PROBE_SELECTION_MARGIN_MIN,
+        label = "Perceptually Lossless, probe selection margin"
+    )
+
+    /**
+     * [INSUFFICIENT]: no window with enough frames failed the bar, but at least one window had
+     * too few frames to decide. It is not a measured rejection, and never a pass.
+     */
+    enum class RungVerdict { UNMEASURED, INSUFFICIENT, FAILED, MARGINAL, PASSED }
+
+    private fun clears(w: WindowScore, bar: QualityBar) = w.mean >= bar.meanMin && w.p5 >= bar.p5Min && w.min >= bar.minMin
+
+    /** How a measured rung stands: clears bar and margin, clears only the bar, or fails the bar. */
+    fun rungVerdict(scores: List<WindowScore>?): RungVerdict = when {
+        scores.isNullOrEmpty() -> RungVerdict.UNMEASURED
+        // A window with enough frames below the bar is a measurement, whatever the others hold.
+        scores.any { it.comparedFrames >= MIN_COMPARED_FRAMES_PER_WINDOW && !clears(it, PERCEPTUAL_LOSSLESS) } ->
+            RungVerdict.FAILED
+        scores.any { it.comparedFrames < MIN_COMPARED_FRAMES_PER_WINDOW } -> RungVerdict.INSUFFICIENT
+        windowsPass(scores, PROBE_SELECTION) -> RungVerdict.PASSED
+        windowsPass(scores) -> RungVerdict.MARGINAL
+        else -> RungVerdict.FAILED
+    }
+
+    /**
+     * The smallest amount, over every window and gate, by which the scores clear the
+     * Perceptually Lossless bar. Negative when a gate fails. For log lines: "passed by 0.31".
+     */
+    fun barMargin(scores: List<WindowScore>): Double = scores.minOf { w ->
+        minOf(w.mean - WINDOW_MEAN_MIN, w.p5 - WINDOW_P5_MIN, w.min - WINDOW_MIN_MIN)
+    }
 
     /**
      * The High Quality bar: an explicitly LOSSY target, deliberately below transparency.
@@ -129,9 +212,16 @@ object QualityProbePolicy {
 
     // Upward near-miss refinement: when the SAFEST probed rung fails but its worst window is within
     // this many VMAF points of the bars, one more probe at [SAFEST_RATIO_CEILING] (a higher, safer,
-    // higher-quality rung) may close the gap. Kept small so the extra encode is spent only when a
-    // pass is plausible — a rung that failed by a lot will not be rescued by a slightly higher one.
-    const val NEAR_MISS_UPWARD_MARGIN = 2.5
+    // higher-quality rung) may close the gap.
+    //
+    // Re-estimated from b166, b167 and b168 (2.5 until then). A failing 0.95 was retried at 0.97
+    // 122 times and passed 0 times; 94 of those started more than 0.5 short. Near the ceiling the
+    // mean gains a median 0.04 VMAF per +0.01 of ratio (90th percentile 0.12), so 0.95 -> 0.97 buys
+    // about 0.08 and rarely more than 0.25. Every 0.97 pass in those batches came from a 0.95 that
+    // had already passed (the marginal path, which this does not govern). 0.5 keeps the retries a
+    // steep file could still close and skips the ~38 per batch that none did. Search cost only: the
+    // acceptance bar is untouched.
+    const val NEAR_MISS_UPWARD_MARGIN = 0.5
 
     // Full-encode certification uses the same window thresholds; a certified sub-default
     // encode must PROVE its windows, an unmeasurable certification fails closed only when
@@ -214,6 +304,14 @@ object QualityProbePolicy {
      * non-saving or degrading re-encode into a claimed win — only recover a genuine near-transparent
      * saving (typically a cross-codec H.264 -> HEVC clip) that the fixed ladder stopped just short of.
      */
+    /**
+     * When the safest probed rung was MARGINAL (cleared the bar, not the selection margin), one
+     * probe at [SAFEST_RATIO_CEILING] is the best chance of a pass that clears the margin too.
+     * Null when the rung is already at the ceiling.
+     */
+    fun upwardMarginCandidate(highestMarginalRatio: Double): Double? =
+        if (highestMarginalRatio >= SAFEST_RATIO_CEILING - 1e-9) null else SAFEST_RATIO_CEILING
+
     fun upwardRefinementCandidate(highestFailedRatio: Double, highestFailedScores: List<WindowScore>?): Double? {
         if (highestFailedRatio >= SAFEST_RATIO_CEILING - 1e-9) return null
         val shortfall = worstWindowShortfall(highestFailedScores) ?: return null
@@ -286,7 +384,7 @@ object QualityProbePolicy {
         when (outcome) {
             is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
             PairScoreOutcome.Unavailable -> certificationPasses(usedRatio, defaultRatio, null)
-            PairScoreOutcome.MisalignmentRejected -> false
+            is PairScoreOutcome.MisalignmentRejected -> false
         }
 
     /**
@@ -310,16 +408,70 @@ object QualityProbePolicy {
         when (outcome) {
             is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
             PairScoreOutcome.Unavailable -> true
-            PairScoreOutcome.MisalignmentRejected -> false
+            is PairScoreOutcome.MisalignmentRejected -> false
         }
+
+    /**
+     * How to describe a ladder that ended without a proven ratio.
+     *
+     * The distinction is load-bearing and was previously lost. "no candidate ratio passed" asserts
+     * that every rung WAS measured and rejected — positive pixel evidence that the clip cannot be
+     * re-encoded transparently. When no rung produced a single scored window, that sentence is
+     * false, and a reader (or a threshold calibrated from captures) takes measurement failure for
+     * evidence of incompressibility. Across the five 219-file S23 Ultra captures, 84 of 425 ladder
+     * runs (19.8%) reported "no candidate ratio passed" having measured nothing at all.
+     *
+     * Only the wording changes here; no acceptance decision reads this string. The gate that
+     * matters — [ProbeDecision.highestCandidateMeasuredRejected], which feeds the probe-skip
+     * ratchet — already required a measured rung and is untouched.
+     */
+    fun ladderExhaustedDetail(
+        measured: Int,
+        misaligned: Int,
+        unavailable: Int,
+        unavailableReasons: Map<String, Int> = emptyMap(),
+        misalignedReasons: Map<String, Int> = emptyMap()
+    ): String {
+        // "unmeasurable" alone was still too coarse to act on. The first captures from the fixed
+        // 4 ms tolerance showed 28 unavailable rungs, and the count could not distinguish an
+        // export that timed out on a 52-minute source from a decoder that failed on a 90-second
+        // one — which point at completely different fixes. Naming them costs nothing and is the
+        // difference between a capture that poses a question and one that answers it.
+        val why = unavailableReasons.entries
+            .sortedByDescending { it.value }
+            .joinToString("; ") { "${it.value}x ${it.key}" }
+        val unavailableDetail = if (why.isEmpty()) "$unavailable unmeasurable" else "$unavailable unmeasurable [$why]"
+        // Misalignment needs the same treatment, and for a sharper reason: its two causes are
+        // opposite diagnoses. "leading offset not aligned" means the probe pipeline never lined
+        // the streams up and the clip was never fairly measured; "internal frame misalignment"
+        // means frames really are missing or retimed inside the window. A bare count reads as the
+        // second when it may be entirely the first — 13 of 27 ladders in batch_1788254475481
+        // ended here with no way to tell.
+        val misWhy = misalignedReasons.entries
+            .sortedByDescending { it.value }
+            .joinToString("; ") { "${it.value}x ${it.key}" }
+        val misalignedDetail =
+            if (misWhy.isEmpty()) "$misaligned not time-alignable" else "$misaligned not time-alignable [$misWhy]"
+        return when {
+            measured > 0 && (misaligned + unavailable) == 0 -> "no candidate ratio passed"
+            measured > 0 -> "no candidate ratio passed (of ${measured + misaligned + unavailable} rungs, " +
+                "$measured measured; $misalignedDetail, $unavailableDetail)"
+            (misaligned + unavailable) == 0 -> "no candidate ratio passed"
+            else -> "no probe rung could be measured ($misalignedDetail, " +
+                "$unavailableDetail) — nothing was scored, so this is NOT evidence the clip " +
+                "resists re-encoding"
+        }
+    }
 
     /**
      * Probe windows for a clip of [durationUs]: up to three short windows away from the very
      * start/end (codec warm-up and tail padding are unrepresentative). Short clips get one
      * centered window. Returns an empty list when the clip is too short to sample honestly.
      */
-    fun probeWindows(durationUs: Long, windowUs: Long = 1_200_000L): List<ScoreWindow> {
+    fun probeWindows(durationUs: Long, windowUs: Long = BASE_WINDOW_US): List<ScoreWindow> {
         if (durationUs < 2_000_000L) return emptyList()
+        // A frame-rate-sized window (windowDurationUs) can be longer than a short clip.
+        if (windowUs >= durationUs) return emptyList()
         if (durationUs < 10_000_000L) {
             val start = (durationUs - windowUs) / 2
             return listOf(ScoreWindow(start, start + windowUs))

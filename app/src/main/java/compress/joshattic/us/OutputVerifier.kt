@@ -68,7 +68,12 @@ object OutputVerifier {
         // certification of the final output remains mandatory for such encodes (enforced in
         // the batch pipeline); this field only stops the structural floor from rejecting an
         // encode the pixels already justified. Null = classic behavior, byte-identical.
-        val pixelProvenVideoBitrateFloor: Int? = null
+        val pixelProvenVideoBitrateFloor: Int? = null,
+        // True only when AudioTrackIdentity proved the output's audio packets byte-identical to
+        // the source's. Proof of a pass-through copy, which no bitrate label can give.
+        val audioPacketsIdentical: Boolean = false,
+        // How many packets that proof compared (0 when it was not made).
+        val audioPacketsCompared: Int = 0
     )
 
     fun verify(
@@ -92,6 +97,13 @@ object OutputVerifier {
         val outputMetadata = runCatching {
             VideoMetadataPreserver.capture(context, Uri.fromFile(outputFile))
         }.getOrDefault(VideoMetadataSnapshot())
+        val audioIdentity = if (BatchQualityMode.fromLabel(modeLabel) == BatchQualityMode.PERCEPTUAL_LOSSLESS &&
+            sourceTracks.audioCodec != null && sourceTracks.audioCodec == outputTracks.audioCodec
+        ) {
+            AudioTrackIdentity.compare(context, source.sourceUri, outputFile)
+        } else {
+            null
+        }
         val sourceInfo = VideoSourceInfo(
             width = source.originalWidth,
             height = source.originalHeight,
@@ -125,7 +137,11 @@ object OutputVerifier {
                 outputSize = outputFile.length(),
                 privacyMode = privacyMode,
                 sourceFrameCount = readSourceFrameCount(context, source.sourceUri),
-                pixelProvenVideoBitrateFloor = pixelProvenVideoBitrateFloor
+                pixelProvenVideoBitrateFloor = pixelProvenVideoBitrateFloor,
+                // Only worth reading packets when a copy is possible at all: a Perceptually
+                // Lossless output whose audio codec matches the source's.
+                audioPacketsIdentical = audioIdentity?.result == AudioTrackIdentity.Result.IDENTICAL,
+                audioPacketsCompared = audioIdentity?.packets ?: 0
             )
         )
     }
@@ -247,15 +263,19 @@ object OutputVerifier {
             0
         }
 
-        // Audio in Perceptually Lossless and Remux Only is stream-copied, never re-encoded; when
-        // the copied track's bitrate is not exposed but the codec/channels/sample-rate all match
-        // the source exactly, the source bitrate is the truthful value for the copied packets.
-        val audioLooksStreamCopied = input.outputTrackProbe.audioBitrate <= 0 &&
-            audioCodecMatches &&
+        // A stream-copied track carries the source packets verbatim. Two ways to recognise one:
+        //  - the copied track's bitrate is not exposed but codec/channels/sample-rate all match,
+        //    so the source bitrate is the truthful value for the copied packets; or
+        //  - AudioTrackIdentity compared the packets and found them byte-identical. That is the
+        //    stronger proof, and the one that works when the muxer DOES expose a bitrate. Without
+        //    it, a 128 kbps pass-through copy met the PL re-encode rule below (>= 256 kbps less
+        //    10%) and failed, which discarded 13 encodes in batch_1790263711162.
+        val audioLooksStreamCopied = audioCodecMatches &&
             input.sourceTrackProbe.audioCodec != null &&
             audioShapeMatches &&
             input.outputTrackProbe.audioChannelCount != null &&
-            input.outputTrackProbe.audioSampleRate != null
+            input.outputTrackProbe.audioSampleRate != null &&
+            (input.outputTrackProbe.audioBitrate <= 0 || input.audioPacketsIdentical)
         val effectiveOutputAudioBitrate = when {
             input.outputTrackProbe.audioBitrate > 0 -> input.outputTrackProbe.audioBitrate
             audioLooksStreamCopied -> input.sourceTrackProbe.audioBitrate
@@ -448,13 +468,22 @@ object OutputVerifier {
             audioCodec = "${codecLabel(input.sourceTrackProbe.audioCodec)} -> ${codecLabel(input.outputTrackProbe.audioCodec)} ${statusSuffix(audioCodecMatches)}",
             audioDetails = "${sampleRateLabel(input.sourceTrackProbe.audioSampleRate)}/${channelLabel(input.sourceTrackProbe.audioChannelCount)} -> ${sampleRateLabel(input.outputTrackProbe.audioSampleRate)}/${channelLabel(input.outputTrackProbe.audioChannelCount)} ${statusSuffix(audioShapeMatches)}",
             audioBitrate = "${bitrateLabel(input.sourceTrackProbe.audioBitrate)} -> ${bitrateLabel(effectiveOutputAudioBitrate)}${if (audioLooksStreamCopied) " (stream copied)" else ""} ${statusSuffix(audioBitratePass)}",
+            audioBasis = AudioPreservation.describe(
+                mode = input.mode,
+                sourceHasAudio = input.sourceTrackProbe.audioCodec != null,
+                packetsIdentical = input.audioPacketsIdentical,
+                packetsCompared = input.audioPacketsCompared,
+                inferredStreamCopy = audioLooksStreamCopied && !input.audioPacketsIdentical
+            ),
             hdr = "${input.sourceTrackProbe.hdrLabel} -> ${input.outputTrackProbe.hdrLabel}" +
                 if (colorComparison.basis == ColorMatchBasis.MEDIA3_ASSUMED_SDR) {
                     " (Media3 assumed SDR default) ${statusSuffix(hdrMatches)}"
                 } else {
                     " ${statusSuffix(hdrMatches)}"
                 },
-            colorStandard = "${colorStandardLabel(input.sourceTrackProbe.colorStandard)} -> ${colorStandardLabel(input.outputTrackProbe.colorStandard)} ${statusSuffix(standardMatches)}",
+            colorStandard = "${colorStandardLabel(input.sourceTrackProbe.colorStandard)} -> ${colorStandardLabel(input.outputTrackProbe.colorStandard)}" +
+                (if (colorComparison.standardIsBt601Variant) " (both BT.601: same matrix, NTSC/PAL tag only)" else "") +
+                " ${statusSuffix(standardMatches)}",
             colorRange = "${colorRangeLabel(input.sourceTrackProbe.colorRange)} -> ${colorRangeLabel(input.outputTrackProbe.colorRange)} ${statusSuffix(rangeMatches)}",
             // Reports the predicate that is actually judged, not a stricter one the verdict never
             // used: a label saying "unverified" beside a passing check is how a real failure went
@@ -676,9 +705,16 @@ object OutputVerifier {
         MISMATCH
     }
 
+    private val BT601_STANDARDS = setOf(
+        MediaFormat.COLOR_STANDARD_BT601_NTSC,
+        MediaFormat.COLOR_STANDARD_BT601_PAL
+    )
+
     internal data class ColorTransitionComparison(
         val transferMatches: Boolean,
         val standardMatches: Boolean,
+        // True when standardMatches holds only through the BT.601 NTSC <-> PAL equivalence.
+        val standardIsBt601Variant: Boolean = false,
         val rangeMatches: Boolean,
         val hdrMetadataMatches: Boolean,
         val bitDepthMatches: Boolean,
@@ -711,12 +747,23 @@ object OutputVerifier {
             MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
             allowMedia3SdrDefault
         )
-        val standard = compareColorField(
+        val exactOrDefaultStandard = compareColorField(
             source.colorStandard,
             output.colorStandard,
             MediaFormat.COLOR_STANDARD_BT709,
             allowMedia3SdrDefault
         )
+        // BT.601 has two tags, NTSC (4) and PAL (2). They share one YUV matrix and one transfer
+        // function; only the primaries tag differs. Media3's ColorInfo has a single BT.601 colour
+        // space, so every Media3 encode of a BT.601 NTSC source is written as PAL. That is a
+        // representational collapse, not a colour change, and it rejected 2 otherwise-passing
+        // encodes in the b161 captures ("Color standard: 4 -> 2"). Accepted for a Perceptually
+        // Lossless re-encode only. A remux must still copy the tag exactly.
+        val bt601Variant = !exactOrDefaultStandard.first &&
+            mode == BatchQualityMode.PERCEPTUAL_LOSSLESS &&
+            source.colorStandard in BT601_STANDARDS &&
+            output.colorStandard in BT601_STANDARDS
+        val standard = if (bt601Variant) true to ColorMatchBasis.EXACT else exactOrDefaultStandard
         val range = compareColorField(
             source.colorRange,
             output.colorRange,
@@ -748,6 +795,7 @@ object OutputVerifier {
         return ColorTransitionComparison(
             transferMatches = transfer.first,
             standardMatches = standard.first,
+            standardIsBt601Variant = bt601Variant,
             rangeMatches = range.first,
             hdrMetadataMatches = hdrMetadataMatches,
             bitDepthMatches = bitDepthMatches,

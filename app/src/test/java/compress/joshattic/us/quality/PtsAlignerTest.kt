@@ -214,4 +214,33 @@ class PtsAlignerTest {
         // Residual skew after the drop is 33_200 - 33_367 = -167 us: inside the 4 ms floor.
         assertTrue(pairs.all { (r, d) -> kotlin.math.abs(r - d) <= PtsAligner.TOLERANCE_FLOOR_US })
     }
+    @Test
+    fun aLeadingOffsetFailureReportsTheUnclosedSkewAndWhichSideWasDropped() {
+        // The magnitude and sign are the diagnosis, and naming only the failure withheld both.
+        // 12 of the 13 misaligned ladders in batch_1788257645030 ended here, and the capture
+        // could not say whether the clip began a hair late (a rounding residue) or seconds early
+        // (a clip cut at a different instant, which no number of drops can repair).
+        val aligner = PtsAligner()
+        // Dist head is far ahead of ref for longer than the drop budget allows.
+        repeat(PtsAligner.MAX_ALIGNMENT_DROPS) {
+            assertEquals(PtsAligner.Action.DROP_DIST, aligner.decide(refNormUs = 500_000L, distNormUs = 0L))
+        }
+        assertEquals(PtsAligner.Action.FAIL, aligner.decide(refNormUs = 500_000L, distNormUs = 0L))
+        val reason = aligner.failureReason!!
+        assertTrue("names the budget: $reason", reason.contains("within ${PtsAligner.MAX_ALIGNMENT_DROPS} drops"))
+        assertTrue("names the unclosed skew: $reason", reason.contains("unclosed skew 500ms"))
+        assertTrue("names which side was dropped: $reason", reason.contains("dist dropped ${PtsAligner.MAX_ALIGNMENT_DROPS}"))
+    }
+
+    @Test
+    fun anInternalMisalignmentAlsoReportsItsSkew() {
+        // Distinguishing a one-frame retime from a gross content offset needs the number, not
+        // just the classification.
+        val aligner = PtsAligner()
+        assertEquals(PtsAligner.Action.PAIR, aligner.decide(refNormUs = 0L, distNormUs = 0L))
+        assertEquals(PtsAligner.Action.FAIL, aligner.decide(refNormUs = 100_000L, distNormUs = 0L))
+        val reason = aligner.failureReason!!
+        assertTrue("classified as internal: $reason", reason.contains("internal frame misalignment"))
+        assertTrue("names its skew: $reason", reason.contains("skew 100ms"))
+    }
 }

@@ -82,3 +82,15 @@ python -m unittest scripts.diagnostics.test_parse_batch_logcat -v
 # Capture supervisor: clock-independent session selection (dot-sources the script with -LibraryOnly).
 pwsh -NoProfile -File .\scripts\diagnostics\test_capture_statemachine.ps1
 ```
+
+## Observational replay fixture (b169 review)
+
+`make_replay_fixture.py` turns a review pack's `observational-fixtures.json` (raw job records),
+its `target-device-set.csv` and, optionally, the batch's `decisions.log` (for size-gate lines)
+into `app/src/test/resources/replay/b169_targets.tsv`, which `B169ObservationalReplayTest` runs
+through the production Kotlin policies. It is a partial observational replay: scores are the
+records' three-decimal roundings, certification frame counts and the initial learned state were
+never recorded, and nothing absent is filled in. From schema v3 a capture also carries the
+learned-state snapshot and ordered updates, and full-precision `stage` events, which make exact
+replay possible for new runs. `scripts/device/map_targets.py` finds the target files locally by
+name hash.

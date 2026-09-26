@@ -27,7 +27,13 @@ object Mp4MetadataRemuxer {
         sourceUri: Uri,
         outputFile: File,
         snapshot: VideoMetadataSnapshot,
-        onProgress: (copiedBytes: Long, outputBytes: Long) -> Unit = { _, _ -> }
+        onProgress: (copiedBytes: Long, outputBytes: Long) -> Unit = { _, _ -> },
+        // Called between samples; throw (e.g. ensureActive) to stop. Media3InputNormalizer uses it
+        // so a cancelled batch does not finish copying a multi-gigabyte file.
+        cancellationCheck: () -> Unit = {},
+        // Every video sample written, by presentation time, so a caller can tell a complete copy
+        // from one the extractor ended early (readSampleData < 0 ends the loop silently).
+        onVideoSample: (presentationTimeUs: Long) -> Unit = {}
     ): Mp4MetadataRemuxResult {
         if (outputFile.exists()) outputFile.delete()
         outputFile.parentFile?.mkdirs()
@@ -78,8 +84,11 @@ object Mp4MetadataRemuxer {
             val buffer = ByteBuffer.allocateDirect(maxBufferSize)
             val bufferInfo = MediaCodec.BufferInfo()
             var copiedBytes = 0L
+            val videoTrack = videoTracks.single()
+            var samples = 0L
 
             while (true) {
+                if (samples++ % 256L == 0L) cancellationCheck()
                 val inputTrackIndex = extractor.sampleTrackIndex
                 if (inputTrackIndex < 0) break
 
@@ -101,6 +110,7 @@ object Mp4MetadataRemuxer {
                 bufferInfo.set(0, sampleSize, extractor.sampleTime, flags)
                 muxer.writeSampleData(outputTrackIndex, buffer, bufferInfo)
                 copiedBytes += sampleSize
+                if (inputTrackIndex == videoTrack) onVideoSample(bufferInfo.presentationTimeUs)
                 onProgress(copiedBytes, outputFile.length())
                 extractor.advance()
             }

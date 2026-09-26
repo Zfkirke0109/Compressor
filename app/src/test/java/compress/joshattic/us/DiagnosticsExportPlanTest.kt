@@ -17,11 +17,33 @@ class DiagnosticsExportPlanTest {
 
     @Test
     fun logcatDumpIsScopedToThisProcess() {
-        // --pid is what makes this work WITHOUT the privileged READ_LOGS permission, and it is
-        // also what keeps other apps' output out of a file the user is about to share.
         val args = DiagnosticsExportPlan.logcatDumpArgs(pid = 25965)
         assertTrue("--pid=25965" in args)
         assertEquals("logcat", args.first())
+    }
+
+    @Test
+    fun crossProcessDumpDropsThePidFilterSoACrashedRunIsStillReadable() {
+        // The 2026-09-01 High Quality captures came back with zero job records and no session
+        // summary. Nothing had failed to log: the batch crashed the process, so the export ran
+        // from a NEW pid and --pid hid every record the dead process had written. An export that
+        // cannot see the run that crashed is worse than useless — it reads as "nothing happened".
+        val args = DiagnosticsExportPlan.logcatDumpArgsAllProcesses()
+        assertTrue(args.none { it.startsWith("--pid") })
+        assertEquals("logcat", args.first())
+        assertTrue("-d" in args)
+    }
+
+    @Test
+    fun crossProcessDumpStillFiltersToCompressorsOwnTags() {
+        // Dropping --pid must not turn the export into a device-wide log dump. The platform
+        // already limits an unprivileged reader to its own UID; the tag filter is what keeps the
+        // file to Compressor's diagnostics rather than everything this app has ever logged.
+        val args = DiagnosticsExportPlan.logcatDumpArgsAllProcesses()
+        DiagnosticsExportPlan.DIAGNOSTIC_TAGS.forEach { tag ->
+            assertTrue("expected tag filter for $tag", "$tag:V" in args)
+        }
+        assertEquals(DiagnosticsExportPlan.DIAGNOSTIC_TAGS.size, args.count { it == "-s" })
     }
 
     @Test

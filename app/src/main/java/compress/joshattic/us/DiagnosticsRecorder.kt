@@ -21,6 +21,13 @@ import java.io.File
  * even for a Secure Folder run. When the files dir IS reachable (main-profile runs) the same records
  * also land in files/diagnostics/<batchId>/ for direct inspection.
  *
+ * Schema v3 (from the b169 review): job records carry the FINAL verdict in `verdict`/`verified`/
+ * `replacementSafe` and the structural verifier's in `structuralVerdict`/`structuralVerified`/
+ * `structuralReplacementSafe` (see FinalAcceptance), plus `finalAccepted`, `candidateBytes`,
+ * `certificationDecision` and `encodePlan`; `stage` events and the learned-state snapshot/updates
+ * are new. v2 records are still read: a v2 job whose candidate was discarded may carry the
+ * structural verdict as if it were final, and the summariser flags those instead of trusting them.
+ *
  * Schema v2 envelope (on every record): schemaVersion, batchId, eventId, sequence, eventType (also
  * mirrored as `type` for v1 readers), jobId, timestampMs, androidUserId, profileKind. `sequence` is a
  * thread-safe monotonic counter per batch; `eventId` is a fresh unique token per logical event, so a
@@ -75,7 +82,12 @@ class DiagnosticsRecorder private constructor(
      *   of the same corpus are NOT comparable unless this value matches. Recording it is what lets
      *   `compare_sessions.py` say whether a difference between runs was controlled for at all.
      */
-    fun sessionStart(mode: String, selectedCount: Int, learnedStateIdentity: String? = null) {
+    fun sessionStart(
+        mode: String,
+        selectedCount: Int,
+        learnedStateIdentity: String? = null,
+        exhaustivePerceptualLossless: Boolean? = null
+    ) {
         record(
             "session_start",
             fields = mapOf(
@@ -84,6 +96,10 @@ class DiagnosticsRecorder private constructor(
                 "appVersionName" to identity.appVersionName,
                 "appVersionCode" to identity.appVersionCode,
                 "buildCommit" to identity.buildCommit,
+                // Monotonic and orderable, unlike buildCommit: a PR build's commit is a merge SHA
+                // GitHub recomputes, so two captures cannot be ranked by it. See app/build.gradle.kts.
+                "buildTag" to identity.buildTag,
+                "buildNumber" to identity.buildNumber,
                 "buildType" to identity.buildType,
                 "gitAppId" to APP_ID,
                 "androidUserId" to identity.androidUserId,
@@ -95,7 +111,8 @@ class DiagnosticsRecorder private constructor(
                 "sdkInt" to Build.VERSION.SDK_INT,
                 "mode" to mode,
                 "selectedCount" to selectedCount,
-                "learnedStateIdentity" to learnedStateIdentity,
+                "exhaustivePerceptualLossless" to exhaustivePerceptualLossless,
+            "learnedStateIdentity" to learnedStateIdentity,
                 "privacy" to "redacted-hashes"
             )
         )
@@ -161,9 +178,21 @@ class DiagnosticsRecorder private constructor(
         // VMAF. Recorded so a capture round can establish what banding real perceptually-lossless
         // outputs actually produce; NO acceptance decision reads it (see WindowBandingDiag).
         certBandingDiag: String? = null,
+        certV1Scores: String? = null,
+        probeV1Scores: String? = null,
+        probeRateDiag: String? = null,
         // Why sampled pixel certification did or did not run (see CertificationStatus). A null
         // certWindowScores is ambiguous on its own; this disambiguates it.
         certificationStatus: String? = null,
+        // See AudioPreservation: bit-identical copy / inferred copy / re-encoded, per job.
+        audioPreservation: String? = null,
+        // For a kept original: on what basis (measured, learned, heuristic, cannot be measured),
+        // in the same words the user saw. plannedDecisionReason keeps the plan's raw reason, which
+        // may be a heuristic prediction; this field says so.
+        decisionBasis: String? = null,
+        // Set only when Media3 could not parse the source: what it read instead, or why nothing
+        // (Media3InputNormalizer). Null for every file Media3 read directly.
+        media3Input: String? = null,
         // Requested vs actual encoder configuration (see EncoderConfigDelta). Media3 format
         // fallback can substitute MIME or resolution and still report success; without this a
         // later verification rejection is inexplicable from a capture alone.
@@ -190,7 +219,19 @@ class DiagnosticsRecorder private constructor(
         materializationMode: String? = null,
         originalReuseBlockReason: String? = null,
         copyAvoidedBytes: Long? = null,
-        discardedVideoBitrate: Int? = null
+        discardedVideoBitrate: Int? = null,
+        // Schema v3: final acceptance kept apart from structural verification (FinalAcceptance).
+        finalAccepted: Boolean? = null,
+        candidateBytes: Long? = null,
+        structuralVerdict: String? = null,
+        structuralVerified: Boolean? = null,
+        structuralReplacementSafe: Boolean? = null,
+        // CertificationDecision.wire for the certification that decided the job, when one ran.
+        certificationDecision: String? = null,
+        // ResolvedEncodePlan.describe() of the encode that ran (null when none did).
+        encodePlan: String? = null,
+        // Every full-encode attempt for this job, in order (see SaferRungRetry): ratio, outcome, ms.
+        attempts: String? = null
     ) {
         val accountingEntry = BatchTerminalAccountingEntry(terminal, sourceSize, outputSize)
         outcomes += accountingEntry
@@ -238,7 +279,14 @@ class DiagnosticsRecorder private constructor(
                 "probePairDiag" to probePairDiag,
                 "certWindowScores" to certWindowScores,
                 "certBandingDiag" to certBandingDiag,
+                // VMAF v1 shadow scores (mean/p5/min per window, ";"-joined). Telemetry only.
+                "certV1Scores" to certV1Scores,
+                "probeV1Scores" to probeV1Scores,
+                "probeRateDiag" to probeRateDiag,
                 "certificationStatus" to certificationStatus,
+                "audioPreservation" to audioPreservation,
+                "decisionBasis" to decisionBasis,
+                "media3Input" to media3Input,
                 "encoderConfig" to encoderConfig,
                 "thermalStart" to thermalStart,
                 "thermalEnd" to thermalEnd,
@@ -246,6 +294,14 @@ class DiagnosticsRecorder private constructor(
                 "materializationMode" to materializationMode,
                 "originalReuseBlockReason" to originalReuseBlockReason,
                 "copyAvoidedBytes" to copyAvoidedBytes,
+                "finalAccepted" to finalAccepted,
+                "candidateBytes" to candidateBytes,
+                "structuralVerdict" to structuralVerdict,
+                "structuralVerified" to structuralVerified,
+                "structuralReplacementSafe" to structuralReplacementSafe,
+                "certificationDecision" to certificationDecision,
+                "encodePlan" to encodePlan,
+                "attempts" to attempts,
                 "outputSize" to outputSize,
                 "rawByteDelta" to rawByteDelta,
                 "savedBytes" to savedBytes,
@@ -254,6 +310,49 @@ class DiagnosticsRecorder private constructor(
                 "countsAsRealCompression" to terminal.countsAsRealCompression,
                 "elapsedMs" to elapsedMs
             )
+        )
+    }
+
+    /**
+     * One pipeline stage of one attempt: `plan`, `probe_rung`, `size_gate`, `encode`, `finalize`,
+     * `verify`, `certify`, `retry`, `accept`. [reasonCode] is a stable machine-readable token (see
+     * [StageEvent]); [fields] are privacy-safe values of that stage. Additive telemetry: no decision
+     * reads it.
+     */
+    fun stage(event: StageEvent) {
+        record(
+            "stage",
+            jobId = jobId(event.sourceKey),
+            fields = linkedMapOf<String, Any?>(
+                "attempt" to event.attempt,
+                "stage" to event.stage,
+                "reasonCode" to event.reasonCode,
+                "elapsedMs" to event.elapsedMs
+            ) + event.fields
+        )
+    }
+
+    /**
+     * The learned state the batch STARTS from, in full, with its hash: a replay needs the state,
+     * not only [SmartPerceptualProfileEngine.learnedStateIdentity]. Keys are technical profile
+     * buckets (device, codecs, resolution/fps/bitrate classes); they carry no file names or paths.
+     */
+    fun learnedStateSnapshot(snapshot: LearnedStateSnapshot) {
+        record(
+            "learned_state_snapshot",
+            fields = mapOf(
+                "profiles" to JSONObject(snapshot.entries as Map<*, *>),
+                "profileCount" to snapshot.entries.size,
+                "sha256" to snapshot.sha256
+            )
+        )
+    }
+
+    /** One learned-state write, in the order it happened, so the snapshot plus updates replays exactly. */
+    fun learnedStateUpdate(key: String, before: String?, after: String) {
+        record(
+            "learned_state_update",
+            fields = mapOf("profileKey" to key, "before" to before, "after" to after)
         )
     }
 
@@ -314,6 +413,8 @@ class DiagnosticsRecorder private constructor(
         val appVersionName: String,
         val appVersionCode: Long,
         val buildCommit: String,
+        val buildTag: String,
+        val buildNumber: Int,
         val buildType: String,
         val androidUserId: Int,
         val profileKind: String,
@@ -322,7 +423,7 @@ class DiagnosticsRecorder private constructor(
 
     companion object {
         const val TAG = "CompressorDiag"
-        const val SCHEMA_VERSION = 2
+        const val SCHEMA_VERSION = 3
         private const val APP_ID = "io.github.zfkirke0109.galaxycompressor"
         // Per-process random-free salt: a fixed app salt keeps hashes stable across the before/after
         // runs (so jobs correlate) while still not being a reversible identifier.
@@ -356,11 +457,15 @@ class DiagnosticsRecorder private constructor(
             val debuggable = context.applicationInfo.flags and
                 android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
             val buildCommit = runCatching { BuildConfig.GIT_COMMIT }.getOrDefault("unknown")
+            val buildTag = runCatching { BuildConfig.BUILD_TAG }.getOrDefault("unknown")
+            val buildNumber = runCatching { BuildConfig.BUILD_NUMBER }.getOrDefault(0)
             return SessionIdentity(
                 packageName = context.packageName,
                 appVersionName = info?.versionName ?: "unknown",
                 appVersionCode = versionCode,
                 buildCommit = buildCommit,
+                buildTag = buildTag,
+                buildNumber = buildNumber,
                 buildType = if (debuggable) "debug" else "release",
                 androidUserId = userId,
                 profileKind = if (userId == 0) "normal" else "secondary_profile",
@@ -368,19 +473,63 @@ class DiagnosticsRecorder private constructor(
             )
         }
 
+        /**
+         * The identity every session record carries, as a map for the diagnostics archive
+         * manifest. Technical identifiers only.
+         */
+        fun identityMap(context: Context): Map<String, Any?> {
+            val id = buildIdentity(context)
+            return linkedMapOf(
+                "packageName" to id.packageName,
+                "appVersionName" to id.appVersionName,
+                "appVersionCode" to id.appVersionCode,
+                "buildCommit" to id.buildCommit,
+                "buildTag" to id.buildTag,
+                "buildNumber" to id.buildNumber,
+                "buildType" to id.buildType,
+                "androidUserId" to id.androidUserId,
+                "profileKind" to id.profileKind,
+                "deviceModel" to Build.MODEL,
+                "manufacturer" to Build.MANUFACTURER,
+                "androidRelease" to Build.VERSION.RELEASE,
+                "sdkInt" to Build.VERSION.SDK_INT,
+                "schemaVersion" to SCHEMA_VERSION
+            )
+        }
+
+        /** Every run directory under `diagnostics/` that holds a session or decision log. */
+        fun runDirectories(context: Context): List<File> {
+            val root = File(context.filesDir, "diagnostics")
+            if (!root.isDirectory) return emptyList()
+            return root.listFiles().orEmpty().filter { dir ->
+                dir.isDirectory && DiagnosticsArchivePlan.isRunDirectoryName(dir.name) &&
+                    (File(dir, "session.jsonl").isFile || File(dir, "decisions.log").isFile)
+            }
+        }
+
         fun start(
             context: Context,
             batchId: String,
             mode: String,
             selectedCount: Int,
-            learnedStateIdentity: String? = null
+            learnedStateIdentity: String? = null,
+            exhaustivePerceptualLossless: Boolean? = null
         ): DiagnosticsRecorder {
+            // Retention: keep the newest runs, so the export stays one archive a phone can send
+            // and the folder cannot grow without bound. Older runs have been exported already or
+            // are no longer wanted.
+            runCatching {
+                val names = runDirectories(context).map { it.name }
+                DiagnosticsRetention.runsToPrune(names).forEach { name ->
+                    File(context.filesDir, "diagnostics/$name").deleteRecursively()
+                }
+            }
             val file = runCatching {
                 val dir = File(context.filesDir, "diagnostics/$batchId").apply { mkdirs() }
                 File(dir, "session.jsonl")
             }.getOrNull()
             return DiagnosticsRecorder(batchId, file, buildIdentity(context)).also {
-                it.sessionStart(mode, selectedCount, learnedStateIdentity)
+                it.sessionStart(mode, selectedCount, learnedStateIdentity, exhaustivePerceptualLossless)
             }
         }
 

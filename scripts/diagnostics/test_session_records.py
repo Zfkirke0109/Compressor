@@ -84,5 +84,36 @@ def _main():
     return 1 if fails else 0
 
 
+def test_a_diagnostics_zip_reads_every_run_newest_first_and_its_manifest():
+    import zipfile
+
+    from session_records import read_manifest, zip_session_entries
+
+    older = {"type": "session_start", "batchId": "batch_1790263711162"}
+    older_job = {"type": "job", "batchId": "batch_1790263711162", "nameHash": "a1"}
+    newer = {"type": "session_start", "batchId": "batch_1790270611232"}
+    newer_job = {"type": "job", "batchId": "batch_1790270611232", "nameHash": "b2"}
+    manifest = {"manifestVersion": 1, "appVersionName": "1.6.164", "scope": "ALL_RUNS", "files": []}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "Compressor-v1.6.164-20260924-140000-AllRuns.zip")
+        with zipfile.ZipFile(path, "w") as z:
+            # Written oldest first on purpose: order must come from the batch epoch, not the zip.
+            z.writestr("runs/batch_1790263711162/session.jsonl", json.dumps(older) + "\n" + json.dumps(older_job) + "\n")
+            z.writestr("runs/batch_1790263711162/decisions.log", "09-24 10:28:31 I CompressorProbe: ...\n")
+            z.writestr("runs/batch_1790270611232/session.jsonl", json.dumps(newer) + "\n" + json.dumps(newer_job) + "\n")
+            z.writestr("crashes/crash-1790273718621.log", "Compressor process exit record\n")
+            z.writestr("manifest.json", json.dumps(manifest))
+        assert zip_session_entries(path) == [
+            "runs/batch_1790270611232/session.jsonl",
+            "runs/batch_1790263711162/session.jsonl",
+        ]
+        recs = read_records(path)
+        assert [r.get("batchId") for r in recs] == [
+            "batch_1790270611232", "batch_1790270611232", "batch_1790263711162", "batch_1790263711162"
+        ]
+        assert read_manifest(path)["appVersionName"] == "1.6.164"
+        assert read_manifest(os.path.join(tmp, "plain.txt")) is None
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

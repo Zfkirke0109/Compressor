@@ -22,3 +22,21 @@ target_include_directories(compressorvmaf PRIVATE ${VMAF_INCLUDE_DIR})
 # NDK r27 does not do this by default (r28+ does).
 target_link_options(compressorvmaf PRIVATE "-Wl,-z,max-page-size=16384")
 target_link_libraries(compressorvmaf vmaf log m)
+
+# ---------------------------------------------------------------------------------------------
+# VMAF v1 SHADOW scorer: a separate library linking its own libvmaf 3.2.0 (see
+# prebuilt_v1/PROVENANCE.txt). Every libvmaf symbol is kept local (--exclude-libs,ALL) and
+# self-references bind inside the library (-Bsymbolic), so the two libvmaf copies in the process
+# can never resolve to each other. No verdict reads its scores.
+# ---------------------------------------------------------------------------------------------
+set(VMAF_V1_DIR ${CMAKE_CURRENT_SOURCE_DIR}/prebuilt_v1)
+if(EXISTS ${VMAF_V1_DIR}/${ANDROID_ABI}/libvmaf.a)
+    add_library(vmafv1 STATIC IMPORTED)
+    set_target_properties(vmafv1 PROPERTIES IMPORTED_LOCATION ${VMAF_V1_DIR}/${ANDROID_ABI}/libvmaf.a)
+    add_library(compressorvmafv1 SHARED vmaf_v1_jni.c)
+    set_target_properties(compressorvmafv1 PROPERTIES LINKER_LANGUAGE CXX C_VISIBILITY_PRESET hidden)
+    target_include_directories(compressorvmafv1 PRIVATE ${VMAF_V1_DIR}/include)
+    target_link_options(compressorvmafv1 PRIVATE
+        "-Wl,-z,max-page-size=16384" "-Wl,--exclude-libs,ALL" "-Wl,-Bsymbolic")
+    target_link_libraries(compressorvmafv1 vmafv1 log m)
+endif()

@@ -23,6 +23,11 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        # The action's default package list includes the legacy "tools" package, which
+        # Google's SDK repository no longer serves (sdkmanager: "Failed to find package
+        # 'tools'"), failing every run before anything builds. Request only what is used.
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android API 36
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
@@ -57,7 +62,15 @@ jobs:
           COMPRESSOR_DEBUG_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           COMPRESSOR_DEBUG_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           COMPRESSOR_DEBUG_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          COMPRESSOR_BUILD_NUMBER: ${{ github.run_number }}
+          COMPRESSOR_BUILD_LABEL: ${{ github.event_name == 'pull_request' && format('pr{0}', github.event.pull_request.number) || 'main' }}
         run: ./gradlew :app:assembleDebug --stacktrace --console=plain > gradle-build.log 2>&1
+
+      - name: Verify 16 KB native page-size compatibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/verify_native_alignment.py app/build/outputs/apk/debug/*.apk
 
       - name: Remove signing material from runner
         if: always()
@@ -86,6 +99,11 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        # The action's default package list includes the legacy "tools" package, which
+        # Google's SDK repository no longer serves (sdkmanager: "Failed to find package
+        # 'tools'"), failing every run before anything builds. Request only what is used.
+        with:
+          packages: 'platform-tools'
 
       - name: Install Android API 36
         run: sdkmanager "platforms;android-36" "build-tools;36.0.0"
