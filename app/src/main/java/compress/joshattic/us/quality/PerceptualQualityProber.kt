@@ -157,10 +157,12 @@ class PerceptualQualityProber(private val context: Context) {
         transformerInputUri: Uri = sourceUri
     ): ProbeDecision {
         if (!VmafNative.isAvailable) return ProbeDecision(null, emptyList(), null, "vmaf unavailable")
-        if (QualityProbePolicy.probeWindows(durationMs * 1000L).isEmpty()) {
+        // Long enough to hold the minimum frame count at this frame rate (QualityProbePolicy).
+        val windowUs = QualityProbePolicy.windowDurationUs(sourceFps)
+        if (QualityProbePolicy.probeWindows(durationMs * 1000L, windowUs).isEmpty()) {
             return ProbeDecision(null, emptyList(), null, "clip too short to probe")
         }
-        val plan = planWindows(sourceUri, durationMs)
+        val plan = planWindows(sourceUri, durationMs, windowUs)
         val windows = plan.windows
         if (windows.isEmpty()) {
             return ProbeDecision(
@@ -187,6 +189,9 @@ class PerceptualQualityProber(private val context: Context) {
         var measured = 0
         var misaligned = 0
         var unavailable = 0
+        // Rungs whose windows passed or were undecided but held too few frames to judge. Never a
+        // measured rejection: see QualityProbePolicy.RungVerdict.INSUFFICIENT.
+        var insufficient = 0
         val unavailableReasons = linkedMapOf<String, Int>()
         val misalignedReasons = linkedMapOf<String, Int>()
         val rateDiags = mutableListOf<String>()
@@ -214,7 +219,12 @@ class PerceptualQualityProber(private val context: Context) {
             false, measured, misaligned, unavailable, rateDiag = rateDiag(), provenRateFactors = factorsOf(rung)
         )
         fun exhausted(detail: String) = ProbeDecision(
-            null, probed, lastMeasuredScores, detail, highestMeasuredRejected,
+            null, probed, lastMeasuredScores,
+            detail + if (insufficient > 0) {
+                "; $insufficient rung(s) undecided: a window held fewer than " +
+                    "${QualityProbePolicy.MIN_COMPARED_FRAMES_PER_WINDOW} frames, which is not a quality measurement"
+            } else "",
+            highestMeasuredRejected,
             measured, misaligned, unavailable, rateDiag = rateDiag()
         )
         // A rung that cleared the bar by less than the selection margin is not thrown away: if no
@@ -348,6 +358,14 @@ class PerceptualQualityProber(private val context: Context) {
                         highestMeasuredRejected = true
                     }
                     DiagLog.i(TAG, "ratio %.2f rejected by probe windows (measured=true)".format(ratio))
+                }
+                QualityProbePolicy.RungVerdict.INSUFFICIENT -> {
+                    insufficient++
+                    DiagLog.i(
+                        TAG,
+                        "ratio %.2f undecided: window frames=%s, fewer than %d in some window (fps-limited evidence, not a rejection)"
+                            .format(ratio, scores!!.joinToString("/") { it.comparedFrames.toString() }, QualityProbePolicy.MIN_COMPARED_FRAMES_PER_WINDOW)
+                    )
                 }
                 QualityProbePolicy.RungVerdict.UNMEASURED ->
                     DiagLog.i(TAG, "ratio %.2f rejected by probe windows (measured=false)".format(ratio))
@@ -716,14 +734,18 @@ class PerceptualQualityProber(private val context: Context) {
      * (clip starts MIN_LEAD_IN_US before the window) when the source cannot be indexed, so a
      * source that cannot be seeked still gets a lead-in, just not a cheap one.
      */
-    private suspend fun planWindows(sourceUri: Uri, durationMs: Long): ProbeWindowPlanner.Plan =
+    private suspend fun planWindows(
+        sourceUri: Uri,
+        durationMs: Long,
+        windowUs: Long = QualityProbePolicy.BASE_WINDOW_US
+    ): ProbeWindowPlanner.Plan =
         withContext(Dispatchers.IO) {
             val index = MediaExtractorSyncIndex.open(context, sourceUri)
             try {
-                val plan = ProbeWindowPlanner.plan(durationMs * 1000L, index)
+                val plan = ProbeWindowPlanner.plan(durationMs * 1000L, index, windowUs)
                 DiagLog.i(
                     TAG,
-                    "window plan; windows=" + plan.windows.joinToString(",") {
+                    "window plan; windowMs=${windowUs / 1000}; windows=" + plan.windows.joinToString(",") {
                         "[${it.startUs / 1000}..${it.endUs / 1000}ms clip@${it.clipStartUs / 1000}ms ${it.anchor}]"
                     } + (if (plan.unplaceable.isEmpty()) "" else "; unplaceable=" + plan.unplaceable.joinToString(",") {
                         "${it.wantedStartUs / 1000}ms(${it.reason})"
@@ -849,13 +871,14 @@ class PerceptualQualityProber(private val context: Context) {
      * [PairScoreOutcome.MisalignmentRejected] is measured evidence the OUTPUT's frames are
      * not temporally comparable to the source (frame loss/retiming) and must always fail.
      */
-    suspend fun certify(sourceUri: Uri, outputFile: File, durationMs: Long): PairScoreOutcome {
+    suspend fun certify(sourceUri: Uri, outputFile: File, durationMs: Long, sourceFps: Double = 0.0): PairScoreOutcome {
         if (!VmafNative.isAvailable) return PairScoreOutcome.Unavailable
-        if (QualityProbePolicy.probeWindows(durationMs * 1000L).isEmpty()) return PairScoreOutcome.Unavailable
-        // The SAME windows the ladder scored, so probe and certification scores of one file
-        // compare frame for frame; and each window follows a source keyframe, so the reference
-        // decode does not have to run from a keyframe minutes earlier.
-        val windows = planWindows(sourceUri, durationMs).windows.map { it.scoreWindowForCertification() }
+        val windowUs = QualityProbePolicy.windowDurationUs(sourceFps)
+        if (QualityProbePolicy.probeWindows(durationMs * 1000L, windowUs).isEmpty()) return PairScoreOutcome.Unavailable
+        // The SAME windows the ladder scored (same frame-rate-sized length), so probe and
+        // certification scores of one file compare frame for frame; and each window follows a
+        // source keyframe, so the reference decode does not have to run from a keyframe minutes earlier.
+        val windows = planWindows(sourceUri, durationMs, windowUs).windows.map { it.scoreWindowForCertification() }
         if (windows.isEmpty()) return PairScoreOutcome.Unavailable
         return withContext(Dispatchers.IO) {
             // Banding telemetry is collected on certification only, never on ladder rungs: it is

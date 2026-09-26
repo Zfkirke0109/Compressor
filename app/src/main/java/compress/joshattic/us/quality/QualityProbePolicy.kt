@@ -19,6 +19,33 @@ object QualityProbePolicy {
     const val WINDOW_MIN_MIN = 84.0
     const val MIN_COMPARED_FRAMES_PER_WINDOW = 12
 
+    // ---- Window duration ------------------------------------------------------------------------
+    //
+    // A window must hold both the calibrated amount of time (1.2 s) and enough frames for its p5 and
+    // minimum to mean anything (MIN_COMPARED_FRAMES_PER_WINDOW). At 30 fps 1.2 s is 36 frames; at
+    // 10 fps it is 12 at best, and b168 job_478c2fa19100 (1356x760, 10 fps) scored 11 in one window
+    // while every window cleared the bar and the selection margin (0.95: 99.24/97.25/97.25,
+    // 98.19/95.43/95.43, 97.51/95.08/95.08). The frame count, not the pixels, rejected it, and the
+    // ladder then reported that as "no candidate ratio passed" and the file as "would visibly lose
+    // quality". The requirement is now met by the window's length: below ~11.7 fps it grows to hold
+    // MIN_COMPARED_FRAMES_PER_WINDOW plus two frames of headroom (edge frames and VFR jitter).
+
+    /** The calibrated window length, and the one used whenever the frame rate is unknown. */
+    const val BASE_WINDOW_US = 1_200_000L
+
+    /** Frames added above the minimum when a window is sized from the frame rate. */
+    const val WINDOW_FRAME_HEADROOM = 2
+
+    /** Longest window: a 3.5 fps time-lapse still gets 14 frames; slower material stays undecided. */
+    const val MAX_WINDOW_US = 4_000_000L
+
+    /** Window length for a source of [fps] frames per second; [BASE_WINDOW_US] when unknown. */
+    fun windowDurationUs(fps: Double): Long {
+        if (!fps.isFinite() || fps <= 0.0) return BASE_WINDOW_US
+        val needed = Math.ceil((MIN_COMPARED_FRAMES_PER_WINDOW + WINDOW_FRAME_HEADROOM) * 1_000_000.0 / fps).toLong()
+        return needed.coerceIn(BASE_WINDOW_US, MAX_WINDOW_US)
+    }
+
     /**
      * A per-window acceptance bar: the three VMAF thresholds a window must clear.
      *
@@ -76,11 +103,21 @@ object QualityProbePolicy {
         label = "Perceptually Lossless, probe selection margin"
     )
 
-    enum class RungVerdict { UNMEASURED, FAILED, MARGINAL, PASSED }
+    /**
+     * [INSUFFICIENT]: no window with enough frames failed the bar, but at least one window had
+     * too few frames to decide. It is not a measured rejection, and never a pass.
+     */
+    enum class RungVerdict { UNMEASURED, INSUFFICIENT, FAILED, MARGINAL, PASSED }
+
+    private fun clears(w: WindowScore, bar: QualityBar) = w.mean >= bar.meanMin && w.p5 >= bar.p5Min && w.min >= bar.minMin
 
     /** How a measured rung stands: clears bar and margin, clears only the bar, or fails the bar. */
     fun rungVerdict(scores: List<WindowScore>?): RungVerdict = when {
         scores.isNullOrEmpty() -> RungVerdict.UNMEASURED
+        // A window with enough frames below the bar is a measurement, whatever the others hold.
+        scores.any { it.comparedFrames >= MIN_COMPARED_FRAMES_PER_WINDOW && !clears(it, PERCEPTUAL_LOSSLESS) } ->
+            RungVerdict.FAILED
+        scores.any { it.comparedFrames < MIN_COMPARED_FRAMES_PER_WINDOW } -> RungVerdict.INSUFFICIENT
         windowsPass(scores, PROBE_SELECTION) -> RungVerdict.PASSED
         windowsPass(scores) -> RungVerdict.MARGINAL
         else -> RungVerdict.FAILED
@@ -175,9 +212,16 @@ object QualityProbePolicy {
 
     // Upward near-miss refinement: when the SAFEST probed rung fails but its worst window is within
     // this many VMAF points of the bars, one more probe at [SAFEST_RATIO_CEILING] (a higher, safer,
-    // higher-quality rung) may close the gap. Kept small so the extra encode is spent only when a
-    // pass is plausible — a rung that failed by a lot will not be rescued by a slightly higher one.
-    const val NEAR_MISS_UPWARD_MARGIN = 2.5
+    // higher-quality rung) may close the gap.
+    //
+    // Re-estimated from b166, b167 and b168 (2.5 until then). A failing 0.95 was retried at 0.97
+    // 122 times and passed 0 times; 94 of those started more than 0.5 short. Near the ceiling the
+    // mean gains a median 0.04 VMAF per +0.01 of ratio (90th percentile 0.12), so 0.95 -> 0.97 buys
+    // about 0.08 and rarely more than 0.25. Every 0.97 pass in those batches came from a 0.95 that
+    // had already passed (the marginal path, which this does not govern). 0.5 keeps the retries a
+    // steep file could still close and skips the ~38 per batch that none did. Search cost only: the
+    // acceptance bar is untouched.
+    const val NEAR_MISS_UPWARD_MARGIN = 0.5
 
     // Full-encode certification uses the same window thresholds; a certified sub-default
     // encode must PROVE its windows, an unmeasurable certification fails closed only when
@@ -424,8 +468,10 @@ object QualityProbePolicy {
      * start/end (codec warm-up and tail padding are unrepresentative). Short clips get one
      * centered window. Returns an empty list when the clip is too short to sample honestly.
      */
-    fun probeWindows(durationUs: Long, windowUs: Long = 1_200_000L): List<ScoreWindow> {
+    fun probeWindows(durationUs: Long, windowUs: Long = BASE_WINDOW_US): List<ScoreWindow> {
         if (durationUs < 2_000_000L) return emptyList()
+        // A frame-rate-sized window (windowDurationUs) can be longer than a short clip.
+        if (windowUs >= durationUs) return emptyList()
         if (durationUs < 10_000_000L) {
             val start = (durationUs - windowUs) / 2
             return listOf(ScoreWindow(start, start + windowUs))

@@ -58,4 +58,13 @@ class Media3InputNormalizerTest {
         assertTrue(Media3InputNormalizer.isComplete(7_340_000L - 450_000L, 7_340_000L))
         assertFalse(Media3InputNormalizer.isComplete(7_340_000L - 600_000L, 7_340_000L))
     }
+
+    @Test
+    fun aCopyHoldingAFractionOfTheSourceIsNotANormalisedInput() {
+        // b168: 177.4 MB copied from 1,432 MB; 72.9 MB from 4,250 MB. Both passed the timestamp check.
+        assertFalse(Media3InputNormalizer.isSubstantial(177_400_000L, 1_432_387_113L))
+        assertFalse(Media3InputNormalizer.isSubstantial(72_900_000L, 4_250_584_607L))
+        assertTrue(Media3InputNormalizer.isSubstantial(1_430_000_000L, 1_432_387_113L))
+        assertTrue(Media3InputNormalizer.isSubstantial(1L, 0L))
+    }
 }

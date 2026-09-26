@@ -199,6 +199,9 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "budgetExhausted": budget_exhausted(jobs),
         "decisionBasis": dict(Counter(basis_kind(j.get("decisionBasis")) for j in jobs if j.get("decisionBasis")).most_common()),
         "media3Input": media3_input(jobs),
+        # Ladders left undecided because a window held too few frames (low frame rate): never a
+        # quality result, and never allowed to read as "would visibly lose quality".
+        "framesUndecided": sum(1 for j in jobs if "a window held fewer than" in str(j.get("probeDetail") or "")),
         "overshootPrediction": overshoot_prediction(jobs),
         "completed": summary is not None,
         "sessionEnd": session_end(summary, session.get("terminal")),
@@ -236,7 +239,11 @@ def media3_input(jobs: list[dict[str, Any]]) -> dict[str, Any]:
         text = str(j.get("media3Input") or "")
         if not text:
             continue
-        if text.startswith("platform-normalised copy also unreadable"):
+        if text.startswith("not normalised: the source is damaged"):
+            kind = "damaged (zero-filled)"
+        elif "damaged" in text:
+            kind = "damaged (copy too small)"
+        elif text.startswith("platform-normalised copy also unreadable"):
             kind = "copy also unreadable"
         elif text.startswith("platform-normalised copy"):
             kind = "normalised"
@@ -445,6 +452,8 @@ def render(s: dict[str, Any]) -> str:
         out.append("  media3 input   : files Media3 could not parse, by what the platform copy did")
         for kind, entry in s["media3Input"].items():
             out.append(f"      {kind:<22} {entry['files']:3} file(s)  {entry['terminals']}")
+    if s.get("framesUndecided"):
+        out.append(f"  frames-limited : {s['framesUndecided']} ladder(s) undecided on too few frames per window (not a quality result)")
     over = s.get("overshootPrediction")
     if over:
         out.append(

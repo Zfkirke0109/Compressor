@@ -65,11 +65,29 @@ A passing rung is encoded only if the output is predicted to be smaller than the
 prediction uses the encoder's overshoot, and the probe clips measure it on the file itself: b167's
 4K `job_732f7ecfb699` was predicted at 1.003x from the class's learned value, measured at 1.26x by
 its probes and encoded at 1.235x, 587 MB for a 528 MB source. The probe measurement runs high
-(over 40 encodes, actual minus predicted averaged −0.030, sd 0.033), so the gate takes the measured
-mean less 0.13 (`MeasuredOvershoot`), and never less than the learned value. Replayed on b167 it
-skips that encode and nothing that saved. When the gate keeps the original, the message says the
-quality was measured and the size was predicted. It no longer falls back to the inference plan,
-whose target ratio may be a rung the probes had just measured as failing.
+(over 40 encodes, actual minus predicted averaged −0.030, sd 0.033; b168 repeated it), so the gate
+takes the measured mean less 0.13 (`MeasuredOvershoot`). The first version also took the class's
+learned value whenever that was higher, and claimed from a replay that this skipped nothing that
+saved. b168 disproved it: `job_458aa0663c3e` passed its probes at 0.90 and was kept, because one
+heavily compressed file had raised the 4K H.264 bucket's learned overshoot to 1.119, although b167
+had encoded 458a itself at 1.003 and saved 9.5 %. The replay had assumed a learned value of 1.0 for
+every file. Now a file's own probe bound decides whenever it has one; the learned value, now a plain
+order-independent mean, only stands in when the probes gave fewer than two windows. When the gate
+keeps the original, the message says the quality was measured and the size was predicted. It no
+longer falls back to the inference plan, whose target ratio may be a rung the probes had just
+measured as failing.
+
+Each window holds at least 12 compared frames. At 30 fps the calibrated 1.2 s holds 36; below about
+11.7 fps the window now grows to hold 14 (`QualityProbePolicy.windowDurationUs`). A rung whose only
+problem is a window with too few frames is *undecided*, never a measured rejection: b168's 10 fps
+`job_478c2fa19100` was skipped as "would visibly lose quality" on windows that cleared every gate.
+
+The retry at the 0.97 ceiling after a failing safest rung now needs that rung within 0.5 of the bar
+(it was 2.5). Across b166–b168 that retry ran 122 times and passed 0 times; near the ceiling the
+mean gains about 0.04 VMAF per +0.01 of ratio. A 0.98 or 0.99 rung was considered and not added:
+at 0.97 the encoder already spends 97 % of the source's own bitrate, it responds normally (+1.8 %
+bits for +2.1 % requested), quality barely moves, and on each file's own measured slope at most two
+b168 files could cross, both with under 1 % to gain before overshoot.
 
 The encoder request is the same for probes and the full encode: bitrate mode, keyframe interval
 (matched to the source's own, 1 to 5 s; see `KeyframeIntervalPolicy`) and the opt-in B-frame
@@ -184,7 +202,7 @@ enough to defend.
 | Every window's first frame scored with zero motion | libvmaf gives the first frame of a session zero motion, and `vmaf_v0.6.1` then scores even an identical frame 97.43. Each window now feeds one pre-window pair as motion context and drops its score (`MotionContext`); the offline calibration scored whole clips, so this makes the device match it |
 | Probe passes that the full encode then fails | selection margin from measured probe-to-encode drift; re-measured in every capture |
 | Probe clip encoded differently from the full encode | one request shape (mode, keyframe interval, B-frames) for both |
-| Media3 cannot parse the source, and never says so | an extractor error Media3 will not retry stops its loader for good, and during an export nothing reports it: six b167 files idled to the 60 s probe timeout and the 120 s muxer watchdog. The extractors are wrapped (`SourceParseFailure`); the export ends once it stops moving, the ladder stops, and the decision log shows the bytes at the failure. The file is then copied by the platform extractor and muxer (the Remux Only path) and Media3 reads the copy (`Media3InputNormalizer`). Windows, scoring reference, verification and certification stay on the original. A copy that ends early, an HDR source or too little free space keeps the original |
+| Media3 cannot parse the source, and never says so | an extractor error Media3 will not retry stops its loader for good, and during an export nothing reports it: six b167 files idled to the 60 s probe timeout and the 120 s muxer watchdog. The extractors are wrapped (`SourceParseFailure`); the export ends once it stops moving, the ladder stops, and the decision log shows the bytes at the failure. The file is then copied by the platform extractor and muxer (the Remux Only path) and Media3 reads the copy (`Media3InputNormalizer`). Windows, scoring reference, verification and certification stay on the original. A copy that ends early, an HDR source or too little free space keeps the original. b168 showed all six such files are damaged, not malformed: only zero bytes at every failure offset, and platform copies holding 2–16 % of the source's bytes, which cost 74 minutes and two muxing timeouts. A zero-filled failure offset or a copy under half the source's size now ends the attempt at once as a damaged source |
 | A metric that is not the definition | Section 4 |
 
 ## 6. What the label means on screen

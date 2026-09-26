@@ -1191,7 +1191,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 val parseFailure = probed.sourceParseFailure
                 // Media3 cannot read this file. Measure again on a copy it may be able to read;
                 // the windows and the reference stay on the original (Media3InputNormalizer).
-                if (parseFailure != null && normaliseMedia3Input(s, parseFailure)) {
+                val measured = if (parseFailure != null && normaliseMedia3Input(s, parseFailure)) {
                     updateItem(s.index) {
                         it.copy(message = "Probing quality on the rewritten copy: sampling windows with on-device VMAF…")
                     }
@@ -1200,6 +1200,21 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     )
                 } else {
                     probed
+                }
+                if (measured.sourceParseFailure != null) {
+                    // Media3 cannot read this file (or its copy) and nothing was measured. Say so
+                    // in the record, and send the item through the encode-failure path ("re-encode
+                    // could not be verified"), which never starts an encode, rather than a
+                    // keep-original that would read "already efficient": nothing established that.
+                    measured.copy(
+                        preferRemux = false,
+                        remuxReason = null,
+                        remuxWasSourceEfficient = false,
+                        remuxWasEvidencePreferred = false,
+                        probeDetail = listOfNotNull(measured.probeDetail, s.diagnosticMedia3Input).joinToString("; ")
+                    )
+                } else {
+                    measured
                 }
             } else {
                 basePlan
@@ -1612,6 +1627,15 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         if (failure.inputPosition >= 0L) {
             withContext(Dispatchers.IO) { SourceBytes.hexAround(context, item.sourceUri, failure.inputPosition) }
                 ?.let { DiagLog.w("CompressorBatch", "source parse failure; job=$job; ${failure.describe()}; $it") }
+            // Missing data is not malformed data: no copy can restore video that is not in the file.
+            val zeros = withContext(Dispatchers.IO) { SourceBytes.zeroFraction(context, item.sourceUri, failure.inputPosition) }
+            if (zeros != null && zeros >= SourceBytes.DAMAGED_ZERO_FRACTION) {
+                s.diagnosticMedia3Input = "not normalised: the source is damaged: " +
+                    "${String.format(java.util.Locale.US, "%.1f", zeros * 100)} % of the ${SourceBytes.ZERO_SCAN_SPAN / 1024} KiB " +
+                    "around byte ${failure.inputPosition} are zero bytes, so there is no video there for any reader to recover"
+                DiagLog.w("CompressorBatch", "media3 input; job=$job; ${failure.describe()}; ${s.diagnosticMedia3Input}")
+                return false
+            }
         }
         val decline = Media3InputNormalizer.declineReason(
             isHdr = item.toSourceInfo().isHdr,
@@ -1632,6 +1656,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 item.sourceUri,
                 target,
                 item.metadataSnapshot.rotationDegrees,
+                sourceBytes = item.originalSize,
                 cancellationCheck = { ioContext.ensureActive() }
             )
         }
@@ -1782,7 +1807,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             updateItem(s.index) {
                 it.copy(message = "Certifying pixels: encoder undershot the bitrate floor, checking real quality…")
             }
-            val recoveryOutcome = qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+            val recoveryOutcome = qualityProber.certify(item.sourceUri, outputFile, item.durationMs, item.originalFps.toDouble())
             val recoveryScores = (recoveryOutcome as? PairScoreOutcome.Scored)?.windows
             s.diagnosticCertWindowScores = compactWindowScores(recoveryScores)
             s.diagnosticCertBandingDiag = compactBandingDiag(recoveryScores)
@@ -1870,7 +1895,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             it.copy(message = "Certifying pixels: sampled VMAF check of the final output…")
         }
         val certOutcome = s.floorRecoveryCertScores?.let { PairScoreOutcome.Scored(it) }
-            ?: qualityProber.certify(item.sourceUri, outputFile, item.durationMs)
+            ?: qualityProber.certify(item.sourceUri, outputFile, item.durationMs, item.originalFps.toDouble())
         val certScores = (certOutcome as? PairScoreOutcome.Scored)?.windows
         s.diagnosticCertWindowScores = compactWindowScores(certScores)
         s.diagnosticCertBandingDiag = compactBandingDiag(certScores)
@@ -3074,7 +3099,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             "CompressorProbe",
             "probe result; job=${diagnosticJobId(item)}; probed=${decision.probedRatios}; " +
                 "proven=${decision.provenRatio ?: "none"}; marginal=${decision.marginal}; shape=${shape.compact()}; " +
-                "input=${if (transformerInputUri == item.sourceUri) "source" else "platform-normalised"}; detail=${decision.detail}"
+                "input=${if (transformerInputUri == item.sourceUri) "source" else "platform-normalised"}; ${deviceLoadNote()}; " +
+                "detail=${decision.detail}"
         )
         val probeTrace = plan.copy(
             probedRatios = decision.probedRatios,
@@ -3108,9 +3134,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         learningEngine.recordProbePass(plan.profileKey)
         // A proven ratio must still clear file-size measurement noise before overturning a
         // remux decision — a NOISE threshold, not a worthiness bar: verified 1-2% savings count.
-        // The overshoot is the one this file's probe clips measured, bounded low (MeasuredOvershoot),
-        // whenever that exceeds the class's learned value: b167 job_732f7ecfb699 learned 1.003,
-        // measured 1.26, encoded at 1.235 and was discarded for size after 70 s of 4K encoding.
+        // The overshoot is the one this file's probe clips measured, bounded low (MeasuredOvershoot);
+        // the class's learned value only stands in when the probes gave too few windows. b167
+        // job_732f7ecfb699 (learned 1.003, measured 1.26) was encoded and discarded for size; b168
+        // job_458aa0663c3e (measured 1.062, learned 1.119 from 732f) was kept although b167 had
+        // encoded it at 1.003 and saved 9.5 %.
         val overshoot = MeasuredOvershoot.forPrediction(plan.expectedOvershootFactor, decision.provenRateFactors)
         val predicted = BatchQualityBitratePolicy.predictedPerceptualLosslessBytes(
             source = source,
@@ -3142,7 +3170,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 predictedBytes = predicted,
                 sourceBytes = item.originalSize,
                 overshoot = overshoot,
-                overshootMeasured = overshoot > plan.expectedOvershootFactor
+                overshootMeasured = MeasuredOvershoot.fromThisFile(decision.provenRateFactors)
             )
             return probeTrace.copy(
                 preferRemux = true,
@@ -3165,6 +3193,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             requiresMeasuredCertification = exhaustive && plan.preferRemux
         )
     }
+
+    /**
+     * Power-save and thermal state, for the probe line. b168 scored the same ladders 3x slower
+     * than b167 on identical scoring code (2.8 s per window for one fifth of the batch, 10-20 s for
+     * the rest), which points at the device, and nothing in the capture could say which.
+     */
+    private fun deviceLoadNote(): String = runCatching {
+        val pm = getApplication<Application>().getSystemService(android.os.PowerManager::class.java)
+        val thermal = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) pm.currentThermalStatus.toString() else "n/a"
+        "powerSave=${pm.isPowerSaveMode}; thermalStatus=$thermal"
+    }.getOrDefault("powerSave=unknown")
 
     private fun logEncoderPlan(
         item: BatchVideoItem,

@@ -291,6 +291,20 @@ def test_a_size_gated_keep_original_is_its_own_basis_kind():
     assert basis_kind("Basis: heuristic. Probes at 0.95 produced no measurement that could decide it.") == "probed, undecided"
 
 
+def test_damaged_sources_and_frame_limited_ladders_are_counted_apart():
+    path = write([
+        start(batchId="b1"),
+        job("a", terminal="UNEXPECTED_REMUX", media3Input="not normalised: the source is damaged: 100.0 % of the 64 KiB around byte 5 are zero bytes"),
+        job("b", terminal="UNEXPECTED_REMUX", media3Input="normalisation failed: platform copy holds only 12.4 % of the source's bytes: most of its sample data is empty or unreadable, so the file itself is damaged"),
+        job("c", terminal="ALREADY_HIGHLY_OPTIMIZED", probeDetail="no candidate ratio passed; 4 rung(s) undecided: a window held fewer than 12 frames, which is not a quality measurement"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["media3Input"]["damaged (zero-filled)"]["files"] == 1
+    assert s["media3Input"]["damaged (copy too small)"]["files"] == 1
+    assert s["framesUndecided"] == 1
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
 

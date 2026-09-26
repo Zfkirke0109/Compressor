@@ -71,11 +71,22 @@ object Media3InputNormalizer {
         return lastVideoUs >= declaredDurationUs - toleranceUs
     }
 
+    /**
+     * A remux carries every sample, so it is about the size of its source. b168's platform copies of
+     * the six damaged files were 2-16 % of theirs (the platform extractor drops empty samples) and
+     * still passed the timestamp check, then cost 74 minutes of probing and two muxing timeouts.
+     */
+    const val MIN_COPY_FRACTION = 0.5
+
+    fun isSubstantial(copyBytes: Long, sourceBytes: Long): Boolean =
+        sourceBytes <= 0L || copyBytes >= sourceBytes * MIN_COPY_FRACTION
+
     fun normalise(
         context: Context,
         sourceUri: Uri,
         outputFile: File,
         rotationDegrees: Int?,
+        sourceBytes: Long,
         cancellationCheck: () -> Unit
     ): Result {
         val startedAt = System.currentTimeMillis()
@@ -109,6 +120,14 @@ object Media3InputNormalizer {
             return Result.Declined(
                 "platform copy ended early: last video sample at ${lastVideoUs / 1000} ms of a declared " +
                     "${declaredUs / 1000} ms ($videoSamples samples); the platform extractor cannot read it either"
+            )
+        }
+        val copyBytes = remux.outputFile.length()
+        if (!isSubstantial(copyBytes, sourceBytes)) {
+            runCatching { outputFile.delete() }
+            return Result.Declined(
+                "platform copy holds only ${String.format(Locale.US, "%.1f", 100.0 * copyBytes / sourceBytes)} % of the " +
+                    "source's bytes: most of its sample data is empty or unreadable, so the file itself is damaged"
             )
         }
         return Result.Normalised(

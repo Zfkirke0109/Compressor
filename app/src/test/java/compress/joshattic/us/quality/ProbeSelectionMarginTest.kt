@@ -54,9 +54,13 @@ class ProbeSelectionMarginTest {
     }
 
     @Test
-    fun tooFewFramesIsAFailureNotAMarginalPass() {
+    fun tooFewFramesIsNeitherAPassNorAMeasuredRejection() {
+        // Until b168 this was FAILED, which the ladder counted as a measured rejection: b168
+        // job_478c2fa19100 (10 fps) was skipped as "would visibly lose quality" on windows that
+        // cleared every gate, because one held 11 frames. Too few frames decides nothing.
         val short = listOf(WindowScore(comparedFrames = 5, mean = 99.0, p5 = 99.0, min = 99.0))
-        assertEquals(QualityProbePolicy.RungVerdict.FAILED, QualityProbePolicy.rungVerdict(short))
+        assertEquals(QualityProbePolicy.RungVerdict.INSUFFICIENT, QualityProbePolicy.rungVerdict(short))
+        assertEquals(false, QualityProbePolicy.windowsPass(short))
     }
 
     @Test

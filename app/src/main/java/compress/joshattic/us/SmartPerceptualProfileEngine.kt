@@ -147,6 +147,10 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         // profile, e.g. the S23 Ultra HEVC VBR path measured ~1.25 on 4K60 HDR. Used only to make
         // pre-encode size prediction honest; never to relax verification.
         val measuredOvershootFactor: Double? = null,
+        // How many encodes [measuredOvershootFactor] averages. It is a plain mean, so the same
+        // encodes give the same value in any order; see blendOvershoot. 0 on stores written before
+        // the count existed, where a stored factor is taken as one measurement.
+        val overshootSamples: Int = 0,
         // Decaying probe-skip latch. consecutiveMeasuredProbeRejections counts probe ladders whose
         // SAFEST candidate was MEASURED (not merely unmeasurable) and rejected by the VMAF windows.
         // probeSkipsSinceLastProbe counts ladders skipped under the latch since the last real probe.
@@ -172,6 +176,7 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             "lastReason=${lastFailureReason.orEmpty().replace(";", ",")}",
             "lastSizeRatio=${lastOutputToSourceRatio ?: ""}",
             "overshoot=${measuredOvershootFactor ?: ""}",
+            "overshootN=$overshootSamples",
             "probeRejects=$consecutiveMeasuredProbeRejections",
             "probeSkips=$probeSkipsSinceLastProbe",
             "everCompressed=$everCompressed"
@@ -194,6 +199,7 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
                         lastFailureReason = fields["lastReason"]?.ifBlank { null },
                         lastOutputToSourceRatio = fields["lastSizeRatio"]?.toDoubleOrNull(),
                         measuredOvershootFactor = fields["overshoot"]?.toDoubleOrNull(),
+                        overshootSamples = (fields["overshootN"]?.toIntOrNull() ?: 0).coerceAtLeast(0),
                         // Missing on pre-latch stored profiles; negative/corrupt clamps to 0 so a
                         // tampered store can never manufacture a probe-skip.
                         consecutiveMeasuredProbeRejections =
@@ -336,7 +342,8 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             preferRemux = false,
             lastFailureReason = null,
             lastOutputToSourceRatio = outputToSourceBytesRatio,
-            measuredOvershootFactor = blendOvershoot(current.measuredOvershootFactor, measuredOvershootFactor),
+            measuredOvershootFactor = blendOvershoot(current, measuredOvershootFactor),
+            overshootSamples = overshootSamplesAfter(current, measuredOvershootFactor),
             // A verified full encode is the strongest possible pixel evidence for the class.
             consecutiveMeasuredProbeRejections = 0,
             probeSkipsSinceLastProbe = 0,
@@ -377,21 +384,34 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             nextTargetRatio = next,
             preferRemux = highRatioFailures >= HIGH_RATIO_FAILURES_BEFORE_REMUX,
             lastFailureReason = reason,
-            measuredOvershootFactor = blendOvershoot(current.measuredOvershootFactor, measuredOvershootFactor)
+            measuredOvershootFactor = blendOvershoot(current, measuredOvershootFactor),
+            overshootSamples = overshootSamplesAfter(current, measuredOvershootFactor)
         )
         store.write(key.asKey(), updated.encode())
         return updated
     }
 
-    // Average the new measurement with the stored one so a single outlier run cannot swing the
-    // prediction; clamped into [MIN_OVERSHOOT_FACTOR, MAX_OVERSHOOT_FACTOR].
-    private fun blendOvershoot(stored: Double?, measured: Double?): Double? {
-        val clampedMeasured = measured?.takeIf { it.isFinite() && it > 0 }
-            ?.coerceIn(MIN_OVERSHOOT_FACTOR, MAX_OVERSHOOT_FACTOR)
-            ?: return stored
-        val base = stored?.coerceIn(MIN_OVERSHOOT_FACTOR, MAX_OVERSHOOT_FACTOR)
-        return if (base == null) clampedMeasured else (base + clampedMeasured) / 2.0
+    // The mean of every measured encode for this profile, clamped into [MIN_OVERSHOOT_FACTOR,
+    // MAX_OVERSHOOT_FACTOR]. It used to be (stored + new) / 2, which gives the LAST encode half the
+    // weight whatever came before, so the same encodes in a different order gave a different
+    // value: b167's 4K H.264 bucket went 1.0025 -> 1.119 on one heavily compressed file. A plain
+    // mean is order-independent. It cannot make one outlier harmless for a small bucket, which is
+    // why the size gate now prefers a file's own probe measurement (MeasuredOvershoot).
+    private fun usableOvershoot(measured: Double?): Double? =
+        measured?.takeIf { it.isFinite() && it > 0 }?.coerceIn(MIN_OVERSHOOT_FACTOR, MAX_OVERSHOOT_FACTOR)
+
+    private fun storedSamples(current: LearnedEncodeProfile): Int =
+        if (current.measuredOvershootFactor == null) 0 else current.overshootSamples.coerceAtLeast(1)
+
+    private fun blendOvershoot(current: LearnedEncodeProfile, measured: Double?): Double? {
+        val m = usableOvershoot(measured) ?: return current.measuredOvershootFactor
+        val base = current.measuredOvershootFactor?.coerceIn(MIN_OVERSHOOT_FACTOR, MAX_OVERSHOOT_FACTOR) ?: return m
+        val n = storedSamples(current)
+        return (base * n + m) / (n + 1)
     }
+
+    private fun overshootSamplesAfter(current: LearnedEncodeProfile, measured: Double?): Int =
+        storedSamples(current) + if (usableOvershoot(measured) != null) 1 else 0
 
     companion object {
         // v3: the 2026-07-14 VMAF suite (validation\vmaf_analysis\PIXEL_QUALITY_REPORT.md) proved

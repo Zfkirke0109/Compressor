@@ -53,7 +53,7 @@ object KeepOriginalMessages {
         overshoot: Double,
         overshootMeasured: Boolean
     ): String {
-        val origin = if (overshootMeasured) "measured on this file's probe clips, less a margin" else "learned for this device and content class"
+        val origin = if (overshootMeasured) "measured on this file's probe clips, less a margin" else "learned for this device and content class; this file's probes gave too few windows"
         return "Basis: pixel probes passed at ${"%.2f".format(Locale.US, provenRatio)}; the size prediction decided. " +
             "At that rate the re-encode is predicted at ${mb(predictedBytes)} against the ${mb(sourceBytes)} original " +
             "(encoder overshoot ×${"%.2f".format(Locale.US, overshoot)}, $origin), so it would not be smaller. " +

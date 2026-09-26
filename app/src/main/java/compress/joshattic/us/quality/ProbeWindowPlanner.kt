@@ -86,7 +86,7 @@ object ProbeWindowPlanner {
     fun plan(
         durationUs: Long,
         index: SyncSampleIndex?,
-        windowUs: Long = 1_200_000L
+        windowUs: Long = QualityProbePolicy.BASE_WINDOW_US
     ): Plan {
         val wanted = QualityProbePolicy.probeWindows(durationUs, windowUs)
         if (wanted.isEmpty()) return Plan(emptyList(), emptyList())

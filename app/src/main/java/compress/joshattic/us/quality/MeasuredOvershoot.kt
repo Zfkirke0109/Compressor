@@ -12,11 +12,22 @@ package compress.joshattic.us.quality
  * 70 s of 4K encoding. The probes had measured the overshoot two minutes earlier.
  *
  * Why a lower bound and not the measurement. The probe model runs high. Over 40 b166/b167 encodes,
- * actual minus predicted averaged -0.030 (sd 0.033, range -0.184 to +0.019). Used directly, it would
- * have skipped two encodes that did save (job_4e02400464fd 2.7 %, job_c0f82bb62f94 4.6 %). The
- * gate therefore uses the mean less [MARGIN] (the bias plus three standard deviations), and never
- * less than the learned value. Replayed over the 33 distinct proven-rung encodes of the retained
- * b167 runs, that skips job_732f7ecfb699 (predicted 1.03x the source) and nothing that saved.
+ * actual minus predicted averaged -0.030 (sd 0.033, range -0.184 to +0.019), and b168 repeated it
+ * (21 encodes, -0.026, range -0.068 to +0.019). The bound is the mean less [MARGIN] (the bias plus
+ * three standard deviations).
+ *
+ * Why the file's own measurement outranks the learned value (b168). The first version of this gate
+ * used max(learned, bound). b168 job_458aa0663c3e passed its probes at 0.90 and was kept as
+ * "already efficient": its probes measured 1.062 (bound 0.932), but the learned value was 1.119,
+ * which is exactly the running average of this bucket's two b167 encodes, 458a itself at 1.003 and
+ * 732f at 1.235. One heavily compressed file had raised the prediction for every file in the
+ * 4K H.264 bucket, and it outranked the file's own evidence. b167 had encoded 458a at 1.003 and
+ * saved 9.5 %, pixel-certified. The replay that claimed "skips nothing that saved" assumed a learned
+ * value of 1.0 for every file, so it never saw learned state accumulate in batch order; that claim
+ * was wrong. Now, when the file's own probes give a bound, the learned value is not used: it is
+ * evidence about other files. It still stands in when the probes gave fewer than [MIN_WINDOWS].
+ * Replaying b168's 28 gate decisions with their logged learned values, only 458a changes (to
+ * encode); 732f is still skipped (bound 1.13).
  */
 object MeasuredOvershoot {
 
@@ -33,11 +44,15 @@ object MeasuredOvershoot {
         return usable.average() - MARGIN
     }
 
-    /** The factor the worth-encoding prediction uses: the learned one unless the probes bound it higher. */
-    fun forPrediction(learned: Double, windowFactors: List<Double>): Double {
-        val bound = lowerBound(windowFactors) ?: return learned
-        return if (bound > learned) bound else learned
-    }
+    /**
+     * The factor the worth-encoding prediction uses: this file's probe bound when there is one,
+     * else the learned value. (The prediction itself never assumes less than 1.0.)
+     */
+    fun forPrediction(learned: Double, windowFactors: List<Double>): Double =
+        lowerBound(windowFactors) ?: learned
+
+    /** True when [forPrediction] came from this file's probes rather than the learned value. */
+    fun fromThisFile(windowFactors: List<Double>): Boolean = lowerBound(windowFactors) != null
 
     /** `measuredOvershoot=1.260(n=3,bound=1.130),learned=1.003,used=1.130` */
     fun describe(learned: Double, windowFactors: List<Double>): String {

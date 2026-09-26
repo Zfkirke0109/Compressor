@@ -158,9 +158,9 @@ class QualityProbePolicyTest {
 
     @Test
     fun upwardRefinementOnlyFiresForARealNearMissBelowTheCeiling() {
-        val nearMiss = listOf(WindowScore(30, mean = 93.5, p5 = 92.0, min = 88.0)) // short by 2.0
-        val farMiss = listOf(WindowScore(30, mean = 85.0, p5 = 92.0, min = 88.0))  // short by 10.5
-        val exactBoundary = listOf(WindowScore(30, mean = 93.0, p5 = 92.0, min = 88.0)) // short by 2.5
+        val nearMiss = listOf(WindowScore(30, mean = 95.2, p5 = 92.0, min = 88.0)) // short by 0.3
+        val farMiss = listOf(WindowScore(30, mean = 93.5, p5 = 92.0, min = 88.0))  // short by 2.0: 0 of 94 such retries passed (b166-b168)
+        val exactBoundary = listOf(WindowScore(30, mean = 95.0, p5 = 92.0, min = 88.0)) // short by 0.5
 
         // Near-miss at 0.95 -> retry at the 0.97 ceiling.
         assertEquals(0.97, QualityProbePolicy.upwardRefinementCandidate(0.95, nearMiss)!!, 1e-9)
@@ -376,5 +376,66 @@ class QualityProbePolicyTest {
         val tooFew = listOf(WindowScore(5, mean = 99.0, p5 = 99.0, min = 99.0))
         assertFalse(QualityProbePolicy.windowsPass(tooFew, QualityProbePolicy.HIGH_QUALITY))
         assertFalse(QualityProbePolicy.windowsPass(tooFew, QualityProbePolicy.PERCEPTUAL_LOSSLESS))
+    }
+
+    // ---- Low frame rates (b168 job_478c2fa19100: 1356x760, 10 fps) -----------------------------
+
+    @Test
+    fun windowsGrowToHoldTheMinimumFrameCountAtLowFrameRates() {
+        assertEquals(1_400_000L, QualityProbePolicy.windowDurationUs(10.0))
+        assertEquals(1_505_377L, QualityProbePolicy.windowDurationUs(9.3))          // 14 frames at 9.3 fps
+        assertEquals(1_200_000L, QualityProbePolicy.windowDurationUs(11.67))        // 1.2 s already holds 14
+        for (fps in listOf(23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0, 120.0)) {
+            assertEquals("fps $fps keeps the calibrated window", 1_200_000L, QualityProbePolicy.windowDurationUs(fps))
+        }
+        // Unknown or nonsense frame rates keep the calibrated window; the verdict below guards them.
+        for (fps in listOf(0.0, -1.0, Double.NaN, Double.POSITIVE_INFINITY)) {
+            assertEquals(1_200_000L, QualityProbePolicy.windowDurationUs(fps))
+        }
+        // A 2 fps time-lapse is capped, and stays undecided rather than being judged on 8 frames.
+        assertEquals(QualityProbePolicy.MAX_WINDOW_US, QualityProbePolicy.windowDurationUs(2.0))
+        for (fps in listOf(3.5, 5.0, 7.5, 10.0, 12.0)) {
+            val frames = QualityProbePolicy.windowDurationUs(fps) / 1_000_000.0 * fps
+            assertTrue("fps $fps: $frames frames", frames >= QualityProbePolicy.MIN_COMPARED_FRAMES_PER_WINDOW + 1)
+        }
+    }
+
+    @Test
+    fun tooFewFramesIsUndecidedNotAMeasuredRejection() {
+        // b168's 0.95 rung for job_478c2fa19100: every gate cleared bar and margin; one window had 11 frames.
+        val rung = listOf(
+            WindowScore(12, mean = 99.240, p5 = 97.246, min = 97.246),
+            WindowScore(12, mean = 98.189, p5 = 95.433, min = 95.433),
+            WindowScore(11, mean = 97.508, p5 = 95.077, min = 95.077)
+        )
+        assertEquals(QualityProbePolicy.RungVerdict.INSUFFICIENT, QualityProbePolicy.rungVerdict(rung))
+        // Never accepted on that evidence either.
+        assertFalse(QualityProbePolicy.windowsPass(rung))
+        // With enough frames the same scores are a pass.
+        assertEquals(QualityProbePolicy.RungVerdict.PASSED, QualityProbePolicy.rungVerdict(rung.map { it.copy(comparedFrames = 14) }))
+    }
+
+    @Test
+    fun aSufficientlySampledFailureStillRejectsAlongsideAShortWindow() {
+        val rung = listOf(
+            WindowScore(36, mean = 93.0, p5 = 90.0, min = 88.0),     // measured, below the mean bar
+            WindowScore(11, mean = 99.0, p5 = 97.0, min = 97.0)
+        )
+        assertEquals(QualityProbePolicy.RungVerdict.FAILED, QualityProbePolicy.rungVerdict(rung))
+    }
+
+    @Test
+    fun aShortWindowThatAlsoFailsIsStillUndecided() {
+        // 11 frames below the bar is not enough to call the file degraded either.
+        val rung = listOf(WindowScore(11, mean = 94.68, p5 = 92.30, min = 92.30), WindowScore(12, mean = 98.0, p5 = 96.0, min = 96.0))
+        assertEquals(QualityProbePolicy.RungVerdict.INSUFFICIENT, QualityProbePolicy.rungVerdict(rung))
+    }
+
+    @Test
+    fun aWindowLongerThanTheClipIsNotPlaced() {
+        // 3 s at 3 fps would need a 4 s window: too short to sample honestly, never a negative start.
+        assertTrue(QualityProbePolicy.probeWindows(3_000_000L, QualityProbePolicy.windowDurationUs(3.0)).isEmpty())
+        val w = QualityProbePolicy.probeWindows(8_000_000L, QualityProbePolicy.windowDurationUs(5.0)).single()
+        assertTrue(w.startUs >= 0L && w.endUs <= 8_000_000L)
     }
 }
