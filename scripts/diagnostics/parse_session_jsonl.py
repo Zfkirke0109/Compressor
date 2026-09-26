@@ -190,7 +190,7 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "terminals": dict(terminals.most_common()),
         "effectiveModes": dict(modes.most_common()),
         "materialization": dict(materialization.most_common()),
-        "elapsedMs": (summary or {}).get("elapsedMs"),
+        "elapsedMs": (summary or session.get("terminal") or {}).get("elapsedMs"),
         "exhaustivePerceptualLossless": (start or {}).get("exhaustivePerceptualLossless"),
         "buildTag": (start or {}).get("buildTag"),
         "v1ShadowPairs": v1_shadow_pairs(jobs),
@@ -198,7 +198,97 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "marginalAttempts": marginal_attempts(jobs),
         "budgetExhausted": budget_exhausted(jobs),
         "decisionBasis": dict(Counter(basis_kind(j.get("decisionBasis")) for j in jobs if j.get("decisionBasis")).most_common()),
+        "media3Input": media3_input(jobs),
+        "overshootPrediction": overshoot_prediction(jobs),
         "completed": summary is not None,
+        "sessionEnd": session_end(summary, session.get("terminal")),
+    }
+
+
+def session_end(summary: dict[str, Any] | None, terminal: dict[str, Any] | None) -> dict[str, Any]:
+    """How the batch ended, from its own terminal record.
+
+    A batch the user cancelled writes session_cancelled, and one that failed writes session_failed.
+    Reporting either as merely "did not finish" hides which it was: b167's 14-second cancelled
+    batch read as an unexplained stop with 221 jobs.
+    """
+    if summary is not None:
+        return {"kind": "completed"}
+    if terminal is not None:
+        kind = terminal.get("type") or terminal.get("eventType")
+        return {
+            "kind": "cancelled" if kind == "session_cancelled" else "failed",
+            "reason": terminal.get("reason"),
+            "elapsedMs": terminal.get("totalElapsedMs", terminal.get("elapsedMs")),
+            "cancelledJobs": terminal.get("cancelled"),
+        }
+    return {"kind": "unfinished"}
+
+
+def media3_input(jobs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Files Media3 could not parse (SourceParseFailure), and what the platform copy did for them.
+
+    `media3Input` is recorded only for such files. The outcome that matters is whether the
+    platform-normalised copy let the encode through, so the terminals are counted per kind.
+    """
+    out: dict[str, Any] = {}
+    for j in jobs:
+        text = str(j.get("media3Input") or "")
+        if not text:
+            continue
+        if text.startswith("platform-normalised copy also unreadable"):
+            kind = "copy also unreadable"
+        elif text.startswith("platform-normalised copy"):
+            kind = "normalised"
+        elif text.startswith("normalisation failed"):
+            kind = "normalisation failed"
+        elif text.startswith("not normalised"):
+            kind = "not normalised"
+        else:
+            kind = "other"
+        entry = out.setdefault(kind, {"files": 0, "terminals": {}})
+        entry["files"] += 1
+        term = str(j.get("terminal"))
+        entry["terminals"][term] = entry["terminals"].get(term, 0) + 1
+    return out
+
+
+def overshoot_prediction(jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Actual encoder overshoot against the proven rung's probe prediction, per encoded file.
+
+    The worth-encoding gate trusts the probe prediction only down to MeasuredOvershoot.MARGIN
+    (0.13) below its mean. This re-measures the error on every capture: an actual more than the
+    margin BELOW the prediction is a file the gate could have skipped wrongly.
+    """
+    import re
+    errors: list[float] = []
+    for j in jobs:
+        rate, proven, config = j.get("probeRateDiag"), j.get("pixelProvenRatio"), j.get("encoderConfig")
+        if not rate or proven is None or not config:
+            continue
+        m = re.search(r"ratio=([0-9.]+);mode", str(config))
+        if not m:
+            continue
+        section = None
+        for part in str(rate).split(";"):
+            key, _, value = part.partition("=")
+            try:
+                if abs(float(key) - float(proven)) < 1e-6:
+                    section = value
+            except ValueError:
+                continue
+        factors = [float(x) for x in re.findall(r",x([0-9.]+)\]", section or "")]
+        if len(factors) < 2:
+            continue
+        errors.append(float(m.group(1)) - sum(factors) / len(factors))
+    if not errors:
+        return None
+    return {
+        "encodes": len(errors),
+        "meanError": sum(errors) / len(errors),
+        "worstUnder": min(errors),
+        "worstOver": max(errors),
+        "beyondMargin": sum(1 for e in errors if e < -0.13),
     }
 
 
@@ -267,6 +357,8 @@ def budget_exhausted(jobs: list[dict[str, Any]]) -> dict[str, int]:
 
 def basis_kind(text: Any) -> str:
     t = str(text or "")
+    if "the size prediction decided" in t:
+        return "probe passed, size predicted"
     if "(learned)" in t:
         return "learned"
     if "cannot be pixel-measured" in t:
@@ -319,7 +411,20 @@ def render(s: dict[str, Any]) -> str:
         f"  effective modes: {s['effectiveModes']}",
     ]
     if not s["completed"]:
-        out.insert(1, "  !! NO session_summary — this batch did not finish; totals are a partial run")
+        end = s.get("sessionEnd") or {"kind": "unfinished"}
+        seconds = end.get("elapsedMs")
+        after = f" after {seconds / 1000:.1f} s" if isinstance(seconds, (int, float)) else ""
+        if end["kind"] == "cancelled":
+            jobs = end.get("cancelledJobs")
+            line = (f"  !! CANCELLED{after} (reason={end.get('reason')}"
+                    + (f"; {jobs} job(s) recorded as CANCELLED" if jobs is not None else "")
+                    + ") — totals are a partial run")
+        elif end["kind"] == "failed":
+            line = f"  !! FAILED{after} (reason={end.get('reason')}) — totals are a partial run"
+        else:
+            line = ("  !! NO session_summary and no cancel/fail record — this batch did not finish"
+                    " (the process ended mid-run); totals are a partial run")
+        out.insert(1, line)
     if s.get("buildTag") or s.get("exhaustivePerceptualLossless") is not None:
         out.append(f"  build tag      : {s.get('buildTag')}   exhaustive PL: {s.get('exhaustivePerceptualLossless')}")
     drift = s.get("probeCertDrift")
@@ -336,6 +441,17 @@ def render(s: dict[str, Any]) -> str:
         out.append(f"  budget exhausted: {budget['ladders']} ladder(s), {budget['encodedThenFailed']} then encoded and failed certification")
     if s.get("decisionBasis"):
         out.append(f"  keep-original basis: {s['decisionBasis']}")
+    if s.get("media3Input"):
+        out.append("  media3 input   : files Media3 could not parse, by what the platform copy did")
+        for kind, entry in s["media3Input"].items():
+            out.append(f"      {kind:<22} {entry['files']:3} file(s)  {entry['terminals']}")
+    over = s.get("overshootPrediction")
+    if over:
+        out.append(
+            f"  overshoot pred.: {over['encodes']} encode(s); actual minus probe-predicted mean"
+            f" {over['meanError']:+.3f}, range {over['worstUnder']:+.3f}..{over['worstOver']:+.3f};"
+            f" {over['beyondMargin']} below the -0.13 margin"
+        )
     pairs = s.get("v1ShadowPairs") or []
     if pairs:
         out.append(f"  VMAF v1 shadow : {len(pairs)} certification window(s) scored by both models (min score)")

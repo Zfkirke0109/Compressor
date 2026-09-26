@@ -29,6 +29,13 @@ import java.util.Locale
  *
  * [attach] is called when a batch starts and [detach] when it ends. Before attach — and if the file
  * cannot be opened at all — this degrades to plain logcat, so no call site has to handle failure.
+ *
+ * Ownership. There is one log at a time, and [attach] returns a token that only [detach] with the
+ * same token can end. b167 showed why: two scorer self-checks overlapped, the first one's ceiling
+ * line went into the second one's log, and the first one's detach then switched logging off under
+ * the second, whose results were lost. A batch started during a self-check could have lost its
+ * whole decision log the same way. The callers now also keep runs from overlapping; the token
+ * makes a stale detach harmless even if they do.
  */
 object DiagLog {
 
@@ -48,23 +55,45 @@ object DiagLog {
     @Volatile
     private var capped = false
 
+    /** Who attached the current file; see [attach]. */
+    private var owner: Any? = null
+
     private val stamp = SimpleDateFormat("MM-dd HH:mm:ss.SSS", Locale.US)
 
-    /** Begin mirroring to `diagnostics/<batchId>/decisions.log`. Idempotent per batch. */
+    /**
+     * Begin mirroring to `diagnostics/<batchId>/decisions.log`, replacing any current file.
+     * Returns the token that ends it; see [detach].
+     */
     @Synchronized
-    fun attach(context: Context, batchId: String) {
-        file = runCatching {
+    fun attach(context: Context, batchId: String): Any = attachTo(
+        runCatching {
             val dir = File(context.filesDir, "diagnostics/$batchId").apply { mkdirs() }
             File(dir, "decisions.log")
         }.getOrNull()
-        written = file?.takeIf { it.exists() }?.length() ?: 0L
+    )
+
+    /** [attach] without a Context, so the ownership rules are testable on the JVM. */
+    @Synchronized
+    internal fun attachTo(target: File?): Any {
+        file = target
+        written = target?.takeIf { it.exists() }?.length() ?: 0L
         capped = false
+        return Any().also { owner = it }
     }
 
-    /** Stop mirroring. Lines logged outside a batch still reach logcat. */
+    /** The file lines are mirrored to right now, if any. */
+    internal val attachedFile: File? get() = file
+
+    /**
+     * Stop mirroring, if [token] is still the current owner. A detach by a run whose log was
+     * already replaced does nothing, so it cannot switch off a later run's log. Lines logged
+     * outside a run still reach logcat.
+     */
     @Synchronized
-    fun detach() {
+    fun detach(token: Any) {
+        if (owner !== token) return
         file = null
+        owner = null
     }
 
     fun i(tag: String, message: String) {

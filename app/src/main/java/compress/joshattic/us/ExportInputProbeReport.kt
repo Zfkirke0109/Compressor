@@ -11,6 +11,10 @@ package compress.joshattic.us
  * within 166-208 ms of each other in storage order). What is left is the input side, which the
  * trace does not cover: is a read blocked, did the loader stop asking, or did the source report an
  * early end? Each has a different fix, and this report tells them apart.
+ *
+ * b167 answered it: every stall closed the input right after a 5-byte read and never reopened it,
+ * which is Mp4Extractor rejecting a NAL length. The extractor error itself is now recorded
+ * ([parseFailure], from SourceParseFailure) and named first.
  */
 data class ExportInputProbeReport(
     val opens: Int,
@@ -24,7 +28,11 @@ data class ExportInputProbeReport(
     val lastByteAtMs: Long,
     val lastCloseAtMs: Long,
     /** The last value `read` returned: bytes, 0, or -1 for end of input. */
-    val lastReadResult: Int
+    val lastReadResult: Int,
+    /** The extractor error the loader will not recover from, if one was thrown (SourceParseFailure). */
+    val parseFailure: String? = null,
+    /** Extractor read errors Media3 retried by itself. */
+    val retriedReadErrors: Int = 0
 ) {
     val isOpen: Boolean get() = opens > closes
     val readInFlight: Boolean get() = readsEntered > readsExited
@@ -33,11 +41,16 @@ data class ExportInputProbeReport(
         fun ago(t: Long) = if (t <= 0L) "never" else "${(nowMs - t).coerceAtLeast(0L)}ms ago"
         return "input[opens=$opens,closes=$closes,open=$isOpen,bytes=${"%.1f".format(java.util.Locale.US, bytes / 1e6)}MB," +
             "lastOpenPos=$lastOpenPosition,lastOpenLen=$lastOpenLength,reads=$readsEntered,readInFlight=$readInFlight," +
-            "lastRead=$lastReadResult,lastByte=${ago(lastByteAtMs)},lastOpen=${ago(lastOpenAtMs)},lastClose=${ago(lastCloseAtMs)}]"
+            "lastRead=$lastReadResult,lastByte=${ago(lastByteAtMs)},lastOpen=${ago(lastOpenAtMs)},lastClose=${ago(lastCloseAtMs)}" +
+            (if (retriedReadErrors > 0) ",retriedReadErrors=$retriedReadErrors" else "") + "]"
     }
 
     /** One sentence naming where the input path stopped. */
     fun diagnosis(nowMs: Long): String = when {
+        // Checked first: when the extractor threw, every other symptom below (input closed, no
+        // read pending) is a consequence of it, and naming the symptom hides the cause.
+        parseFailure != null -> "the extractor threw $parseFailure; Media3's loader does not retry that " +
+            "and the export does not report it, so the input stopped here"
         opens == 0 -> "the source was never opened"
         readInFlight -> "a read of the source has been blocked for ${(nowMs - lastByteAtMs.coerceAtLeast(lastOpenAtMs)).coerceAtLeast(0L)} ms: " +
             "an I/O stall in the content provider, not in Media3"

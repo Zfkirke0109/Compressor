@@ -183,6 +183,9 @@ class DiagnosticsRecorder private constructor(
         // in the same words the user saw. plannedDecisionReason keeps the plan's raw reason, which
         // may be a heuristic prediction; this field says so.
         decisionBasis: String? = null,
+        // Set only when Media3 could not parse the source: what it read instead, or why nothing
+        // (Media3InputNormalizer). Null for every file Media3 read directly.
+        media3Input: String? = null,
         // Requested vs actual encoder configuration (see EncoderConfigDelta). Media3 format
         // fallback can substitute MIME or resolution and still report success; without this a
         // later verification rejection is inexplicable from a capture alone.
@@ -264,6 +267,7 @@ class DiagnosticsRecorder private constructor(
                 "certificationStatus" to certificationStatus,
                 "audioPreservation" to audioPreservation,
                 "decisionBasis" to decisionBasis,
+                "media3Input" to media3Input,
                 "encoderConfig" to encoderConfig,
                 "thermalStart" to thermalStart,
                 "thermalEnd" to thermalEnd,

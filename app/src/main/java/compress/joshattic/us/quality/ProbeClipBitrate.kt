@@ -11,9 +11,10 @@ import java.io.File
  * sample sizes are the best available estimate of the encoder's overshoot on this content. In b165
  * job_732f7ecfb699 (4K portrait) the full encode came out 23% above its request and was rejected
  * for size after four and a half minutes; the probe clips had encoded the same content minutes
- * earlier. Today this is telemetry only: every rung logs its measured window bitrate and the
- * steady-state prediction next to the request, so the next capture can check the model against the
- * `encodeResult` lines of the same files before any decision leans on it.
+ * earlier. Every rung logs its measured window bitrate and the steady-state prediction next to
+ * the request. b166/b167 checked the model against the `encodeResult` lines of the same files (40
+ * encodes): it runs high, by 0.030 on average (sd 0.033). The proven rung's factors now feed the
+ * worth-encoding prediction, through the lower bound in MeasuredOvershoot, never directly.
  *
  * The model separates keyframes from the rest because a 1.2 s window holds a whole keyframe
  * whichever way the GOP falls, which would over-count intra bits by the ratio of GOP to window.
@@ -52,11 +53,17 @@ object ProbeClipBitrate {
         return (bytesPerSecond * 8.0).toLong()
     }
 
+    /** [predictedSteadyStateBps] over the request: the encoder's overshoot on this clip, or null. */
+    fun overshootFactor(requestedBps: Int, split: Split, fps: Double, gopSeconds: Float): Double? {
+        if (requestedBps <= 0) return null
+        return predictedSteadyStateBps(split, fps, gopSeconds)?.let { it.toDouble() / requestedBps }
+    }
+
     /** `rate[req=5183kbps,win=5610kbps,I=1x142kB,P=35x18kB,steady=5240kbps,x1.011]` */
     fun compact(requestedBps: Int, split: Split, fps: Double, gopSeconds: Float): String {
         val measured = measuredBps(split)
         val predicted = predictedSteadyStateBps(split, fps, gopSeconds)
-        val factor = predicted?.takeIf { requestedBps > 0 }?.let { "%.3f".format(java.util.Locale.US, it.toDouble() / requestedBps) }
+        val factor = overshootFactor(requestedBps, split, fps, gopSeconds)?.let { "%.3f".format(java.util.Locale.US, it) }
         return "rate[req=${requestedBps / 1000}kbps,win=${measured?.let { "${it / 1000}kbps" } ?: "?"}," +
             "I=${split.syncCount}x${split.syncCount.takeIf { it > 0 }?.let { split.syncBytes / it / 1000 } ?: 0}kB," +
             "P=${split.otherCount}x${split.otherCount.takeIf { it > 0 }?.let { split.otherBytes / it / 1000 } ?: 0}kB," +

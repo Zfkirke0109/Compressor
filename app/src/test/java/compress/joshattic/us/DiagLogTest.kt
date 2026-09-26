@@ -1,6 +1,9 @@
 package compress.joshattic.us
 
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import java.io.File
 import org.junit.Test
 
 /**
@@ -34,5 +37,32 @@ class DiagLogTest {
         // Written to the app's private storage on a phone whose corpus is already tens of GB of
         // video. A diagnostic log must never be the thing that fills it.
         assertTrue("cap must stay modest", DiagLog.MAX_BYTES <= 32L * 1024 * 1024)
+    }
+
+    @Test
+    fun aStaleDetachCannotSwitchOffTheNextRunsLog() {
+        // b167: self-check A attached, self-check B attached over it, then A's detach switched
+        // logging off under B and B's results never reached a file.
+        val a = File("a.log")
+        val b = File("b.log")
+        val tokenA = DiagLog.attachTo(a)
+        val tokenB = DiagLog.attachTo(b)
+        try {
+            DiagLog.detach(tokenA)
+            assertEquals(b, DiagLog.attachedFile)
+        } finally {
+            DiagLog.detach(tokenB)
+        }
+        assertNull(DiagLog.attachedFile)
+    }
+
+    @Test
+    fun theOwnerDetachesItsOwnLog() {
+        val token = DiagLog.attachTo(File("c.log"))
+        DiagLog.detach(token)
+        assertNull(DiagLog.attachedFile)
+        // A second detach with the same token is harmless.
+        DiagLog.detach(token)
+        assertNull(DiagLog.attachedFile)
     }
 }

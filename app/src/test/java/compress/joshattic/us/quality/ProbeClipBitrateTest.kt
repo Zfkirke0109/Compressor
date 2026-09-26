@@ -35,4 +35,15 @@ class ProbeClipBitrateTest {
         assertEquals(true, line.contains("I=1x142kB,P=35x18kB,steady="))
         assertEquals(true, line.endsWith("]"))
     }
+
+    @Test
+    fun theOvershootFactorIsTheSteadyStateOverTheRequest() {
+        val split = ProbeClipBitrate.Split(900_000L, 1, 30_000L * 35, 35, 1_166_666L)
+        // 9,520,000 bps steady state against an 8,000,000 bps request.
+        assertEquals(1.19, ProbeClipBitrate.overshootFactor(8_000_000, split, 30.0, 3.0f)!!, 1e-3)
+        assertNull(ProbeClipBitrate.overshootFactor(0, split, 30.0, 3.0f))
+        assertNull(ProbeClipBitrate.overshootFactor(8_000_000, ProbeClipBitrate.Split(0, 0, 0, 0, 0), 30.0, 3.0f))
+        // The compact line prints the same factor.
+        assertEquals(true, ProbeClipBitrate.compact(8_000_000, split, 30.0, 3.0f).endsWith(",x1.190]"))
+    }
 }

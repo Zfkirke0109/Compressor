@@ -21,6 +21,13 @@ import androidx.media3.transformer.DefaultDecoderFactory
 import androidx.media3.transformer.ExoPlayerAssetLoader
 import compress.joshattic.us.EncoderExperiments
 import compress.joshattic.us.ExportInputProbe
+import compress.joshattic.us.SourceBytes
+import compress.joshattic.us.SourceParseFailure
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import androidx.media3.transformer.ProgressHolder
+import compress.joshattic.us.ExportStallMeter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
@@ -58,7 +65,16 @@ data class ProbeDecision(
     // and certification decides. Recorded so a capture can count how such attempts fare.
     val marginal: Boolean = false,
     // Per-rung probe clip bitrate telemetry (ProbeClipBitrate.compact), in ladder order.
-    val rateDiag: String? = null
+    val rateDiag: String? = null,
+    // The encoder's overshoot at the PROVEN rung as its probe clips measured it, one factor per
+    // window (steady-state bitrate over the request; ProbeClipBitrate.overshootFactor). Feeds the
+    // worth-encoding prediction through MeasuredOvershoot. Empty when nothing was proven or the
+    // clips could not be read.
+    val provenRateFactors: List<Double> = emptyList(),
+    // Set when a probe export stopped because Media3 could not parse the source (see
+    // SourceParseFailure). The full encode reads the same file with the same extractor, so the
+    // caller must not start it on this input.
+    val sourceParseFailure: SourceParseFailure? = null
 ) {
     /** True when the ladder ran but not one rung yielded a single scored window. */
     val nothingMeasured: Boolean get() = rungsMeasured == 0 && (rungsMisaligned + rungsUnavailable) > 0
@@ -133,8 +149,12 @@ class PerceptualQualityProber(private val context: Context) {
         shape: ProbeEncodeShape = ProbeEncodeShape(),
         // Wall-clock budget; the short ladder gets more (ExhaustivePerceptualLosslessPolicy).
         budgetMs: Long = ExhaustivePerceptualLosslessPolicy.PROBE_BUDGET_MS,
-        // Source frame rate, for the probe clip bitrate model (telemetry only).
-        sourceFps: Double = 0.0
+        // Source frame rate, for the probe clip bitrate model.
+        sourceFps: Double = 0.0,
+        // What Media3 reads to cut the probe clips. The source itself unless it had to be
+        // normalised (Media3InputNormalizer); the windows, the scoring reference and every
+        // verdict stay on [sourceUri] either way.
+        transformerInputUri: Uri = sourceUri
     ): ProbeDecision {
         if (!VmafNative.isAvailable) return ProbeDecision(null, emptyList(), null, "vmaf unavailable")
         if (QualityProbePolicy.probeWindows(durationMs * 1000L).isEmpty()) {
@@ -161,6 +181,7 @@ class PerceptualQualityProber(private val context: Context) {
         // no rung clears the margin; see QualityProbePolicy.PROBE_SELECTION.
         var marginalRatio: Double? = null
         var marginalScores: List<WindowScore>? = null
+        var marginalFactors: List<Double> = emptyList()
         // Rung accounting, so a ladder that measured nothing can never be reported as one that
         // measured everything and rejected it.
         var measured = 0
@@ -187,9 +208,10 @@ class PerceptualQualityProber(private val context: Context) {
         }
         fun rateDiag() = rateDiags.takeIf { it.isNotEmpty() }?.joinToString(";")
         fun scoresOf(r: RungResult) = (r as? RungResult.Measured)?.scores
-        fun proven(ratio: Double, scores: List<WindowScore>?, how: String) = ProbeDecision(
-            ratio, probed, scores, "windows passed at %.2f%s".format(ratio, how),
-            false, measured, misaligned, unavailable, rateDiag = rateDiag()
+        fun factorsOf(r: RungResult) = (r as? RungResult.Measured)?.rateFactors.orEmpty()
+        fun proven(ratio: Double, rung: RungResult, how: String) = ProbeDecision(
+            ratio, probed, scoresOf(rung), "windows passed at %.2f%s".format(ratio, how),
+            false, measured, misaligned, unavailable, rateDiag = rateDiag(), provenRateFactors = factorsOf(rung)
         )
         fun exhausted(detail: String) = ProbeDecision(
             null, probed, lastMeasuredScores, detail, highestMeasuredRejected,
@@ -214,7 +236,8 @@ class PerceptualQualityProber(private val context: Context) {
                     QualityProbePolicy.PROBE_SELECTION_MARGIN_P5,
                     QualityProbePolicy.PROBE_SELECTION_MARGIN_MIN
                 ),
-                false, measured, misaligned, unavailable, marginal = true, rateDiag = rateDiag()
+                false, measured, misaligned, unavailable, marginal = true, rateDiag = rateDiag(),
+                provenRateFactors = marginalFactors
             )
         }
         for (ratio in candidateRatios) {
@@ -232,8 +255,28 @@ class PerceptualQualityProber(private val context: Context) {
                 }
             }
             probed += ratio
-            val rung = probeOneRatio(sourceUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows, shape, sourceFps)
+            val rung = probeOneRatio(
+                sourceUri, transformerInputUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows, shape, sourceFps
+            )
             countRung(ratio, rung)
+            if (rung is RungResult.Unavailable && rung.reason.startsWith(SourceParseFailure.REASON_PREFIX)) {
+                // Media3 cannot read this input: every rung cuts the same windows from it, and the
+                // full encode reads all of it. Stop here and say so; the caller decides what next.
+                val failure = lastExportInput?.parseFailure ?: SourceParseFailure(
+                    extractor = "unknown",
+                    errorClass = "ParseError",
+                    message = rung.reason.removePrefix(SourceParseFailure.REASON_PREFIX).trim(),
+                    inputPosition = -1L
+                )
+                if (failure.inputPosition >= 0L) {
+                    withContext(Dispatchers.IO) { SourceBytes.hexAround(context, transformerInputUri, failure.inputPosition) }
+                        ?.let { DiagLog.w(TAG, "source parse failure; ${failure.describe()}; $it") }
+                }
+                return exhausted(
+                    QualityProbePolicy.ladderExhaustedDetail(measured, misaligned, unavailable, unavailableReasons, misalignedReasons) +
+                        "; remaining rungs skipped: Media3 cannot parse this input"
+                ).copy(sourceParseFailure = failure)
+            }
             if (rung is RungResult.Unavailable && rung.reason.startsWith(EXPORT_TIMEOUT_PREFIX)) {
                 describeKeyframes(sourceUri)?.let { DiagLog.w(TAG, "probe export timed out; source $it") }
                 // Every rung exports the same windows, and a clip that took over a minute to cut
@@ -266,14 +309,15 @@ class PerceptualQualityProber(private val context: Context) {
                     if (refined != null && !overBudget()) {
                         probed += refined
                         val refinedRung = probeOneRatio(
-                            sourceUri, outputMime, refined, targetBitrateForRatio(refined), audioBitrate, windows, shape, sourceFps
+                            sourceUri, transformerInputUri, outputMime, refined, targetBitrateForRatio(refined), audioBitrate,
+                            windows, shape, sourceFps
                         )
                         countRung(refined, refinedRung)
                         val refinedScores = scoresOf(refinedRung)
                         when (QualityProbePolicy.rungVerdict(refinedScores)) {
                             QualityProbePolicy.RungVerdict.PASSED -> {
                                 DiagLog.i(TAG, "refinement %.2f pixel-proven (bisection below %.2f)".format(refined, ratio))
-                                return proven(refined, refinedScores, " (refined)")
+                                return proven(refined, refinedRung, " (refined)")
                             }
                             QualityProbePolicy.RungVerdict.MARGINAL -> DiagLog.i(
                                 TAG,
@@ -283,11 +327,12 @@ class PerceptualQualityProber(private val context: Context) {
                             else -> DiagLog.i(TAG, "refinement %.2f rejected; keeping proven %.2f".format(refined, ratio))
                         }
                     }
-                    return proven(ratio, scores, "")
+                    return proven(ratio, rung, "")
                 }
                 QualityProbePolicy.RungVerdict.MARGINAL -> {
                     marginalRatio = ratio
                     marginalScores = scores
+                    marginalFactors = factorsOf(rung)
                     highestFailedBelow = ratio
                     if (ratio == highestCandidate) highestMarginal = true
                     DiagLog.i(
@@ -324,18 +369,20 @@ class PerceptualQualityProber(private val context: Context) {
             if (upward != null && upward !in probed) {
                 probed += upward
                 val upRung = probeOneRatio(
-                    sourceUri, outputMime, upward, targetBitrateForRatio(upward), audioBitrate, windows, shape, sourceFps
+                    sourceUri, transformerInputUri, outputMime, upward, targetBitrateForRatio(upward), audioBitrate,
+                    windows, shape, sourceFps
                 )
                 countRung(upward, upRung)
                 val upScores = scoresOf(upRung)
                 when (QualityProbePolicy.rungVerdict(upScores)) {
                     QualityProbePolicy.RungVerdict.PASSED -> {
                         DiagLog.i(TAG, "upward near-miss refinement %.2f pixel-proven (safest rung %.2f just missed)".format(upward, highestCandidate))
-                        return proven(upward, upScores, " (upward near-miss refinement)")
+                        return proven(upward, upRung, " (upward near-miss refinement)")
                     }
                     QualityProbePolicy.RungVerdict.MARGINAL -> {
                         marginalRatio = upward
                         marginalScores = upScores
+                        marginalFactors = factorsOf(upRung)
                         DiagLog.i(
                             TAG,
                             "upward near-miss refinement %.2f cleared the bar by only %.2f, below the selection margin"
@@ -357,6 +404,7 @@ class PerceptualQualityProber(private val context: Context) {
     /** Scores one candidate ratio across all windows; returns a [RungResult] describing the outcome. */
     private suspend fun probeOneRatio(
         sourceUri: Uri,
+        transformerInputUri: Uri,
         outputMime: String,
         ratio: Double,
         videoBitrate: Int,
@@ -367,6 +415,7 @@ class PerceptualQualityProber(private val context: Context) {
     ): RungResult {
         val collected = mutableListOf<WindowScore>()
         val rates = mutableListOf<String>()
+        val factors = mutableListOf<Double>()
         fun rateDiag() = rates.takeIf { it.isNotEmpty() }?.joinToString("|")
         for (window in windows) {
             val probeFile = File.createTempFile("probe_${"%.2f".format(ratio)}_", ".mp4", context.cacheDir)
@@ -377,7 +426,7 @@ class PerceptualQualityProber(private val context: Context) {
                 // have been reported as timing out. The sealed result keeps the two apart by
                 // construction.
                 val exported = withTimeoutOrNull(PROBE_EXPORT_TIMEOUT_MS) {
-                    exportClip(sourceUri, probeFile, outputMime, videoBitrate, audioBitrate, window, shape)
+                    exportClip(transformerInputUri, probeFile, outputMime, videoBitrate, audioBitrate, window, shape)
                 }
                 if (exported == null) {
                     // What the INPUT side of the export was doing when the clock ran out; see
@@ -398,6 +447,7 @@ class PerceptualQualityProber(private val context: Context) {
                 withContext(Dispatchers.IO) { ProbeClipBitrate.measure(probeFile, window.leadInUs) }?.let { split ->
                     val line = ProbeClipBitrate.compact(videoBitrate, split, sourceFps, shape.iFrameIntervalSeconds)
                     rates += line
+                    ProbeClipBitrate.overshootFactor(videoBitrate, split, sourceFps, shape.iFrameIntervalSeconds)?.let { factors += it }
                     DiagLog.i(
                         TAG,
                         "probe rate; ratio=%.2f; window=[%d..%dms]; %s".format(
@@ -433,12 +483,12 @@ class PerceptualQualityProber(private val context: Context) {
                 }
                 collected += scores
                 // Early exit: one failing window already rejects this ratio.
-                if (!QualityProbePolicy.windowsPass(scores)) return RungResult.Measured(collected, rateDiag())
+                if (!QualityProbePolicy.windowsPass(scores)) return RungResult.Measured(collected, rateDiag(), factors.toList())
             } finally {
                 runCatching { probeFile.delete() }
             }
         }
-        return RungResult.Measured(collected, rateDiag())
+        return RungResult.Measured(collected, rateDiag(), factors.toList())
     }
 
     /**
@@ -457,7 +507,12 @@ class PerceptualQualityProber(private val context: Context) {
     }
 
     private sealed interface RungResult {
-        data class Measured(val scores: List<WindowScore>, val rateDiag: String? = null) : RungResult
+        data class Measured(
+            val scores: List<WindowScore>,
+            val rateDiag: String? = null,
+            // ProbeClipBitrate.overshootFactor per scored window, in window order.
+            val rateFactors: List<Double> = emptyList()
+        ) : RungResult
         /**
          * The probe clip and the source could not be paired in time. Not a quality result.
          *
@@ -505,6 +560,7 @@ class PerceptualQualityProber(private val context: Context) {
             // still delivering (ExportInputProbeReport).
             val inputProbe = ExportInputProbe(DefaultDataSource.Factory(context))
             lastExportInput = inputProbe
+            val mainHandler = Handler(Looper.getMainLooper())
             val mediaItem = MediaItem.Builder()
                 .setUri(sourceUri)
                 .setClippingConfiguration(
@@ -549,6 +605,9 @@ class PerceptualQualityProber(private val context: Context) {
                 .setEncoderFactory(encoderFactory)
                 .addListener(object : Transformer.Listener {
                     override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                        inputProbe.parseFailure?.let {
+                            DiagLog.i(TAG, "probe export completed although the extractor threw ${it.describe()}: the error lay past the clip")
+                        }
                         // A "successful" export that wrote nothing is still a failure, and a
                         // different one from an error — say which.
                         val outcome = if (outputFile.length() > 0L) {
@@ -569,8 +628,13 @@ class PerceptualQualityProber(private val context: Context) {
                         // problem, which are three different bugs. Discarding it (the previous
                         // `resume(false)`) is what left 10 of 16 ladders in capture
                         // batch_1788252039055 reporting a bare "export failed" with no way to act.
-                        val reason = "export failed: ${exportException.getErrorCodeName()}" +
-                            (exportException.message?.take(120)?.let { " — $it" } ?: "")
+                        // A parse error Media3 did report (during preparation) is the same failure as
+                        // one it swallows, and takes the same path: the ladder stops and the caller
+                        // may normalise the input.
+                        val parse = inputProbe.parseFailure?.takeIf { SourceParseFailure.hasParserCause(exportException) }
+                        val reason = parse?.let { "${SourceParseFailure.REASON_PREFIX} ${it.describe()}" }
+                            ?: ("export failed: ${exportException.getErrorCodeName()}" +
+                                (exportException.message?.take(120)?.let { " — $it" } ?: ""))
                         DiagLog.w(TAG, "probe export failed: $reason", exportException)
                         DiagLog.w(TAG, "probe export input; ${inputProbe.snapshot()}")
                         runCatching { outputFile.delete() }
@@ -581,6 +645,35 @@ class PerceptualQualityProber(private val context: Context) {
             continuation.invokeOnCancellation {
                 transformer.cancel()
                 runCatching { outputFile.delete() }
+            }
+            // Media3 stops loading on a parse error it will never retry, and the export then sits
+            // idle until the 60 s timeout (SourceParseFailure). End it once it stops moving instead;
+            // a clip whose error lay past its end keeps moving until it completes.
+            inputProbe.onFatalParse = { failure ->
+                val meter = ExportStallMeter()
+                mainHandler.post(object : Runnable {
+                    override fun run() {
+                        if (!continuation.isActive) return
+                        val holder = ProgressHolder()
+                        val progress = if (transformer.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) {
+                            holder.progress.toLong()
+                        } else {
+                            0L
+                        }
+                        if (!meter.stalled(outputFile.length() + progress, SystemClock.elapsedRealtime())) {
+                            mainHandler.postDelayed(this, SourceParseFailure.STALL_POLL_MS)
+                            return
+                        }
+                        DiagLog.w(
+                            TAG,
+                            "probe export stopped: ${failure.describe()}; no progress for " +
+                                "${SourceParseFailure.EXPORT_GRACE_MS}ms; ${inputProbe.snapshot()}"
+                        )
+                        transformer.cancel()
+                        runCatching { outputFile.delete() }
+                        continuation.resume(ExportOutcome.Failed("${SourceParseFailure.REASON_PREFIX} ${failure.describe()}"))
+                    }
+                })
             }
             try {
                 transformer.start(

@@ -215,6 +215,82 @@ def test_ladders_that_ran_out_of_budget_are_counted_with_their_blind_encodes():
     assert summarize(path)["budgetExhausted"] == {"ladders": 2, "encodedThenFailed": 1}
 
 
+def test_a_cancelled_batch_is_reported_as_cancelled_not_as_unfinished():
+    # b167's 14-second batch was cancelled by the user and wrote session_cancelled; the summary
+    # called it an unexplained stop. The terminal record says which it was, so the report must too.
+    from parse_session_jsonl import render
+    path = write([
+        start(batchId="b1"),
+        job("a", terminal="CANCELLED"),
+        {"type": "session_cancelled", "batchId": "b1", "reason": "user_cancelled",
+         "totalElapsedMs": 14800, "cancelled": 1},
+    ])
+    s = summarize(path)
+    assert s["completed"] is False
+    assert s["sessionEnd"] == {"kind": "cancelled", "reason": "user_cancelled", "elapsedMs": 14800, "cancelledJobs": 1}
+    text = render(s)
+    assert "CANCELLED after 14.8 s" in text
+    assert "did not finish" not in text
+
+
+def test_a_failed_batch_names_its_failure():
+    from parse_session_jsonl import render
+    path = write([
+        start(batchId="b1"),
+        job("a"),
+        {"type": "session_failed", "batchId": "b1", "reason": "IllegalStateException", "elapsedMs": 5000},
+    ])
+    text = render(summarize(path))
+    assert "FAILED after 5.0 s (reason=IllegalStateException)" in text
+
+
+def test_files_media3_could_not_parse_are_grouped_by_what_the_copy_did():
+    path = write([
+        start(batchId="b1"),
+        job("a", terminal="TRANSCODED_SMALLER", media3Input="platform-normalised copy; copy=1432.4MB in 21000ms"),
+        job("b", terminal="UNEXPECTED_REMUX", media3Input="normalisation failed: platform copy ended early"),
+        job("c", terminal="UNEXPECTED_REMUX", media3Input="platform-normalised copy also unreadable by Media3 (x)"),
+        job("d", terminal="UNEXPECTED_REMUX", media3Input="not normalised: HDR source"),
+        job("e", terminal="TRANSCODED_SMALLER"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    m = summarize(path)["media3Input"]
+    assert m["normalised"] == {"files": 1, "terminals": {"TRANSCODED_SMALLER": 1}}
+    assert m["normalisation failed"]["files"] == 1
+    assert m["copy also unreadable"]["files"] == 1
+    assert m["not normalised"]["files"] == 1
+    assert sum(e["files"] for e in m.values()) == 4
+
+
+def test_overshoot_prediction_error_is_measured_at_the_proven_rung_only():
+    # Rung 0.90 is the proven one: its two windows predict 1.26 on average and the encode came out
+    # at 1.235. The 0.80 rung's numbers must not enter the comparison.
+    path = write([
+        start(batchId="b1"),
+        job("a", pixelProvenRatio=0.9,
+            probeRateDiag="0.80=rate[req=1kbps,win=1kbps,I=1x1kB,P=1x1kB,steady=1kbps,x1.500];"
+                          "0.90=rate[req=1kbps,win=1kbps,I=1x1kB,P=1x1kB,steady=1kbps,x1.250]|"
+                          "rate[req=1kbps,win=1kbps,I=1x1kB,P=1x1kB,steady=1kbps,x1.270]",
+            encoderConfig="mime=video/avc->video/hevc;vbr=1->1;ratio=1.235;mode=VBR"),
+        job("b", pixelProvenRatio=0.9,
+            probeRateDiag="0.90=rate[req=1kbps,win=1kbps,I=1x1kB,P=1x1kB,steady=1kbps,x1.100]",
+            encoderConfig="ratio=1.000;mode=VBR"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    o = summarize(path)["overshootPrediction"]
+    # job b has one window only, below MeasuredOvershoot.MIN_WINDOWS, so it is left out.
+    assert o["encodes"] == 1
+    assert abs(o["meanError"] - (1.235 - 1.26)) < 1e-9
+    assert o["beyondMargin"] == 0
+
+
+def test_a_size_gated_keep_original_is_its_own_basis_kind():
+    from parse_session_jsonl import basis_kind
+    assert basis_kind("Basis: pixel probes passed at 0.90; the size prediction decided. At that rate ...") == \
+        "probe passed, size predicted"
+    assert basis_kind("Basis: heuristic. Probes at 0.95 produced no measurement that could decide it.") == "probed, undecided"
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
 

@@ -180,7 +180,15 @@ private fun BatchCompressorScreen(
             }
 
             item { BatchSettingsCard(state, viewModel, context, requestOriginalMediaAccess) }
-            item { DiagnosticsExportCard(context, state.isCompressing, state.items.any { !it.isAlreadyCompressed }, viewModel::runScorerSelfCheck) }
+            item {
+                DiagnosticsExportCard(
+                    context,
+                    state.isCompressing,
+                    state.items.any { !it.isAlreadyCompressed },
+                    state.isSelfChecking,
+                    viewModel::runScorerSelfCheck
+                )
+            }
             if (state.items.isNotEmpty()) {
                 item { BatchSummaryCard(state) }
                 item { PreservationReportCard(state) }
@@ -323,6 +331,7 @@ private fun DiagnosticsExportCard(
     context: Context,
     isCompressing: Boolean,
     hasSelection: Boolean,
+    isSelfChecking: Boolean,
     onRunScorerSelfCheck: (Context) -> Unit
 ) {
     val scope = rememberCoroutineScope()
@@ -462,8 +471,9 @@ private fun DiagnosticsExportCard(
             OutlinedButton(
                 onClick = { onRunScorerSelfCheck(context) },
                 modifier = Modifier.fillMaxWidth(),
-                enabled = !busy && !isCompressing && hasSelection
-            ) { Text("Run scorer self-check") }
+                // One self-check at a time; starting a batch stops a running one.
+                enabled = !busy && !isCompressing && hasSelection && !isSelfChecking
+            ) { Text(if (isSelfChecking) "Scorer self-check running…" else "Run scorer self-check") }
 
             HorizontalDivider()
 

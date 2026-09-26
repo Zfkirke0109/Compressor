@@ -1,5 +1,7 @@
 package compress.joshattic.us
 
+import java.util.Locale
+
 /**
  * What the user is told when a Perceptually Lossless run keeps a file as-is WITHOUT a measured
  * rejection, and on what basis.
@@ -28,10 +30,34 @@ object KeepOriginalMessages {
         evidencePreferred: Boolean,
         probedRatios: List<Double>,
         probeDetail: String?,
-        pixelCertifiableBlockReason: String?
+        pixelCertifiableBlockReason: String?,
+        sizeGateBasis: String? = null
     ): String {
         val why = reason?.let { softenUnmeasuredClaim(it) } ?: "No re-encode was planned."
-        return "Kept original, no copy written. $why ${basis(evidencePreferred, probedRatios, probeDetail, pixelCertifiableBlockReason)}"
+        return "Kept original, no copy written. $why " +
+            basis(evidencePreferred, probedRatios, probeDetail, pixelCertifiableBlockReason, sizeGateBasis)
+    }
+
+    /** The user-facing reason when a probe-proven rung is predicted not to be smaller. */
+    const val SIZE_GATE_REASON = "Re-encoding would not make this file smaller."
+
+    /**
+     * The basis when a rung PASSED its probe windows and the size prediction kept the original.
+     * Says which part was measured (quality) and which was predicted (size), and where the
+     * overshoot in that prediction came from.
+     */
+    fun sizeGateBasis(
+        provenRatio: Double,
+        predictedBytes: Long,
+        sourceBytes: Long,
+        overshoot: Double,
+        overshootMeasured: Boolean
+    ): String {
+        val origin = if (overshootMeasured) "measured on this file's probe clips, less a margin" else "learned for this device and content class"
+        return "Basis: pixel probes passed at ${"%.2f".format(Locale.US, provenRatio)}; the size prediction decided. " +
+            "At that rate the re-encode is predicted at ${mb(predictedBytes)} against the ${mb(sourceBytes)} original " +
+            "(encoder overshoot ×${"%.2f".format(Locale.US, overshoot)}, $origin), so it would not be smaller. " +
+            "The quality was measured; the size was predicted."
     }
 
     /** The basis sentence alone, for records and tests. */
@@ -39,8 +65,12 @@ object KeepOriginalMessages {
         evidencePreferred: Boolean,
         probedRatios: List<Double>,
         probeDetail: String?,
-        pixelCertifiableBlockReason: String?
+        pixelCertifiableBlockReason: String?,
+        sizeGateBasis: String? = null
     ): String = when {
+        // A measured pass that the size prediction overruled. Checked first: whatever inference
+        // or class history proposed, this is what decided.
+        sizeGateBasis != null -> sizeGateBasis
         evidencePreferred ->
             "Basis: earlier measured failures for this device and content class (learned), not a measurement of this file."
         probedRatios.isEmpty() && pixelCertifiableBlockReason != null ->
@@ -70,6 +100,8 @@ object KeepOriginalMessages {
         CertificationStatus.SKIPPED_GEOMETRY_ABOVE_CAP -> "its resolution is above the 4K scoring limit"
         else -> blockReason
     }
+
+    private fun mb(bytes: Long) = String.format(Locale.US, "%,.1f MB", bytes / 1e6)
 
     private fun shorten(detail: String): String {
         val cut = detail.indexOf(" — ")

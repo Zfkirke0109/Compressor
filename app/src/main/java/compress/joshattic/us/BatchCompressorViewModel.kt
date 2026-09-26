@@ -39,6 +39,7 @@ import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.VideoEncoderSettings
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -56,6 +57,7 @@ import compress.joshattic.us.quality.PerceptualQualityProber
 import compress.joshattic.us.quality.QualityProbePolicy
 import compress.joshattic.us.quality.ExhaustivePerceptualLosslessPolicy
 import compress.joshattic.us.quality.KeyframeIntervalPolicy
+import compress.joshattic.us.quality.MeasuredOvershoot
 import compress.joshattic.us.quality.ProbeEncodeShape
 import compress.joshattic.us.quality.WindowScore
 import compress.joshattic.us.quality.VmafNative
@@ -154,6 +156,8 @@ data class BatchCompressorUiState(
     val items: List<BatchVideoItem> = emptyList(),
     val isLoading: Boolean = false,
     val isCompressing: Boolean = false,
+    // A scorer self-check is running (runScorerSelfCheck). One at a time; a batch start cancels it.
+    val isSelfChecking: Boolean = false,
     val qualityPreset: String = BatchQualityPreset.ORIGINAL.label,
     val frameRateOption: String = BatchFrameRateOption.ORIGINAL.label,
     val codecOption: String = BatchCodecOption.AUTO.label,
@@ -218,6 +222,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     val uiState = _uiState.asStateFlow()
 
     private var compressionJob: Job? = null
+    private var selfCheckJob: Job? = null
 
     /**
      * Keeps a failed batch from killing the process.
@@ -327,7 +332,15 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val probeWindowScores: String? = null,
         // Per-window frame-pairing diagnostics of the same rung (counts + decode-order pts skew):
         // distinguishes "windows measured real quality" from "windows scored misaligned frames".
-        val probePairDiag: String? = null
+        val probePairDiag: String? = null,
+        // Set when a rung PASSED its windows but the output at that rung is predicted to be no
+        // smaller than the source, so the size prediction, not a quality measurement, kept the
+        // original. The basis sentence (KeepOriginalMessages) must say exactly that.
+        val sizeGateBasis: String? = null,
+        // Set when the probe exports stopped because Media3 cannot parse the input they read
+        // (SourceParseFailure): the full encode would stop the same way, so it is not started on
+        // that input.
+        val sourceParseFailure: SourceParseFailure? = null
     )
 
     private data class EncodeAttemptResult(
@@ -678,25 +691,34 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val context = callerContext.applicationContext
         val current = _uiState.value
         if (current.isCompressing || compressionJob?.isCompleted == false) return
+        // One at a time: b167 ran two overlapping self-checks and lost the second one's results
+        // (see DiagLog). The button is disabled while one runs; this guards a double tap.
+        if (selfCheckJob?.isActive == true) return
         val item = current.items.firstOrNull { !it.isAlreadyCompressed } ?: run {
             _uiState.update { it.copy(statusMessage = "Select a video first, then run the scorer self-check.") }
             return
         }
-        viewModelScope.launch(Dispatchers.Main) {
-            _uiState.update { it.copy(statusMessage = "Scorer self-check running on ${item.originalName}…") }
+        selfCheckJob = viewModelScope.launch(Dispatchers.Main) {
+            _uiState.update { it.copy(isSelfChecking = true, statusMessage = "Scorer self-check running on ${item.originalName}…") }
             val stamp = System.currentTimeMillis()
-            DiagLog.attach(context, "selfcheck_$stamp")
-            val report = try {
-                val mime = runCatching { chooseOutputMime(BatchCodecOption.AUTO, item, BatchQualityPreset.ORIGINAL) }
-                    .getOrDefault(MimeTypes.VIDEO_H265)
-                DiagLog.i("CompressorProbe", "self-check start; job=${diagnosticJobId(item)}; source=${item.originalWidth}x${item.originalHeight}@${item.originalFps}; mime=${item.sourceVideoMime}")
-                qualityProber.selfCheck(item.sourceUri, item.durationMs, item.toSourceInfo().videoBitrate, mime)
-            } catch (e: Exception) {
-                "self-check failed: ${e.message ?: e.javaClass.simpleName}"
+            val log = DiagLog.attach(context, "selfcheck_$stamp")
+            try {
+                val report = try {
+                    val mime = runCatching { chooseOutputMime(BatchCodecOption.AUTO, item, BatchQualityPreset.ORIGINAL) }
+                        .getOrDefault(MimeTypes.VIDEO_H265)
+                    DiagLog.i("CompressorProbe", "self-check start; job=${diagnosticJobId(item)}; source=${item.originalWidth}x${item.originalHeight}@${item.originalFps}; mime=${item.sourceVideoMime}")
+                    qualityProber.selfCheck(item.sourceUri, item.durationMs, item.toSourceInfo().videoBitrate, mime)
+                } catch (e: CancellationException) {
+                    DiagLog.i("CompressorProbe", "self-check cancelled; a batch is starting")
+                    throw e
+                } catch (e: Exception) {
+                    "self-check failed: ${e.message ?: e.javaClass.simpleName}"
+                }
+                _uiState.update { it.copy(statusMessage = "Scorer self-check (${item.originalName}):\n$report") }
             } finally {
-                DiagLog.detach()
+                DiagLog.detach(log)
+                _uiState.update { it.copy(isSelfChecking = false) }
             }
-            _uiState.update { it.copy(statusMessage = "Scorer self-check (${item.originalName}):\n$report") }
         }
     }
 
@@ -714,6 +736,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         }
 
         compressionJob = viewModelScope.launch(Dispatchers.Main + compressionExceptionHandler) {
+            // A running self-check would share the encoder, the scorer and the decision log with
+            // the batch. The batch wins: the self-check stops first, at its next suspension point.
+            selfCheckJob?.takeIf { it.isActive }?.cancelAndJoin()
             runBatch(context)
         }
     }
@@ -802,6 +827,20 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // (KeyframeIntervalPolicy). Set in planItem for every item that may be encoded.
         var iFrameIntervalSeconds: Float = KeyframeIntervalPolicy.WHEN_UNKNOWN_SECONDS
 
+        // The platform-normalised copy Media3 reads instead of the source after a
+        // SourceParseFailure (Media3InputNormalizer); null while Media3 reads the source itself.
+        // Only the Transformer's input: every verdict is still taken against the original.
+        var media3Input: File? = null
+        var media3InputAttempted = false
+        // What happened on that path, for the job record ("media3Input").
+        var diagnosticMedia3Input: String? = null
+        val transformerInputUri: Uri get() = media3Input?.let { Uri.fromFile(it) } ?: item.sourceUri
+
+        fun releaseMedia3Input() {
+            media3Input?.let { runCatching { it.delete() } }
+            media3Input = null
+        }
+
         // Output stage.
         var encodeAttempt: EncodeAttemptResult? = null
         var remuxResult: Mp4MetadataRemuxResult? = null
@@ -854,7 +893,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // records survive every capture because they are written to filesDir, while the
         // human-readable "why" lines lived only in a device-wide ring buffer that has now
         // been evicted out from under three consecutive rounds of evidence.
-        DiagLog.attach(context, "batch_$batchStartedAt")
+        val decisionLog = DiagLog.attach(context, "batch_$batchStartedAt")
         val diagnostics = DiagnosticsRecorder.start(
             context = context,
             batchId = "batch_$batchStartedAt",
@@ -925,7 +964,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // throw in the rest of this block cannot leak them. Idempotent — safe even if begin()
             // never fired (e.g. a pre-try setup failure).
             batchGuard.end()
-            DiagLog.detach()
+            DiagLog.detach(decisionLog)
             if (runCancelled) publishBatchCancelled(run)
             // Emit the honest session terminal record: cancelled batches get session_cancelled,
             // a completed run gets session_summary. A hard-failure path is reported below.
@@ -1110,6 +1149,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         } catch (e: Exception) {
             s.deleteCandidatesUnlessAccepted()
             handleItemFailure(s, e)
+        } finally {
+            s.releaseMedia3Input()
         }
         return s.cooldownForNextItemMs
     }
@@ -1144,7 +1185,22 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 updateItem(s.index) {
                     it.copy(message = "Probing quality: sampling windows with on-device VMAF…")
                 }
-                refinePlanWithPixelProbes(item, resolvedMime, basePlan, run.exhaustivePerceptualLossless, s.iFrameIntervalSeconds)
+                val probed = refinePlanWithPixelProbes(
+                    item, resolvedMime, basePlan, run.exhaustivePerceptualLossless, s.iFrameIntervalSeconds, s.transformerInputUri
+                )
+                val parseFailure = probed.sourceParseFailure
+                // Media3 cannot read this file. Measure again on a copy it may be able to read;
+                // the windows and the reference stay on the original (Media3InputNormalizer).
+                if (parseFailure != null && normaliseMedia3Input(s, parseFailure)) {
+                    updateItem(s.index) {
+                        it.copy(message = "Probing quality on the rewritten copy: sampling windows with on-device VMAF…")
+                    }
+                    refinePlanWithPixelProbes(
+                        item, resolvedMime, basePlan, run.exhaustivePerceptualLossless, s.iFrameIntervalSeconds, s.transformerInputUri
+                    )
+                } else {
+                    probed
+                }
             } else {
                 basePlan
             }
@@ -1381,8 +1437,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 evidencePreferred = plan.remuxWasEvidencePreferred,
                 probedRatios = plan.probedRatios,
                 probeDetail = plan.probeDetail,
-                pixelCertifiableBlockReason = plan.pixelCertifiableBlockReason
+                pixelCertifiableBlockReason = plan.pixelCertifiableBlockReason,
+                sizeGateBasis = plan.sizeGateBasis
             ),
+            media3Input = s.diagnosticMedia3Input,
             wasStreamCopy = false,
             verification = null,
             retainedValidation = retention,
@@ -1435,7 +1493,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         evidencePreferred = plan.remuxWasEvidencePreferred,
                         probedRatios = plan.probedRatios,
                         probeDetail = plan.probeDetail,
-                        pixelCertifiableBlockReason = plan.pixelCertifiableBlockReason
+                        pixelCertifiableBlockReason = plan.pixelCertifiableBlockReason,
+                        sizeGateBasis = plan.sizeGateBasis
                     )
                 }
             )
@@ -1460,18 +1519,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 ?: throw IllegalStateException("Encoder selection failed before export planning. Use Remux Only or choose a different codec.")
             try {
                 s.candidateFiles += item.cacheOutputFile(context, run.quality)
-                val attempt = compressOne(
-                    context,
-                    item,
-                    s.index,
-                    run.quality,
-                    run.frameRate,
-                    safeResolvedMime,
-                    s.perceptualPlan?.targetRatio,
-                    s.perceptualPlan?.useCbrCeiling == true,
-                    s.perceptualPlan?.pixelProvenRatio,
-                    iFrameIntervalSeconds = s.iFrameIntervalSeconds
-                )
+                val attempt = encodeReadingSource(s, safeResolvedMime)
                 s.encodeAttempt = attempt
                 withContext(Dispatchers.IO) {
                     val remuxContext = currentCoroutineContext()
@@ -1483,58 +1531,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     )
                 }
             } catch (e: ExportException) {
-                s.diagnosticEncoderFailed = true
-                // A rejected encoder configuration or export failure must never strand a
-                // Perceptually Lossless item as "Failed": the honest production answer is the
-                // untouched original (or, when that cannot be reused, the verified stream copy).
-                val perceptualPlan = s.perceptualPlan ?: throw e
-                val reason = "encoder export failed (${e.errorCodeName})"
-                s.diagnosticFallbackReason = reason
-                DiagLog.w(
-                    "CompressorBatch",
-                    "Perceptually lossless encode failed before verification for ${diagnosticJobId(item)}: $reason; falling back to remux"
-                )
-                if (e.errorCode == ExportException.ERROR_CODE_MUXING_TIMEOUT) {
-                    // The two 30-minute sources in b161/b163 timed out here with nothing in the
-                    // record to explain it. The keyframe structure is the first thing to know.
-                    qualityProber.describeKeyframes(item.sourceUri)?.let {
-                        DiagLog.w("CompressorBatch", "muxing timeout; job=${diagnosticJobId(item)}; source $it")
-                    }
-                }
-                // An encoder or muxer failure says nothing about the ratio (see
-                // LearningEvidencePolicy.Kind.PIPELINE), so it teaches nothing.
-                DiagLog.i(
-                    "CompressorLearning",
-                    "result=pipeline_failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
-                        "reason=$reason; learned state unchanged"
-                )
-                if (retainOriginalInsteadOfCopy(
-                        context = context,
-                        diagnostics = run.diagnostics,
-                        item = item,
-                        index = s.index,
-                        quality = run.quality,
-                        privacyMode = run.privacyMode,
-                        plan = perceptualPlan,
-                        resolvedMime = s.diagnosticResolvedMime,
-                        plannedTargetVideoBitrate = s.diagnosticTargetVideoBitrate,
-                        plannedDecisionReason = s.diagnosticDecisionReason,
-                        evidence = DiscardedAttemptEvidence(fallbackReason = reason, encoderFailed = true),
-                        itemStartedAt = s.itemStartedAt,
-                        thermalStart = s.thermalWindow,
-                        precedingCooldownMs = s.precedingHandoffCooldownMs
-                    )
-                ) {
-                    s.candidateFiles.forEach { runCatching { it.delete() } }
-                    // The encoder failed without producing an output (encodeAttempt is null), so
-                    // no cooldown is owed. That matches the stream-copy path this replaces.
-                    return false
-                }
-                s.effectiveQuality = BatchQualityPreset.REMUX_ONLY
-                s.diagnosticEffectiveQuality = s.effectiveQuality
-                s.preEncodeRemuxNote = "Remux Fallback Kept: the encoder rejected the perceptually lossless attempt ($reason)"
-                s.candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
-                remuxOnlyOne(context, item, s.index, run.privacyMode)
+                fallBackAfterEncodeFailure(
+                    s, e, "encoder export failed (${e.errorCodeName})",
+                    muxingTimeout = e.errorCode == ExportException.ERROR_CODE_MUXING_TIMEOUT
+                ) ?: return false
+            } catch (e: SourceParseException) {
+                fallBackAfterEncodeFailure(
+                    s, e,
+                    "encoder could not read the source (${e.failure.describe()})" +
+                        (s.diagnosticMedia3Input?.let { "; $it" } ?: ""),
+                    muxingTimeout = false
+                ) ?: return false
             }
         }
         s.remuxResult = remuxResult
@@ -1542,6 +1549,177 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         s.outputUri = Uri.fromFile(remuxResult.outputFile)
         s.outputSize = remuxResult.outputFile.length()
         return true
+    }
+
+    /**
+     * The full encode. Media3 reads the source, or the normalised copy the probes already moved to.
+     * After a SourceParseFailure it reads once more from a platform-normalised copy
+     * (Media3InputNormalizer) when one can be made. The copy is deleted as soon as the encode ends:
+     * verification, certification and the metadata remux only use the original and the output.
+     */
+    private suspend fun encodeReadingSource(s: ItemRun, mime: String): EncodeAttemptResult {
+        // The probes already found that Media3 cannot read its input (and planItem has already
+        // tried the copy, if one could be made): starting the encode would only wait it out.
+        s.perceptualPlan?.sourceParseFailure?.let { throw SourceParseException(it) }
+        val run = s.run
+        val plan = s.perceptualPlan
+        suspend fun encode() = compressOne(
+            run.context,
+            s.item,
+            s.index,
+            run.quality,
+            run.frameRate,
+            mime,
+            plan?.targetRatio,
+            plan?.useCbrCeiling == true,
+            plan?.pixelProvenRatio,
+            iFrameIntervalSeconds = s.iFrameIntervalSeconds,
+            transformerInputUri = s.transformerInputUri
+        )
+        return try {
+            try {
+                encode()
+            } catch (e: SourceParseException) {
+                if (s.media3Input != null) {
+                    s.diagnosticMedia3Input = "platform-normalised copy also unreadable by Media3 (${e.failure.describe()})"
+                    throw e
+                }
+                if (!normaliseMedia3Input(s, e.failure)) throw e
+                updateItem(s.index) { it.copy(message = "Encoding from the rewritten copy…") }
+                try {
+                    encode()
+                } catch (again: SourceParseException) {
+                    s.diagnosticMedia3Input = "platform-normalised copy also unreadable by Media3 (${again.failure.describe()})"
+                    throw again
+                }
+            }
+        } finally {
+            s.releaseMedia3Input()
+        }
+    }
+
+    /**
+     * After Media3 could not parse what it read for [s]: write the platform-normalised copy it
+     * will read instead (Media3InputNormalizer). False, with the reason recorded, when no copy can
+     * be made. At most one attempt per item.
+     */
+    private suspend fun normaliseMedia3Input(s: ItemRun, failure: SourceParseFailure): Boolean {
+        if (s.media3InputAttempted) return s.media3Input != null
+        s.media3InputAttempted = true
+        val item = s.item
+        val context = s.run.context
+        val job = diagnosticJobId(item)
+        if (failure.inputPosition >= 0L) {
+            withContext(Dispatchers.IO) { SourceBytes.hexAround(context, item.sourceUri, failure.inputPosition) }
+                ?.let { DiagLog.w("CompressorBatch", "source parse failure; job=$job; ${failure.describe()}; $it") }
+        }
+        val decline = Media3InputNormalizer.declineReason(
+            isHdr = item.toSourceInfo().isHdr,
+            sourceBytes = item.originalSize,
+            usableBytes = runCatching { context.cacheDir.usableSpace }.getOrDefault(0L)
+        )
+        if (decline != null) {
+            s.diagnosticMedia3Input = "not normalised: $decline"
+            DiagLog.w("CompressorBatch", "media3 input; job=$job; ${failure.describe()}; ${s.diagnosticMedia3Input}")
+            return false
+        }
+        updateItem(s.index) { it.copy(message = "The encoder cannot read this file as stored; rewriting its container (no re-encode)…") }
+        val target = File(context.cacheDir, "media3input_${System.nanoTime()}.mp4")
+        val result = withContext(Dispatchers.IO) {
+            val ioContext = currentCoroutineContext()
+            Media3InputNormalizer.normalise(
+                context,
+                item.sourceUri,
+                target,
+                item.metadataSnapshot.rotationDegrees,
+                cancellationCheck = { ioContext.ensureActive() }
+            )
+        }
+        return when (result) {
+            is Media3InputNormalizer.Result.Normalised -> {
+                s.media3Input = result.file
+                s.diagnosticMedia3Input = "platform-normalised copy; ${result.compact()}"
+                DiagLog.i("CompressorBatch", "media3 input; job=$job; after ${failure.describe()}; ${s.diagnosticMedia3Input}")
+                true
+            }
+            is Media3InputNormalizer.Result.Declined -> {
+                s.diagnosticMedia3Input = "normalisation failed: ${result.reason}"
+                DiagLog.w("CompressorBatch", "media3 input; job=$job; after ${failure.describe()}; ${s.diagnosticMedia3Input}")
+                false
+            }
+        }
+    }
+
+    /**
+     * An encode that failed before verification. For a Perceptually Lossless item, the honest
+     * answer is the untouched original (or, when that cannot be reused, the verified stream copy);
+     * null means the original was retained and the item is finished. Other modes rethrow into the
+     * item failure path, with [reason] recorded.
+     */
+    private suspend fun fallBackAfterEncodeFailure(
+        s: ItemRun,
+        e: Exception,
+        reason: String,
+        muxingTimeout: Boolean
+    ): Mp4MetadataRemuxResult? {
+        val run = s.run
+        val item = s.item
+        val context = run.context
+        s.diagnosticEncoderFailed = true
+        s.diagnosticFallbackReason = reason
+        // A rejected encoder configuration or export failure must never strand a
+        // Perceptually Lossless item as "Failed": the honest production answer is the
+        // untouched original (or, when that cannot be reused, the verified stream copy).
+        val perceptualPlan = s.perceptualPlan ?: throw e
+        DiagLog.w(
+            "CompressorBatch",
+            "Perceptually lossless encode failed before verification for ${diagnosticJobId(item)}: $reason; falling back to remux"
+        )
+        if (muxingTimeout) {
+            // The two 30-minute sources in b161/b163 timed out here with nothing in the
+            // record to explain it. The keyframe structure is the first thing to know.
+            qualityProber.describeKeyframes(item.sourceUri)?.let {
+                DiagLog.w("CompressorBatch", "muxing timeout; job=${diagnosticJobId(item)}; source $it")
+            }
+        }
+        // An encoder or muxer failure says nothing about the ratio (see
+        // LearningEvidencePolicy.Kind.PIPELINE), so it teaches nothing.
+        DiagLog.i(
+            "CompressorLearning",
+            "result=pipeline_failure; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
+                "reason=$reason; learned state unchanged"
+        )
+        if (retainOriginalInsteadOfCopy(
+                context = context,
+                diagnostics = run.diagnostics,
+                item = item,
+                index = s.index,
+                quality = run.quality,
+                privacyMode = run.privacyMode,
+                plan = perceptualPlan,
+                resolvedMime = s.diagnosticResolvedMime,
+                plannedTargetVideoBitrate = s.diagnosticTargetVideoBitrate,
+                plannedDecisionReason = s.diagnosticDecisionReason,
+                evidence = DiscardedAttemptEvidence(
+                    fallbackReason = reason,
+                    encoderFailed = true,
+                    media3Input = s.diagnosticMedia3Input
+                ),
+                itemStartedAt = s.itemStartedAt,
+                thermalStart = s.thermalWindow,
+                precedingCooldownMs = s.precedingHandoffCooldownMs
+            )
+        ) {
+            s.candidateFiles.forEach { runCatching { it.delete() } }
+            // The encoder failed without producing an output (encodeAttempt is null), so
+            // no cooldown is owed. That matches the stream-copy path this replaces.
+            return null
+        }
+        s.effectiveQuality = BatchQualityPreset.REMUX_ONLY
+        s.diagnosticEffectiveQuality = s.effectiveQuality
+        s.preEncodeRemuxNote = "Remux Fallback Kept: the encoder rejected the perceptually lossless attempt ($reason)"
+        s.candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
+        return remuxOnlyOne(context, item, s.index, run.privacyMode)
     }
 
     /**
@@ -1796,6 +1974,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             certV1Scores = s.diagnosticCertV1Scores,
             certificationStatus = s.diagnosticCertStatus,
             encoderConfig = s.encodeAttempt?.configDelta?.compact(),
+            media3Input = s.diagnosticMedia3Input,
             precedingCooldownMs = s.precedingHandoffCooldownMs
         )
         updateItem(s.index) {
@@ -2031,6 +2210,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             certV1Scores = s.diagnosticCertV1Scores,
             certificationStatus = s.diagnosticCertStatus,
             encoderConfig = s.encodeAttempt?.configDelta?.compact(),
+            media3Input = s.diagnosticMedia3Input,
             thermalStart = metrics.thermalStart,
             thermalEnd = metrics.thermalEnd,
             precedingCooldownMs = s.precedingHandoffCooldownMs,
@@ -2202,7 +2382,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             verification = null,
             outputSize = 0L,
             terminal = terminal,
-            elapsedMs = elapsedMs
+            elapsedMs = elapsedMs,
+            fallbackReason = s.diagnosticFallbackReason,
+            media3Input = s.diagnosticMedia3Input
         )
     }
 
@@ -2266,7 +2448,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val certBandingDiag: String? = null,
         val certV1Scores: String? = null,
         val certificationStatus: String? = null,
-        val encoderConfig: String? = null
+        val encoderConfig: String? = null,
+        val media3Input: String? = null
     )
 
     /**
@@ -2389,6 +2572,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             certV1Scores = evidence.certV1Scores,
             certificationStatus = evidence.certificationStatus,
             encoderConfig = evidence.encoderConfig,
+            media3Input = evidence.media3Input,
             thermalStart = thermalStart.thermalLabel,
             thermalEnd = thermalEnd.thermalLabel,
             precedingCooldownMs = precedingCooldownMs,
@@ -2810,7 +2994,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         outputMime: String,
         plan: PerceptualLosslessPlan,
         exhaustive: Boolean,
-        iFrameIntervalSeconds: Float
+        iFrameIntervalSeconds: Float,
+        // What Media3 reads to cut the probe clips: the source, or its normalised copy.
+        transformerInputUri: Uri = item.sourceUri
     ): PerceptualLosslessPlan {
         if (!plan.probeEligible) return plan
         // HDR and codec-downgrade plans never probe; those gates are not inference.
@@ -2881,12 +3067,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             allowDownwardRefinement = !plan.shortProbeLadder,
             shape = shape,
             budgetMs = ExhaustivePerceptualLosslessPolicy.probeBudgetMs(plan.shortProbeLadder),
-            sourceFps = item.originalFps.toDouble()
+            sourceFps = item.originalFps.toDouble(),
+            transformerInputUri = transformerInputUri
         )
         DiagLog.i(
             "CompressorProbe",
             "probe result; job=${diagnosticJobId(item)}; probed=${decision.probedRatios}; " +
-                "proven=${decision.provenRatio ?: "none"}; marginal=${decision.marginal}; shape=${shape.compact()}; detail=${decision.detail}"
+                "proven=${decision.provenRatio ?: "none"}; marginal=${decision.marginal}; shape=${shape.compact()}; " +
+                "input=${if (transformerInputUri == item.sourceUri) "source" else "platform-normalised"}; detail=${decision.detail}"
         )
         val probeTrace = plan.copy(
             probedRatios = decision.probedRatios,
@@ -2896,6 +3084,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probeV1Scores = compactV1Scores(decision.windowScores),
             probeRateDiag = decision.rateDiag
         )
+        // Nothing was measured and nothing is learned from a file Media3 cannot read; planItem
+        // decides whether a normalised copy gets a second attempt.
+        decision.sourceParseFailure?.let { return probeTrace.copy(sourceParseFailure = it) }
         val proven = decision.provenRatio ?: run {
             // Measured rejection at the SAFEST candidate ratio is positive pixel evidence
             // that no allowed target can encode this clip transparently: skip the item
@@ -2917,21 +3108,49 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         learningEngine.recordProbePass(plan.profileKey)
         // A proven ratio must still clear file-size measurement noise before overturning a
         // remux decision — a NOISE threshold, not a worthiness bar: verified 1-2% savings count.
+        // The overshoot is the one this file's probe clips measured, bounded low (MeasuredOvershoot),
+        // whenever that exceeds the class's learned value: b167 job_732f7ecfb699 learned 1.003,
+        // measured 1.26, encoded at 1.235 and was discarded for size after 70 s of 4K encoding.
+        val overshoot = MeasuredOvershoot.forPrediction(plan.expectedOvershootFactor, decision.provenRateFactors)
         val predicted = BatchQualityBitratePolicy.predictedPerceptualLosslessBytes(
             source = source,
             outputMimeType = outputMime,
             learnedTargetRatio = proven,
-            expectedOvershootFactor = plan.expectedOvershootFactor,
+            expectedOvershootFactor = overshoot,
             pixelProvenRatioFloor = proven
         )
-        if (!ExhaustivePerceptualLosslessPolicy.worthEncoding(
-                sourceBytes = item.originalSize,
+        val worth = ExhaustivePerceptualLosslessPolicy.worthEncoding(
+            sourceBytes = item.originalSize,
+            predictedBytes = predicted,
+            exhaustive = exhaustive,
+            meetsNoiseThreshold = BatchQualityBitratePolicy.meetsMinimumUsefulSavings(item.originalSize, predicted)
+        )
+        DiagLog.i(
+            "CompressorProbe",
+            "size gate; job=${diagnosticJobId(item)}; proven=${"%.2f".format(java.util.Locale.US, proven)}; " +
+                "predictedBytes=$predicted; sourceBytes=${item.originalSize}; " +
+                "${MeasuredOvershoot.describe(plan.expectedOvershootFactor, decision.provenRateFactors)}; " +
+                "verdict=${if (worth) "encode" else "keep original"}"
+        )
+        if (!worth) {
+            // The ladder returns the lowest rung it may use and every rung above it is larger, so
+            // no usable ratio is both proven and smaller: keep the original. Falling back to the
+            // inference plan instead would encode at its target ratio, which may be a rung the
+            // probes just measured as failing.
+            val basis = KeepOriginalMessages.sizeGateBasis(
+                provenRatio = proven,
                 predictedBytes = predicted,
-                exhaustive = exhaustive,
-                meetsNoiseThreshold = BatchQualityBitratePolicy.meetsMinimumUsefulSavings(item.originalSize, predicted)
+                sourceBytes = item.originalSize,
+                overshoot = overshoot,
+                overshootMeasured = overshoot > plan.expectedOvershootFactor
             )
-        ) {
-            return probeTrace
+            return probeTrace.copy(
+                preferRemux = true,
+                remuxReason = KeepOriginalMessages.SIZE_GATE_REASON,
+                remuxWasSourceEfficient = true,
+                remuxWasEvidencePreferred = false,
+                sizeGateBasis = basis
+            )
         }
         // Adopt the proven ratio in BOTH directions: below the learned target it buys more
         // savings at proven quality; above it (a safer retreat rung) it converts a would-be
@@ -3005,7 +3224,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         learnedTargetRatio: Double? = null,
         useCbrCeiling: Boolean = false,
         pixelProvenRatioFloor: Double? = null,
-        iFrameIntervalSeconds: Float = KeyframeIntervalPolicy.WHEN_UNKNOWN_SECONDS
+        iFrameIntervalSeconds: Float = KeyframeIntervalPolicy.WHEN_UNKNOWN_SECONDS,
+        // What Media3 reads: the source, or its platform-normalised copy (Media3InputNormalizer).
+        transformerInputUri: Uri = item.sourceUri
     ): EncodeAttemptResult = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
             val outputFile = item.cacheOutputFile(context, quality)
@@ -3147,7 +3368,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             "export failed; job=${diagnosticJobId(item)}; code=${exportException.errorCodeName}; ${inputProbe.snapshot()}"
                         )
                         runCatching { outputFile.delete() }
-                        if (continuation.isActive) continuation.resumeWithException(exportException)
+                        // A parse error Media3 did report (during preparation) takes the same path
+                        // as one it swallows: the item may retry from a normalised copy.
+                        val parse = inputProbe.parseFailure?.takeIf { SourceParseFailure.hasParserCause(exportException) }
+                        if (continuation.isActive) {
+                            continuation.resumeWithException(parse?.let { SourceParseException(it) } ?: exportException)
+                        }
                     }
                 })
                 .build()
@@ -3157,6 +3383,38 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 progressJob?.cancel()
                 transformer.cancel()
                 runCatching { outputFile.delete() }
+            }
+            // Media3 stops loading on a parse error it will never retry and never reports during an
+            // export; without this the encode idles until the 120 s muxer watchdog
+            // (SourceParseFailure). A full-file export cannot complete once its loader has stopped,
+            // so once it stops moving it is ended and the item's fallback decides.
+            val parseWatchHandler = android.os.Handler(android.os.Looper.getMainLooper())
+            inputProbe.onFatalParse = { failure ->
+                val meter = ExportStallMeter()
+                parseWatchHandler.post(object : Runnable {
+                    override fun run() {
+                        if (!continuation.isActive) return
+                        val holder = ProgressHolder()
+                        val progress = if (transformer.getProgress(holder) == Transformer.PROGRESS_STATE_AVAILABLE) {
+                            holder.progress.toLong()
+                        } else {
+                            0L
+                        }
+                        if (!meter.stalled(outputFile.length() + progress, android.os.SystemClock.elapsedRealtime())) {
+                            parseWatchHandler.postDelayed(this, SourceParseFailure.STALL_POLL_MS)
+                            return
+                        }
+                        DiagLog.w(
+                            "CompressorBatch",
+                            "export stopped; job=${diagnosticJobId(item)}; ${failure.describe()}; no progress for " +
+                                "${SourceParseFailure.EXPORT_GRACE_MS}ms; ${inputProbe.snapshot()}"
+                        )
+                        progressJob?.cancel()
+                        transformer.cancel()
+                        runCatching { outputFile.delete() }
+                        continuation.resumeWithException(SourceParseException(failure))
+                    }
+                })
             }
 
             val effectsList = mutableListOf<Effect>()
@@ -3174,7 +3432,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 effectsList.add(FrameDropEffect.createSimpleFrameDropEffect(item.originalFps, plannedFps.toFloat()))
             }
 
-            val editedMediaItem = EditedMediaItem.Builder(MediaItem.fromUri(item.sourceUri))
+            val editedMediaItem = EditedMediaItem.Builder(MediaItem.fromUri(transformerInputUri))
                 .setEffects(Effects(emptyList(), effectsList))
                 .build()
 
@@ -3226,23 +3484,24 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             context = context,
             sourceUri = item.sourceUri,
             outputFile = outputFile,
-            snapshot = item.metadataSnapshot.filteredForPrivacy(privacyMode)
-        ) { copiedBytes, outputBytes ->
-            remuxContext.ensureActive()
-            val progress = if (item.originalSize > 0L) {
-                (copiedBytes.toFloat() / item.originalSize.toFloat()).coerceIn(0f, 0.99f)
-            } else {
-                0f
+            snapshot = item.metadataSnapshot.filteredForPrivacy(privacyMode),
+            onProgress = { copiedBytes, outputBytes ->
+                remuxContext.ensureActive()
+                val progress = if (item.originalSize > 0L) {
+                    (copiedBytes.toFloat() / item.originalSize.toFloat()).coerceIn(0f, 0.99f)
+                } else {
+                    0f
+                }
+                updateItem(index) {
+                    it.copy(
+                        progress = progress,
+                        currentOutputSize = outputBytes,
+                        targetOutputSize = estimatedOutputSize,
+                        message = "Remuxing: ${formatFileSize(outputBytes)} written • ${(progress * 100f).toInt()}% • no re-encode"
+                    )
+                }
             }
-            updateItem(index) {
-                it.copy(
-                    progress = progress,
-                    currentOutputSize = outputBytes,
-                    targetOutputSize = estimatedOutputSize,
-                    message = "Remuxing: ${formatFileSize(outputBytes)} written • ${(progress * 100f).toInt()}% • no re-encode"
-                )
-            }
-        }
+        )
     }
 
     private fun qualityFromLabel(label: String): BatchQualityPreset {
@@ -3419,6 +3678,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         certificationStatus: String? = null,
         // For a kept original: the basis sentence the user saw (KeepOriginalMessages.basis).
         decisionBasis: String? = null,
+        // What Media3 read when it could not parse the source (Media3InputNormalizer), else null.
+        media3Input: String? = null,
         encoderConfig: String? = null,
         thermalStart: String? = null,
         thermalEnd: String? = null,
@@ -3497,6 +3758,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probeV1Scores = probeV1Scores,
             probeRateDiag = probeRateDiag,
             decisionBasis = decisionBasis,
+            media3Input = media3Input,
             certificationStatus = certificationStatus,
             audioPreservation = verification?.audioBasis,
             encoderConfig = encoderConfig,
