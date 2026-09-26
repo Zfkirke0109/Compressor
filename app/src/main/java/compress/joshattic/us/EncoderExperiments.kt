@@ -34,6 +34,23 @@ object EncoderExperiments {
             .apply()
     }
 
+    private const val KEY_SAFER_RUNG_RETRY = "safer_rung_retry"
+
+    /**
+     * Opt-in: after a measured certification failure, one full-encode retry at a HIGHER ratio
+     * the probes already measured as passing (SaferRungRetry). Off by default until a device run
+     * shows what it recovers and costs.
+     */
+    fun isSaferRungRetryEnabled(context: Context): Boolean =
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_SAFER_RUNG_RETRY, false)
+
+    fun setSaferRungRetryEnabled(context: Context, enabled: Boolean) {
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_SAFER_RUNG_RETRY, enabled)
+            .apply()
+    }
+
     /** The part of an encoder config line that names the experiment, or "" when off. */
     fun describe(maxBFrames: Int): String = if (maxBFrames > 0) ";bframes=$maxBFrames" else ""
 }

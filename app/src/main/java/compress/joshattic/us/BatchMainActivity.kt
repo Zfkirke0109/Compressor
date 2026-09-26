@@ -523,6 +523,32 @@ private fun DiagnosticsExportCard(
             }
 
             HorizontalDivider()
+
+            var saferRetry by remember { mutableStateOf(EncoderExperiments.isSaferRungRetryEnabled(context)) }
+            Text("Experiment: safer-rung retry", style = MaterialTheme.typography.labelLarge)
+            Text(
+                "Off by default. When a full encode fails pixel certification on measured windows, and the " +
+                    "probes had also passed a higher (safer) ratio for the same file, encode once more at that " +
+                    "ratio. The retry must pass every check again, including the unchanged pixel bar; if it " +
+                    "fails, the original is kept. At most one retry per file. Whether it recovers anything is " +
+                    "not yet measured on this device.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = saferRetry,
+                    onCheckedChange = { on -> EncoderExperiments.setSaferRungRetryEnabled(context, on); saferRetry = on },
+                    enabled = !isCompressing
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (saferRetry) "Safer-rung retry on for the next batch" else "Safer-rung retry off",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            HorizontalDivider()
             // Which build is actually running. Checking this used to mean exporting a capture and
             // diffing a log string against the source; on 2026-09-01 a whole calibration round was
             // spent on an APK that predated the instrumentation it was meant to exercise. The
@@ -938,19 +964,17 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
             if (state.isCompressing) {
                 state.activeItem?.let { active ->
                     Text(
-                        "Active: ${active.currentOutputDisplaySize} / est ${active.targetOutputDisplaySize} • ${active.progressPercent}%",
+                        "Active: ${ItemProgressModel.describe(active)} • ${active.activeSizeLine()}",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.primary,
                         fontWeight = FontWeight.SemiBold
                     )
                 }
-                if (state.totalTargetOutputBytes > 0L) {
-                    Text(
-                        "Batch written: ${state.formattedTotalCurrentOutput} / est ${state.formattedTotalTargetOutput}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+                Text(
+                    "Finished: ${state.items.count { ItemProgressModel.isTerminal(it) }} of ${state.items.size} items",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
             if (state.totalOutputBytes > 0) {
                 Text("Outputs: ${state.formattedTotalOutput} • Saved by real compression: ${state.formattedTotalSaved}")
@@ -1085,13 +1109,25 @@ private fun BatchItemCard(
             }
 
             if (item.status == BatchItemStatus.Compressing) {
+                // The phase and its own measured fraction (ItemProgressModel), never an encoder's
+                // 100 % presented as the item's: finalizing, verification and certification follow.
                 Text(
-                    "Output: ${item.currentOutputDisplaySize} / est ${item.targetOutputDisplaySize} • ${item.progressPercent}%",
+                    ItemProgressModel.describe(item),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.primary,
                     fontWeight = FontWeight.SemiBold
                 )
-                LinearProgressIndicator(progress = { item.progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                Text(
+                    item.activeSizeLine(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                val fraction = item.phaseFraction
+                if (fraction != null) {
+                    LinearProgressIndicator(progress = { fraction.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                } else {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
             }
 
             if (item.outputSize > 0L) {
@@ -1172,13 +1208,32 @@ private fun BatchVideoItem.shortStatusLabel(): String {
     }
     return when {
         status == BatchItemStatus.Skipped || isAlreadyCompressed -> "Skipped"
-        status == BatchItemStatus.Compressing -> "${progressPercent}%"
+        status == BatchItemStatus.Compressing ->
+            phaseFraction?.takeIf { phase.hasFraction }?.let { "${phase.label} ${(it * 100f).toInt()}%" } ?: phase.label
         status == BatchItemStatus.Done -> "Done"
         status == BatchItemStatus.Replaced -> "Replaced"
         status == BatchItemStatus.SavedCopy -> "Saved"
         status == BatchItemStatus.Failed -> "Failed"
         status == BatchItemStatus.Cancelled -> "Cancelled"
         else -> "Ready"
+    }
+}
+
+/**
+ * Sizes for an active row, each named for what it is: the live file while the muxer writes (a
+ * temporary footprint that can shrink when the file is closed), the finalized candidate (not yet
+ * accepted), and the estimate, marked provisional until the probes have chosen a ratio.
+ */
+private fun BatchVideoItem.activeSizeLine(): String {
+    val estimate = if (targetOutputSize > 0L) {
+        "est ${formatCardBytes(targetOutputSize)}${if (estimateIsProvisional) " (provisional)" else ""}"
+    } else {
+        "no estimate"
+    }
+    return when {
+        candidateOutputSize > 0L -> "Candidate ${formatCardBytes(candidateOutputSize)} (not yet accepted) • $estimate"
+        currentOutputSize > 0L -> "Writing ${formatCardBytes(currentOutputSize)} (temporary) • $estimate"
+        else -> estimate
     }
 }
 
@@ -1223,9 +1278,9 @@ private fun formatCardBytes(bytes: Long): String {
     val mb = kb * 1024.0
     val gb = mb * 1024.0
     return when {
-        safe >= gb -> String.format(java.util.Locale.US, "%.2f GB", safe / gb)
-        safe >= mb -> String.format(java.util.Locale.US, "%.1f MB", safe / mb)
-        safe >= kb -> String.format(java.util.Locale.US, "%.1f KB", safe / kb)
+        safe >= gb -> String.format(java.util.Locale.US, "%.2f GiB", safe / gb)
+        safe >= mb -> String.format(java.util.Locale.US, "%.1f MiB", safe / mb)
+        safe >= kb -> String.format(java.util.Locale.US, "%.1f KiB", safe / kb)
         else -> "${bytes.coerceAtLeast(0L)} B"
     }
 }

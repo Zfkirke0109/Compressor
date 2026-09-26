@@ -67,4 +67,15 @@ class Media3InputNormalizerTest {
         assertTrue(Media3InputNormalizer.isSubstantial(1_430_000_000L, 1_432_387_113L))
         assertTrue(Media3InputNormalizer.isSubstantial(1L, 0L))
     }
+
+    @Test
+    fun aHeavilyPaddedButCompleteCopyIsStillDeclinedWhichOnlyCostsTheSaving() {
+        // Known limit (b169 review, R8): a size ratio cannot tell dropped samples from removed
+        // padding. A source with 60 % free/skip atoms whose copy is complete in time is declined
+        // too. That keeps the original (the safe side) and loses at most that file's saving; the
+        // guard stays until a padded-container device fixture shows it matters.
+        val declared = 30_000_000L
+        assertTrue(Media3InputNormalizer.isComplete(declared - 33_000L, declared))
+        assertFalse(Media3InputNormalizer.isSubstantial(400_000_000L, 1_000_000_000L))
+    }
 }

@@ -320,13 +320,15 @@ data class CompressorUiState(
     }
 }
 
+// Binary units, labelled as such: the value was always divided by 1024², and "MB" beside it made
+// 246,118,100 bytes read as 234.7 "MB" while the diagnostics said 246 MB. Locale-pinned.
 fun formatFileSize(size: Long): String {
-    if (size <= 0) return "0 MB"
-    val mb = size / (1024.0 * 1024.0)
-    if (mb >= 1000) {
-        return String.format("%.1f GB", mb / 1024)
+    if (size <= 0) return "0 MiB"
+    val mib = size / (1024.0 * 1024.0)
+    if (mib >= 1000) {
+        return String.format(java.util.Locale.US, "%.1f GiB", mib / 1024)
     }
-    return String.format("%.1f MB", mb)
+    return String.format(java.util.Locale.US, "%.1f MiB", mib)
 }
 
 @OptIn(UnstableApi::class)

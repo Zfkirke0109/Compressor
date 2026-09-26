@@ -74,7 +74,13 @@ data class ProbeDecision(
     // Set when a probe export stopped because Media3 could not parse the source (see
     // SourceParseFailure). The full encode reads the same file with the same extractor, so the
     // caller must not start it on this input.
-    val sourceParseFailure: SourceParseFailure? = null
+    val sourceParseFailure: SourceParseFailure? = null,
+    // A HIGHER rung that also passed with the selection margin, when [provenRatio] came from a
+    // successful downward refinement below it: the measured fallback the opt-in safer-rung retry
+    // may use if the proven rung's full encode fails certification (SaferRungRetry). Null otherwise;
+    // it never changes which rung is selected.
+    val saferPassingRatio: Double? = null,
+    val saferPassingRateFactors: List<Double> = emptyList()
 ) {
     /** True when the ladder ran but not one rung yielded a single scored window. */
     val nothingMeasured: Boolean get() = rungsMeasured == 0 && (rungsMisaligned + rungsUnavailable) > 0
@@ -327,7 +333,9 @@ class PerceptualQualityProber(private val context: Context) {
                         when (QualityProbePolicy.rungVerdict(refinedScores)) {
                             QualityProbePolicy.RungVerdict.PASSED -> {
                                 DiagLog.i(TAG, "refinement %.2f pixel-proven (bisection below %.2f)".format(refined, ratio))
+                                // The rung above stays on record as a measured, passing fallback.
                                 return proven(refined, refinedRung, " (refined)")
+                                    .copy(saferPassingRatio = ratio, saferPassingRateFactors = factorsOf(rung))
                             }
                             QualityProbePolicy.RungVerdict.MARGINAL -> DiagLog.i(
                                 TAG,
@@ -871,7 +879,14 @@ class PerceptualQualityProber(private val context: Context) {
      * [PairScoreOutcome.MisalignmentRejected] is measured evidence the OUTPUT's frames are
      * not temporally comparable to the source (frame loss/retiming) and must always fail.
      */
-    suspend fun certify(sourceUri: Uri, outputFile: File, durationMs: Long, sourceFps: Double = 0.0): PairScoreOutcome {
+    suspend fun certify(
+        sourceUri: Uri,
+        outputFile: File,
+        durationMs: Long,
+        sourceFps: Double = 0.0,
+        // (windows scored, windows planned), for the row's "Certifying pixels 1 of 3 windows".
+        onWindowScored: ((done: Int, total: Int) -> Unit)? = null
+    ): PairScoreOutcome {
         if (!VmafNative.isAvailable) return PairScoreOutcome.Unavailable
         val windowUs = QualityProbePolicy.windowDurationUs(sourceFps)
         if (QualityProbePolicy.probeWindows(durationMs * 1000L, windowUs).isEmpty()) return PairScoreOutcome.Unavailable
@@ -880,12 +895,14 @@ class PerceptualQualityProber(private val context: Context) {
         // source keyframe, so the reference decode does not have to run from a keyframe minutes earlier.
         val windows = planWindows(sourceUri, durationMs, windowUs).windows.map { it.scoreWindowForCertification() }
         if (windows.isEmpty()) return PairScoreOutcome.Unavailable
+        onWindowScored?.invoke(0, windows.size)
         return withContext(Dispatchers.IO) {
             // Banding telemetry is collected on certification only, never on ladder rungs: it is
             // extra native work per frame, and certification runs once per output while the ladder
             // runs up to four times. Recorded for calibration; no verdict reads it.
             VmafPairScorer.score(
-                context, sourceUri, Uri.fromFile(outputFile), windows, collectBanding = true, shadowV1 = true
+                context, sourceUri, Uri.fromFile(outputFile), windows, collectBanding = true, shadowV1 = true,
+                onWindowScored = onWindowScored
             )
         }
     }

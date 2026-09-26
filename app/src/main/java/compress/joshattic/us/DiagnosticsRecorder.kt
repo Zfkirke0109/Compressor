@@ -21,6 +21,13 @@ import java.io.File
  * even for a Secure Folder run. When the files dir IS reachable (main-profile runs) the same records
  * also land in files/diagnostics/<batchId>/ for direct inspection.
  *
+ * Schema v3 (from the b169 review): job records carry the FINAL verdict in `verdict`/`verified`/
+ * `replacementSafe` and the structural verifier's in `structuralVerdict`/`structuralVerified`/
+ * `structuralReplacementSafe` (see FinalAcceptance), plus `finalAccepted`, `candidateBytes`,
+ * `certificationDecision` and `encodePlan`; `stage` events and the learned-state snapshot/updates
+ * are new. v2 records are still read: a v2 job whose candidate was discarded may carry the
+ * structural verdict as if it were final, and the summariser flags those instead of trusting them.
+ *
  * Schema v2 envelope (on every record): schemaVersion, batchId, eventId, sequence, eventType (also
  * mirrored as `type` for v1 readers), jobId, timestampMs, androidUserId, profileKind. `sequence` is a
  * thread-safe monotonic counter per batch; `eventId` is a fresh unique token per logical event, so a
@@ -212,7 +219,19 @@ class DiagnosticsRecorder private constructor(
         materializationMode: String? = null,
         originalReuseBlockReason: String? = null,
         copyAvoidedBytes: Long? = null,
-        discardedVideoBitrate: Int? = null
+        discardedVideoBitrate: Int? = null,
+        // Schema v3: final acceptance kept apart from structural verification (FinalAcceptance).
+        finalAccepted: Boolean? = null,
+        candidateBytes: Long? = null,
+        structuralVerdict: String? = null,
+        structuralVerified: Boolean? = null,
+        structuralReplacementSafe: Boolean? = null,
+        // CertificationDecision.wire for the certification that decided the job, when one ran.
+        certificationDecision: String? = null,
+        // ResolvedEncodePlan.describe() of the encode that ran (null when none did).
+        encodePlan: String? = null,
+        // Every full-encode attempt for this job, in order (see SaferRungRetry): ratio, outcome, ms.
+        attempts: String? = null
     ) {
         val accountingEntry = BatchTerminalAccountingEntry(terminal, sourceSize, outputSize)
         outcomes += accountingEntry
@@ -275,6 +294,14 @@ class DiagnosticsRecorder private constructor(
                 "materializationMode" to materializationMode,
                 "originalReuseBlockReason" to originalReuseBlockReason,
                 "copyAvoidedBytes" to copyAvoidedBytes,
+                "finalAccepted" to finalAccepted,
+                "candidateBytes" to candidateBytes,
+                "structuralVerdict" to structuralVerdict,
+                "structuralVerified" to structuralVerified,
+                "structuralReplacementSafe" to structuralReplacementSafe,
+                "certificationDecision" to certificationDecision,
+                "encodePlan" to encodePlan,
+                "attempts" to attempts,
                 "outputSize" to outputSize,
                 "rawByteDelta" to rawByteDelta,
                 "savedBytes" to savedBytes,
@@ -283,6 +310,49 @@ class DiagnosticsRecorder private constructor(
                 "countsAsRealCompression" to terminal.countsAsRealCompression,
                 "elapsedMs" to elapsedMs
             )
+        )
+    }
+
+    /**
+     * One pipeline stage of one attempt: `plan`, `probe_rung`, `size_gate`, `encode`, `finalize`,
+     * `verify`, `certify`, `retry`, `accept`. [reasonCode] is a stable machine-readable token (see
+     * [StageEvent]); [fields] are privacy-safe values of that stage. Additive telemetry: no decision
+     * reads it.
+     */
+    fun stage(event: StageEvent) {
+        record(
+            "stage",
+            jobId = jobId(event.sourceKey),
+            fields = linkedMapOf<String, Any?>(
+                "attempt" to event.attempt,
+                "stage" to event.stage,
+                "reasonCode" to event.reasonCode,
+                "elapsedMs" to event.elapsedMs
+            ) + event.fields
+        )
+    }
+
+    /**
+     * The learned state the batch STARTS from, in full, with its hash: a replay needs the state,
+     * not only [SmartPerceptualProfileEngine.learnedStateIdentity]. Keys are technical profile
+     * buckets (device, codecs, resolution/fps/bitrate classes); they carry no file names or paths.
+     */
+    fun learnedStateSnapshot(snapshot: LearnedStateSnapshot) {
+        record(
+            "learned_state_snapshot",
+            fields = mapOf(
+                "profiles" to JSONObject(snapshot.entries as Map<*, *>),
+                "profileCount" to snapshot.entries.size,
+                "sha256" to snapshot.sha256
+            )
+        )
+    }
+
+    /** One learned-state write, in the order it happened, so the snapshot plus updates replays exactly. */
+    fun learnedStateUpdate(key: String, before: String?, after: String) {
+        record(
+            "learned_state_update",
+            fields = mapOf("profileKey" to key, "before" to before, "after" to after)
         )
     }
 
@@ -353,7 +423,7 @@ class DiagnosticsRecorder private constructor(
 
     companion object {
         const val TAG = "CompressorDiag"
-        const val SCHEMA_VERSION = 2
+        const val SCHEMA_VERSION = 3
         private const val APP_ID = "io.github.zfkirke0109.galaxycompressor"
         // Per-process random-free salt: a fixed app salt keeps hashes stable across the before/after
         // runs (so jobs correlate) while still not being a reversible identifier.

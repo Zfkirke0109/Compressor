@@ -289,6 +289,13 @@ object VmafPairScorer {
     private const val FRAME_COUNT_TOLERANCE = 2
 
     /**
+     * The verdict model is plain vmaf_v0.6.1 without the phone transform, as in the offline
+     * harness the thresholds were calibrated against (`measure_quality.py`). VmafNative.open
+     * defaults to phoneModel=true, so this must be passed explicitly; a unit test pins it.
+     */
+    const val PRODUCTION_PHONE_MODEL = false
+
+    /**
      * Geometry ceiling for pixel scoring: 4K-class (3840x2176 covers 3840x2160 and its portrait
      * transpose). Scoring runs at NATIVE resolution — never rescaled — because every threshold in
      * [QualityProbePolicy] was calibrated against the offline harness
@@ -367,7 +374,9 @@ object VmafPairScorer {
         // Also score each window with the VMAF v1 shadow model (VmafNativeV1). Certification
         // only: a second VMAF pass on every probe rung would spend the ladder's time budget, and
         // a ladder that runs out of budget cannot pass — shadow data must never cost a saving.
-        shadowV1: Boolean = false
+        shadowV1: Boolean = false,
+        // Called after each window is scored with (windows done, windows planned). Progress only.
+        onWindowScored: ((done: Int, total: Int) -> Unit)? = null
     ): PairScoreOutcome {
         if (!VmafNative.isAvailable) return PairScoreOutcome.Unavailable
         val refGeom = YuvFrameReader.displayGeometry(context, ref) ?: return PairScoreOutcome.Unavailable
@@ -386,7 +395,10 @@ object VmafPairScorer {
         val results = mutableListOf<WindowScore>()
         for (window in windows) {
             when (val outcome = scoreWindow(context, ref, dist, window, width, height, collectBanding, shadowV1)) {
-                is WindowOutcome.Scored -> results += outcome.score
+                is WindowOutcome.Scored -> {
+                    results += outcome.score
+                    runCatching { onWindowScored?.invoke(results.size, windows.size) }
+                }
                 WindowOutcome.Unavailable -> return PairScoreOutcome.Unavailable
                 is WindowOutcome.Misaligned -> return PairScoreOutcome.MisalignmentRejected(outcome.reason)
             }
@@ -414,7 +426,7 @@ object VmafPairScorer {
         // calibrated against the PC harness's default-model scores, and mixing models would
         // silently loosen the bar (the phone transform maps scores upward).
         val handle = VmafNative.open(
-            width, height, phoneModel = false, threads = SCORER_THREADS, collectBanding = collectBanding
+            width, height, phoneModel = PRODUCTION_PHONE_MODEL, threads = SCORER_THREADS, collectBanding = collectBanding
         )
         if (handle == 0L) return WindowOutcome.Unavailable
         // Shadow v1 session over the SAME frame pairs. Zero when unavailable; every failure on
