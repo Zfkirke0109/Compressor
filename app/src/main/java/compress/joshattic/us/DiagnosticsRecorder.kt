@@ -48,6 +48,19 @@ class DiagnosticsRecorder private constructor(
 ) {
     private val outcomes = mutableListOf<BatchTerminalAccountingEntry>()
     private val sequence = AtomicInteger(0)
+    // Content fingerprints of every job recorded, for the session's source manifest (b177 F4).
+    private val fingerprints = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private var snapshotSha256: String? = null
+    private val learningUpdates = AtomicInteger(0)
+
+    /**
+     * Which job and attempt the next learned-state writes belong to (b177 F4). Items run one at a
+     * time, so the pipeline sets this when an item or an attempt starts and clears it after; a
+     * write outside any item is recorded with a null job, as before.
+     */
+    data class LearningContext(val sourceKey: String, val token: Int, val attemptIndex: Int)
+
+    @Volatile var learningContext: LearningContext? = null
 
     fun jobId(sourceKey: String): String = redactedJobId(sourceKey)
 
@@ -231,7 +244,20 @@ class DiagnosticsRecorder private constructor(
         // ResolvedEncodePlan.describe() of the encode that ran (null when none did).
         encodePlan: String? = null,
         // Every full-encode attempt for this job, in order (see SaferRungRetry): ratio, outcome, ms.
-        attempts: String? = null
+        attempts: String? = null,
+        // b177 F3: the same attempts as structured objects (AttemptLedger.Entry.toMap), and how many
+        // started, which counts attempts that ended without a candidate.
+        attemptLedger: List<Map<String, Any?>>? = null,
+        attemptsStarted: Int? = null,
+        // b177 F2: the probe rung whose windows are in probeWindowScores (RungEvidence.id), and the
+        // request identity of the kept encode (EncodeConfigIdentity). A drift join needs both to match.
+        probeRungId: String? = null,
+        encodeConfigId: String? = null,
+        // b177 F5: what the resolved plan asked for the audio ("copy", "reencode", "none"); the
+        // observed result is audioPreservation.
+        audioRequested: String? = null,
+        // SourceFingerprint of the source (sampled content hash), for matching runs by content.
+        sourceFingerprint: String? = null
     ) {
         val accountingEntry = BatchTerminalAccountingEntry(terminal, sourceSize, outputSize)
         outcomes += accountingEntry
@@ -243,6 +269,7 @@ class DiagnosticsRecorder private constructor(
             0.0
         }
         val id = jobId(sourceKey)
+        sourceFingerprint?.let { fingerprints[id] = it }
         record(
             "job",
             jobId = id,
@@ -302,6 +329,12 @@ class DiagnosticsRecorder private constructor(
                 "certificationDecision" to certificationDecision,
                 "encodePlan" to encodePlan,
                 "attempts" to attempts,
+                "attemptLedger" to attemptLedger?.let { list -> JSONArray(list.map { JSONObject(it as Map<*, *>) }) },
+                "attemptsStarted" to attemptsStarted,
+                "probeRungId" to probeRungId,
+                "encodeConfigId" to encodeConfigId,
+                "audioRequested" to audioRequested,
+                "sourceFingerprint" to sourceFingerprint,
                 "outputSize" to outputSize,
                 "rawByteDelta" to rawByteDelta,
                 "savedBytes" to savedBytes,
@@ -325,6 +358,7 @@ class DiagnosticsRecorder private constructor(
             jobId = jobId(event.sourceKey),
             fields = linkedMapOf<String, Any?>(
                 "attempt" to event.attempt,
+                "attemptIndex" to event.attemptIndex,
                 "stage" to event.stage,
                 "reasonCode" to event.reasonCode,
                 "elapsedMs" to event.elapsedMs
@@ -338,6 +372,7 @@ class DiagnosticsRecorder private constructor(
      * buckets (device, codecs, resolution/fps/bitrate classes); they carry no file names or paths.
      */
     fun learnedStateSnapshot(snapshot: LearnedStateSnapshot) {
+        snapshotSha256 = snapshot.sha256
         record(
             "learned_state_snapshot",
             fields = mapOf(
@@ -350,9 +385,30 @@ class DiagnosticsRecorder private constructor(
 
     /** One learned-state write, in the order it happened, so the snapshot plus updates replays exactly. */
     fun learnedStateUpdate(key: String, before: String?, after: String) {
+        val ctx = learningContext
         record(
             "learned_state_update",
-            fields = mapOf("profileKey" to key, "before" to before, "after" to after)
+            jobId = ctx?.let { jobId(it.sourceKey) },
+            fields = mapOf(
+                "profileKey" to key, "before" to before, "after" to after,
+                // Linked to the job/attempt that caused it and to the snapshot it builds on.
+                "attempt" to ctx?.token, "attemptIndex" to ctx?.attemptIndex,
+                "updateIndex" to learningUpdates.getAndIncrement(),
+                "snapshotSha256" to snapshotSha256
+            )
+        )
+    }
+
+    /** Session-level identities: scoring libraries/models and the device's encoder inventory. */
+    fun runIdentity(scoring: Map<String, Any?>, encoders: List<EncoderInventory.Entry>) {
+        record(
+            "run_identity",
+            fields = linkedMapOf<String, Any?>(
+                "scoring" to JSONObject(scoring as Map<*, *>),
+                "encoderInventory" to JSONArray(encoders.map { it.compact() }),
+                "encoderCount" to encoders.size,
+                "sourceFingerprintBasis" to SourceFingerprint.BASIS
+            )
         )
     }
 
@@ -370,7 +426,10 @@ class DiagnosticsRecorder private constructor(
                 "realCompressionInputBytes" to summary.realCompressionInputBytes,
                 "realCompressionOutputBytes" to summary.realCompressionOutputBytes,
                 "totalBytesSaved" to summary.totalBytesSaved,
-                "totalElapsedMs" to totalElapsedMs
+                "totalElapsedMs" to totalElapsedMs,
+                "sourceManifestSha256" to SourceFingerprint.manifest(fingerprints),
+                "sourceManifestJobs" to fingerprints.size,
+                "learnedStateUpdates" to learningUpdates.get()
             )
         )
     }

@@ -13,11 +13,14 @@ import java.util.Locale
  */
 data class StageEvent(
     val sourceKey: String,
+    /** The batch-wide callback token (AttemptToken.attempt): unique, but NOT a retry number. */
     val attempt: Int,
     val stage: String,
     val reasonCode: String,
     val elapsedMs: Long? = null,
-    val fields: Map<String, Any?> = emptyMap()
+    val fields: Map<String, Any?> = emptyMap(),
+    /** Per-job attempt number (AttemptLedger, 1-based; 0 before the first encode). b177 F3. */
+    val attemptIndex: Int? = null
 ) {
     object Stage {
         const val PLAN = "plan"
@@ -46,6 +49,13 @@ data class StageEvent(
         const val CERT_INSUFFICIENT = "cert_insufficient_frames"
         const val CERT_UNAVAILABLE = "cert_unavailable"
         const val CERT_MISALIGNED = "cert_misaligned"
+        const val CERT_PARTIAL = "cert_partial_unavailable"
+        const val RUNG_MEASURED = "rung_measured"
+        const val RUNG_MISALIGNED = "rung_misaligned"
+        const val RUNG_UNAVAILABLE = "rung_unavailable"
+        const val ENCODE_STARTED = "encode_started"
+        const val ENCODE_CANCELLED = "encode_cancelled"
+        const val ATTEMPT_CLOSED = "attempt_closed"
         const val RETRY_ALLOWED = "retry_allowed"
         const val RETRY_DENIED = "retry_denied"
         const val ACCEPTED = "accepted"
@@ -53,16 +63,30 @@ data class StageEvent(
     }
 
     companion object {
-        /** Full-precision window evidence: mean/p5/min exactly as compared, frames, and window bounds. */
-        fun windowFields(prefix: String, windows: List<compress.joshattic.us.quality.WindowScore>?): Map<String, Any?> {
+        /**
+         * Full-precision window evidence: mean/p5/min exactly as compared, frames, window ids (the
+         * planned source bounds, "startUs-endUs") and, where measured, per-window timing.
+         * [windowIds] overrides the ids carried by the scores (probe rungs know their plan).
+         */
+        fun windowFields(
+            prefix: String,
+            windows: List<compress.joshattic.us.quality.WindowScore>?,
+            windowIds: List<String>? = null
+        ): Map<String, Any?> {
             if (windows.isNullOrEmpty()) return mapOf("${prefix}Windows" to 0)
-            return mapOf(
+            val ids = windowIds ?: windows.map { it.windowId ?: "unknown" }
+            val fields = linkedMapOf<String, Any?>(
                 "${prefix}Windows" to windows.size,
                 "${prefix}Mean" to windows.joinToString(";") { full(it.mean) },
                 "${prefix}P5" to windows.joinToString(";") { full(it.p5) },
                 "${prefix}Min" to windows.joinToString(";") { full(it.min) },
-                "${prefix}Frames" to windows.joinToString(";") { it.comparedFrames.toString() }
+                "${prefix}Frames" to windows.joinToString(";") { it.comparedFrames.toString() },
+                "${prefix}WindowIds" to ids.joinToString(";")
             )
+            if (windows.any { it.timing != null }) {
+                fields["${prefix}Timing"] = windows.joinToString(";") { it.timing?.compact() ?: "none" }
+            }
+            return fields
         }
 
         /** Round-trippable decimal: enough digits that parsing it gives back the same double. */

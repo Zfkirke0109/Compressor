@@ -73,7 +73,9 @@ object OutputVerifier {
         // the source's. Proof of a pass-through copy, which no bitrate label can give.
         val audioPacketsIdentical: Boolean = false,
         // How many packets that proof compared (0 when it was not made).
-        val audioPacketsCompared: Int = 0
+        val audioPacketsCompared: Int = 0,
+        // True when the packets were compared and differ: evidence of a re-encode, not a guess.
+        val audioPacketsDiffer: Boolean = false
     )
 
     fun verify(
@@ -97,7 +99,10 @@ object OutputVerifier {
         val outputMetadata = runCatching {
             VideoMetadataPreserver.capture(context, Uri.fromFile(outputFile))
         }.getOrDefault(VideoMetadataSnapshot())
-        val audioIdentity = if (BatchQualityMode.fromLabel(modeLabel) == BatchQualityMode.PERCEPTUAL_LOSSLESS &&
+        // Compared in every re-encoding mode, not only Perceptually Lossless: a lossy mode that
+        // requested an audio copy is otherwise described by its mode name instead of by what its
+        // output holds (b177 F5). A measurement only; it adds proof and removes no check.
+        val audioIdentity = if (BatchQualityMode.fromLabel(modeLabel) != BatchQualityMode.REMUX_ONLY &&
             sourceTracks.audioCodec != null && sourceTracks.audioCodec == outputTracks.audioCodec
         ) {
             AudioTrackIdentity.compare(context, source.sourceUri, outputFile)
@@ -141,7 +146,8 @@ object OutputVerifier {
                 // Only worth reading packets when a copy is possible at all: a Perceptually
                 // Lossless output whose audio codec matches the source's.
                 audioPacketsIdentical = audioIdentity?.result == AudioTrackIdentity.Result.IDENTICAL,
-                audioPacketsCompared = audioIdentity?.packets ?: 0
+                audioPacketsCompared = audioIdentity?.packets ?: 0,
+                audioPacketsDiffer = audioIdentity?.result == AudioTrackIdentity.Result.DIFFERENT
             )
         )
     }
@@ -473,7 +479,8 @@ object OutputVerifier {
                 sourceHasAudio = input.sourceTrackProbe.audioCodec != null,
                 packetsIdentical = input.audioPacketsIdentical,
                 packetsCompared = input.audioPacketsCompared,
-                inferredStreamCopy = audioLooksStreamCopied && !input.audioPacketsIdentical
+                inferredStreamCopy = audioLooksStreamCopied && !input.audioPacketsIdentical,
+                packetsDiffer = input.audioPacketsDiffer
             ),
             hdr = "${input.sourceTrackProbe.hdrLabel} -> ${input.outputTrackProbe.hdrLabel}" +
                 if (colorComparison.basis == ColorMatchBasis.MEDIA3_ASSUMED_SDR) {

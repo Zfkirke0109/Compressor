@@ -29,6 +29,8 @@ import android.os.SystemClock
 import androidx.media3.transformer.ProgressHolder
 import compress.joshattic.us.ExportStallMeter
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -80,7 +82,10 @@ data class ProbeDecision(
     // may use if the proven rung's full encode fails certification (SaferRungRetry). Null otherwise;
     // it never changes which rung is selected.
     val saferPassingRatio: Double? = null,
-    val saferPassingRateFactors: List<Double> = emptyList()
+    val saferPassingRateFactors: List<Double> = emptyList(),
+    // Every rung the ladder tried, in order, frozen as each finished (b177 F2). The proven rung's
+    // windows are [windowScores]; the safer rung's are here, under its own ratio and config id.
+    val rungs: List<RungEvidence> = emptyList()
 ) {
     /** True when the ladder ran but not one rung yielded a single scored window. */
     val nothingMeasured: Boolean get() = rungsMeasured == 0 && (rungsMisaligned + rungsUnavailable) > 0
@@ -201,7 +206,33 @@ class PerceptualQualityProber(private val context: Context) {
         val unavailableReasons = linkedMapOf<String, Int>()
         val misalignedReasons = linkedMapOf<String, Int>()
         val rateDiags = mutableListOf<String>()
+        // Every rung the ladder tried, frozen as it finished (RungEvidence, b177 F2).
+        val rungEvidence = mutableListOf<RungEvidence>()
+        val windowRefs = windows.map { WindowRef(it.startUs, it.endUs) }
+        var rungMark = System.nanoTime()
         fun countRung(ratio: Double, r: RungResult) {
+            val bitrate = targetBitrateForRatio(ratio)
+            rungEvidence += RungEvidence(
+                ratio = ratio,
+                outcome = when (r) {
+                    is RungResult.Measured -> RungEvidence.MEASURED
+                    is RungResult.Misaligned -> RungEvidence.MISALIGNED
+                    is RungResult.Unavailable -> RungEvidence.UNAVAILABLE
+                },
+                verdict = (r as? RungResult.Measured)?.let { QualityProbePolicy.rungVerdict(it.scores).name.lowercase() },
+                requestedVideoBitrate = bitrate,
+                configId = EncodeConfigIdentity.of(outputMime, shape, bitrate),
+                windows = windowRefs,
+                scores = (r as? RungResult.Measured)?.scores.orEmpty(),
+                rateFactors = (r as? RungResult.Measured)?.rateFactors.orEmpty(),
+                rateDiag = (r as? RungResult.Measured)?.rateDiag,
+                elapsedMs = (System.nanoTime() - rungMark) / 1_000_000L,
+                reason = when (r) {
+                    is RungResult.Misaligned -> r.reason
+                    is RungResult.Unavailable -> r.reason
+                    else -> null
+                }
+            )
             when (r) {
                 is RungResult.Measured -> {
                     measured++
@@ -222,7 +253,8 @@ class PerceptualQualityProber(private val context: Context) {
         fun factorsOf(r: RungResult) = (r as? RungResult.Measured)?.rateFactors.orEmpty()
         fun proven(ratio: Double, rung: RungResult, how: String) = ProbeDecision(
             ratio, probed, scoresOf(rung), "windows passed at %.2f%s".format(ratio, how),
-            false, measured, misaligned, unavailable, rateDiag = rateDiag(), provenRateFactors = factorsOf(rung)
+            false, measured, misaligned, unavailable, rateDiag = rateDiag(), provenRateFactors = factorsOf(rung),
+            rungs = rungEvidence.toList()
         )
         fun exhausted(detail: String) = ProbeDecision(
             null, probed, lastMeasuredScores,
@@ -231,7 +263,7 @@ class PerceptualQualityProber(private val context: Context) {
                     "${QualityProbePolicy.MIN_COMPARED_FRAMES_PER_WINDOW} frames, which is not a quality measurement"
             } else "",
             highestMeasuredRejected,
-            measured, misaligned, unavailable, rateDiag = rateDiag()
+            measured, misaligned, unavailable, rateDiag = rateDiag(), rungs = rungEvidence.toList()
         )
         // A rung that cleared the bar by less than the selection margin is not thrown away: if no
         // safer rung clears the margin, the highest such rung is attempted and the full-output
@@ -253,7 +285,7 @@ class PerceptualQualityProber(private val context: Context) {
                     QualityProbePolicy.PROBE_SELECTION_MARGIN_MIN
                 ),
                 false, measured, misaligned, unavailable, marginal = true, rateDiag = rateDiag(),
-                provenRateFactors = marginalFactors
+                provenRateFactors = marginalFactors, rungs = rungEvidence.toList()
             )
         }
         for (ratio in candidateRatios) {
@@ -271,6 +303,7 @@ class PerceptualQualityProber(private val context: Context) {
                 }
             }
             probed += ratio
+            rungMark = System.nanoTime()
             val rung = probeOneRatio(
                 sourceUri, transformerInputUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows, shape, sourceFps
             )
@@ -324,6 +357,7 @@ class PerceptualQualityProber(private val context: Context) {
                     }
                     if (refined != null && !overBudget()) {
                         probed += refined
+                        rungMark = System.nanoTime()
                         val refinedRung = probeOneRatio(
                             sourceUri, transformerInputUri, outputMime, refined, targetBitrateForRatio(refined), audioBitrate,
                             windows, shape, sourceFps
@@ -394,6 +428,7 @@ class PerceptualQualityProber(private val context: Context) {
             }
             if (upward != null && upward !in probed) {
                 probed += upward
+                rungMark = System.nanoTime()
                 val upRung = probeOneRatio(
                     sourceUri, transformerInputUri, outputMime, upward, targetBitrateForRatio(upward), audioBitrate,
                     windows, shape, sourceFps
@@ -481,9 +516,11 @@ class PerceptualQualityProber(private val context: Context) {
                         )
                     )
                 }
+                val scoringJob = currentCoroutineContext()[Job]
                 val outcome = withContext(Dispatchers.IO) {
                     VmafPairScorer.score(
                         context,
+                        cancelled = { scoringJob?.isActive == false },
                         ref = sourceUri,
                         dist = Uri.fromFile(probeFile),
                         // The clip starts at the planned keyframe (its first frame, written at
@@ -506,6 +543,14 @@ class PerceptualQualityProber(private val context: Context) {
                         return RungResult.Misaligned(why)
                     }
                     PairScoreOutcome.Unavailable -> return RungResult.Unavailable("scorer produced no evidence")
+                    // One window per call, so this cannot occur today; if it ever does, a measured
+                    // failure in it still rejects the rung and anything else is not evidence.
+                    is PairScoreOutcome.Incomplete ->
+                        if (CertificationDecision.of(outcome) == CertificationDecision.MEASURED_FAILURE) {
+                            outcome.scored
+                        } else {
+                            return RungResult.Unavailable("scorer produced partial evidence")
+                        }
                 }
                 collected += scores
                 // Early exit: one failing window already rejects this ratio.
@@ -822,6 +867,9 @@ class PerceptualQualityProber(private val context: Context) {
                     }
                 }
                 is PairScoreOutcome.MisalignmentRejected -> "misaligned: ${outcome.reason}"
+                is PairScoreOutcome.Incomplete ->
+                    "partial: ${outcome.scored.size} of ${outcome.plannedWindows} windows scored; " +
+                        outcome.scored.joinToString("; ") { w -> "%.2f/%.2f/%.2f".format(java.util.Locale.US, w.mean, w.p5, w.min) }
                 PairScoreOutcome.Unavailable -> "unavailable"
             }
             lines += "$label: $text"
@@ -884,6 +932,10 @@ class PerceptualQualityProber(private val context: Context) {
         outputFile: File,
         durationMs: Long,
         sourceFps: Double = 0.0,
+        // Also score each window with the VMAF v1 shadow model. Off unless the caller's opt-in,
+        // budgeted calibration mode allows it (ShadowCalibration, b177 WP2): v1 is telemetry,
+        // never the verdict, and unconditionally it added 748 s to b177 PL-B.
+        shadowV1: Boolean = false,
         // (windows scored, windows planned), for the row's "Certifying pixels 1 of 3 windows".
         onWindowScored: ((done: Int, total: Int) -> Unit)? = null
     ): PairScoreOutcome {
@@ -896,13 +948,15 @@ class PerceptualQualityProber(private val context: Context) {
         val windows = planWindows(sourceUri, durationMs, windowUs).windows.map { it.scoreWindowForCertification() }
         if (windows.isEmpty()) return PairScoreOutcome.Unavailable
         onWindowScored?.invoke(0, windows.size)
+        val scoringJob = currentCoroutineContext()[Job]
         return withContext(Dispatchers.IO) {
             // Banding telemetry is collected on certification only, never on ladder rungs: it is
             // extra native work per frame, and certification runs once per output while the ladder
             // runs up to four times. Recorded for calibration; no verdict reads it.
             VmafPairScorer.score(
-                context, sourceUri, Uri.fromFile(outputFile), windows, collectBanding = true, shadowV1 = true,
-                onWindowScored = onWindowScored
+                context, sourceUri, Uri.fromFile(outputFile), windows, collectBanding = true, shadowV1 = shadowV1,
+                onWindowScored = onWindowScored,
+                cancelled = { scoringJob?.isActive == false }
             )
         }
     }

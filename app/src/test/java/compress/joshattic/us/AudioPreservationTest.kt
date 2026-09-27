@@ -33,7 +33,32 @@ class AudioPreservationTest {
     @Test
     fun noAudioAndLossyModesAreNamedPlainly() {
         assertEquals(AudioPreservation.NO_AUDIO, AudioPreservation.describe(BatchQualityMode.PERCEPTUAL_LOSSLESS, false, false, 0, false))
-        assertEquals("re-encoded (lossy mode)", AudioPreservation.describe(BatchQualityMode.HIGH_QUALITY, true, false, 0, false))
+    }
+
+    @Test
+    fun lossyModesAreDescribedByWhatTheOutputShowsNotByTheModeName() {
+        // b177 F5: both HDR High Quality jobs requested audio=copy and were recorded as re-encoded.
+        assertEquals(
+            AudioPreservation.bitIdentical(6_000),
+            AudioPreservation.describe(BatchQualityMode.HIGH_QUALITY, true, packetsIdentical = true, packetsCompared = 6_000, inferredStreamCopy = false)
+        )
+        assertEquals(AudioPreservation.INFERRED_COPY, AudioPreservation.describe(BatchQualityMode.HIGH_QUALITY, true, false, 0, inferredStreamCopy = true))
+        assertEquals(
+            AudioPreservation.LOSSY_PACKETS_DIFFER,
+            AudioPreservation.describe(BatchQualityMode.STORAGE_SAVER, true, false, 0, false, packetsDiffer = true)
+        )
+        // Nothing shown either way: not called a copy, and not asserted to be a re-encode.
+        val unknown = AudioPreservation.describe(BatchQualityMode.HIGH_QUALITY, true, false, 0, false)
+        assertEquals(AudioPreservation.LOSSY_NOT_SHOWN_AS_COPY, unknown)
+        assertTrue(!unknown!!.startsWith("re-encoded"))
+    }
+
+    @Test
+    fun theRequestIsRecordedSeparately() {
+        assertEquals("copy", AudioPreservation.requested(ResolvedEncodePlan.AudioPlan.Copy(256_000)))
+        assertEquals("reencode", AudioPreservation.requested(ResolvedEncodePlan.AudioPlan.Reencode(256_000)))
+        assertEquals("none", AudioPreservation.requested(ResolvedEncodePlan.AudioPlan.None))
+        assertEquals(null, AudioPreservation.requested(null))
     }
 
     @Test

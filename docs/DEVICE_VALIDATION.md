@@ -1,4 +1,4 @@
-# Device validation for the b169 review round
+# Device validation (b169 and b177 review rounds)
 
 What JVM tests and the observational replay cannot establish, and how to establish it on the
 S23 Ultra. Nothing here uploads a source video: files are matched locally by name hash, pushed
@@ -78,3 +78,30 @@ compare the 23 winners' `savedBytes` against b169 per job (`compare_sessions.py`
   0.90 is safe for its class. A retry that fails is also evidence, recorded per attempt.
 - Nothing in these runs validates HDR, perceptual equivalence (see PERCEPTUALLY_LOSSLESS.md §4.3),
   or VMAF v1 as a gate.
+
+## 5. b177 round
+
+What changed off-device, and its evidence, is in `docs/B177_REVIEW_RESPONSE.md`. What only the
+phone can show now:
+
+1. **`ProductionEvidenceDeviceTest`** (run by `run-device-checks.sh` with the same clip):
+   - certification windows on `zero_track_duration.mp4` and `fragmented_no_duration.mp4`
+     (synthetic, in the test APK's assets; made by `scripts/device/make_missing_duration_fixture.py`)
+     are spread through the clip, not collapsed on 0. The run log prints what the platform reported
+     for each file's duration (`b177-fixture …`);
+   - a real Perceptually Lossless batch through `BatchCompressorViewModel` writes `run_identity`, a
+     64-hex `sourceFingerprint`, an `attemptLedger` whose length equals `attemptsStarted` with no
+     attempt left open, `audioRequested`, `encode`/`verify` (and, when probed, `probe_rung`) stage
+     events with `attemptIndex`, learned-state updates that name their job, and leaves the source's
+     SHA-256 unchanged with replace-original off.
+2. **The pilot**: `python3 research/encoder_experiments/run_experiment.py plan
+   research/encoder_experiments/pilot_manifest.json`. Arms in order A0, A1, A2, A0; export
+   Everything after each; `ingest` and `table`.
+3. **Timing**: a Perfetto trace with CPU frequency, idle states and scheduling, plus a screen
+   recording, on `job_458aa0663c3e` in the first A0. New builds log `timing[...]` per window
+   (queue waits, v0, flush, CAMBI, v1, decoder and process CPU).
+4. **Encoder inventory**: the `run_identity` record lists every video encoder's advertised
+   bitrate modes and complexity and quality ranges. CQ and complexity arms stay blocked until it
+   shows support and a CQ quality search exists.
+5. Settings to confirm before each arm (Settings, Experiments): safer-rung retry, B-frames, longer
+   keyframe interval, VMAF v1 shadow calibration. The `run_identity` record repeats them.

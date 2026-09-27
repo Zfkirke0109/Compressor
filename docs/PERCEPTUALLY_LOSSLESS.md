@@ -143,7 +143,12 @@ make more files pass.** They may be moved only with the evidence Section 4 produ
 
 ### 2.2 The shadow score
 
-Every certification window is also scored with **VMAF v1** (`vmaf_v1.0.16_5d0h`, libvmaf 3.2.0,
+**Since b177 the shadow is opt-in** (Settings → Experiment: VMAF v1 shadow calibration, off by
+default) and budgeted (`ShadowCalibration`): at most 24 certification windows per batch, never
+above 1080p class. Unconditionally, in b177 PL-B, it logged 748,120 ms over 74 windows (399,072 ms
+on one 25 s 4K clip) without affecting a decision. Turning it off changes no acceptance: the gate
+never reads it (`ShadowCalibrationTest.v1DataNeverChangesTheVerdict`). When enabled, each
+certification window is also scored with **VMAF v1** (`vmaf_v1.0.16_5d0h`, libvmaf 3.2.0,
 10-bit input by bit replication). **Shadow only: no acceptance decision reads it, and a lower v1
 score is not, by itself, evidence that a v0-certified output fails anything.** This is the model Netflix (June 2026) recommends for phone
 viewing at about 5H; it drops VIF, adds CAMBI and chroma awareness, and replaces the v0 phone
@@ -180,6 +185,18 @@ Audio is never covered by the video gate.
   perceptually lossless**, and the word "lossless" is not applied to it. If this path is ever to
   carry the claim, it needs its own listening test (an ABX with the same statistics as Section 4)
   or a validated objective proxy; neither exists in this project today.
+- **Requested, observed and proven are three fields (b177 F5).** `audioRequested` is what the
+  resolved plan asked for (`copy`, `reencode`, `none`); `audioPreservation` is what the output
+  shows, at the strength it was shown: bit-identical (packets compared), an inferred copy (codec,
+  channels and rate match, no new bitrate written), packets that differ, or not shown to be a copy.
+  The lossy modes are now described the same way instead of by their name: before b177 both HDR
+  High Quality jobs requested `audio=copy` and were recorded "re-encoded (lossy mode)" regardless.
+  Packets are compared in every re-encoding mode; it is a measurement and removes no check.
+- The summariser flags a job that requested a copy but is not recorded as one. In b177 PL-B one
+  accepted PL output does this: `job_c0f82bb62f94` (877,194 bytes saved) requested
+  `audio=copy(source=256000bps)` and its audio is recorded as a re-encode, not validated. It passed
+  the unchanged audio bitrate rule; whether Media3 re-encoded it or the packets merely differ is
+  not known from the log and needs the file.
 
 ## 4. Validating the definition: a 2AFC / ABX procedure
 
@@ -262,10 +279,25 @@ times per batch (`SaferRungRetry`). Both attempts are recorded (`attempts` in th
 failure is learned once; the retry's outcome is learned as its own attempt at its own ratio.
 
 The motivating case is b169 `job_478c2fa19100` (10 fps): 0.90 passed the probes, 0.85 was selected
-by refinement, and the 0.85 full encode's third window scored mean 95.423 against 95.5. Whether a
-0.90 full encode certifies is **not known**: it has never been encoded. `job_c92a4ca7e1be` failed
-at 0.97 with nothing measured above it and is never retried. Wider ladders (0.98/0.99), smaller
-margins or new overshoot constants are not part of this experiment.
+by refinement, and the 0.85 full encode's third window scored mean 95.423 against 95.5.
+`job_c92a4ca7e1be` failed at 0.97 with nothing measured above it and is never retried. Wider
+ladders (0.98/0.99), smaller margins or new overshoot constants are not part of this experiment.
+
+**Observed in b177 PL-B (one run, observational):** `job_478c2fa19100` was retried at 0.90 and
+certified: output 15,658,828 bytes, 1,094,517 bytes saved (6.53 %), final window means 98.978 /
+97.873 / 95.676 (p5 97.143 / 95.165 / 92.758), audio packet-identical. It was the only outcome
+that changed against PL-A. That is one measured recovery of that file on that build, not evidence
+that 0.90 is safe for its class.
+
+**Bookkeeping fixed after b177 (F2/F3):** the retry's record carried the 0.85 rung's probe windows
+beside the 0.90 encode, and the summariser read the difference as drift. Every probe rung is now
+frozen as it finishes (`RungEvidence`: ratio, config id, planned window ids, full-precision scores,
+rate factors, time), and the retry carries the 0.90 rung's own evidence and `probeRungId`. Every
+encode attempt is in an append-only ledger (`AttemptLedger`, `attemptLedger` / `attemptsStarted`
+in the record) finished exactly once by whichever path ends it: export failure, structural
+failure, certification, acceptance, fallback, cancellation or an unexpected failure. A retry that
+fails before producing a candidate now counts in the denominator. Stage events carry the per-job
+`attemptIndex` beside the batch-wide callback token.
 
 ## 5. Where measurement can still go wrong, and how each is guarded
 
@@ -280,6 +312,9 @@ margins or new overshoot constants are not part of this experiment.
 | Probe passes that the full encode then fails | selection margin from measured probe-to-encode drift; re-measured in every capture |
 | Probe clip encoded differently from the full encode | one request shape (mode, keyframe interval, B-frames) for both |
 | Media3 cannot parse the source, and never says so | an extractor error Media3 will not retry stops its loader for good, and during an export nothing reports it: six b167 files idled to the 60 s probe timeout and the 120 s muxer watchdog. The extractors are wrapped (`SourceParseFailure`); the export ends once it stops moving, the ladder stops, and the decision log shows the bytes at the failure. The file is then copied by the platform extractor and muxer (the Remux Only path) and Media3 reads the copy (`Media3InputNormalizer`). Windows, scoring reference, verification and certification stay on the original. A copy that ends early, an HDR source or too little free space keeps the original. b168 showed all six such files are damaged, not malformed: only zero bytes at every failure offset, and platform copies holding 2–16 % of the source's bytes, which cost 74 minutes and two muxing timeouts. A zero-filled failure offset or a copy under half the source's size now ends the attempt at once as a damaged source |
+| A later window that cannot be scored erasing earlier ones | b177 F1: the scorer used to return bare "unavailable" as soon as one window failed to score, discarding the windows already scored; at the default ratio (or without a probe basis) the structural fallback could then accept an output whose first window had measured below the bar. Every window is now attempted, the scored ones are kept (`PairScoreOutcome.Incomplete`), a measured failure among them rejects on every basis, too few frames rejects as before, and a clean partial sample is never pixel certification (`CertificationGate`, `PartialScoringTest`) |
+| A floor-recovery sample too small to decide teaching a quality failure | b177 F6: a bitrate-floor failure whose recovery pixels measured nothing below the bar (too few frames, partial, or a pass) now teaches nothing; with no pixel measured at all, the structural floor keeps its conservative step-up; a measured recovery failure steps up (`LearningEvidencePolicy`, `FloorRecoveryLearningTest`). The original is kept in every case |
+| A window that runs for minutes looking like a hung row | b177 WP2: per-window wall and CPU time by stage (`WindowTiming`: queue waits, v0, flush, CAMBI, v1, decoder threads, process CPU); a 10-minute wall ceiling per window checked between frame pairs (then "unavailable" with the reason); cooperative cancellation on the scoring thread that closes native sessions on that same thread and never races a running native call |
 | A metric that is not the definition | Section 4 |
 
 ## 6. What the label means on screen

@@ -188,10 +188,12 @@ def test_probe_to_certification_drift_and_marginal_attempts_are_reported():
         {"type": "session_start", "batchId": "b1"},
         job("a", certificationStatus="ran_scored", pixelCertified=True,
             probeWindowScores="97.0/93.0/88.0;96.0/92.0/86.0", certWindowScores="96.5/92.0/87.5;96.0/91.0/85.0",
-            probeDetail="windows passed at 0.70"),
+            probeDetail="windows passed at 0.70", plannedTargetRatio=0.70),
+        # b177: a legacy pair is joined only when the probe rung is the encoded ratio.
         job("b", certificationStatus="ran_scored", pixelCertified=False,
             probeWindowScores="95.8/91.2/84.3", certWindowScores="95.0/90.0/83.0",
-            probeDetail="windows passed at 0.90 by only 0.20, below the selection margin (0.5/1.25/1.0); certification decides"),
+            probeDetail="windows passed at 0.90 by only 0.20, below the selection margin (0.5/1.25/1.0); certification decides",
+            plannedTargetRatio=0.90),
         job("c", decisionBasis="Basis: heuristic. This file cannot be pixel-measured on this device: its resolution is above the 4K scoring limit."),
         job("d", decisionBasis="Basis: earlier measured failures for this device and content class (learned), not a measurement of this file."),
         {"type": "session_summary", "batchId": "b1"},
@@ -369,7 +371,111 @@ def test_a_v3_capture_reports_its_learned_snapshot_and_stage_events():
     assert "snapshot sha256=abababababababab" in render(s)
 
 
+
+
+
+# ---- b177: evidence joins by identity, every attempt counted, audio request vs observation ----
+
+def _cert_job(h, **kw):
+    d = {"type": "job", "batchId": "b1", "nameHash": h, "id": f"job_{h}", "jobId": f"job_{h}",
+         "terminal": "TRANSCODED_SMALLER", "countsAsRealCompression": True, "sourceSize": 1000,
+         "outputSize": 900, "verified": True, "certificationStatus": "ran_scored",
+         "plannedTargetRatio": 0.85, "probeDetail": "windows passed at 0.85",
+         "probeWindowScores": "99.000/97.000/97.000;98.000/96.000/96.000",
+         "certWindowScores": "98.500/96.500/96.500;97.500/95.500/95.500"}
+    d.update(kw)
+    return d
+
+
+def test_a_legacy_retry_record_is_excluded_from_drift_not_paired_across_rungs():
+    # b177 PL-B job_478c2fa19100: .90 encode and certification, .85 probe windows on the record.
+    path = write([
+        start(),
+        _cert_job("ok"),
+        _cert_job("retry", plannedTargetRatio=0.9,
+                  probeDetail="windows passed at 0.85 (refined); safer-rung retry at 0.90 after a measured certification failure at 0.85",
+                  attempts="0.85:measured_below_bar:cand=1:encodeMs=1;0.90:accepted:cand=2:encodeMs=2"),
+        {"type": "session_summary", "batchId": "b1", "elapsedMs": 1},
+    ])
+    drift = summarize(path)["probeCertDrift"]
+    assert drift["windows"] == 2
+    assert drift["joinBasis"] == {"legacy_same_rung_position": 2}
+    assert drift["excluded"] == [{"jobId": "job_retry", "reason": "retry: the record's probe windows belong to another rung"}]
+
+
+def test_a_legacy_record_whose_probe_rung_differs_from_the_encoded_ratio_is_excluded():
+    path = write([start(), _cert_job("x", plannedTargetRatio=0.9), {"type": "session_summary", "batchId": "b1"}])
+    drift = summarize(path)["probeCertDrift"]
+    assert drift["windows"] == 0
+    assert drift["excluded"][0]["reason"] == "probe rung 0.85 differs from the encoded ratio 0.9"
+
+
+def test_identity_join_uses_stage_events_window_ids_and_full_precision():
+    rung = "0.90@cfgA"
+    path = write([
+        start(),
+        {"type": "stage", "batchId": "b1", "jobId": "job_n", "stage": "probe_rung", "reasonCode": "rung_measured",
+         "rungId": rung, "probeMean": "99.10000001;97.0", "probeP5": "97.0;95.0", "probeMin": "96.9;94.9",
+         "probeWindowIds": "1-2;3-4"},
+        {"type": "stage", "batchId": "b1", "jobId": "job_n", "stage": "certify", "reasonCode": "cert_passed",
+         "accepted": True, "certMean": "98.10000001;96.5;95.0", "certP5": "96.0;94.5;93.0",
+         "certMin": "95.9;94.4;92.9", "certWindowIds": "1-2;3-4;5-6"},
+        _cert_job("n", plannedTargetRatio=0.9, probeRungId=rung, encodeConfigId="cfgA"),
+        _cert_job("m", plannedTargetRatio=0.9, probeRungId="0.90@cfgA", encodeConfigId="cfgB"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    drift = summarize(path)["probeCertDrift"]
+    assert drift["joinBasis"] == {"identity_window_id": 2}
+    assert drift["unjoinedWindows"] == 1  # window 5-6 was certified but never probed
+    # Deltas (-1.0, -0.5) from the full-precision event values; q() takes the lower middle.
+    assert abs(drift["mean"]["median"] - (-1.0)) < 1e-9
+    assert abs(drift["mean"]["worst"] - (-1.0)) < 1e-9
+    assert {"jobId": "job_m", "reason": "probe config cfgA differs from the encode config cfgB"} in drift["excluded"]
+
+
+def test_retries_count_every_started_attempt_including_those_without_a_candidate():
+    path = write([
+        start(),
+        _cert_job("a", terminal="UNEXPECTED_REMUX", countsAsRealCompression=False, outputSize=1000,
+                  attemptsStarted=2,
+                  attempts="0.85:measured_below_bar:cand=1:encodeMs=1:n=1:token=5;0.90:export_failed:cand=0:encodeMs=3:n=2:token=6"),
+        {"type": "stage", "batchId": "b1", "jobId": "job_c", "stage": "encode", "reasonCode": "encode_cancelled",
+         "attemptIndex": 2, "attemptsStarted": 2, "attempts": "0.85:measured_below_bar:cand=1:encodeMs=1:n=1:token=7;0.90:cancelled:cand=0:encodeMs=0:n=2:token=8"},
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    r = summarize(path)["saferRungRetries"]
+    assert r["retried"] == 2
+    assert r["secondAttemptOutcomes"] == {"export_failed": 1, "cancelled": 1}
+    assert r["certifiedAfterRetry"] == 0
+
+
+def test_a_requested_audio_copy_recorded_as_reencoded_is_flagged():
+    path = write([
+        start(),
+        job("hq", batchId="b1", terminal="LOSSY_SMALLER", encodePlan="outputMime=video/hevc; audio=copy(source=256000bps)",
+            audioPreservation="re-encoded (lossy mode)"),
+        job("new", batchId="b1", terminal="LOSSY_SMALLER", audioRequested="copy",
+            audioPreservation="bit-identical copy of the source's compressed audio (6000 packets compared)"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    audio = summarize(path)["audioClaims"]
+    assert audio["requestedCopyObservedOther"] == [{"jobId": None, "nameHash": "hq", "observed": "re-encoded (lossy mode)", "legacyModeLabel": True}]
+    assert audio["verifiedCopies"] == 1
+
+
+def test_replay_coverage_names_missing_stages_and_unlinked_learning():
+    path = write([
+        start(),
+        {"type": "stage", "batchId": "b1", "stage": "plan", "reasonCode": "plan_resolved"},
+        {"type": "learned_state_update", "batchId": "b1", "jobId": None, "profileKey": "k", "after": "v"},
+        job("a", batchId="b1"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    cov = summarize(path)["replayCoverage"]
+    assert cov["label"] == "PARTIAL_OBSERVATIONAL_REPLAY"
+    assert set(cov["missingStages"]) >= {"probe_rung", "size_gate", "encode", "verify"}
+    assert cov["learnedUpdatesLinked"] == 0 and cov["learnedUpdates"] == 1
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())
-
-

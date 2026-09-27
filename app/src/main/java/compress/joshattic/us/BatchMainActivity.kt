@@ -549,6 +549,55 @@ private fun DiagnosticsExportCard(
             }
 
             HorizontalDivider()
+
+            var longGop by remember { mutableStateOf(EncoderExperiments.isLongGopEnabled(context)) }
+            Text("Experiment: longer keyframe interval", style = MaterialTheme.typography.labelLarge)
+            Text(
+                "Off by default. Probes and encodes request twice the source's keyframe interval (at most " +
+                    "${EncoderExperiments.LONG_GOP_MAX_SECONDS.toInt()} s). Every quality check is unchanged, and this " +
+                    "setting learns separately, so it never uses or changes the ratios learned without it.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = longGop,
+                    onCheckedChange = { on -> EncoderExperiments.setLongGopEnabled(context, on); longGop = on },
+                    enabled = !isCompressing
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (longGop) "Longer keyframe interval on for the next batch" else "Longer keyframe interval off",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            HorizontalDivider()
+
+            var shadowCalibration by remember { mutableStateOf(EncoderExperiments.isShadowCalibrationEnabled(context)) }
+            Text("Experiment: VMAF v1 shadow calibration", style = MaterialTheme.typography.labelLarge)
+            Text(
+                "Off by default. Also scores certification windows with the newer VMAF v1 model, for " +
+                    "calibration only: no decision reads it, and pass/fail stays on the v0.6.1 bar. It is slow " +
+                    "(up to minutes per 4K window), so it runs on at most ${compress.joshattic.us.quality.ShadowCalibration.MAX_WINDOWS_PER_BATCH} " +
+                    "windows per batch and never above 1080p.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = shadowCalibration,
+                    onCheckedChange = { on -> EncoderExperiments.setShadowCalibrationEnabled(context, on); shadowCalibration = on },
+                    enabled = !isCompressing
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (shadowCalibration) "Shadow calibration on for the next batch" else "Shadow calibration off",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            HorizontalDivider()
             // Which build is actually running. Checking this used to mean exporting a capture and
             // diffing a log string against the source; on 2026-09-01 a whole calibration round was
             // spent on an APK that predated the instrumentation it was meant to exercise. The

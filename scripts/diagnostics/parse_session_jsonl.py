@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import Counter, OrderedDict
 from typing import Any
@@ -52,7 +53,8 @@ def load_sessions(path: str) -> "OrderedDict[str, dict[str, Any]]":
         key = str(batch_id)
         if key not in sessions:
             sessions[key] = {"batchId": key, "start": None, "summary": None, "jobs": [],
-                             "stages": [], "learnedSnapshot": None, "learnedUpdates": 0}
+                             "stages": [], "learnedSnapshot": None, "learnedUpdates": 0,
+                             "learnedUpdatesLinked": 0, "identity": None}
         return sessions[key]
 
     # Records are attributed by their own batchId where they carry one, and otherwise to the
@@ -76,7 +78,13 @@ def load_sessions(path: str) -> "OrderedDict[str, dict[str, Any]]":
         elif kind == "learned_state_snapshot":
             bucket(rec.get("batchId") or current)["learnedSnapshot"] = rec
         elif kind == "learned_state_update":
-            bucket(rec.get("batchId") or current)["learnedUpdates"] += 1
+            b = bucket(rec.get("batchId") or current)
+            b["learnedUpdates"] += 1
+            # b177 F4: from this build each update names the job that caused it.
+            if rec.get("jobId"):
+                b["learnedUpdatesLinked"] += 1
+        elif kind == "run_identity":
+            bucket(rec.get("batchId") or current)["identity"] = rec
     return sessions
 
 
@@ -206,7 +214,7 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "exhaustivePerceptualLossless": (start or {}).get("exhaustivePerceptualLossless"),
         "buildTag": (start or {}).get("buildTag"),
         "v1ShadowPairs": v1_shadow_pairs(jobs),
-        "probeCertDrift": probe_cert_drift(jobs),
+        "probeCertDrift": probe_cert_drift(jobs, session.get("stages", [])),
         "marginalAttempts": marginal_attempts(jobs),
         "budgetExhausted": budget_exhausted(jobs),
         "decisionBasis": dict(Counter(basis_kind(j.get("decisionBasis")) for j in jobs if j.get("decisionBasis")).most_common()),
@@ -218,7 +226,9 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "acceptanceContradictions": acceptance_contradictions(jobs),
         "certificationDecisions": dict(Counter(
             str(j.get("certificationDecision")) for j in jobs if j.get("certificationDecision")).most_common()),
-        "saferRungRetries": safer_rung_retries(jobs),
+        "saferRungRetries": safer_rung_retries(jobs, session.get("stages", [])),
+        "audioClaims": audio_claims(jobs),
+        "replayCoverage": replay_coverage(session),
         "stageReasons": dict(Counter(
             f"{r.get('stage')}:{r.get('reasonCode')}" for r in session.get("stages", [])).most_common()),
         "learnedSnapshot": (
@@ -258,16 +268,87 @@ def acceptance_contradictions(jobs: list[dict[str, Any]]) -> dict[str, Any]:
     return {"count": len(flagged), "jobs": flagged}
 
 
-def safer_rung_retries(jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Jobs with more than one full-encode attempt (the opt-in SaferRungRetry), and how they ended."""
-    retried = [j for j in jobs if len([a for a in str(j.get("attempts") or "").split(";") if a]) > 1]
-    if not retried:
+def _attempt_outcomes(attempts: Any) -> list[str]:
+    """Outcome of each element of an `attempts` string ("0.85:measured_below_bar:cand=…;…")."""
+    out = []
+    for a in str(attempts or "").split(";"):
+        parts = a.split(":")
+        if len(parts) >= 2 and a:
+            out.append(parts[1])
+    return out
+
+
+def safer_rung_retries(jobs: list[dict[str, Any]], stages: list[dict[str, Any]] = ()) -> dict[str, Any] | None:
+    """Jobs with more than one full-encode attempt (the opt-in SaferRungRetry), and how they ended.
+
+    b177 F3: the denominator is attempts STARTED. From this build the job record carries
+    `attemptsStarted` and every attempt's outcome, including an export failure or cancellation
+    that left no candidate; a cancelled item writes no job record, so its `encode_cancelled`
+    stage event is counted too. Older records only listed attempts that reached certification.
+    """
+    rows = []
+    for j in jobs:
+        outcomes = _attempt_outcomes(j.get("attempts"))
+        started = j.get("attemptsStarted") if isinstance(j.get("attemptsStarted"), int) else len(outcomes)
+        if started > 1:
+            rows.append((j.get("jobId") or j.get("id"), outcomes, j))
+    recorded = {r[0] for r in rows}
+    for ev in stages:
+        if ev.get("stage") == "encode" and ev.get("reasonCode") == "encode_cancelled":
+            if (ev.get("attemptsStarted") or 0) > 1 and ev.get("jobId") not in recorded:
+                rows.append((ev.get("jobId"), _attempt_outcomes(ev.get("attempts")), None))
+    if not rows:
         return None
     return {
-        "retried": len(retried),
-        "certifiedAfterRetry": sum(1 for j in retried if j.get("countsAsRealCompression") is True),
-        "terminals": dict(Counter(str(j.get("terminal")) for j in retried).most_common()),
-        "jobs": [{"jobId": j.get("jobId") or j.get("id"), "attempts": j.get("attempts")} for j in retried],
+        "retried": len(rows),
+        "certifiedAfterRetry": sum(1 for _, _, j in rows if j is not None and j.get("countsAsRealCompression") is True),
+        "secondAttemptOutcomes": dict(Counter(o[1] for _, o, _ in rows if len(o) > 1).most_common()),
+        "terminals": dict(Counter(str(j.get("terminal")) if j is not None else "CANCELLED" for _, _, j in rows).most_common()),
+        "jobs": [{"jobId": jid, "attempts": (j or {}).get("attempts") if j is not None else "|".join(o)} for jid, o, j in rows],
+    }
+
+
+def audio_claims(jobs: list[dict[str, Any]]) -> dict[str, Any]:
+    """What was asked of the audio against what the record says happened (b177 F5).
+
+    `audioRequested` is from this build; older records only carry it inside `encodePlan`
+    ("audio=copy(...)"). An older lossy-mode record says "re-encoded (lossy mode)" for every job,
+    whatever happened: that label is flagged as a mode name, not an observation.
+    """
+    contradictions = []
+    verified = 0
+    for j in jobs:
+        requested = j.get("audioRequested")
+        if requested is None and "audio=copy(" in str(j.get("encodePlan") or ""):
+            requested = "copy"
+        observed = str(j.get("audioPreservation") or "")
+        if observed.startswith("bit-identical"):
+            verified += 1
+        if requested == "copy" and (observed.startswith("re-encoded") or "packets differ" in observed):
+            contradictions.append({
+                "jobId": j.get("jobId"), "nameHash": j.get("nameHash"), "observed": observed,
+                "legacyModeLabel": observed == "re-encoded (lossy mode)",
+            })
+    return {"requestedCopyObservedOther": contradictions, "verifiedCopies": verified}
+
+
+_REPLAY_STAGES = ("plan", "probe_rung", "size_gate", "encode", "finalize", "verify", "certify", "accept")
+
+
+def replay_coverage(session: dict[str, Any]) -> dict[str, Any]:
+    """Whether the capture could replay its policy decisions, and what is missing if not (b177 F4)."""
+    seen = {ev.get("stage") for ev in session.get("stages", [])}
+    missing = [st for st in _REPLAY_STAGES if st not in seen]
+    updates = session.get("learnedUpdates", 0)
+    linked = session.get("learnedUpdatesLinked", 0)
+    complete = not missing and updates == linked and session.get("learnedSnapshot") is not None \
+        and session.get("identity") is not None
+    return {
+        "label": "REPLAYABLE_RECORD" if complete else "PARTIAL_OBSERVATIONAL_REPLAY",
+        "missingStages": missing,
+        "learnedUpdates": updates,
+        "learnedUpdatesLinked": linked,
+        "runIdentity": session.get("identity") is not None,
     }
 
 
@@ -375,33 +456,110 @@ def _scores(field: Any) -> list[tuple[float, float, float]]:
     return out
 
 
-def probe_cert_drift(jobs: list[dict[str, Any]]) -> dict[str, Any] | None:
+_RUNG_IN_DETAIL = re.compile(r"windows passed at (\d+(?:\.\d+)?)")
+
+
+def _floats(field: Any) -> list[float]:
+    out = []
+    for v in str(field or "").split(";"):
+        try:
+            out.append(float(v))
+        except ValueError:
+            out.append(float("nan"))
+    return out
+
+
+def _window_map(ev: dict[str, Any], prefix: str) -> dict[str, tuple[float, float, float]]:
+    ids = [i for i in str(ev.get(f"{prefix}WindowIds") or "").split(";") if i]
+    means, p5s, mins = (_floats(ev.get(f"{prefix}{k}")) for k in ("Mean", "P5", "Min"))
+    if not ids or not (len(ids) == len(means) == len(p5s) == len(mins)):
+        return {}
+    return {i: (m, p, n) for i, m, p, n in zip(ids, means, p5s, mins)}
+
+
+def probe_cert_drift(jobs: list[dict[str, Any]], stages: list[dict[str, Any]] = ()) -> dict[str, Any] | None:
     """How far the finished encode landed from its probe, window by window, per gate.
 
-    A certified job records the probe windows of the rung it used and the certification windows
-    of the full output at the same positions. The drift between them is what the probe selection
-    margin (QualityProbePolicy.PROBE_SELECTION) was calibrated from in b165; this re-measures it
-    on every capture, so the margin can be checked rather than trusted.
+    A pair is formed only when the probe window and the certification window are the same window
+    of the same source, at the same ratio and encoder request (b177 F2). From this build the job
+    names its probe rung (`probeRungId` = ratio@config) and its encode config (`encodeConfigId`),
+    and the stage events carry full-precision windows with ids: those are joined by window id.
+    Older records have neither, so a legacy job is paired by position only when its probe rung
+    (from `probeDetail`) is the ratio it encoded at and it made a single attempt. Everything else
+    is excluded with the reason, never paired: b177 PL-B's retry recorded .85 probe windows beside
+    .90 certification windows, and positional pairing read that as drift.
     """
+    rungs: dict[tuple[Any, Any], dict[str, Any]] = {}
+    certs: dict[Any, dict[str, Any]] = {}
+    for ev in stages:
+        if ev.get("stage") == "probe_rung" and ev.get("rungId"):
+            rungs[(ev.get("jobId"), ev.get("rungId"))] = ev
+        elif ev.get("stage") == "certify" and ev.get("accepted") is True:
+            certs[ev.get("jobId")] = ev
     deltas: list[tuple[float, float, float]] = []
+    basis: Counter = Counter()
+    excluded: list[dict[str, Any]] = []
+    unjoined = 0
     for j in jobs:
         if j.get("certificationStatus") != "ran_scored":
             continue
+        jid = j.get("jobId") or j.get("id")
+        planned = j.get("plannedTargetRatio")
+        rung_id, cfg = j.get("probeRungId"), j.get("encodeConfigId")
+        if rung_id or cfg:
+            ratio_s, _, rung_cfg = str(rung_id or "").partition("@")
+            if not rung_id or not cfg:
+                excluded.append({"jobId": jid, "reason": "probe rung or encode config not on record"})
+                continue
+            if rung_cfg != cfg:
+                excluded.append({"jobId": jid, "reason": f"probe config {rung_cfg} differs from the encode config {cfg}"})
+                continue
+            if not isinstance(planned, (int, float)) or abs(float(ratio_s) - planned) > 1e-9:
+                excluded.append({"jobId": jid, "reason": f"probe rung {ratio_s} differs from the encoded ratio {planned}"})
+                continue
+            probe_ev, cert_ev = rungs.get((jid, rung_id)), certs.get(jid)
+            p = _window_map(probe_ev, "probe") if probe_ev else {}
+            c = _window_map(cert_ev, "cert") if cert_ev else {}
+            if not p or not c:
+                excluded.append({"jobId": jid, "reason": "no window ids on the probe or certification events"})
+                continue
+            for wid in c:
+                if wid in p:
+                    a, b = p[wid], c[wid]
+                    deltas.append((b[0] - a[0], b[1] - a[1], b[2] - a[2]))
+                    basis["identity_window_id"] += 1
+                else:
+                    unjoined += 1
+            unjoined += sum(1 for wid in p if wid not in c)
+            continue
+        # Legacy record.
+        detail = str(j.get("probeDetail") or "")
+        if "safer-rung retry" in detail or len(_attempt_outcomes(j.get("attempts"))) > 1:
+            excluded.append({"jobId": jid, "reason": "retry: the record's probe windows belong to another rung"})
+            continue
+        m = _RUNG_IN_DETAIL.search(detail)
+        rung_ratio = float(m.group(1)) if m else None
+        if rung_ratio is None or not isinstance(planned, (int, float)) or abs(rung_ratio - planned) > 1e-9:
+            excluded.append({"jobId": jid, "reason": f"probe rung {m.group(1) if m else 'unknown'} differs from the encoded ratio {planned}"})
+            continue
         p, c = _scores(j.get("probeWindowScores")), _scores(j.get("certWindowScores"))
         if not p or len(p) != len(c):
+            excluded.append({"jobId": jid, "reason": "probe and certification window counts differ"})
             continue
         deltas += [(b[0] - a[0], b[1] - a[1], b[2] - a[2]) for a, b in zip(p, c)]
-    if not deltas:
-        return None
+        basis["legacy_same_rung_position"] += len(p)
 
     def q(values: list[float], frac: float) -> float:
         v = sorted(values)
         return v[max(0, min(len(v) - 1, round(frac * (len(v) - 1))))]
 
-    out: dict[str, Any] = {"windows": len(deltas)}
+    out: dict[str, Any] = {"windows": len(deltas), "joinBasis": dict(basis), "excluded": excluded,
+                           "unjoinedWindows": unjoined}
+    if not deltas and not excluded:
+        return None
     for i, name in enumerate(("mean", "p5", "min")):
         col = [d[i] for d in deltas]
-        out[name] = {"median": q(col, 0.5), "p10": q(col, 0.1), "worst": min(col)}
+        out[name] = {"median": q(col, 0.5), "p10": q(col, 0.1), "worst": min(col)} if col else None
     return out
 
 
@@ -501,10 +659,14 @@ def render(s: dict[str, Any]) -> str:
         out.append(f"  build tag      : {s.get('buildTag')}   exhaustive PL: {s.get('exhaustivePerceptualLossless')}")
     drift = s.get("probeCertDrift")
     if drift:
-        out.append(f"  probe->cert    : {drift['windows']} window(s) scored on both (full encode minus probe)")
+        out.append(f"  probe->cert    : {drift['windows']} window(s) scored on both (full encode minus probe);"
+                   f" join {drift.get('joinBasis')}; excluded {len(drift.get('excluded') or [])} job(s)")
         for name in ("mean", "p5", "min"):
-            d = drift[name]
-            out.append(f"      {name:<4}  median {d['median']:+.2f}   p10 {d['p10']:+.2f}   worst {d['worst']:+.2f}")
+            d = drift.get(name)
+            if d:
+                out.append(f"      {name:<4}  median {d['median']:+.2f}   p10 {d['p10']:+.2f}   worst {d['worst']:+.2f}")
+        for e in (drift.get("excluded") or [])[:6]:
+            out.append(f"      excluded {e['jobId']}: {e['reason']}")
     marginal = s.get("marginalAttempts") or {}
     if marginal.get("attempted"):
         out.append(f"  marginal passes: {marginal['attempted']} attempted, {marginal['certified']} certified")
@@ -534,8 +696,19 @@ def render(s: dict[str, Any]) -> str:
     if retries:
         out.append(
             f"  safer-rung retry: {retries['retried']} job(s) retried, {retries['certifiedAfterRetry']} certified after retry;"
-            f" {retries['terminals']}"
+            f" second attempts {retries.get('secondAttemptOutcomes')}; {retries['terminals']}"
         )
+    audio = s.get("audioClaims") or {}
+    if audio.get("requestedCopyObservedOther"):
+        n = len(audio["requestedCopyObservedOther"])
+        legacy = sum(1 for a in audio["requestedCopyObservedOther"] if a.get("legacyModeLabel"))
+        out.append(f"  !! audio        : {n} job(s) requested a copy but are recorded otherwise"
+                   f" ({legacy} with the pre-b177 mode label, which is not an observation)")
+    cov = s.get("replayCoverage")
+    if cov:
+        out.append(f"  replay         : {cov['label']}; missing stages {cov['missingStages'] or 'none'};"
+                   f" learned updates linked {cov['learnedUpdatesLinked']}/{cov['learnedUpdates']};"
+                   f" run identity {'yes' if cov['runIdentity'] else 'no'}")
     over = s.get("overshootPrediction")
     if over:
         out.append(

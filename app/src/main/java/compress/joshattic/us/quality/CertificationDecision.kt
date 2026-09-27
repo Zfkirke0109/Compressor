@@ -25,6 +25,14 @@ enum class CertificationDecision(val wire: String) {
     /** Nothing could be scored (no library, geometry, decoder failure, empty result). */
     UNAVAILABLE("unavailable"),
 
+    /**
+     * Some windows scored, every scored window had enough frames and cleared the bar, and at least
+     * one planned window produced no evidence (b177 F1). Not a measurement of the sample: never
+     * pixel certification, never taught. Where the plan tolerated absent evidence structurally,
+     * it tolerates this the same way (CertificationGate).
+     */
+    PARTIAL("partial_unavailable"),
+
     /** Frames could not be time-aligned: positive evidence of frame loss or retiming. */
     MISALIGNED("misaligned");
 
@@ -42,10 +50,18 @@ enum class CertificationDecision(val wire: String) {
                 // Probe selection's extra margin is a probe rule; certification needs the bar only.
                 QualityProbePolicy.RungVerdict.MARGINAL, QualityProbePolicy.RungVerdict.PASSED -> PASSED
             }
+            // A measured failure among the scored windows rules whatever is missing; then too few
+            // frames; a clean partial sample is still only partial.
+            is PairScoreOutcome.Incomplete -> when (QualityProbePolicy.rungVerdict(outcome.scored)) {
+                QualityProbePolicy.RungVerdict.UNMEASURED -> UNAVAILABLE
+                QualityProbePolicy.RungVerdict.FAILED -> MEASURED_FAILURE
+                QualityProbePolicy.RungVerdict.INSUFFICIENT -> INSUFFICIENT_EVIDENCE
+                QualityProbePolicy.RungVerdict.MARGINAL, QualityProbePolicy.RungVerdict.PASSED -> PARTIAL
+            }
         }
 
         /** Fewest compared frames in any window, for the reason text. Null when nothing was scored. */
         fun fewestFrames(outcome: PairScoreOutcome): Int? =
-            (outcome as? PairScoreOutcome.Scored)?.windows?.minOfOrNull { it.comparedFrames }
+            outcome.scoredWindows?.minOfOrNull { it.comparedFrames }
     }
 }

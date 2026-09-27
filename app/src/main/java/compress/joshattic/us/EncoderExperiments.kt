@@ -51,6 +51,75 @@ object EncoderExperiments {
             .apply()
     }
 
+    private const val KEY_SHADOW_CALIBRATION = "shadow_v1_calibration"
+
+    /**
+     * Opt-in: score certification windows with the VMAF v1 shadow model as well, within the
+     * budget of quality.ShadowCalibration. Telemetry for model calibration; the verdict never
+     * reads it. Off by default since b177, where the unconditional shadow added 748 s to a batch.
+     */
+    fun isShadowCalibrationEnabled(context: Context): Boolean =
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_SHADOW_CALIBRATION, false)
+
+    fun setShadowCalibrationEnabled(context: Context, enabled: Boolean) {
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_SHADOW_CALIBRATION, enabled)
+            .apply()
+    }
+
+    private const val KEY_LONG_GOP = "long_gop_x2"
+
+    /** The longest keyframe interval the long-GOP experiment may request. */
+    const val LONG_GOP_MAX_SECONDS = 10f
+
+    /**
+     * Opt-in (b177 WP3, one-factor pilot): request twice the source-matched keyframe interval
+     * (KeyframeIntervalPolicy), capped at [LONG_GOP_MAX_SECONDS], for the probes AND the full
+     * encode alike, so a probe still vouches for the encode it predicts. Every gate is unchanged.
+     * Its learned state is kept apart from the baseline's ([learningKeySuffix]): a ratio learned at
+     * one GOP is not evidence about another.
+     */
+    fun isLongGopEnabled(context: Context): Boolean =
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_LONG_GOP, false)
+
+    fun setLongGopEnabled(context: Context, enabled: Boolean) {
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_LONG_GOP, enabled)
+            .apply()
+    }
+
+    /** The keyframe interval to request for a source whose own interval policy gave [baseSeconds]. */
+    fun keyframeIntervalSeconds(baseSeconds: Float, longGop: Boolean): Float =
+        if (longGop) (baseSeconds * 2f).coerceAtMost(LONG_GOP_MAX_SECONDS) else baseSeconds
+
+    private const val KEY_BASELINE_B_FRAMES = "learning_baseline_b_frames"
+
+    /**
+     * Appended to the learned-profile key's encoder field for a configuration the baseline state
+     * was not learned with, so an experiment never reads or writes the baseline's ratios (b177 WP3).
+     * Empty for the baseline, so existing learned profiles keep their keys.
+     *
+     * B-frames were never part of the key, so the existing state was learned under whatever the
+     * B-frame setting was. The first plan made by this build pins that setting as the baseline
+     * ([KEY_BASELINE_B_FRAMES]); a later change of the setting then learns under ";bf<N>".
+     */
+    fun learningKeySuffix(longGop: Boolean, bFrames: Int = 0, baselineBFrames: Int = bFrames): String =
+        (if (bFrames != baselineBFrames) ";bf$bFrames" else "") + (if (longGop) ";gopx2" else "")
+
+    fun learningKeySuffix(context: Context): String {
+        val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val bFrames = maxBFrames(context)
+        val baseline = if (prefs.contains(KEY_BASELINE_B_FRAMES)) {
+            prefs.getInt(KEY_BASELINE_B_FRAMES, bFrames)
+        } else {
+            prefs.edit().putInt(KEY_BASELINE_B_FRAMES, bFrames).apply()
+            bFrames
+        }
+        return learningKeySuffix(isLongGopEnabled(context), bFrames, baseline)
+    }
+
     /** The part of an encoder config line that names the experiment, or "" when off. */
     fun describe(maxBFrames: Int): String = if (maxBFrames > 0) ";bframes=$maxBFrames" else ""
 }

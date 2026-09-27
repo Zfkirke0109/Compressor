@@ -26,8 +26,52 @@ data class WindowScore(
     // consulted by any pass/fail decision; the verdict is mean/p5/min above (vmaf_v0.6.1).
     val v1: WindowV1Diag? = null,
     // Where the low scores sit (see WindowFrameDiag). Telemetry only.
-    val frameDiag: WindowFrameDiag? = null
-)
+    val frameDiag: WindowFrameDiag? = null,
+    // The planned window on the SOURCE timeline, so probe and certification windows join by
+    // identity rather than list position (b177 F2). Null on synthetic scores.
+    val windowStartUs: Long? = null,
+    val windowEndUs: Long? = null,
+    // Where the window's time went (b177 F8/WP2). Telemetry only.
+    val timing: WindowTiming? = null
+) {
+    val windowId: String? get() = if (windowStartUs != null && windowEndUs != null) "$windowStartUs-$windowEndUs" else null
+}
+
+/**
+ * Wall and CPU time of one scored window, by stage (b177 WP2). Durations use the monotonic clock.
+ *
+ * b177 PL-B took 1,430,434 ms on a 25 s 4K30 clip that took 203,049 ms in PL-A, and the capture
+ * could not say where: v1 shadow logged 399 s of it, and probe windows WITHOUT the shadow ran at
+ * 51-202 s each where PL-A ran them in about 20 s. These fields separate decoder starvation
+ * ([queueWaitMs]), the verdict model ([v0ReadMs] + [v0FlushMs]), banding ([cambiMs]) and the shadow
+ * ([v1ReadMs] + [v1FlushMs]); thread and process CPU say whether the time was spent computing or
+ * waiting. libvmaf runs its own worker threads, so [scorerThreadCpuMs] undercounts the model's CPU
+ * and [processCpuMs] (the whole app) bounds it from above.
+ */
+data class WindowTiming(
+    val wallMs: Long,
+    val queueWaitMs: Long,
+    val v0ReadMs: Long,
+    val v0FlushMs: Long,
+    val cambiMs: Long,
+    val v1ReadMs: Long,
+    val v1FlushMs: Long,
+    val scorerThreadCpuMs: Long,
+    val processCpuMs: Long,
+    val refDecodeCpuMs: Long,
+    val distDecodeCpuMs: Long,
+    val refFramesDecoded: Int,
+    val distFramesDecoded: Int,
+    val width: Int,
+    val height: Int,
+    val scorerThreads: Int,
+    val shadowThreads: Int
+) {
+    fun compact(): String =
+        "wall=$wallMs,queue=$queueWaitMs,v0=$v0ReadMs+$v0FlushMs,cambi=$cambiMs,v1=$v1ReadMs+$v1FlushMs," +
+            "cpu[thread=$scorerThreadCpuMs,process=$processCpuMs,refDec=$refDecodeCpuMs,distDec=$distDecodeCpuMs]," +
+            "frames=$refFramesDecoded/$distFramesDecoded,${width}x$height,threads=$scorerThreads/$shadowThreads"
+}
 
 /** VMAF v1 shadow scores for one window. See [VmafNativeV1]: evidence, never a gate. */
 data class WindowV1Diag(val mean: Double, val p5: Double, val min: Double) {
@@ -243,16 +287,32 @@ internal class StreamOrigin(fixedUs: Long?) {
 }
 
 /**
- * Tri-state scoring result. The distinction between the two failure cases is load-bearing:
- * [Unavailable] means evidence could not be produced (native lib missing, geometry mismatch,
+ * Scoring result. The distinction between the failure cases is load-bearing:
+ * [Unavailable] means no window produced evidence (native lib missing, geometry mismatch,
  * decoder failure) — legacy "no evidence" semantics, eligible for the structural default-ratio
  * certification fallback. [MisalignmentRejected] is POSITIVE evidence that the two streams'
  * frames are not temporally comparable (frame loss or retiming) — it must always fail closed
- * and is NEVER eligible for any structural fallback.
+ * and is NEVER eligible for any structural fallback. [Incomplete] is some windows scored and at
+ * least one not: what was scored is kept, so a measured failure in it still rules
+ * (CertificationDecision).
  */
 sealed interface PairScoreOutcome {
     data class Scored(val windows: List<WindowScore>) : PairScoreOutcome
     object Unavailable : PairScoreOutcome
+
+    /**
+     * At least one window scored and at least one produced no evidence (b177 F1). Before this the
+     * scorer returned bare [Unavailable] as soon as any window failed to score, which erased the
+     * windows already scored: an adequate window at mean 90 followed by a decoder failure became
+     * "no evidence", and at the default ratio (or without a probe basis) the structural fallback
+     * could accept the output. [scored] is kept in plan order; windows that produced nothing are
+     * counted, not invented.
+     */
+    data class Incomplete(
+        val scored: List<WindowScore>,
+        val plannedWindows: Int,
+        val unavailableWindows: Int
+    ) : PairScoreOutcome
 
     /**
      * [reason] names WHICH of PtsAligner's two failures occurred, because they are different
@@ -269,8 +329,22 @@ sealed interface PairScoreOutcome {
      * reason was written to logcat under a tag the in-app export did not collect, and the outcome
      * carried no payload, so nothing reached the structured record either.
      */
-    data class MisalignmentRejected(val reason: String?) : PairScoreOutcome
+    data class MisalignmentRejected(
+        val reason: String?,
+        // Windows scored before the misaligned one, for the record. They change no decision:
+        // misalignment already fails closed everywhere.
+        val scoredBefore: List<WindowScore> = emptyList()
+    ) : PairScoreOutcome
 }
+
+/** Every window this outcome actually scored, pass or fail, in plan order; null when none was. */
+val PairScoreOutcome.scoredWindows: List<WindowScore>?
+    get() = when (this) {
+        is PairScoreOutcome.Scored -> windows
+        is PairScoreOutcome.Incomplete -> scored
+        is PairScoreOutcome.MisalignmentRejected -> scoredBefore.takeIf { it.isNotEmpty() }
+        PairScoreOutcome.Unavailable -> null
+    }
 
 /**
  * Streams display-normalized frames of two files through libvmaf for a set of short windows
@@ -360,10 +434,11 @@ object VmafPairScorer {
     }
 
     /**
-     * Scores [windows]. [PairScoreOutcome.Unavailable] when pixel evidence could not be
-     * produced (native lib missing, geometry mismatch, decoder failure, frame-count mismatch);
+     * Scores [windows]. [PairScoreOutcome.Unavailable] when no window produced pixel evidence
+     * (native lib missing, geometry mismatch, decoder failure, frame-count mismatch);
+     * [PairScoreOutcome.Incomplete] when some did and some did not (the scored ones are kept);
      * [PairScoreOutcome.MisalignmentRejected] when the streams were measurably NOT temporally
-     * comparable (fail closed — never scored, never structurally certifiable). Never throws.
+     * comparable (fail closed — never structurally certifiable). Never throws.
      */
     fun score(
         context: Context,
@@ -376,7 +451,12 @@ object VmafPairScorer {
         // a ladder that runs out of budget cannot pass — shadow data must never cost a saving.
         shadowV1: Boolean = false,
         // Called after each window is scored with (windows done, windows planned). Progress only.
-        onWindowScored: ((done: Int, total: Int) -> Unit)? = null
+        onWindowScored: ((done: Int, total: Int) -> Unit)? = null,
+        // Polled between frame pairs on the scoring thread. True stops the window at the next
+        // checkpoint, releases the native sessions on this same thread, and throws
+        // CancellationException out of [score]. A native call already running is never
+        // interrupted and never closed from another thread.
+        cancelled: () -> Boolean = { false }
     ): PairScoreOutcome {
         if (!VmafNative.isAvailable) return PairScoreOutcome.Unavailable
         val refGeom = YuvFrameReader.displayGeometry(context, ref) ?: return PairScoreOutcome.Unavailable
@@ -392,25 +472,58 @@ object VmafPairScorer {
             return PairScoreOutcome.Unavailable
         }
 
+        return collectWindows(windows, onWindowScored) { window ->
+            scoreWindow(context, ref, dist, window, width, height, collectBanding, shadowV1, cancelled)
+        }
+    }
+
+    /**
+     * The window loop of [score], apart from the native work so it can be tested with scripted
+     * outcomes. Every planned window is attempted: a window that produces no evidence is counted
+     * and the loop goes on, because a later window may still hold a measured failure, and the
+     * windows already scored are never discarded (b177 F1). Misalignment still stops at once and
+     * fails closed.
+     */
+    internal fun <W> collectWindows(
+        windows: List<W>,
+        onWindowScored: ((done: Int, total: Int) -> Unit)?,
+        scoreOne: (W) -> WindowOutcome
+    ): PairScoreOutcome {
         val results = mutableListOf<WindowScore>()
+        var unavailable = 0
         for (window in windows) {
-            when (val outcome = scoreWindow(context, ref, dist, window, width, height, collectBanding, shadowV1)) {
+            when (val outcome = scoreOne(window)) {
                 is WindowOutcome.Scored -> {
                     results += outcome.score
                     runCatching { onWindowScored?.invoke(results.size, windows.size) }
                 }
-                WindowOutcome.Unavailable -> return PairScoreOutcome.Unavailable
-                is WindowOutcome.Misaligned -> return PairScoreOutcome.MisalignmentRejected(outcome.reason)
+                WindowOutcome.Unavailable -> unavailable++
+                is WindowOutcome.Misaligned -> return PairScoreOutcome.MisalignmentRejected(outcome.reason, results.toList())
+                WindowOutcome.Cancelled -> throw java.util.concurrent.CancellationException("pixel scoring cancelled")
             }
         }
-        return PairScoreOutcome.Scored(results)
+        return when {
+            unavailable == 0 -> PairScoreOutcome.Scored(results)
+            results.isEmpty() -> PairScoreOutcome.Unavailable
+            else -> PairScoreOutcome.Incomplete(results.toList(), windows.size, unavailable)
+        }
     }
 
-    private sealed interface WindowOutcome {
+    internal sealed interface WindowOutcome {
         data class Scored(val score: WindowScore) : WindowOutcome
         object Unavailable : WindowOutcome
         data class Misaligned(val reason: String?) : WindowOutcome
+        /** The caller cancelled; nothing about the output was learned. */
+        object Cancelled : WindowOutcome
     }
+
+    /**
+     * Wall-clock ceiling for one window, checked between frame pairs. The slowest window in the
+     * b177 captures took about 203 s (36 frames of 4K). A window past this is reported as
+     * unavailable evidence with the reason, never scored from the frames it reached.
+     */
+    const val WINDOW_WALL_BUDGET_MS = 600_000L
+    private const val CANCELLED_REASON = "scoring cancelled"
 
     private fun scoreWindow(
         context: Context,
@@ -420,8 +533,17 @@ object VmafPairScorer {
         width: Int,
         height: Int,
         collectBanding: Boolean,
-        shadowV1: Boolean
+        shadowV1: Boolean,
+        cancelled: () -> Boolean = { false }
     ): WindowOutcome {
+        val wallStart = System.nanoTime()
+        val threadCpuStart = android.os.SystemClock.currentThreadTimeMillis()
+        val processCpuStart = android.os.Process.getElapsedCpuTime()
+        var queueWaitNanos = 0L
+        var v0ReadNanos = 0L
+        var v1ReadNanos = 0L
+        val refDecodeCpu = java.util.concurrent.atomic.AtomicLong(0L)
+        val distDecodeCpu = java.util.concurrent.atomic.AtomicLong(0L)
         // Plain vmaf_v0.6.1 (no phone transform): every threshold in QualityProbePolicy was
         // calibrated against the PC harness's default-model scores, and mixing models would
         // silently loosen the bar (the phone transform maps scores upward).
@@ -450,8 +572,9 @@ object VmafPairScorer {
         // lies inside the window are scored (see the PAIR branch below).
         val decodeLenUs = window.contextUs + window.leadInUs + (window.endUs - window.startUs)
 
-        fun reader(uri: Uri, startUs: Long, queue: ArrayBlockingQueue<I420Frame>, label: String) =
+        fun reader(uri: Uri, startUs: Long, queue: ArrayBlockingQueue<I420Frame>, label: String, cpu: java.util.concurrent.atomic.AtomicLong) =
             thread(name = "vmaf-$label") {
+                val cpuStart = android.os.SystemClock.currentThreadTimeMillis()
                 try {
                     YuvFrameReader(context, uri, startUs, startUs + decodeLenUs) { frame ->
                         queue.put(frame)
@@ -460,12 +583,13 @@ object VmafPairScorer {
                 } catch (t: Throwable) {
                     error.compareAndSet(null, "$label decode failed: ${t.message}")
                 } finally {
+                    cpu.set(android.os.SystemClock.currentThreadTimeMillis() - cpuStart)
                     runCatching { queue.put(END) }
                 }
             }
 
-        val refThread = reader(ref, (window.startUs - window.leadInUs - window.contextUs).coerceAtLeast(0L), refQueue, "ref")
-        val distThread = reader(dist, (window.distStartUs - window.contextUs).coerceAtLeast(0L), distQueue, "dist")
+        val refThread = reader(ref, (window.startUs - window.leadInUs - window.contextUs).coerceAtLeast(0L), refQueue, "ref", refDecodeCpu)
+        val distThread = reader(dist, (window.distStartUs - window.contextUs).coerceAtLeast(0L), distQueue, "dist", distDecodeCpu)
         var leadInPairsSkipped = 0
         // The last aligned pair before the window: fed to VMAF as motion context, never scored.
         // See MotionContext.
@@ -498,8 +622,19 @@ object VmafPairScorer {
         var misaligned = false
         try {
             while (true) {
+                // Cooperative checkpoints, on this thread, between native calls (b177 WP2).
+                if (cancelled()) {
+                    error.compareAndSet(null, CANCELLED_REASON)
+                    break
+                }
+                if ((System.nanoTime() - wallStart) / 1_000_000L > WINDOW_WALL_BUDGET_MS) {
+                    error.compareAndSet(null, "window scoring exceeded ${WINDOW_WALL_BUDGET_MS / 1000} s")
+                    break
+                }
                 if (pendingRef == null && !refEnded) {
+                    val waitStart = System.nanoTime()
                     val r = refQueue.poll(QUEUE_POLL_TIMEOUT_S, TimeUnit.SECONDS)
+                    queueWaitNanos += System.nanoTime() - waitStart
                     if (r == null) {
                         error.compareAndSet(null, "frame queue timeout")
                         break
@@ -513,7 +648,9 @@ object VmafPairScorer {
                     }
                 }
                 if (pendingDist == null && !distEnded) {
+                    val waitStart = System.nanoTime()
                     val d = distQueue.poll(QUEUE_POLL_TIMEOUT_S, TimeUnit.SECONDS)
+                    queueWaitNanos += System.nanoTime() - waitStart
                     if (d == null) {
                         error.compareAndSet(null, "frame queue timeout")
                         break
@@ -583,7 +720,9 @@ object VmafPairScorer {
                         val absSkew = kotlin.math.abs(skewUs)
                         if (absSkew > skewMaxAbsUs) skewMaxAbsUs = absSkew
                         skewAbsSumUs += absSkew
+                        val v0Start = System.nanoTime()
                         val rc = VmafNative.readFrames(handle, r.data, d.data, width, height)
+                        v0ReadNanos += System.nanoTime() - v0Start
                         if (rc < 0) {
                             error.compareAndSet(null, "vmaf read_frames error $rc")
                             break
@@ -593,7 +732,9 @@ object VmafPairScorer {
                             val v1rc = runCatching {
                                 VmafNativeV1.readFrames(v1Handle, r.data, d.data, width, height)
                             }.getOrDefault(-1)
-                            v1Nanos += System.nanoTime() - v1Start
+                            val spent = System.nanoTime() - v1Start
+                            v1Nanos += spent
+                            v1ReadNanos += spent
                             if (v1rc < 0) closeV1()
                         }
                         fed++
@@ -630,22 +771,32 @@ object VmafPairScorer {
         val err = error.get()
         if (err != null || fed == 0) {
             DiagLog.w(TAG, "window [${window.startUs}..${window.endUs}] failed: ${err ?: "no frames"}")
+            // Same thread as every native call on these handles: nothing can still be using them.
             VmafNative.close(handle)
             closeV1()
+            if (err == CANCELLED_REASON) return WindowOutcome.Cancelled
             // Measured misalignment is positive evidence, not mere absence of evidence.
             return if (misaligned) WindowOutcome.Misaligned(aligner.failureReason) else WindowOutcome.Unavailable
         }
         // The context frame (if any) is scored by libvmaf like any other; its score is dropped here.
+        val flushStart = System.nanoTime()
         val perFrame = MotionContext.scoredSpan(VmafNative.flush(handle), contextFed)
+        val v0FlushNanos = System.nanoTime() - flushStart
         // Banding scores must be read AFTER the flush (which signals end-of-stream) and BEFORE
         // close. Telemetry only: any failure here yields a null diagnostic and never affects the
         // window's outcome.
+        val cambiStart = System.nanoTime()
         val perFrameCambi = if (collectBanding) MotionContext.scoredSpan(VmafNative.cambiScores(handle), contextFed) else null
+        val cambiNanos = System.nanoTime() - cambiStart
         VmafNative.close(handle)
+        var v1FlushNanos = 0L
         val v1Diag = if (v1Handle != 0L) {
             val v1Start = System.nanoTime()
             WindowV1Diag.fromPerFrame(MotionContext.scoredSpan(runCatching { VmafNativeV1.flush(v1Handle) }.getOrNull(), contextFed))
-                .also { v1Nanos += System.nanoTime() - v1Start }
+                .also {
+                    v1FlushNanos = System.nanoTime() - v1Start
+                    v1Nanos += v1FlushNanos
+                }
         } else null
         closeV1()
         if (perFrame == null || perFrame.isEmpty() || perFrame.any { it < 0 }) {
@@ -670,6 +821,26 @@ object VmafPairScorer {
             leadInPairsSkipped = leadInPairsSkipped
         )
         val frameDiag = WindowFrameDiag.fromPerFrame(perFrame)
+        val ms = { nanos: Long -> nanos / 1_000_000L }
+        val timing = WindowTiming(
+            wallMs = ms(System.nanoTime() - wallStart),
+            queueWaitMs = ms(queueWaitNanos),
+            v0ReadMs = ms(v0ReadNanos),
+            v0FlushMs = ms(v0FlushNanos),
+            cambiMs = ms(cambiNanos),
+            v1ReadMs = ms(v1ReadNanos),
+            v1FlushMs = ms(v1FlushNanos),
+            scorerThreadCpuMs = android.os.SystemClock.currentThreadTimeMillis() - threadCpuStart,
+            processCpuMs = android.os.Process.getElapsedCpuTime() - processCpuStart,
+            refDecodeCpuMs = refDecodeCpu.get(),
+            distDecodeCpuMs = distDecodeCpu.get(),
+            refFramesDecoded = refSeen,
+            distFramesDecoded = distSeen,
+            width = width,
+            height = height,
+            scorerThreads = SCORER_THREADS,
+            shadowThreads = if (shadowV1) SHADOW_THREADS else 0
+        )
         val result = WindowScore(
             comparedFrames = perFrame.size,
             mean = perFrame.average(),
@@ -678,7 +849,10 @@ object VmafPairScorer {
             pairing = pairing,
             banding = summarizeBanding(perFrameCambi),
             v1 = v1Diag,
-            frameDiag = frameDiag
+            frameDiag = frameDiag,
+            windowStartUs = window.startUs,
+            windowEndUs = window.endUs,
+            timing = timing
         )
         DiagLog.i(
             TAG,
@@ -687,7 +861,8 @@ object VmafPairScorer {
                 " pairing[${pairing.compact()}]" +
                 (frameDiag?.let { " frames[${it.compact()}]" } ?: "") +
                 (result.banding?.let { " banding[${it.compact()}]" } ?: "") +
-                (result.v1?.let { " v1shadow[${it.compact()} ms=${v1Nanos / 1_000_000}]" } ?: "")
+                (result.v1?.let { " v1shadow[${it.compact()} ms=${v1Nanos / 1_000_000}]" } ?: "") +
+                " timing[${timing.compact()}]"
         )
         return WindowOutcome.Scored(result)
     }

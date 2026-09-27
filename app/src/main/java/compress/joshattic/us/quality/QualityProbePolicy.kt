@@ -384,6 +384,10 @@ object QualityProbePolicy {
         when (outcome) {
             is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
             PairScoreOutcome.Unavailable -> certificationPasses(usedRatio, defaultRatio, null)
+            // What was scored must pass on its own; only then does the missing part fall back to
+            // the absent-evidence rule. A measured failure in a partial sample always rejects.
+            is PairScoreOutcome.Incomplete ->
+                windowsPass(outcome.scored) && certificationPasses(usedRatio, defaultRatio, null)
             is PairScoreOutcome.MisalignmentRejected -> false
         }
 
@@ -408,6 +412,7 @@ object QualityProbePolicy {
         when (outcome) {
             is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
             PairScoreOutcome.Unavailable -> true
+            is PairScoreOutcome.Incomplete -> windowsPass(outcome.scored)
             is PairScoreOutcome.MisalignmentRejected -> false
         }
 
