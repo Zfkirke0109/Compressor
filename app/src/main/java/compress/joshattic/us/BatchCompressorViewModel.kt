@@ -1289,16 +1289,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
         } catch (e: CancellationException) {
             s.deleteCandidatesUnlessAccepted()
-            // No job record is written for a cancelled item; the attempt still ends on record.
-            if (s.ledger.closeOpen(AttemptLedger.CANCELLED)) {
+            // Batch cancellation later writes a generic terminal record; preserve the active
+            // attempt's evidence here, including the retry's own token.
+            s.ledger.cancelEvent(item.sourceUri.toString(), s.elapsedMs)?.let { event ->
                 runCatching {
-                    run.diagnostics.stage(
-                        StageEvent(
-                            sourceKey = item.sourceUri.toString(), attempt = token.attempt, attemptIndex = s.ledger.currentIndex,
-                            stage = StageEvent.Stage.ENCODE, reasonCode = StageEvent.Reason.ENCODE_CANCELLED, elapsedMs = s.elapsedMs,
-                            fields = mapOf("attemptsStarted" to s.ledger.started, "attempts" to s.ledger.wire().joinToString(";"))
-                        )
-                    )
+                    run.diagnostics.stage(event)
                 }
             }
             throw e
@@ -2100,12 +2095,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             ((proven - PIXEL_PROVEN_UNDERSHOOT_TOLERANCE) *
                 item.toSourceInfo().videoBitrate).toInt().coerceAtLeast(1)
         }
-        var verification = withContext(Dispatchers.IO) {
-            OutputVerifier.verify(
+        val verificationInput = withContext(Dispatchers.IO) {
+            OutputVerifier.captureInput(
                 context, item, outputFile, s.effectiveQuality.label, run.privacyMode,
                 pixelProvenVideoBitrateFloor = pixelProvenVerifierFloor
             )
         }
+        var verification = OutputVerifier.verify(verificationInput)
         // Measured request-vs-actual encoder behavior for this attempt. Prefer Media3's own
         // reported average; fall back to the size/duration measurement.
         val outputSize = s.outputSize
@@ -2160,12 +2156,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     "floor recovery; job=${diagnosticJobId(item)}; sampled windows passed; " +
                         "re-verifying with pixel-certified floor $certifiedVideoBitrate"
                 )
-                verification = withContext(Dispatchers.IO) {
-                    OutputVerifier.verify(
-                        context, item, outputFile, s.effectiveQuality.label, run.privacyMode,
-                        pixelProvenVideoBitrateFloor = certifiedVideoBitrate
-                    )
-                }
+                // Certification only reads this candidate. Reevaluate its captured structural
+                // and audio evidence with the certified floor, without scanning the same files
+                // and every audio packet twice. This input is local to this verification call;
+                // a retry or remux captures its own evidence.
+                verification = OutputVerifier.verify(
+                    verificationInput.copy(pixelProvenVideoBitrateFloor = certifiedVideoBitrate)
+                )
             } else {
                 // Same evidence typing as final certification (CertificationDecision). The fallback
                 // that follows is the structural bitrate-floor rule, unchanged; only the record

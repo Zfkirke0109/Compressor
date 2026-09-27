@@ -56,6 +56,19 @@ class AttemptLedgerTest {
     }
 
     @Test
+    fun retryCancellationEventUsesTheOpenAttemptsTokenAndClosesItOnce() {
+        val ledger = firstAttemptFailsCertification()
+        ledger.start(261, 0.90, "0.90@bbb", "bbb", 9_000)
+        val event = checkNotNull(ledger.cancelEvent("source", 10_000))
+        assertEquals(261, event.attempt)
+        assertEquals(2, event.attemptIndex)
+        assertEquals("encode_cancelled", event.reasonCode)
+        assertEquals(2, event.fields["attemptsStarted"])
+        assertTrue((event.fields["attempts"] as String).contains("0.90:cancelled"))
+        assertEquals(null, ledger.cancelEvent("source", 10_001))
+    }
+
+    @Test
     fun measuredFailureThenAcceptedRetry() {
         // b177 PL-B job_478c2fa19100, as the ledger records it.
         val ledger = firstAttemptFailsCertification()

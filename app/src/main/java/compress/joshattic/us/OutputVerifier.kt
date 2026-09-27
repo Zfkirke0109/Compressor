@@ -85,7 +85,19 @@ object OutputVerifier {
         modeLabel: String,
         privacyMode: MetadataPrivacyMode,
         pixelProvenVideoBitrateFloor: Int? = null
-    ): OutputVerificationReport {
+    ): OutputVerificationReport = verify(
+        captureInput(context, source, outputFile, modeLabel, privacyMode, pixelProvenVideoBitrateFloor)
+    )
+
+    /** Immutable evidence for one finalized candidate; never reuse after either file changes. */
+    internal fun captureInput(
+        context: Context,
+        source: BatchVideoItem,
+        outputFile: File,
+        modeLabel: String,
+        privacyMode: MetadataPrivacyMode,
+        pixelProvenVideoBitrateFloor: Int? = null
+    ): VerificationInput {
         val rawOutputProbe = readFileProbe(outputFile)
         val sourceTracks = probeTracks(context, source.sourceUri)
         val outputTracks = readTrackProbe(outputFile.absolutePath)
@@ -129,26 +141,23 @@ object OutputVerifier {
             mediaStoreDatePresent = source.metadataSnapshot.dateSource?.startsWith("MediaStore") == true,
             mp4DatePresent = source.metadataSnapshot.rawDateTag != null
         )
-        return verify(
-            VerificationInput(
-                mode = BatchQualityMode.fromLabel(modeLabel),
-                source = sourceInfo,
-                outputFileProbe = outputProbe,
-                sourceTrackProbe = sourceTracks,
-                outputTrackProbe = outputTracks,
-                sourceMetadata = source.metadataSnapshot,
-                outputMetadata = outputMetadata,
-                sourceSize = source.originalSize,
-                outputSize = outputFile.length(),
-                privacyMode = privacyMode,
-                sourceFrameCount = readSourceFrameCount(context, source.sourceUri),
-                pixelProvenVideoBitrateFloor = pixelProvenVideoBitrateFloor,
-                // Only worth reading packets when a copy is possible at all: a Perceptually
-                // Lossless output whose audio codec matches the source's.
-                audioPacketsIdentical = audioIdentity?.result == AudioTrackIdentity.Result.IDENTICAL,
-                audioPacketsCompared = audioIdentity?.packets ?: 0,
-                audioPacketsDiffer = audioIdentity?.result == AudioTrackIdentity.Result.DIFFERENT
-            )
+        return VerificationInput(
+            mode = BatchQualityMode.fromLabel(modeLabel),
+            source = sourceInfo,
+            outputFileProbe = outputProbe,
+            sourceTrackProbe = sourceTracks,
+            outputTrackProbe = outputTracks,
+            sourceMetadata = source.metadataSnapshot,
+            outputMetadata = outputMetadata,
+            sourceSize = source.originalSize,
+            outputSize = outputFile.length(),
+            privacyMode = privacyMode,
+            sourceFrameCount = readSourceFrameCount(context, source.sourceUri),
+            pixelProvenVideoBitrateFloor = pixelProvenVideoBitrateFloor,
+            // A matching audio codec makes packet-copy proof possible in any encode mode.
+            audioPacketsIdentical = audioIdentity?.result == AudioTrackIdentity.Result.IDENTICAL,
+            audioPacketsCompared = audioIdentity?.packets ?: 0,
+            audioPacketsDiffer = audioIdentity?.result == AudioTrackIdentity.Result.DIFFERENT
         )
     }
 
@@ -277,6 +286,7 @@ object OutputVerifier {
         //    it, a 128 kbps pass-through copy met the PL re-encode rule below (>= 256 kbps less
         //    10%) and failed, which discarded 13 encodes in batch_1790263711162.
         val audioLooksStreamCopied = audioCodecMatches &&
+            !input.audioPacketsDiffer &&
             input.sourceTrackProbe.audioCodec != null &&
             audioShapeMatches &&
             input.outputTrackProbe.audioChannelCount != null &&

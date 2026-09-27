@@ -87,6 +87,18 @@ class AttemptLedger {
 
     fun wire(): List<String> = entries.map { it.wire() }
 
+    /** Closes the interrupted encode and records its cancellation once. */
+    fun cancelEvent(sourceKey: String, elapsedMs: Long): StageEvent? {
+        if (!closeOpen(CANCELLED)) return null
+        val cancelled = checkNotNull(current)
+        return StageEvent(
+            sourceKey = sourceKey, attempt = cancelled.token, attemptIndex = cancelled.index,
+            stage = StageEvent.Stage.ENCODE, reasonCode = StageEvent.Reason.ENCODE_CANCELLED,
+            elapsedMs = elapsedMs,
+            fields = mapOf("attemptsStarted" to started, "attempts" to wire().joinToString(";"))
+        )
+    }
+
     fun accepted(): Int = entries.count { it.outcome == ACCEPTED }
 
     companion object {

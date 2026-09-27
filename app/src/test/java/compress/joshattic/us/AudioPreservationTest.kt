@@ -8,6 +8,16 @@ import org.junit.Test
 class AudioPreservationTest {
 
     @Test
+    fun measuredPacketDifferenceOutranksAnInferredCopy() {
+        for (mode in listOf(BatchQualityMode.HIGH_QUALITY, BatchQualityMode.STORAGE_SAVER)) {
+            assertEquals(AudioPreservation.LOSSY_PACKETS_DIFFER,
+                AudioPreservation.describe(mode, true, false, 3, true, packetsDiffer = true))
+        }
+        assertEquals(AudioPreservation.RE_ENCODED_NOT_VALIDATED,
+            AudioPreservation.describe(BatchQualityMode.PERCEPTUAL_LOSSLESS, true, false, 3, true, packetsDiffer = true))
+    }
+
+    @Test
     fun aProvenCopyIsCalledBitIdenticalWithItsPacketCount() {
         assertEquals(
             "bit-identical copy of the source's compressed audio (5613 packets compared)",

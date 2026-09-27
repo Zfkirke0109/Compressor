@@ -48,13 +48,14 @@ object AudioPreservation {
             BatchQualityMode.REMUX_ONLY -> "stream copy (Remux Only never re-encodes audio)"
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> when {
                 packetsIdentical -> bitIdentical(packetsCompared)
+                packetsDiffer -> RE_ENCODED_NOT_VALIDATED
                 inferredStreamCopy -> INFERRED_COPY
                 else -> RE_ENCODED_NOT_VALIDATED
             }
             else -> when {
                 packetsIdentical -> bitIdentical(packetsCompared)
-                inferredStreamCopy -> INFERRED_COPY
                 packetsDiffer -> LOSSY_PACKETS_DIFFER
+                inferredStreamCopy -> INFERRED_COPY
                 else -> LOSSY_NOT_SHOWN_AS_COPY
             }
         }
