@@ -61,9 +61,9 @@ object QualityProbePolicy {
     )
 
     /**
-     * The transparency bar. Calibrated against the 2026-07-14 VMAF suite and confirmed by the v2
-     * study (`research/perceptual_calibration`), which found current production sits inside the
-     * cross-fold consensus box and stays tied-optimal in 100% of bootstrap resamples.
+     * The transparency bar comes from the 2026-07-14 VMAF suite. The v2 retrospective study
+     * (`research/perceptual_calibration`) checked policy consistency, not independent human
+     * visibility; it cannot confirm a human perceptual threshold or justify changing this bar.
      *
      * Do not move these without a fresh calibration round. They are the meaning of the word
      * "lossless" in this app's user-facing labels.

@@ -20,6 +20,7 @@ Fields kept apart on every row:
 """
 from __future__ import annotations
 
+from numbers import Real
 from typing import Any, Iterable, Mapping
 
 POLICY = "policy"
@@ -63,10 +64,13 @@ def structural_status(record: Mapping[str, Any]) -> str:
     return "not_run"
 
 
-def basis(human_values: Iterable[Any]) -> str:
-    """HUMAN only when every row carries a human label; one policy row makes the set policy."""
+def basis(human_values: Iterable[Any], label_sources: Iterable[Any] | None = None) -> str:
+    """HUMAN only for valid binary judgments explicitly sourced from human annotation."""
     values = list(human_values)
-    if values and all(v not in (None, "") and v == v for v in values):  # v == v rejects NaN
+    sources = list(label_sources) if label_sources is not None else None
+    if (values and all(type(v) is not bool and isinstance(v, Real) and v in (0, 1)
+                       for v in values)
+            and (sources is None or (len(sources) == len(values) and all(s == HUMAN for s in sources)))):
         return HUMAN
     return POLICY
 

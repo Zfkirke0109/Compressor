@@ -193,6 +193,8 @@ def main():
     cols = [
         "nameHash", "jobId", "_capture_batch_dir", "build_era", "timestampMs",
         "terminal", "training_label_v2", "label_reason_v2",
+        "policy_label", "label_source", "measurement_status", "structural_status",
+        "human_visibility_label",
         "evidence_mean_floor", "evidence_p5_floor", "evidence_min_floor", "evidence_source",
         "cert_mean_floor", "cert_p5_floor", "cert_min_floor",
         "probe_mean_floor", "probe_p5_floor", "probe_min_floor", "probedRatios",

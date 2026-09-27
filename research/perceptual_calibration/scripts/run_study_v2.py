@@ -46,10 +46,10 @@ P5_GRID = np.round(np.arange(88.0, 94.0 + 1e-9, 0.1), 1)     # 61
 MIN_GRID = np.round(np.arange(78.0, 90.0 + 1e-9, 0.1), 1)    # 121
 
 
-def confusion_cube(rows: pd.DataFrame):
+def confusion_cube(rows: pd.DataFrame, label_column: str = "training_label_v2"):
     """FA/FR/TA counts for every grid combo, via einsum. Returns (FA, FR, TA) cubes
     with shape (len(MEAN_GRID), len(P5_GRID), len(MIN_GRID))."""
-    y = rows["training_label_v2"].to_numpy()
+    y = rows[label_column].to_numpy()
     mean_f = rows["evidence_mean_floor"].to_numpy(dtype=float)
     p5_f = rows["evidence_p5_floor"].to_numpy(dtype=float)
     min_f = rows["evidence_min_floor"].to_numpy(dtype=float)
@@ -68,10 +68,10 @@ def confusion_cube(rows: pd.DataFrame):
     return FA, FR, TA
 
 
-def select(rows: pd.DataFrame):
+def select(rows: pd.DataFrame, label_column: str = "training_label_v2"):
     """Hard-constraint selection on a training set.
     Returns dict with the tied-optimal feasible box and its distance-minimal point."""
-    FA, FR, TA = confusion_cube(rows)
+    FA, FR, TA = confusion_cube(rows, label_column)
     feasible = FA == 0
     if not feasible.any():
         return {"feasible": False}
@@ -110,8 +110,8 @@ def select(rows: pd.DataFrame):
     }
 
 
-def evaluate(rows: pd.DataFrame, mean, p5, mn):
-    y = rows["training_label_v2"].to_numpy()
+def evaluate(rows: pd.DataFrame, mean, p5, mn, label_column: str = "training_label_v2"):
+    y = rows[label_column].to_numpy()
     pred = (
         (rows["evidence_mean_floor"].to_numpy(dtype=float) >= mean)
         & (rows["evidence_p5_floor"].to_numpy(dtype=float) >= p5)
@@ -146,11 +146,12 @@ def main():
     df = pd.read_csv(args.data)
     df = df.dropna(subset=["evidence_mean_floor", "evidence_p5_floor", "evidence_min_floor"])
     assert df["nameHash"].is_unique, "prepare_dataset_v2 must emit one row per nameHash"
-    n_pos = int((df["training_label_v2"] == 1).sum())
-    n_neg = int((df["training_label_v2"] == 0).sum())
-
     # b177 F9: what the labels are. Policy labels (the default) can check consistency only.
-    basis = label_basis.basis(df["human_visibility_label"]) if "human_visibility_label" in df.columns else label_basis.POLICY
+    basis = (label_basis.basis(df["human_visibility_label"], df["label_source"])
+             if {"human_visibility_label", "label_source"} <= set(df.columns) else label_basis.POLICY)
+    label_column = "human_visibility_label" if basis == label_basis.HUMAN else "training_label_v2"
+    n_pos = int((df[label_column] == 1).sum())
+    n_neg = int((df[label_column] == 0).sum())
     report = {
         "label_basis": basis,
         "label_disclaimer": label_basis.disclaimer(basis),
@@ -162,7 +163,7 @@ def main():
     }
 
     # --- Full-dataset selection (reported for transparency, NOT used for the verdict)
-    full_sel = select(df)
+    full_sel = select(df, label_column)
     full_pub = {k: v for k, v in full_sel.items() if not k.startswith("_")}
     report["full_dataset_selection_in_sample_only"] = full_pub
 
@@ -171,16 +172,16 @@ def main():
     splitter = GroupKFold(n_splits=k)
     folds, holdout_total = [], []
     boxes = []
-    for train_idx, test_idx in splitter.split(df, df["training_label_v2"], df["nameHash"]):
+    for train_idx, test_idx in splitter.split(df, df[label_column], df["nameHash"]):
         train, test = df.iloc[train_idx], df.iloc[test_idx]
-        sel = select(train)
+        sel = select(train, label_column)
         entry = {"train_rows": int(len(train)), "test_rows": int(len(test))}
         if not sel["feasible"]:
             entry["feasible"] = False
             folds.append(entry)
             continue
         s = sel["selected"]
-        held = evaluate(test, s["mean"], s["p5"], s["min"])
+        held = evaluate(test, s["mean"], s["p5"], s["min"], label_column)
         entry.update({k2: v for k2, v in sel.items() if not k2.startswith("_")})
         entry["holdout_confusion"] = held
         folds.append(entry)
@@ -215,8 +216,8 @@ def main():
     ref_holdout = {}
     for name, (m, p, mi) in refs.items():
         per = []
-        for train_idx, test_idx in splitter.split(df, df["training_label_v2"], df["nameHash"]):
-            per.append(evaluate(df.iloc[test_idx], m, p, mi))
+        for train_idx, test_idx in splitter.split(df, df[label_column], df["nameHash"]):
+            per.append(evaluate(df.iloc[test_idx], m, p, mi, label_column))
         ref_holdout[name] = add_confusions(*per)
     report["reference_holdout_confusions"] = ref_holdout
 
@@ -224,13 +225,13 @@ def main():
     chron = df.sort_values("timestampMs")
     split_at = int(len(chron) * 0.7)
     early, late = chron.iloc[:split_at], chron.iloc[split_at:]
-    sel_early = select(early)
+    sel_early = select(early, label_column)
     chron_entry = {"early_rows": int(len(early)), "late_rows": int(len(late))}
     if sel_early["feasible"]:
         s = sel_early["selected"]
         chron_entry["selected_on_early"] = s
-        chron_entry["late_confusion_selected"] = evaluate(late, s["mean"], s["p5"], s["min"])
-        chron_entry["late_confusion_current"] = evaluate(late, *[CURRENT[a] for a in ("mean", "p5", "min")])
+        chron_entry["late_confusion_selected"] = evaluate(late, s["mean"], s["p5"], s["min"], label_column)
+        chron_entry["late_confusion_current"] = evaluate(late, *[CURRENT[a] for a in ("mean", "p5", "min")], label_column)
         chron_entry["current_in_early_tied_set"] = sel_early["current_in_tied_set"]
     report["chronological_validation"] = chron_entry
 
@@ -242,7 +243,7 @@ def main():
         # One row per nameHash (asserted above), so group resampling = row resampling.
         pick = rng.integers(0, len(df), size=len(df))
         sample = df.iloc[pick]
-        s = select(sample)
+        s = select(sample, label_column)
         if not s["feasible"]:
             infeasible_count += 1
             continue
