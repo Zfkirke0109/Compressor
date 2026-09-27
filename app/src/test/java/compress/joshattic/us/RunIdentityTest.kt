@@ -3,9 +3,24 @@ package compress.joshattic.us
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Test
+import compress.joshattic.us.quality.QualityProbePolicy
 
 /** b177 F4: content and tool identities for matching runs. */
 class RunIdentityTest {
+
+    @Test
+    fun capturedGateReadsTheProductionPolicyConstants() {
+        val gate = ScoringIdentity.frozenGate()
+        assertEquals("vmaf_v0.6.1", gate["verdictModel"])
+        assertEquals(false, gate["phoneModel"])
+        assertEquals(QualityProbePolicy.WINDOW_MEAN_MIN, gate["windowMeanMin"])
+        assertEquals(QualityProbePolicy.WINDOW_P5_MIN, gate["windowP5Min"])
+        assertEquals(QualityProbePolicy.WINDOW_MIN_MIN, gate["windowMinMin"])
+        assertEquals(QualityProbePolicy.MIN_COMPARED_FRAMES_PER_WINDOW, gate["minComparedFramesPerWindow"])
+        assertEquals(mapOf("mean" to QualityProbePolicy.PROBE_SELECTION_MARGIN_MEAN,
+                           "p5" to QualityProbePolicy.PROBE_SELECTION_MARGIN_P5,
+                           "min" to QualityProbePolicy.PROBE_SELECTION_MARGIN_MIN), gate["probeSelectionMargins"])
+    }
 
     @Test
     fun fingerprintSamplesStartMiddleAndEndOfLargeFiles() {

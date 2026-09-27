@@ -8,6 +8,7 @@ import android.os.Build
 import java.io.File
 import java.security.MessageDigest
 import java.util.Locale
+import compress.joshattic.us.quality.QualityProbePolicy
 
 /**
  * Identities a capture needs to say two runs measured the same things with the same tools
@@ -61,6 +62,21 @@ object SourceFingerprint {
 
 /** Version and file identity of the native scoring libraries and the models they run. */
 object ScoringIdentity {
+    /** Frozen production decision constants, read from the gate itself rather than copied values. */
+    fun frozenGate(): Map<String, Any> = mapOf(
+        "verdictModel" to "vmaf_v0.6.1",
+        "phoneModel" to compress.joshattic.us.quality.VmafPairScorer.PRODUCTION_PHONE_MODEL,
+        "windowMeanMin" to QualityProbePolicy.WINDOW_MEAN_MIN,
+        "windowP5Min" to QualityProbePolicy.WINDOW_P5_MIN,
+        "windowMinMin" to QualityProbePolicy.WINDOW_MIN_MIN,
+        "probeSelectionMargins" to mapOf(
+            "mean" to QualityProbePolicy.PROBE_SELECTION_MARGIN_MEAN,
+            "p5" to QualityProbePolicy.PROBE_SELECTION_MARGIN_P5,
+            "min" to QualityProbePolicy.PROBE_SELECTION_MARGIN_MIN
+        ),
+        "minComparedFramesPerWindow" to QualityProbePolicy.MIN_COMPARED_FRAMES_PER_WINDOW
+    )
+
     fun describe(context: Context, vmafVersion: String?, v1Model: String?): Map<String, Any?> {
         val libDir = runCatching { File(context.applicationInfo.nativeLibraryDir) }.getOrNull()
         fun libHash(name: String): String = runCatching {
@@ -80,6 +96,7 @@ object ScoringIdentity {
         return linkedMapOf(
             "verdictModel" to "vmaf_v0.6.1",
             "verdictPhoneModel" to compress.joshattic.us.quality.VmafPairScorer.PRODUCTION_PHONE_MODEL,
+            "frozenGate" to frozenGate(),
             "libvmafVersion" to vmafVersion,
             "shadowModel" to v1Model,
             "libcompressorvmafSha256" to libHash("libcompressorvmaf.so"),

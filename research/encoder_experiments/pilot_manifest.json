@@ -53,7 +53,9 @@
      "status": "not run: needs the device"},
     {"id": "A3", "label": "shadow_calibration_on", "changes": {"shadowCalibration": true}, "settings": {"maxBFrames": 2, "longGop": false, "saferRungRetry": true, "shadowCalibration": true},
      "purpose": "timing only: acceptance must equal A0's on every source (v1 is never read by the gate)",
-     "status": "not run: needs the device"}
+     "status": "not run: needs the device"},
+    {"id": "A0_REPEAT", "label": "baseline_repeat", "repeatOf": "A0", "changes": {}, "settings": {"maxBFrames": 2, "longGop": false, "saferRungRetry": true, "shadowCalibration": false},
+     "status": "not run: repeatability measurement needs the device"}
   ],
   "blockedArms": [
     {"label": "encoder_complexity", "reason": "Media3 1.11 Transformer exposes no KEY_COMPLEXITY request; needs a custom Codec.EncoderFactory. The run_identity encoder inventory will show whether c2.qti.hevc.encoder advertises a complexity range at all."},
@@ -62,7 +64,7 @@
     {"label": "salvage_0.98_0.99", "reason": "Nine near-bar rejects total 3,289,602,779 source bytes; a nominal 2% of that is 65.8 MB. Kept as a later, bounded salvage run."},
     {"label": "desktop_x265_svt_av1", "reason": "Optional offline route; separately measured, never merged into an on-device claim."}
   ],
-  "order": ["A0", "A1", "A2", "A0"],
+  "order": ["A0", "A1", "A2", "A3", "A0_REPEAT"],
   "orderNote": "Same source order in every arm; baseline repeated last to measure repeatability. Device on charge, comparable starting thermal state, screen recording and Perfetto trace on job_458aa0663c3e in the first A0.",
   "measures": ["acceptedSavedBytes", "incrementalBytesVsBaseline", "sourceBytes", "outputBytes", "measuredFailures", "unavailableEvidence", "attemptsStarted", "retriesStarted", "audioFindings", "wallMs", "peakCandidateBytes"],
   "stopping": "Extend beyond the pilot only if an arm keeps all regression controls accepted and improves accepted bytes on matched sources. Report the tested frontier if no arm does."

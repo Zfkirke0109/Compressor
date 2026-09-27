@@ -95,18 +95,20 @@ baseline, so existing profiles keep their keys; nothing is reset.
 The rows below are PL-A (retry off) and PL-B (safer-rung retry on). They use the same 226 sources,
 the same build (`pr44-b177`, `2b4a2cf`) and different learned snapshots (`f6192479…` and
 `d6193bd0…`). This is observational, not a controlled A/B. Totals are produced by
-`run_experiment.py table` from the export.
+the initial experiment runner from the export. Strict pilot ingestion now requires the captured
+gate, source fingerprints, run settings, and completed manifest sources, which these historical
+logs do not carry; the older observational table is retained as historical analysis only.
 
 All 226 sources:
 
-| Arm | Accepted | Source bytes | Kept output bytes | Accepted saved bytes | Incremental | Measured rejections | Retried | Wall ms | Largest candidate |
+| Arm | Accepted | Source bytes | Kept output bytes | Accepted saved bytes | Incremental | Measured rejections | Retried | Sum of job elapsed ms | Largest candidate |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | PL-A | 23 | 50,946,351,461 | 5,615,231,923 | 818,443,848 | 0 | 170 | 0 | 7,201,127 | 771,754,918 |
 | PL-B | 24 | 50,946,351,461 | 5,630,890,751 | 819,538,365 | +1,094,517 | 169 | 1 | 9,960,415 | 771,754,918 |
 
 The ten pilot sources:
 
-| Arm | Accepted | Source bytes | Accepted saved bytes | Incremental | Measured rejections | Wall ms |
+| Arm | Accepted | Source bytes | Accepted saved bytes | Incremental | Measured rejections | Sum of job elapsed ms |
 |---|---:|---:|---:|---:|---:|---:|
 | PL-A | 3 | 8,603,236,107 | 88,216,584 | 0 | 7 | 735,872 |
 | PL-B | 4 | 8,603,236,107 | 89,311,101 | +1,094,517 | 6 | 2,271,909 |
