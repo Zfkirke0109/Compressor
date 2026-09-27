@@ -1026,7 +1026,10 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
                 )
             }
             if (state.totalOutputBytes > 0) {
-                Text("Outputs: ${state.formattedTotalOutput} • Saved by real compression: ${state.formattedTotalSaved}")
+                Text("Outputs: ${state.formattedTotalOutput} • ${AcceptedReduction.LABEL}: ${state.formattedTotalSaved}")
+                AcceptedReduction.storageNote(state.realCompressionCount, state.originalsReplacedCount, state.backupBeforeReplace)?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
     }
@@ -1308,7 +1311,8 @@ private fun BatchVideoItem.beforeAfterSummary(): String {
     val savedPercent = if (originalSize > 0L) ((savedBytes * 100.0) / originalSize).toInt() else 0
     val similarSize = originalSize > 0L && kotlin.math.abs(outputSize - originalSize).toDouble() / originalSize.toDouble() < 0.03
     if (terminalResult?.countsAsRealCompression == true) {
-        return "Before/after: ${formatCardBytes(originalSize)} → ${formatCardBytes(outputSize)} • saved ${formatCardBytes(savedBytes)} ($savedPercent%)"
+        // A size reduction, not freed space: the original may still sit beside this output.
+        return "Before/after: ${formatCardBytes(originalSize)} → ${formatCardBytes(outputSize)} • ${formatCardBytes(savedBytes)} smaller ($savedPercent%)"
     }
     val rawDelta = outputSize - originalSize
     val deltaLabel = when {

@@ -157,6 +157,9 @@ def _row(j: dict[str, Any]) -> dict[str, Any]:
         "wallMs": j.get("elapsedMs"),
         "peakCandidateBytes": j.get("candidateBytes"),
         "pixelCertified": j.get("pixelCertified"),
+        "thermalStart": j.get("thermalStart"),
+        "thermalEnd": j.get("thermalEnd"),
+        "precedingCooldownMs": j.get("precedingCooldownMs") or 0,
     }
 
 
@@ -190,6 +193,11 @@ def ingest(manifest: dict[str, Any], arm: str, capture: str, batch: str, out_dir
         raise SystemExit("error: build commit or starting learned snapshot missing")
     if start.get("mode") != "Perceptually Lossless":
         raise SystemExit("error: capture is not a Perceptually Lossless batch")
+    # Fast mode skips probing where learned history predicts failure, so each arm's learned state
+    # would decide which sources were measured at all. Exhaustive measures every source; b177 PL-A
+    # and PL-B ran it and probed the same rungs (448 vs 449) despite different learned snapshots.
+    if start.get("exhaustivePerceptualLossless") is not True:
+        raise SystemExit("error: pilot arms must run with Exhaustive (measure every file) on")
     jobs = [r for r in records if (r.get("type") or r.get("eventType")) == "job"]
     if not jobs:
         raise SystemExit(f"error: no job records for {batch} in {capture}")
@@ -226,6 +234,7 @@ def ingest(manifest: dict[str, Any], arm: str, capture: str, batch: str, out_dir
               "learnedSnapshotSha256": snapshot["sha256"],
               "sourceManifestSha256": summary["sourceManifestSha256"],
               "batchWallMs": summary["totalElapsedMs"],
+              "exhaustivePerceptualLossless": True,
               "missing": [],
               "rows": rows}
     Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -259,6 +268,8 @@ def table(results: dict[str, dict[str, Any]], baseline: str, manifest: dict[str,
     gates = {json.dumps(r.get("frozenGate"), sort_keys=True) for r in results.values()}
     if len(builds) != 1 or None in next(iter(builds)) or len(gates) != 1 or next(iter(gates)) == "null":
         raise SystemExit("error: arm builds or gates are missing or differ")
+    if any(r.get("exhaustivePerceptualLossless") is not True for r in results.values()):
+        raise SystemExit("error: every arm must be an Exhaustive-mode capture")
     source_manifests = {r.get("sourceManifestSha256") for r in results.values()}
     if len(source_manifests) != 1 or not next(iter(source_manifests)):
         raise SystemExit("error: captured source manifest digests differ or are missing")
@@ -311,6 +322,10 @@ def table(results: dict[str, dict[str, Any]], baseline: str, manifest: dict[str,
             "batchWallMs": results[label]["batchWallMs"],
             "summedJobElapsedMs": sum(r["wallMs"] or 0 for r in rows),
             "peakCandidateBytes": max((r["peakCandidateBytes"] or 0 for r in rows), default=0),
+            # Wall time includes the app's thermal cooldowns; report them, and the thermal state
+            # each measured job started in, beside the timing they confound.
+            "summedCooldownMs": sum(r.get("precedingCooldownMs") or 0 for r in rows),
+            "thermalAtJobStart": dict(Counter(r.get("thermalStart") for r in rows if r.get("thermalStart")).most_common()),
             "terminals": dict(Counter(r["terminal"] for r in rows).most_common()),
         }
     changed = []
@@ -340,11 +355,14 @@ def markdown(t: dict[str, Any]) -> str:
             ("jobsRetried", "Jobs retried"), ("audioBitIdentical", "Audio bit-identical"),
             ("audioRequestedCopyNotShown", "Accepted, audio copy not shown"),
             ("batchWallMs", "Batch wall ms"), ("summedJobElapsedMs", "Sum of job elapsed ms"),
-            ("peakCandidateBytes", "Largest candidate bytes")]
+            ("summedCooldownMs", "Thermal cooldown ms"), ("peakCandidateBytes", "Largest candidate bytes")]
     out = ["| Arm | Batch | " + " | ".join(c[1] for c in cols) + " |",
            "|---|---|" + "---:|" * len(cols)]
     for label, a in t["arms"].items():
         out.append(f"| {label} | `{a['batchId']}` | " + " | ".join(f"{a[k]:,}" for k, _ in cols) + " |")
+    out += ["", "Thermal state at the start of each measured job, by arm: "
+            + "; ".join(f"{label}: " + (", ".join(f"{k} {v}" for k, v in a["thermalAtJobStart"].items()) or "not recorded")
+                        for label, a in t["arms"].items()) + "."]
     out += ["", "Attempts started: pre-b177 records list attempts only for jobs that reached a certification "
             "failure or a retry, so older arms undercount; from b177 every encode attempt is counted (attemptsStarted)."]
     out += ["", "Matched-source results are observational. Starting learned snapshot SHA-256 by arm: "

@@ -95,8 +95,10 @@ phone can show now:
      events with `attemptIndex`, learned-state updates that name their job, and leaves the source's
      SHA-256 unchanged with replace-original off.
 2. **The pilot**: `python3 research/encoder_experiments/run_experiment.py plan
-   research/encoder_experiments/pilot_manifest.json`. Arms in order A0, A1, A2, A0; export
-   Everything after each; `ingest` and `table`.
+   research/encoder_experiments/pilot_manifest.json`. Arms in order A0, A1, A2, A3, A0_REPEAT,
+   each in Exhaustive mode with replace-original off; export after each; `ingest` and `table`.
+   The step-by-step runbook, with thermal notes and what each measure means, is
+   `docs/PREINSTALL_REVIEW_RESPONSE.md` §5.
 3. **Timing**: a Perfetto trace with CPU frequency, idle states and scheduling, plus a screen
    recording, on `job_458aa0663c3e` in the first A0. New builds log `timing[...]` per window
    (queue waits, v0, flush, CAMBI, v1, decoder and process CPU).

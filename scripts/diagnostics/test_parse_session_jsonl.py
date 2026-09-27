@@ -505,5 +505,54 @@ def test_replay_coverage_recognizes_valid_per_job_stages_and_update_chain():
     assert replay_coverage(session)["label"] == "PARTIAL_OBSERVATIONAL_REPLAY"
 
 
+def test_replay_coverage_matches_what_each_terminal_path_emits():
+    """The app side of per-job coverage: which stages each terminal path writes (b82d465 contract).
+
+    A probe skip ends in planning with its rungs and a terminal `accept`; a stream-copy remux writes
+    a `finalize` for its candidate; a failed floor recovery writes a `certify` (scope floor_recovery)
+    for its `ran_floor_recovery_*` status. Before, only the finalize path wrote `accept` and only an
+    encode wrote `finalize`, so every realistic PL batch read as partial.
+    """
+    from parse_session_jsonl import replay_coverage
+
+    def ev(job, stage, **fields):
+        return {"jobId": job, "stage": stage, "attemptIndex": fields.pop("attemptIndex", 0), **fields}
+
+    jobs = [
+        {"jobId": "skip", "terminal": "SKIPPED_WOULD_DEGRADE", "probedRatios": "0.85,0.90", "attemptsStarted": None},
+        {"jobId": "remux", "terminal": "ALREADY_HIGHLY_OPTIMIZED", "candidateBytes": 10_000},
+        {"jobId": "enc", "terminal": "TRANSCODED_SMALLER", "attemptsStarted": 1, "probedRatios": "0.90",
+         "probeRungId": "0.90@abc", "pixelProvenRatio": 0.9, "candidateBytes": 9_000,
+         "certificationDecision": "passed", "certificationStatus": "ran_scored"},
+        {"jobId": "rec", "terminal": "REMUX_PREFERRED_BY_EVIDENCE", "attemptsStarted": 1, "candidateBytes": 8_000,
+         "certificationStatus": "ran_floor_recovery_scored_below_bar"},
+    ]
+    stages = [
+        ev("skip", "probe_rung"), ev("skip", "probe_rung"), ev("skip", "accept", reasonCode="rejected"),
+        ev("remux", "finalize", operation="remux"), ev("remux", "verify"), ev("remux", "accept"),
+        ev("enc", "probe_rung"), ev("enc", "size_gate"), ev("enc", "plan"), ev("enc", "encode", attemptIndex=1),
+        ev("enc", "finalize", attemptIndex=1), ev("enc", "verify", attemptIndex=1),
+        ev("enc", "certify", attemptIndex=1, accepted=True), ev("enc", "accept", attemptIndex=1),
+        ev("rec", "plan"), ev("rec", "encode", attemptIndex=1), ev("rec", "finalize", attemptIndex=1),
+        ev("rec", "certify", attemptIndex=1, scope="floor_recovery", accepted=False),
+        ev("rec", "verify", attemptIndex=1), ev("rec", "accept", attemptIndex=1),
+    ]
+    session = {"jobs": jobs, "stages": stages, "learnedSnapshot": {"sha256": "snap"},
+               "identity": {"scoring": {}}, "learnedUpdates": 1,
+               "updates": [{"jobId": "enc", "attemptIndex": 1, "updateIndex": 0, "snapshotSha256": "snap"}]}
+    cov = replay_coverage(session)
+    assert cov["label"] == "REPLAYABLE_RECORD", cov
+    assert cov["missingJobStages"] == {} and cov["orphanStages"] == 0
+
+    # The pre-fix emissions: no terminal event off the finalize path, no finalize for a remux,
+    # no certify for a failed floor recovery.
+    before = dict(session, stages=[s for s in stages if not (
+        (s["jobId"] == "skip" and s["stage"] == "accept")
+        or (s["jobId"] == "remux" and s["stage"] == "finalize")
+        or (s["jobId"] == "rec" and s["stage"] == "certify"))])
+    cov = replay_coverage(before)
+    assert cov["label"] == "PARTIAL_OBSERVATIONAL_REPLAY"
+    assert cov["missingJobStages"] == {"skip": ["accept"], "remux": ["finalize"], "rec": ["certify"]}
+
 if __name__ == "__main__":
     raise SystemExit(_main())

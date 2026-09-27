@@ -28,11 +28,13 @@ Experimental app settings learn under their own profile-key suffix (`EncoderExpe
 learningKeySuffix`): an arm never reads or writes the baseline's learned ratios. Record the
 `learned_state_snapshot` hash at each arm's start; do not clear app data.
 
-Ingestion requires a completed PL batch with exactly the manifest sources, a unique job record
+Ingestion requires a completed PL batch run in Exhaustive mode (Fast mode lets each arm's learned
+history decide which sources are probed at all) with exactly the manifest sources, a unique job record
 per source, matching name hash/size, a sampled source fingerprint, the captured production gate,
 arm settings, build identity, and starting learned-state snapshot. The table requires every arm,
 the same build and exact source fingerprints across arms. It reports batch wall time separately
-from summed per-job elapsed time and prints every arm's starting learned snapshot; differing
+from summed per-job elapsed time and thermal cooldown, lists the thermal state each measured job
+started in, and prints every arm's starting learned snapshot; differing
 snapshots confound any claimed arm effect. Each arm result is written once; a
 repeated baseline uses `A0_REPEAT` rather than replacing A0. Keep the separate private full-hash
 sheet: sampled device fingerprints cannot prove full-file identity. The older b177 captures lack

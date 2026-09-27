@@ -229,6 +229,9 @@ data class BatchCompressorUiState(
     val realCompressionCount: Int get() = terminalAccounting.realCompressionCount
     val nonCompressionCount: Int get() = terminalAccounting.nonCompressionCount
     val totalSavedBytes: Long get() = terminalAccounting.totalBytesSaved
+    // Real compressions whose original was replaced. The rest are copies: their reduction frees nothing.
+    val originalsReplacedCount: Int
+        get() = items.count { it.status == BatchItemStatus.Replaced && it.terminalResult?.countsAsRealCompression == true }
     // Items that reached a terminal state, over all items. An encoder's fraction is not completion.
     val currentBatchProgress: Float get() = ItemProgressModel.batchFraction(items)
     val formattedTotalOriginal: String get() = formatFileSize(totalOriginalBytes)
@@ -1164,7 +1167,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 failedCount = accounting.failedCount,
                 skippedCount = accounting.skippedCount,
                 cancelledCount = accounting.cancelledCount,
-                totalSavedBytes = accounting.totalBytesSaved
+                totalSavedBytes = accounting.totalBytesSaved,
+                originalsReplacedCount = it.originalsReplacedCount,
+                backupsKept = it.backupBeforeReplace
             )
             it.copy(
                 isCompressing = false,
@@ -1228,7 +1233,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     failedCount = accounting.failedCount,
                     skippedCount = accounting.skippedCount,
                     cancelledCount = accounting.cancelledCount,
-                    totalSavedBytes = accounting.totalBytesSaved
+                    totalSavedBytes = accounting.totalBytesSaved,
+                    originalsReplacedCount = it.originalsReplacedCount,
+                    backupsKept = it.backupBeforeReplace
                 ),
                 statusMessage = "Compression canceled. ${accounting.cancelledCount} item${if (accounting.cancelledCount == 1) "" else "s"} canceled.",
                 errorMessage = null
@@ -1532,7 +1539,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             probePairDiag = plan.probePairDiag,
             probeV1Scores = plan.probeV1Scores,
             probeRateDiag = plan.probeRateDiag,
-            precedingCooldownMs = s.precedingHandoffCooldownMs
+            precedingCooldownMs = s.precedingHandoffCooldownMs,
+            stageAttempt = s.phases.token.attempt
         )
         updateItem(s.index) {
             it.copy(
@@ -1603,7 +1611,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             outputSize = 0L,
             terminal = BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED,
             elapsedMs = s.elapsedMs,
-            precedingCooldownMs = s.precedingHandoffCooldownMs
+            precedingCooldownMs = s.precedingHandoffCooldownMs,
+            stageAttempt = s.phases.token.attempt
         )
         updateItem(s.index) {
             it.copy(
@@ -1719,7 +1728,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             precedingCooldownMs = s.precedingHandoffCooldownMs,
             materializationMode = "REUSED_SOURCE",
             copyAvoidedBytes = item.originalSize,
-            probeRungId = plan.probeRungId
+            probeRungId = plan.probeRungId,
+            stageAttempt = s.phases.token.attempt
         )
         val elapsed = s.elapsedMs
         val thermalWindow = s.thermalWindow
@@ -1814,22 +1824,24 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // The closed, rewritten file: the first size that means anything. Still only a candidate.
         s.outputSize = remuxResult.outputFile.length()
         s.phases.candidateReady(s.outputSize)
-        s.resolvedPlan?.let { plan ->
-            run.diagnostics.stage(
-                StageEvent(
-                    sourceKey = item.sourceUri.toString(), attempt = s.phases.token.attempt, attemptIndex = s.ledger.currentIndex,
-                    stage = StageEvent.Stage.FINALIZE, reasonCode = StageEvent.Reason.CANDIDATE_FINALIZED,
-                    elapsedMs = s.elapsedMs,
-                    fields = mapOf(
-                        "candidateBytes" to s.outputSize,
-                        "predictedBytes" to plan.estimatedBytes,
-                        "requestedVideoBitrate" to plan.requestedVideoBitrate,
-                        "reportedVideoBitrate" to s.encodeAttempt?.reportedAverageVideoBitrate,
-                        "encoderName" to s.encodeAttempt?.videoEncoderName
-                    )
+        // Every candidate, a stream-copy remux included: its job record carries candidateBytes, and
+        // per-job replay coverage expects the finalize event that produced them.
+        val plan = s.resolvedPlan
+        run.diagnostics.stage(
+            StageEvent(
+                sourceKey = item.sourceUri.toString(), attempt = s.phases.token.attempt, attemptIndex = s.ledger.currentIndex,
+                stage = StageEvent.Stage.FINALIZE, reasonCode = StageEvent.Reason.CANDIDATE_FINALIZED,
+                elapsedMs = s.elapsedMs,
+                fields = mapOf(
+                    "operation" to if (plan != null) "encode" else "remux",
+                    "candidateBytes" to s.outputSize,
+                    "predictedBytes" to plan?.estimatedBytes,
+                    "requestedVideoBitrate" to plan?.requestedVideoBitrate,
+                    "reportedVideoBitrate" to s.encodeAttempt?.reportedAverageVideoBitrate,
+                    "encoderName" to s.encodeAttempt?.videoEncoderName
                 )
             )
-        }
+        )
         return true
     }
 
@@ -2175,6 +2187,30 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     else -> "failed"
                 }
                 s.failedFloorRecoveryStatus = CertificationStatus.forFailedRecoveryOutcome(recoveryOutcome)
+                // The job record will say `ran_floor_recovery_*`; this is that certification's event,
+                // with its windows. A passing recovery needs none: final certification reuses its
+                // scores and emits its own `certify` event (floorRecoveryScores=true).
+                run.diagnostics.stage(
+                    StageEvent(
+                        sourceKey = item.sourceUri.toString(), attempt = s.phases.token.attempt, attemptIndex = s.ledger.currentIndex,
+                        stage = StageEvent.Stage.CERTIFY,
+                        reasonCode = when (recoveryDecision) {
+                            CertificationDecision.MEASURED_FAILURE -> StageEvent.Reason.CERT_MEASURED_FAILURE
+                            CertificationDecision.INSUFFICIENT_EVIDENCE -> StageEvent.Reason.CERT_INSUFFICIENT
+                            CertificationDecision.MISALIGNED -> StageEvent.Reason.CERT_MISALIGNED
+                            CertificationDecision.PARTIAL -> StageEvent.Reason.CERT_PARTIAL
+                            else -> StageEvent.Reason.CERT_UNAVAILABLE
+                        },
+                        elapsedMs = s.elapsedMs,
+                        fields = mapOf(
+                            "scope" to "floor_recovery",
+                            "accepted" to false,
+                            "pixelCertified" to false,
+                            "configId" to s.ledger.current?.configId,
+                            "plannedWindows" to (recoveryOutcome as? PairScoreOutcome.Incomplete)?.plannedWindows
+                        ) + StageEvent.windowFields("cert", recoveryScores)
+                    )
+                )
                 DiagLog.i(
                     "CompressorProbe",
                     "floor recovery; job=${diagnosticJobId(item)}; certification $cause; fallback proceeds"
@@ -2399,7 +2435,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             precedingCooldownMs = s.precedingHandoffCooldownMs,
             encodePlan = s.resolvedPlan,
             attempts = s.ledger,
-            probeRungId = perceptualPlan.probeRungId
+            probeRungId = perceptualPlan.probeRungId,
+            stageAttempt = s.phases.token.attempt
         )
         updateItem(s.index) {
             it.copy(
@@ -2827,7 +2864,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             certificationDecision = s.certificationDecision,
             encodePlan = s.resolvedPlan,
             attempts = s.ledger,
-            probeRungId = perceptualPlan?.probeRungId
+            probeRungId = perceptualPlan?.probeRungId,
+            acceptStageEmitted = true
         )
 
         if (terminal.isFailure) {
@@ -3005,7 +3043,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             attempts = s.ledger,
             candidateBytes = s.outputSize.takeIf { it > 0L },
             certificationDecision = s.certificationDecision,
-            probeRungId = s.perceptualPlan?.probeRungId
+            probeRungId = s.perceptualPlan?.probeRungId,
+            stageAttempt = s.phases.token.attempt
         )
     }
 
@@ -4391,7 +4430,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         certificationDecision: CertificationDecision? = null,
         encodePlan: ResolvedEncodePlan? = null,
         attempts: AttemptLedger? = null,
-        probeRungId: String? = null
+        probeRungId: String? = null,
+        // The callback token of the attempt that ended the job, for its terminal stage event. The
+        // ledger's current entry carries it once an encode began; a skip passes its own token.
+        stageAttempt: Int = attempts?.current?.token ?: 0,
+        // The finalize path emits a richer `accept` event itself; every other path gets one here.
+        acceptStageEmitted: Boolean = false
     ) {
         require(verification == null || retainedValidation == null) {
             "A job cannot carry both output verification and retained-source validation"
@@ -4408,6 +4452,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             retainedReadable = retainedValidation?.readableAtDecisionTime
         )
         val recordedOutputSize = if (retainedValidation != null) outputSize else acceptance.acceptedOutputBytes
+        if (!acceptStageEmitted) {
+            diagnostics.stage(
+                StageEvent.terminal(
+                    sourceKey = item.sourceUri.toString(), attempt = stageAttempt,
+                    attemptIndex = attempts?.currentIndex ?: 0, terminal = terminal,
+                    keptOutputBytes = recordedOutputSize, candidateBytes = acceptance.candidateBytes,
+                    elapsedMs = elapsedMs
+                )
+            )
+        }
         diagnostics.job(
             // The recorder hashes both values before emission; raw URI/name never leave this call.
             sourceKey = item.sourceUri.toString(),

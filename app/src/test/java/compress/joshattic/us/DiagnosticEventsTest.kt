@@ -10,6 +10,55 @@ import org.junit.Test
 class DiagnosticEventsTest {
 
     @Test
+    fun everyTerminalPathGetsAnAcceptEventThatSaysWhatWasKept() {
+        // A probe skip: nothing produced, nothing kept.
+        val skip = StageEvent.terminal("content://s", 260, 0, BatchTerminalResult.SKIPPED_WOULD_DEGRADE, 0L, null, 1_200L)
+        assertEquals(StageEvent.Stage.ACCEPT, skip.stage)
+        assertEquals(StageEvent.Reason.REJECTED, skip.reasonCode)
+        assertEquals(0, skip.attemptIndex)
+        assertEquals("SKIPPED_WOULD_DEGRADE", skip.fields["terminal"])
+        assertEquals(0L, skip.fields["candidateBytes"])
+        // A certification failure: a candidate existed but was discarded, so it is rejected even
+        // though it had bytes.
+        val discarded = StageEvent.terminal("content://s", 261, 1, BatchTerminalResult.SKIPPED_WOULD_DEGRADE, 0L, 14_928_138L, 9_000L)
+        assertEquals(StageEvent.Reason.REJECTED, discarded.reasonCode)
+        assertEquals(14_928_138L, discarded.fields["candidateBytes"])
+        assertEquals(0L, discarded.fields["keptBytes"])
+        // A failure never reads as accepted, whatever it kept.
+        val failed = StageEvent.terminal("content://s", 262, 1, BatchTerminalResult.ENCODER_FAILURE, 5L, 5L, null)
+        assertEquals(StageEvent.Reason.REJECTED, failed.reasonCode)
+        // A kept result.
+        val kept = StageEvent.terminal("content://s", 263, 2, BatchTerminalResult.TRANSCODED_SMALLER, 15_000_000L, 15_000_000L, 9_500L)
+        assertEquals(StageEvent.Reason.ACCEPTED, kept.reasonCode)
+        assertEquals(2, kept.attemptIndex)
+    }
+
+    @Test
+    fun acceptedReductionIsNotCalledFreeSpaceWhileOriginalsRemain() {
+        // Copy mode (the pilot): every accepted output sits beside its original.
+        assertEquals(
+            "Not free space yet: 3 of 3 accepted outputs are copies beside the original",
+            AcceptedReduction.storageNote(3, 0, backupsKept = true)
+        )
+        assertEquals(
+            "Not free space yet: 1 of 1 accepted output is a copy beside the original",
+            AcceptedReduction.storageNote(1, 0, backupsKept = false)
+        )
+        // Replaced, but backed up first.
+        assertEquals(
+            "Not free space yet: 1 of 3 accepted outputs are copies beside the original; backups of 2 replaced originals are kept",
+            AcceptedReduction.storageNote(3, 2, backupsKept = true)
+        )
+        // Replaced without backups: the reduction is freed space; nothing to qualify.
+        assertEquals(null, AcceptedReduction.storageNote(2, 2, backupsKept = false))
+        assertEquals(null, AcceptedReduction.storageNote(0, 0, backupsKept = true))
+        val summary = BatchMetricsSummary(1_000L, 0L, 2, 1, 1, 0, 0, 0, 5_000_000L)
+        assertFalse(summary.summaryLines.any { it.startsWith("Saved") })
+        assertEquals(true, summary.summaryLines.any { it.startsWith(AcceptedReduction.LABEL) })
+        assertEquals(true, summary.summaryLines.any { it.startsWith("Not free space yet") })
+    }
+
+    @Test
     fun theSnapshotHashIsOrderIndependentAndChangesWithTheState() {
         val a = LearnedStateSnapshot.of(linkedMapOf("k2" to "v2", "k1" to "v1"))
         val b = LearnedStateSnapshot.of(linkedMapOf("k1" to "v1", "k2" to "v2"))

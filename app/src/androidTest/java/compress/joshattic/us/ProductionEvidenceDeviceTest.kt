@@ -159,6 +159,12 @@ class ProductionEvidenceDeviceTest {
             assertTrue(stages.any { it.optString("stage") == "verify" })
         }
         if (!job.isNull("probedRatios")) assertTrue(stages.any { it.optString("stage") == "probe_rung" })
+        // Every job ends with a terminal event, whatever path ended it, and a candidate has the
+        // finalize event that produced it (per-job replay coverage, parse_session_jsonl).
+        records.filter { type(it) == "job" }.map { it.optString("jobId") }.forEach { id ->
+            assertTrue("job $id has no accept event", stages.any { it.optString("jobId") == id && it.optString("stage") == "accept" })
+        }
+        if (job.optLong("candidateBytes") > 0L) assertTrue(stages.any { it.optString("stage") == "finalize" })
         records.filter { type(it) == "learned_state_update" }.forEach {
             assertFalse("a learned-state write names no job: $it", it.isNull("jobId"))
         }

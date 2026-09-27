@@ -91,6 +91,36 @@ data class StageEvent(
 
         /** Round-trippable decimal: enough digits that parsing it gives back the same double. */
         fun full(v: Double): String = if (v.isFinite()) v.toString() else "nan"
+
+        /**
+         * The terminal decision of one job, on whatever path ended it. Per-job replay coverage
+         * (parse_session_jsonl.replay_coverage) requires an `accept` event for every job, and before
+         * this only the finalize path wrote one: a probe skip, a keep-original, a certification
+         * failure or an item failure ended with a job record and no terminal event (199 of 226
+         * jobs in each b177 PL batch). [keptOutputBytes] is what the job keeps: 0 when the
+         * candidate was discarded or nothing was produced, so a discarded candidate is "rejected".
+         */
+        fun terminal(
+            sourceKey: String,
+            attempt: Int,
+            attemptIndex: Int,
+            terminal: BatchTerminalResult,
+            keptOutputBytes: Long,
+            candidateBytes: Long?,
+            elapsedMs: Long?
+        ): StageEvent = StageEvent(
+            sourceKey = sourceKey,
+            attempt = attempt,
+            attemptIndex = attemptIndex,
+            stage = Stage.ACCEPT,
+            reasonCode = if (!terminal.isFailure && keptOutputBytes > 0L) Reason.ACCEPTED else Reason.REJECTED,
+            elapsedMs = elapsedMs,
+            fields = linkedMapOf(
+                "terminal" to terminal.name,
+                "keptBytes" to keptOutputBytes,
+                "candidateBytes" to (candidateBytes ?: 0L)
+            )
+        )
     }
 }
 

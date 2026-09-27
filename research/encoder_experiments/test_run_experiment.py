@@ -44,11 +44,12 @@ def test_a_changed_threshold_or_a_two_factor_arm_is_rejected():
     assert any("one factor at a time" in p for p in problems)
 
 
-def _capture(batch, jobs, arm="A0"):
+def _capture(batch, jobs, arm="A0", exhaustive=True):
     fd, path = tempfile.mkstemp(suffix=".jsonl")
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps({"type": "session_start", "batchId": batch, "mode": "Perceptually Lossless",
-                             "selectedCount": len(jobs), "buildTag": "pr44-test", "buildCommit": "test-commit"}) + "\n")
+                             "selectedCount": len(jobs), "buildTag": "pr44-test", "buildCommit": "test-commit",
+                             "exhaustivePerceptualLossless": exhaustive}) + "\n")
         fh.write(json.dumps({"type": "learned_state_snapshot", "batchId": batch, "sha256": "snapshot"}) + "\n")
         settings = next(a["settings"] for a in MANIFEST["arms"] if a["id"] == arm)
         fh.write(json.dumps({"type": "run_identity", "batchId": batch,
@@ -136,6 +137,35 @@ def test_ingest_refuses_missing_gate_or_wrong_settings_and_prevents_overwrite():
             pass
         else:
             raise AssertionError(f"{mutation} capture was ingested")
+
+
+def test_pilot_arms_must_be_exhaustive_and_report_thermal_and_cooldown():
+    # Fast mode lets each arm's learned history decide which sources are probed at all.
+    source = MANIFEST["sources"][0]
+    m = copy.deepcopy(MANIFEST)
+    m["sources"] = [source]
+    job = {"jobId": source["jobId"], "sourceSize": source["sourceBytes"], "nameHash": source["nameHash"],
+           "outputSize": 0, "countsAsRealCompression": False, "thermalStart": "warm", "precedingCooldownMs": 30_000}
+    try:
+        r.ingest(m, "A0", _capture("fast", [job], exhaustive=False), "fast", tempfile.mkdtemp())
+    except SystemExit as e:
+        assert "Exhaustive" in str(e)
+    else:
+        raise AssertionError("a Fast-mode capture was ingested as a pilot arm")
+    out = tempfile.mkdtemp()
+    results = {arm: r.ingest(m, arm, _capture("b-" + arm, [job], arm=arm), "b-" + arm, out)
+               for arm in ("A0", "A1", "A2", "A3", "A0_REPEAT")}
+    t = r.table(results, "A0", m)
+    assert t["arms"]["A0"]["summedCooldownMs"] == 30_000
+    assert t["arms"]["A0"]["thermalAtJobStart"] == {"warm": 1}
+    assert "Thermal state at the start of each measured job" in r.markdown(t)
+    results["A1"] = dict(results["A1"], exhaustivePerceptualLossless=None)
+    try:
+        r.table(results, "A0", m)
+    except SystemExit as e:
+        assert "Exhaustive" in str(e)
+    else:
+        raise AssertionError("a table mixed a non-exhaustive arm")
 
 
 def test_table_rejects_same_job_id_with_different_content_or_missing_arm():
