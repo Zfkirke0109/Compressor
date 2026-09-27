@@ -85,13 +85,43 @@ Resulting sensitivity on a 100-nit neutral patch: 1% luminance error ≈ 0.72 JN
 
 - `scripts/hdr_pair_measure.py` — decodes matched windows of two HDR files to linear BT.2020
   RGB and reports per-window ΔE<sub>ITP</sub> and PU21-PSNR as JSON.
-- `scripts/test_hdr_pair_measure.py` — **12 tests, all passing**, covering the fail-closed
-  validation and the exact ffmpeg invocation.
+- `scripts/test_hdr_pair_measure.py` — **38 tests, all passing** (b177; 12 before), covering the
+  fail-closed validation, timestamp pairing and coverage, decoder errors, the exact ffmpeg
+  invocation, and the colour conversion against BT.2100 code values. The four known-vector tests
+  that encode real files need ffmpeg and ffprobe and are reported as SKIP, never PASS, without them.
 - `python3 hdr_pair_measure.py --self-test` — synthesizes a PQ/BT.2020 pair with ffmpeg and
   measures it end to end. Identical inputs score **exactly 0.000000**; a deliberately bad
-  encode scores far higher. This caught a real bug on its first run: the `scale` filter takes
-  `in_color_matrix=bt2020`, not `bt2020nc` (the `-colorspace`/ffprobe spelling for the same
-  matrix), which fails with an unhelpful "Undefined constant" error.
+  encode scores far higher.
+
+**b177 review (F7): measurement integrity, fixed before any real HDR result is read.** The
+review's controlled reproduction showed that two unknown primaries and a BT.2020/BT.709 matrix
+mismatch passed validation, and that three reference frames against one output frame returned an
+ordinary one-frame measurement with ΔE 0. Now:
+
+- **Colour interpretation must be known, supported and identical**: BT.2020 primaries, the BT.2020
+  non-constant-luminance matrix (constant luminance is rejected), a declared range (tv or pc),
+  equal bit depth of at least 10, a supported planar 10/12-bit layout, and a known, equal frame
+  rate. "unknown" matching "unknown" fails. PQ and HLG are told apart (`transfer_family`); HLG is
+  still rejected, not measured.
+- **No scaler converts the samples.** ffmpeg hands back native Y'CbCr and `yuv_to_rgb_prime`
+  applies the matrix and range with the exact BT.2100 formulas. The known-vector test found that
+  swscale's 10-bit limited-range expansion is inexact: code 940 (peak white) decoded as 0.99615
+  instead of 1.0, and 502 as 0.49807 instead of 0.5, with or without `accurate_rnd`/`bitexact`.
+- **Frames are paired by presentation timestamp** (`-copyts -start_at_zero` + `showinfo`), never by
+  position. Any frame without a partner, a non-monotonic timeline, or a reference window short of
+  its expected frame count fails the window. A one-frame skew is reported as incomplete coverage,
+  not as a shifted comparison.
+- **Decoder errors propagate**, including one after valid frames (`-xerror`, error lines, exit
+  status).
+- **Durations must agree within one frame**; the windows are planned on the reference. A truncated
+  output is rejected instead of being measured up to its own end.
+- The report (schema `hdr_pair_measure/2`) states transfer family, matrix, range, bit depth, fps,
+  both durations and per-window coverage (expected / matched / unmatched on each side), and still
+  carries `"verdict": null`.
+
+The handoff's `reproduce_hdr_harness_gaps.py` now stops with `HarnessFailure` on its third case
+(its stub frames carry no timestamps and its metadata no frame rate); the same three cases with
+timestamps and frame rate all fail closed with a stated reason.
 
 Requires `ffmpeg` and `ffprobe` on PATH. The self-test path needs only ffmpeg and falls back to
 the `imageio-ffmpeg` static build.
@@ -101,9 +131,10 @@ What it refuses to do, deliberately:
 - **HLG is rejected, not measured.** Its EOTF is a different curve; applying the PQ curve would
   produce confident, wrong numbers instead of an error.
 - **SDR is redirected** to `measure_quality.py`, which has a validated VMAF path.
-- **Nothing is rescaled, tone-mapped, or transfer-converted.** A geometry, transfer, or
-  primaries mismatch fails the run rather than being papered over, and a test asserts the
-  decode command contains no `tonemap` / `zscale` / transfer conversion.
+- **Nothing is rescaled, tone-mapped, or transfer-converted.** A geometry, transfer, primaries,
+  matrix, range, bit-depth or frame-rate mismatch fails the run rather than being papered over,
+  and a test asserts the decode command contains no `scale` / `tonemap` / `zscale` / transfer
+  conversion.
 - **The report carries `"verdict": null`.** No calibrated HDR threshold exists yet, so it states
   measurements and refuses to imply a pass.
 
@@ -115,8 +146,10 @@ so offline numbers and on-device numbers describe the same parts of a clip.
 This tooling measures; it does not authorize. Before a single HDR clip is re-encoded by
 Smart Perceptually Lossless:
 
-1. ~~The extraction layer exists and is validated on known pairs.~~ **Done** — but validated
-   only against synthetic clips so far, never against real S23 Ultra HDR footage.
+1. ~~The extraction layer exists and is validated on known pairs.~~ **Done**, and after b177 its
+   metadata checks, timestamp pairing, coverage and colour conversion are tested too; but it has
+   been validated only against synthetic clips so far, never against real S23 Ultra HDR footage.
+   Dynamic metadata (HDR10+ per frame) is not compared by this harness at all.
 2. A corpus of real HDR camera clips is measured across a bitrate ladder, giving a
    ΔE<sub>ITP</sub> distribution for HDR re-encodes at each ratio.
 3. A threshold is derived from that distribution — including what fraction of the frame
