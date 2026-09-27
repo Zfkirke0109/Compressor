@@ -1,6 +1,7 @@
 package compress.joshattic.us
 
 import android.content.Context
+import android.content.SharedPreferences
 
 /**
  * Opt-in encoder experiments, persisted per device, off by default.
@@ -29,7 +30,17 @@ object EncoderExperiments {
     fun isBFramesEnabled(context: Context): Boolean = maxBFrames(context) > 0
 
     fun setBFramesEnabled(context: Context, enabled: Boolean) {
-        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        setBFramesEnabled(context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE), enabled)
+    }
+
+    internal fun setBFramesEnabled(prefs: SharedPreferences, enabled: Boolean) {
+        // Existing unsuffixed profiles belong to the setting before this build's first change.
+        // Pin it in the same preference update, even if no batch has run since the upgrade.
+        val editor = prefs.edit()
+        if (!prefs.contains(KEY_BASELINE_B_FRAMES)) {
+            editor.putInt(KEY_BASELINE_B_FRAMES, prefs.getInt(KEY_MAX_B_FRAMES, 0))
+        }
+        editor
             .putInt(KEY_MAX_B_FRAMES, if (enabled) B_FRAMES_WHEN_ENABLED else 0)
             .apply()
     }
@@ -102,22 +113,24 @@ object EncoderExperiments {
      * Empty for the baseline, so existing learned profiles keep their keys.
      *
      * B-frames were never part of the key, so the existing state was learned under whatever the
-     * B-frame setting was. The first plan made by this build pins that setting as the baseline
-     * ([KEY_BASELINE_B_FRAMES]); a later change of the setting then learns under ";bf<N>".
+     * B-frame setting was. The first plan, or the first setting change before any plan, pins the
+     * pre-change setting as the baseline ([KEY_BASELINE_B_FRAMES]); other settings learn under ";bf<N>".
      */
     fun learningKeySuffix(longGop: Boolean, bFrames: Int = 0, baselineBFrames: Int = bFrames): String =
         (if (bFrames != baselineBFrames) ";bf$bFrames" else "") + (if (longGop) ";gopx2" else "")
 
-    fun learningKeySuffix(context: Context): String {
-        val prefs = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val bFrames = maxBFrames(context)
+    fun learningKeySuffix(context: Context): String =
+        learningKeySuffixForPreferences(context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE))
+
+    internal fun learningKeySuffixForPreferences(prefs: SharedPreferences): String {
+        val bFrames = prefs.getInt(KEY_MAX_B_FRAMES, 0)
         val baseline = if (prefs.contains(KEY_BASELINE_B_FRAMES)) {
             prefs.getInt(KEY_BASELINE_B_FRAMES, bFrames)
         } else {
             prefs.edit().putInt(KEY_BASELINE_B_FRAMES, bFrames).apply()
             bFrames
         }
-        return learningKeySuffix(isLongGopEnabled(context), bFrames, baseline)
+        return learningKeySuffix(prefs.getBoolean(KEY_LONG_GOP, false), bFrames, baseline)
     }
 
     /** The part of an encoder config line that names the experiment, or "" when off. */
