@@ -4,8 +4,6 @@ import compress.joshattic.us.DiagLog
 import android.content.Context
 import android.net.Uri
 import android.util.Log
-import java.util.concurrent.ArrayBlockingQueue
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
@@ -359,7 +357,7 @@ val PairScoreOutcome.scoredWindows: List<WindowScore>?
 object VmafPairScorer {
     private const val TAG = "VmafPairScorer"
     private const val MAX_QUEUE_CAPACITY = 4
-    private const val QUEUE_POLL_TIMEOUT_S = 30L
+    private const val QUEUE_POLL_TIMEOUT_MS = 30_000L
     private const val FRAME_COUNT_TOLERANCE = 2
 
     /**
@@ -565,26 +563,25 @@ object VmafPairScorer {
             }
         }
         val queueCapacity = queueCapacityFor(width, height)
-        val refQueue = ArrayBlockingQueue<I420Frame>(queueCapacity)
-        val distQueue = ArrayBlockingQueue<I420Frame>(queueCapacity)
+        val refQueue = ScoringFrameQueue<I420Frame>(queueCapacity)
+        val distQueue = ScoringFrameQueue<I420Frame>(queueCapacity)
         val error = AtomicReference<String?>(null)
         // Both readers decode the lead-in as well as the window; only pairs whose reference frame
         // lies inside the window are scored (see the PAIR branch below).
         val decodeLenUs = window.contextUs + window.leadInUs + (window.endUs - window.startUs)
 
-        fun reader(uri: Uri, startUs: Long, queue: ArrayBlockingQueue<I420Frame>, label: String, cpu: java.util.concurrent.atomic.AtomicLong) =
+        fun reader(uri: Uri, startUs: Long, queue: ScoringFrameQueue<I420Frame>, label: String, cpu: java.util.concurrent.atomic.AtomicLong) =
             thread(name = "vmaf-$label") {
                 val cpuStart = android.os.SystemClock.currentThreadTimeMillis()
                 try {
                     YuvFrameReader(context, uri, startUs, startUs + decodeLenUs) { frame ->
-                        queue.put(frame)
-                        error.get() == null
+                        queue.send(frame) && error.get() == null
                     }.run()
                 } catch (t: Throwable) {
                     error.compareAndSet(null, "$label decode failed: ${t.message}")
                 } finally {
                     cpu.set(android.os.SystemClock.currentThreadTimeMillis() - cpuStart)
-                    runCatching { queue.put(END) }
+                    runCatching { queue.send(END) }
                 }
             }
 
@@ -633,10 +630,10 @@ object VmafPairScorer {
                 }
                 if (pendingRef == null && !refEnded) {
                     val waitStart = System.nanoTime()
-                    val r = refQueue.poll(QUEUE_POLL_TIMEOUT_S, TimeUnit.SECONDS)
+                    val r = refQueue.receive(QUEUE_POLL_TIMEOUT_MS) { cancelled() || error.get() != null }
                     queueWaitNanos += System.nanoTime() - waitStart
                     if (r == null) {
-                        error.compareAndSet(null, "frame queue timeout")
+                        error.compareAndSet(null, if (cancelled()) CANCELLED_REASON else "frame queue timeout")
                         break
                     }
                     if (r === END) {
@@ -649,10 +646,10 @@ object VmafPairScorer {
                 }
                 if (pendingDist == null && !distEnded) {
                     val waitStart = System.nanoTime()
-                    val d = distQueue.poll(QUEUE_POLL_TIMEOUT_S, TimeUnit.SECONDS)
+                    val d = distQueue.receive(QUEUE_POLL_TIMEOUT_MS) { cancelled() || error.get() != null }
                     queueWaitNanos += System.nanoTime() - waitStart
                     if (d == null) {
-                        error.compareAndSet(null, "frame queue timeout")
+                        error.compareAndSet(null, if (cancelled()) CANCELLED_REASON else "frame queue timeout")
                         break
                     }
                     if (d === END) {
@@ -759,11 +756,9 @@ object VmafPairScorer {
         } catch (t: Throwable) {
             error.compareAndSet(null, "scorer failed: ${t.message}")
         } finally {
-            // Unblock producers and wait for them.
-            error.compareAndSet(null, null)
-            if (error.get() != null) {
-                refQueue.clear(); distQueue.clear()
-            }
+            // Stop publication before clearing: a producer freed by clear must not refill the
+            // queue and then block forever while publishing END after consumption has stopped.
+            refQueue.stop(); distQueue.stop()
             runCatching { refThread.join(10_000) }
             runCatching { distThread.join(10_000) }
         }
