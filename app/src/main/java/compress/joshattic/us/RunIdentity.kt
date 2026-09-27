@@ -131,7 +131,8 @@ object EncoderInventory {
             info.supportedTypes.filter { it.lowercase(Locale.US) in MIMES }.mapNotNull { mime ->
                 runCatching {
                     val caps = info.getCapabilitiesForType(mime)
-                    val enc = caps.encoderCapabilities
+                    // Null for a codec that is not an encoder for this type; nothing to inventory.
+                    val enc = caps.encoderCapabilities ?: return@runCatching null
                     val q10 = Build.VERSION.SDK_INT >= 29
                     Entry(
                         name = info.name,
