@@ -477,5 +477,33 @@ def test_replay_coverage_names_missing_stages_and_unlinked_learning():
     assert cov["learnedUpdatesLinked"] == 0 and cov["learnedUpdates"] == 1
 
 
+def test_replay_coverage_requires_each_jobs_stages_and_real_update_links():
+    from parse_session_jsonl import replay_coverage, _REPLAY_STAGES
+    stages = [{"stage": stage, "jobId": "a"} for stage in _REPLAY_STAGES]
+    session = {"jobs": [{"jobId": "a", "terminal": "TRANSCODED_SMALLER", "attemptsStarted": 1},
+                        {"jobId": "b", "terminal": "TRANSCODED_SMALLER", "attemptsStarted": 1}],
+               "stages": stages, "learnedSnapshot": {"sha256": "snapshot"}, "identity": {"scoring": {}},
+               "learnedUpdates": 1, "learnedUpdatesLinked": 1,
+               "updates": [{"jobId": "ghost", "attemptIndex": 1, "updateIndex": 0,
+                            "snapshotSha256": "snapshot"}]}
+    cov = replay_coverage(session)
+    assert cov["label"] == "PARTIAL_OBSERVATIONAL_REPLAY"
+    assert "accept" in cov["missingJobStages"]["b"]
+    assert cov["invalidLearningUpdates"] == 1
+
+
+def test_replay_coverage_recognizes_valid_per_job_stages_and_update_chain():
+    from parse_session_jsonl import replay_coverage, _REPLAY_STAGES
+    session = {"jobs": [{"jobId": "a", "terminal": "TRANSCODED_SMALLER", "attemptsStarted": 1}],
+               "stages": [{"stage": stage, "jobId": "a"} for stage in _REPLAY_STAGES],
+               "learnedSnapshot": {"sha256": "snapshot"}, "identity": {"scoring": {}},
+               "learnedUpdates": 1, "learnedUpdatesLinked": 1,
+               "updates": [{"jobId": "a", "attemptIndex": 1, "updateIndex": 0,
+                            "snapshotSha256": "snapshot"}]}
+    assert replay_coverage(session)["label"] == "REPLAYABLE_RECORD"
+    session["updates"][0]["snapshotSha256"] = "other"
+    assert replay_coverage(session)["label"] == "PARTIAL_OBSERVATIONAL_REPLAY"
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

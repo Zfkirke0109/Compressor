@@ -54,7 +54,7 @@ def load_sessions(path: str) -> "OrderedDict[str, dict[str, Any]]":
         if key not in sessions:
             sessions[key] = {"batchId": key, "start": None, "summary": None, "jobs": [],
                              "stages": [], "learnedSnapshot": None, "learnedUpdates": 0,
-                             "learnedUpdatesLinked": 0, "identity": None}
+                             "learnedUpdatesLinked": 0, "updates": [], "identity": None}
         return sessions[key]
 
     # Records are attributed by their own batchId where they carry one, and otherwise to the
@@ -80,6 +80,7 @@ def load_sessions(path: str) -> "OrderedDict[str, dict[str, Any]]":
         elif kind == "learned_state_update":
             b = bucket(rec.get("batchId") or current)
             b["learnedUpdates"] += 1
+            b["updates"].append(rec)
             # b177 F4: from this build each update names the job that caused it.
             if rec.get("jobId"):
                 b["learnedUpdatesLinked"] += 1
@@ -337,17 +338,57 @@ _REPLAY_STAGES = ("plan", "probe_rung", "size_gate", "encode", "finalize", "veri
 
 def replay_coverage(session: dict[str, Any]) -> dict[str, Any]:
     """Whether the capture could replay its policy decisions, and what is missing if not (b177 F4)."""
-    seen = {ev.get("stage") for ev in session.get("stages", [])}
+    stages = session.get("stages", [])
+    seen = {ev.get("stage") for ev in stages}
     missing = [st for st in _REPLAY_STAGES if st not in seen]
     updates = session.get("learnedUpdates", 0)
-    linked = session.get("learnedUpdatesLinked", 0)
-    complete = not missing and updates == linked and session.get("learnedSnapshot") is not None \
-        and session.get("identity") is not None
+    jobs = {j.get("jobId") or j.get("id"): j for j in session.get("jobs", [])}
+    job_stages: dict[str, set[str]] = {jid: set() for jid in jobs if jid}
+    orphan_stages = 0
+    for ev in stages:
+        jid = ev.get("jobId")
+        if jid in job_stages:
+            job_stages[jid].add(ev.get("stage"))
+        else:
+            orphan_stages += 1
+    missing_by_job = {}
+    for jid, j in jobs.items():
+        if not jid:
+            continue
+        required = {"accept"}
+        if (j.get("attemptsStarted") or 0) > 0:
+            required.update(("plan", "encode"))
+        if j.get("probedRatios"):
+            required.add("probe_rung")
+        if j.get("probeRungId") or j.get("pixelProvenRatio") is not None:
+            required.add("size_gate")
+        if j.get("candidateBytes"):
+            required.update(("finalize", "verify"))
+        if j.get("certificationDecision") or str(j.get("certificationStatus") or "").startswith("ran_"):
+            required.add("certify")
+        absent = sorted(required - job_stages.get(jid, set()))
+        if absent:
+            missing_by_job[jid] = absent
+    snapshot = (session.get("learnedSnapshot") or {}).get("sha256")
+    captured_updates = session.get("updates", [])
+    valid_updates = sum(1 for ev in captured_updates if ev.get("jobId") in jobs
+                        and isinstance(ev.get("attemptIndex"), int)
+                        and 0 <= ev["attemptIndex"] <= (jobs[ev["jobId"]].get("attemptsStarted") or 0)
+                        and ev.get("snapshotSha256") == snapshot and snapshot)
+    update_indexes = [ev.get("updateIndex") for ev in captured_updates]
+    valid_update_sequence = update_indexes == list(range(updates))
+    complete = (not missing and not missing_by_job and not orphan_stages and jobs
+                and updates == len(captured_updates) == valid_updates and valid_update_sequence
+                and session.get("learnedSnapshot") is not None and snapshot
+                and session.get("identity") is not None)
     return {
         "label": "REPLAYABLE_RECORD" if complete else "PARTIAL_OBSERVATIONAL_REPLAY",
         "missingStages": missing,
+        "missingJobStages": missing_by_job,
+        "orphanStages": orphan_stages,
         "learnedUpdates": updates,
-        "learnedUpdatesLinked": linked,
+        "learnedUpdatesLinked": valid_updates,
+        "invalidLearningUpdates": updates - valid_updates if len(captured_updates) == updates and valid_update_sequence else updates,
         "runIdentity": session.get("identity") is not None,
     }
 
