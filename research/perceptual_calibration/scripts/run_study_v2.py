@@ -36,6 +36,8 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import GroupKFold
 
+import label_basis
+
 CURRENT = {"mean": 95.5, "p5": 91.0, "min": 84.0}
 PRODUCTION_BPP_FLOOR = 0.03  # documented, NOT searched
 
@@ -147,7 +149,11 @@ def main():
     n_pos = int((df["training_label_v2"] == 1).sum())
     n_neg = int((df["training_label_v2"] == 0).sum())
 
+    # b177 F9: what the labels are. Policy labels (the default) can check consistency only.
+    basis = label_basis.basis(df["human_visibility_label"]) if "human_visibility_label" in df.columns else label_basis.POLICY
     report = {
+        "label_basis": basis,
+        "label_disclaimer": label_basis.disclaimer(basis),
         "study_kind": "constrained offline calibration (exhaustive grid, hard FA constraint); NOT a trained model",
         "rows": int(len(df)), "label_1": n_pos, "label_0": n_neg,
         "current_production": {**CURRENT, "bpp_floor_not_searched": PRODUCTION_BPP_FLOOR},
@@ -261,7 +267,8 @@ def main():
     # --- Verdict ---------------------------------------------------------------------
     pooled = report["nested_grouped_holdout"]["pooled_holdout_confusion"]
     emit_candidate = bool(
-        consensus
+        label_basis.may_recommend_threshold_change(basis)
+        and consensus
         and pooled and pooled["FA"] == 0
         and not current_in_consensus
         and report["bootstrap"]["fraction_current_in_tied_set"] < 0.05
@@ -286,6 +293,8 @@ def main():
         )
     else:
         reasons = []
+        if not label_basis.may_recommend_threshold_change(basis):
+            reasons.append("labels are policy-derived; a threshold change needs independent human labels")
         if current_in_consensus:
             reasons.append("current production lies inside the consensus tied-optimal box")
         if consensus is None:
@@ -310,7 +319,8 @@ def main():
 
     md = ["# v2 calibration study report", "",
           f"- Rows: {report['rows']} (one per source; {n_pos} wins / {n_neg} measured rejections)",
-          f"- Verdict: **{report['verdict']['recommendation']}**", ""]
+          f"- Verdict: **{report['verdict']['recommendation']}**",
+          f"- Label basis: **{basis}**. {label_basis.disclaimer(basis)}", ""]
     if consensus:
         md.append(f"- Consensus tied-optimal box: mean {consensus['mean']}, p5 {consensus['p5']}, min {consensus['min']}")
     md.append(f"- Current production in consensus box: {current_in_consensus}")
