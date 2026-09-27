@@ -284,6 +284,11 @@ def validate_pair(ref: VideoMeta, dist: VideoMeta) -> None:
                 f"{label} pixel format '{meta.pix_fmt}' is not a supported planar 10/12-bit Y'CbCr "
                 "layout; converting it first would put a scaler's rounding into the measurement"
             )
+    if ref.pix_fmt != dist.pix_fmt:
+        raise HarnessFailure(
+            f"pixel format differs ({ref.pix_fmt} vs {dist.pix_fmt}); decoding the distorted file "
+            "as the reference layout would silently convert its chroma samples"
+        )
     if ref.fps <= 0 or dist.fps <= 0:
         raise HarnessFailure("frame rate unknown: timestamps cannot be paired within half a frame")
     if abs(ref.fps - dist.fps) > 1e-3 * ref.fps:

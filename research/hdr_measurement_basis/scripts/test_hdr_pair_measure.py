@@ -56,6 +56,12 @@ def test_matching_pq_pair_validates():
     validate_pair(pq(), pq())
 
 
+def test_mismatched_supported_pixel_layouts_fail_without_implicit_conversion():
+    ref = dataclasses.replace(pq(), pix_fmt="yuv444p10le")
+    dist = dataclasses.replace(pq(), pix_fmt="yuv420p10le")
+    expect_failure(lambda: validate_pair(ref, dist), must_mention="pixel format")
+
+
 def test_geometry_mismatch_is_rejected():
     # Rescaling to compare would measure the scaler, not the encode.
     expect_failure(lambda: validate_pair(pq(3840, 2160), pq(1920, 1080)), must_mention="geometry")

@@ -100,10 +100,10 @@ ordinary one-frame measurement with ΔE 0. Now:
 
 - **Colour interpretation must be known, supported and identical**: BT.2020 primaries, the BT.2020
   non-constant-luminance matrix (constant luminance is rejected), a declared range (tv or pc),
-  equal bit depth of at least 10, a supported planar 10/12-bit layout, and a known, equal frame
+  equal bit depth of at least 10, an identical supported planar 10/12-bit layout, and a known, equal frame
   rate. "unknown" matching "unknown" fails. PQ and HLG are told apart (`transfer_family`); HLG is
   still rejected, not measured.
-- **No scaler converts the samples.** ffmpeg hands back native Y'CbCr and `yuv_to_rgb_prime`
+- **No scaler converts the samples.** A mismatched 4:2:0/4:2:2/4:4:4 pair is rejected; ffmpeg hands back native Y'CbCr and `yuv_to_rgb_prime`
   applies the matrix and range with the exact BT.2100 formulas. The known-vector test found that
   swscale's 10-bit limited-range expansion is inexact: code 940 (peak white) decoded as 0.99615
   instead of 1.0, and 502 as 0.49807 instead of 0.5, with or without `accurate_rnd`/`bitexact`.
