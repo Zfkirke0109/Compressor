@@ -598,6 +598,31 @@ private fun DiagnosticsExportCard(
             }
 
             HorizontalDivider()
+
+            var fullSourceHash by remember { mutableStateOf(EncoderExperiments.isFullSourceHashEnabled(context)) }
+            Text("Pilot: full source hash", style = MaterialTheme.typography.labelLarge)
+            Text(
+                "Off by default. Reads every selected original in full before and after its job and " +
+                    "records its SHA-256 in the diagnostics, to prove the pilot arms used identical files " +
+                    "and that no original changed. It never modifies a file and records no names or paths, " +
+                    "but it reads each original twice, so leave it off for normal batches.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = fullSourceHash,
+                    onCheckedChange = { on -> EncoderExperiments.setFullSourceHashEnabled(context, on); fullSourceHash = on },
+                    enabled = !isCompressing
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (fullSourceHash) "Full source hash on for the next batch" else "Full source hash off",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            HorizontalDivider()
             // Which build is actually running. Checking this used to mean exporting a capture and
             // diffing a log string against the source; on 2026-09-01 a whole calibration round was
             // spent on an APK that predated the instrumentation it was meant to exercise. The

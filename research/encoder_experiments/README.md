@@ -13,7 +13,7 @@ batches; nothing here encodes, uploads or touches media on the device.
 ```sh
 python3 run_experiment.py validate pilot_manifest.json
 python3 run_experiment.py plan pilot_manifest.json           # the run sheet
-python3 run_experiment.py hash pilot_manifest.json /path/to/originals --out private-hashes.csv   # stays local
+python3 run_experiment.py hash pilot_manifest.json /path/to/originals --out private-hashes.csv   # stays local; or use the app's switch below
 python3 run_experiment.py ingest pilot_manifest.json --arm A0 --capture Everything.zip --batch batch_… --out results/
 python3 run_experiment.py ingest pilot_manifest.json --arm A0_REPEAT --capture Everything.zip --batch batch_… --out results/
 python3 run_experiment.py table pilot_manifest.json --results results/ --baseline A0 --markdown table.md
@@ -36,8 +36,12 @@ the same build and exact source fingerprints across arms. It reports batch wall 
 from summed per-job elapsed time and thermal cooldown, lists the thermal state each measured job
 started in, and prints every arm's starting learned snapshot; differing
 snapshots confound any claimed arm effect. Each arm result is written once; a
-repeated baseline uses `A0_REPEAT` rather than replacing A0. Keep the separate private full-hash
-sheet: sampled device fingerprints cannot prove full-file identity. The older b177 captures lack
+repeated baseline uses `A0_REPEAT` rather than replacing A0. Sampled device fingerprints cannot
+prove full-file identity. Either keep the private full-hash sheet from `hash`, or, with no computer
+that can read the Secure Folder, turn on the app's **Pilot: full source hash** switch for every
+arm: the capture then carries each source's SHA-256 before and after its job (`source_hash`
+records, job id only), ingestion requires the pair to match the source size and each other, and
+the table requires the same hash in every hashed arm. The older b177 captures lack
 these fields and remain observational evidence, not validated pilot arms.
 
 Historical b177 PL-A and PL-B exports gave the recorded observational totals

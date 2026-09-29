@@ -44,7 +44,7 @@ def test_a_changed_threshold_or_a_two_factor_arm_is_rejected():
     assert any("one factor at a time" in p for p in problems)
 
 
-def _capture(batch, jobs, arm="A0", exhaustive=True):
+def _capture(batch, jobs, arm="A0", exhaustive=True, full_hash=False, extra=()):
     fd, path = tempfile.mkstemp(suffix=".jsonl")
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps({"type": "session_start", "batchId": batch, "mode": "Perceptually Lossless",
@@ -54,7 +54,9 @@ def _capture(batch, jobs, arm="A0", exhaustive=True):
         settings = next(a["settings"] for a in MANIFEST["arms"] if a["id"] == arm)
         fh.write(json.dumps({"type": "run_identity", "batchId": batch,
                              "scoring": {"frozenGate": MANIFEST["frozenGate"], "verdictModel": "vmaf_v0.6.1",
-                                         "verdictPhoneModel": False, **settings}}) + "\n")
+                                         "verdictPhoneModel": False, "fullSourceHash": full_hash, **settings}}) + "\n")
+        for rec in extra:
+            fh.write(json.dumps({"batchId": batch, **rec}) + "\n")
         for j in jobs:
             fh.write(json.dumps({"type": "job", "batchId": batch,
                                  "nameHash": "name-" + j["jobId"], "sourceFingerprint": "fingerprint-" + j["jobId"],
@@ -166,6 +168,61 @@ def test_pilot_arms_must_be_exhaustive_and_report_thermal_and_cooldown():
         assert "Exhaustive" in str(e)
     else:
         raise AssertionError("a table mixed a non-exhaustive arm")
+
+
+def _hash_records(job_id, size, before="a" * 64, after=None, drop=None):
+    recs = [{"type": "source_hash", "jobId": job_id, "phase": "before", "sha256": before, "bytes": size, "hashMs": 900},
+            {"type": "source_hash", "jobId": job_id, "phase": "after", "sha256": after or before, "bytes": size, "hashMs": 850}]
+    return [r for r in recs if r["phase"] != drop]
+
+
+def test_on_device_full_source_hash_proves_identity_within_and_across_arms():
+    # The app's opt-in switch replaces `hash` when no computer can read the Secure Folder.
+    source = MANIFEST["sources"][0]
+    m = copy.deepcopy(MANIFEST)
+    m["sources"] = [source]
+    jid, size = source["jobId"], source["sourceBytes"]
+    job = {"jobId": jid, "sourceSize": size, "nameHash": source["nameHash"], "outputSize": 0,
+           "countsAsRealCompression": False}
+
+    def ingest(arm, **kw):
+        return r.ingest(m, arm, _capture("b-" + arm, [job], arm=arm, **kw), "b-" + arm, tempfile.mkdtemp())
+
+    ok = ingest("A0", full_hash=True, extra=_hash_records(jid, size))
+    assert ok["fullSourceHash"] is True and ok["rows"][0]["sourceSha256"] == "a" * 64
+    assert ok["sourceHashMs"] == 1750
+    refusals = {
+        "changed during the arm": dict(full_hash=True, extra=_hash_records(jid, size, after="b" * 64)),
+        "exactly one": dict(full_hash=True, extra=_hash_records(jid, size, drop="after")),
+        "different number of bytes": dict(full_hash=True, extra=_hash_records(jid, size - 1)),
+        "no source_hash records": dict(full_hash=True),
+        "switch was off": dict(extra=_hash_records(jid, size)),
+    }
+    for needle, kw in refusals.items():
+        try:
+            ingest("A0", **kw)
+        except SystemExit as e:
+            assert needle in str(e), (needle, str(e))
+        else:
+            raise AssertionError(f"accepted a capture that should fail with: {needle}")
+
+    # Across arms: the same content everywhere, or the table refuses.
+    out = tempfile.mkdtemp()
+    results = {}
+    for arm in ("A0", "A1", "A2", "A3", "A0_REPEAT"):
+        cap = _capture("x-" + arm, [job], arm=arm, full_hash=True, extra=_hash_records(jid, size))
+        results[arm] = r.ingest(m, arm, cap, "x-" + arm, out)
+    t = r.table(results, "A0", m)
+    assert t["fullSourceHashArms"] == ["A0", "A1", "A2", "A3", "A0_REPEAT"]
+    assert "full SHA-256" in t["identity"]
+    assert "Full source SHA-256 matched" in r.markdown(t)
+    results["A2"]["rows"][0]["sourceSha256"] = "c" * 64
+    try:
+        r.table(results, "A0", m)
+    except SystemExit as e:
+        assert "full source hash differs" in str(e)
+    else:
+        raise AssertionError("the table joined arms whose sources differ in content")
 
 
 def test_table_rejects_same_job_id_with_different_content_or_missing_arm():

@@ -79,6 +79,25 @@ object EncoderExperiments {
             .apply()
     }
 
+    private const val KEY_FULL_SOURCE_HASH = "full_source_hash"
+
+    /**
+     * Opt-in, for the encoder pilot: hash every source in full (SHA-256 of all its bytes) before
+     * its job and again after it, and record both (FullSourceHash). This is the on-device stand-in
+     * for `run_experiment.py hash`, which needs a computer or a shell that can read the Secure
+     * Folder: it proves each arm measured byte-identical sources and that no job changed an
+     * original. Reads every source twice, so it stays off outside a pilot. Nothing reads it.
+     */
+    fun isFullSourceHashEnabled(context: Context): Boolean =
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_FULL_SOURCE_HASH, false)
+
+    fun setFullSourceHashEnabled(context: Context, enabled: Boolean) {
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_FULL_SOURCE_HASH, enabled)
+            .apply()
+    }
+
     private const val KEY_LONG_GOP = "long_gop_x2"
 
     /** The longest keyframe interval the long-GOP experiment may request. */

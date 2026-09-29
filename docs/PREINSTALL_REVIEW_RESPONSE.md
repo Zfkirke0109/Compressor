@@ -107,9 +107,15 @@ in `pilot_manifest.json` available in the Secure Folder gallery; no other heavy 
    b177-era state on record). Do not clear app data or reset learned profiles.
 2. Install the APK from §4 as an update in user 150 (`adb install -r --user 150 <apk>` or the
    Secure Folder installer). Open the app once; confirm Settings shows `1.6.<run>`.
-3. On a computer, privately: `python3 research/encoder_experiments/run_experiment.py hash
-   research/encoder_experiments/pilot_manifest.json <originals-dir> --out private-hashes.csv`.
-   Keep the CSV and paths local; they never go in the repository or a report.
+3. Source identity. **On the phone (no computer needed):** Settings → Experiments → turn on
+   **Pilot: full source hash** and leave it on for every arm. Each original is then hashed in
+   full (SHA-256) before and after its job, and the export carries both hashes by job id, no
+   names or paths. `ingest` refuses an arm where a before/after pair differs or is missing, and
+   `table` refuses arms whose hashes differ. The hashing reads each original twice; its time is
+   reported separately and kept out of the job times. **Or, with a computer or a shell that can
+   read the Secure Folder:** `python3 research/encoder_experiments/run_experiment.py hash
+   research/encoder_experiments/pilot_manifest.json <originals-dir> --out private-hashes.csv`,
+   kept local.
 4. Optional device checks first (need adb): `scripts/device/run-device-checks.sh <short-clip>.mp4
    150` (PipelineDeviceTest + ProductionEvidenceDeviceTest).
 5. For each arm in order **A0, A1, A2, A3, A0_REPEAT**:
@@ -126,13 +132,14 @@ in `pilot_manifest.json` available in the Secure Folder gallery; no other heavy 
    - Do not cancel. When it ends: Diagnostics → Current run → export ZIP.
    - `python3 research/encoder_experiments/run_experiment.py ingest
      research/encoder_experiments/pilot_manifest.json --arm <ARM> --capture <zip> --batch
-     batch_<id> --out results/`. A refusal names what is missing; fix and re-run the arm under
-     the next ID rather than editing a capture.
+     batch_<id> --out results/` (or send the ZIP and have it ingested for you). A refusal names
+     what is missing; fix and re-run the arm under the next ID rather than editing a capture.
 6. `python3 research/encoder_experiments/run_experiment.py table
    research/encoder_experiments/pilot_manifest.json --results results/ --baseline A0 --markdown
    table.md` and `python3 scripts/diagnostics/parse_session_jsonl.py <zip> --batch batch_<id>`
    per arm (replay coverage, attempts, audio claims, drift).
-7. Share the ZIPs, `table.md`, the thermal notes and the recording. Not the private hash sheet.
+7. Share the ZIPs, `table.md`, the thermal notes and the recording. The in-app hashes are in the
+   ZIPs already; a computer-made hash sheet, if any, stays private (it holds paths).
 
 What each measure means:
 

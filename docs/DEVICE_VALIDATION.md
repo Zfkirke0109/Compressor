@@ -106,4 +106,5 @@ phone can show now:
    bitrate modes and complexity and quality ranges. CQ and complexity arms stay blocked until it
    shows support and a CQ quality search exists.
 5. Settings to confirm before each arm (Settings, Experiments): safer-rung retry, B-frames, longer
-   keyframe interval, VMAF v1 shadow calibration. The `run_identity` record repeats them.
+   keyframe interval, VMAF v1 shadow calibration, and (on for every arm when no computer can hash
+   the originals) Pilot: full source hash. The `run_identity` record repeats them.

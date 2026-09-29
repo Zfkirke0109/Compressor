@@ -60,6 +60,53 @@ object SourceFingerprint {
         digest(entries.size.toLong(), entries.toSortedMap().map { (k, v) -> "$k=${v ?: "unreadable"}\n".toByteArray(Charsets.UTF_8) })
 }
 
+/**
+ * SHA-256 of every byte of a source, for the pilot's opt-in source check (EncoderExperiments
+ * .isFullSourceHashEnabled). [SourceFingerprint] samples 3 MiB and cannot prove two files are
+ * identical or that an original was left untouched; this can, at the cost of reading the file.
+ */
+object FullSourceHash {
+    const val BUFFER = 1 shl 20
+
+    data class Result(val sha256: String?, val bytes: Long, val elapsedMs: Long, val error: String?)
+
+    /**
+     * Pure core: hashes [input] to its end. [checkpoint] runs before every read, so a cancelled
+     * batch stops within one buffer; whatever it throws propagates.
+     */
+    fun digest(input: java.io.InputStream, checkpoint: () -> Unit = {}): Pair<String, Long> {
+        val md = MessageDigest.getInstance("SHA-256")
+        val buf = ByteArray(BUFFER)
+        var total = 0L
+        while (true) {
+            checkpoint()
+            val n = input.read(buf)
+            if (n < 0) break
+            md.update(buf, 0, n)
+            total += n
+        }
+        return md.digest().joinToString("") { String.format(Locale.US, "%02x", it) } to total
+    }
+
+    /**
+     * Hashes [uri] through the content resolver. A read failure is returned as [Result.error],
+     * never thrown; cancellation (from [checkpoint]) is rethrown.
+     */
+    fun of(context: Context, uri: Uri, checkpoint: () -> Unit = {}): Result {
+        val start = android.os.SystemClock.elapsedRealtime()
+        return try {
+            val stream = context.contentResolver.openInputStream(uri)
+                ?: return Result(null, 0L, android.os.SystemClock.elapsedRealtime() - start, "source could not be opened")
+            val (sha, bytes) = stream.use { digest(it, checkpoint) }
+            Result(sha, bytes, android.os.SystemClock.elapsedRealtime() - start, null)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Result(null, 0L, android.os.SystemClock.elapsedRealtime() - start, e.javaClass.simpleName)
+        }
+    }
+}
+
 /** Version and file identity of the native scoring libraries and the models they run. */
 object ScoringIdentity {
     /** Frozen production decision constants, read from the gate itself rather than copied values. */

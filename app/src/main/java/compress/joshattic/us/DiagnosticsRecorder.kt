@@ -399,6 +399,25 @@ class DiagnosticsRecorder private constructor(
         )
     }
 
+    /**
+     * A full-content hash of one source (opt-in, FullSourceHash), taken [phase] "before" its job
+     * starts or "after" it ends. The recorder hashes the source key into the job id as usual; no
+     * path or name is written. The hashing time is kept here, outside the job's elapsed time.
+     */
+    fun sourceHash(sourceKey: String, phase: String, result: FullSourceHash.Result) {
+        record(
+            "source_hash",
+            jobId = jobId(sourceKey),
+            fields = mapOf(
+                "phase" to phase,
+                "sha256" to result.sha256,
+                "bytes" to result.bytes,
+                "hashMs" to result.elapsedMs,
+                "error" to result.error
+            )
+        )
+    }
+
     /** Session-level identities: scoring libraries/models and the device's encoder inventory. */
     fun runIdentity(scoring: Map<String, Any?>, encoders: List<EncoderInventory.Entry>) {
         record(

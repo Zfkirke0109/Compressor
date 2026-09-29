@@ -9,6 +9,47 @@ import compress.joshattic.us.quality.QualityProbePolicy
 class RunIdentityTest {
 
     @Test
+    fun fullSourceHashIsTheStandardSha256OfEveryByte() {
+        // FIPS 180-2 test vector.
+        val (abc, n) = FullSourceHash.digest("abc".byteInputStream())
+        assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", abc)
+        assertEquals(3L, n)
+        // Content longer than one read buffer, fed in uneven pieces, hashes as the whole.
+        val bytes = ByteArray(FullSourceHash.BUFFER * 2 + 12_345) { (it * 31 + 7).toByte() }
+        val trickle = object : java.io.InputStream() {
+            var pos = 0
+            override fun read(): Int = if (pos < bytes.size) bytes[pos++].toInt() and 0xff else -1
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (pos >= bytes.size) return -1
+                val k = minOf(len, 777_777, bytes.size - pos)
+                System.arraycopy(bytes, pos, b, off, k)
+                pos += k
+                return k
+            }
+        }
+        val expected = java.security.MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { String.format(java.util.Locale.US, "%02x", it) }
+        assertEquals(expected to bytes.size.toLong(), FullSourceHash.digest(trickle))
+        // One changed byte anywhere changes the hash: the sampled fingerprint could miss this one.
+        val edited = bytes.copyOf().also { it[FullSourceHash.BUFFER + 5] = (it[FullSourceHash.BUFFER + 5] + 1).toByte() }
+        assertNotEquals(expected, FullSourceHash.digest(edited.inputStream()).first)
+    }
+
+    @Test
+    fun aCancelledBatchStopsHashingAtTheNextBuffer() {
+        var reads = 0
+        val endless = object : java.io.InputStream() {
+            override fun read(): Int = 0
+            override fun read(b: ByteArray, off: Int, len: Int): Int { reads++; return len }
+        }
+        val thrown = runCatching {
+            FullSourceHash.digest(endless) { if (reads >= 3) throw kotlinx.coroutines.CancellationException("cancelled") }
+        }.exceptionOrNull()
+        assertEquals(true, thrown is kotlinx.coroutines.CancellationException)
+        assertEquals(3, reads)
+    }
+
+    @Test
     fun capturedGateReadsTheProductionPolicyConstants() {
         val gate = ScoringIdentity.frozenGate()
         assertEquals("vmaf_v0.6.1", gate["verdictModel"])

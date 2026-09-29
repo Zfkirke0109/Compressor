@@ -829,7 +829,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val frameRate: BatchFrameRateOption,
         val codec: BatchCodecOption,
         val privacyMode: MetadataPrivacyMode,
-        val exhaustivePerceptualLossless: Boolean
+        val exhaustivePerceptualLossless: Boolean,
+        // Opt-in pilot check: hash every source in full before and after its job (FullSourceHash).
+        val fullSourceHash: Boolean = false
     ) {
         // Safer-rung retries spent in this batch (SaferRungRetry.MAX_RETRIES_PER_BATCH).
         var saferRungRetries = 0
@@ -1025,7 +1027,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         "maxBFrames" to EncoderExperiments.maxBFrames(context),
                         "longGop" to EncoderExperiments.isLongGopEnabled(context),
                         "saferRungRetry" to EncoderExperiments.isSaferRungRetryEnabled(context),
-                        "shadowCalibration" to EncoderExperiments.isShadowCalibrationEnabled(context)
+                        "shadowCalibration" to EncoderExperiments.isShadowCalibrationEnabled(context),
+                        "fullSourceHash" to EncoderExperiments.isFullSourceHashEnabled(context)
                     ),
                 EncoderInventory.snapshot()
             )
@@ -1039,7 +1042,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             frameRate = frameRate,
             codec = codec,
             privacyMode = privacyMode,
-            exhaustivePerceptualLossless = exhaustivePerceptualLossless
+            exhaustivePerceptualLossless = exhaustivePerceptualLossless,
+            fullSourceHash = EncoderExperiments.isFullSourceHashEnabled(context)
         )
         _uiState.value.items.filter { it.isAlreadyCompressed }.forEach { skippedItem ->
             recordDiagnosticJob(
@@ -1254,6 +1258,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         precedingHandoffCooldownMs: Long
     ): Long {
         val thermalWindow = waitForThermalWindow(run.context, item.originalName)
+        // Before itemStartedAt, so the job's elapsed time does not include it; the record keeps its own time.
+        if (run.fullSourceHash) hashSourceForPilot(run, item, "before")
         val s = ItemRun(
             run = run,
             index = index,
@@ -1311,7 +1317,27 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             s.releaseMedia3Input()
             run.diagnostics.learningContext = null
         }
+        // After the job has ended and its record is written; a cancelled item never gets here.
+        if (run.fullSourceHash) hashSourceForPilot(run, item, "after")
         return s.cooldownForNextItemMs
+    }
+
+    /**
+     * The pilot's full-content source hash (opt-in; FullSourceHash). Read on IO, cancellable per
+     * MiB; a read failure is recorded, never fatal. Only the recorder's job id and the hash leave
+     * this method: no path or name.
+     */
+    private suspend fun hashSourceForPilot(run: BatchRun, item: BatchVideoItem, phase: String) {
+        val result = withContext(Dispatchers.IO) {
+            val hashContext = currentCoroutineContext()
+            FullSourceHash.of(run.context, item.sourceUri) { hashContext.ensureActive() }
+        }
+        DiagLog.i(
+            "CompressorBatch",
+            "source hash; job=${diagnosticJobId(item)}; phase=$phase; bytes=${result.bytes}; " +
+                "sizeMatches=${result.bytes == item.originalSize}; ms=${result.elapsedMs}; error=${result.error ?: "none"}"
+        )
+        runCatching { run.diagnostics.sourceHash(item.sourceUri.toString(), phase, result) }
     }
 
     /**

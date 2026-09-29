@@ -9,7 +9,9 @@ matched sources.
   plan MANIFEST                     print the run sheet: arm order, the app settings to set, sources
   hash MANIFEST ORIGINALS_DIR --out PRIVATE.csv
                                     full SHA-256 of each local original matched by nameHash
-                                    (private output: paths stay on this machine)
+                                    (private output: paths stay on this machine). Without a
+                                    computer, the app's "Pilot: full source hash" switch records
+                                    the same hash before and after every job, and ingest checks it
   ingest MANIFEST --arm LABEL --capture ZIP_OR_JSONL --batch BATCH_ID --out RESULTS_DIR
                                     extract the manifest's sources from one arm's capture
   table MANIFEST --results RESULTS_DIR --baseline LABEL [--scope manifest|all] [--markdown OUT]
@@ -163,6 +165,44 @@ def _row(j: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _full_source_hashes(records: list[dict[str, Any]], jobs: list[dict[str, Any]], switched_on: bool) -> tuple[dict[str, str], int]:
+    """The app's opt-in full-content source hashes, checked (see FullSourceHash in the app).
+
+    Every job needs exactly one hash before it ran and one after, both of all `sourceSize` bytes
+    and equal: the arm measured that exact content and left the original unchanged. Returns
+    {jobId: sha256} and the hashing time, which batch wall time includes and job times do not.
+    """
+    hashes = [r for r in records if (r.get("type") or r.get("eventType")) == "source_hash"]
+    if not hashes:
+        if switched_on:
+            raise SystemExit("error: full source hash was on but the capture holds no source_hash records")
+        return {}, 0
+    if not switched_on:
+        raise SystemExit("error: source_hash records in a capture whose run identity says the switch was off")
+    by_job: dict[Any, dict[Any, list[dict[str, Any]]]] = {}
+    for h in hashes:
+        by_job.setdefault(h.get("jobId"), {}).setdefault(h.get("phase"), []).append(h)
+    out, total_ms = {}, 0
+    for j in jobs:
+        jid = j.get("jobId") or j.get("id")
+        phases = by_job.pop(jid, {})
+        before, after = phases.get("before", []), phases.get("after", [])
+        if len(before) != 1 or len(after) != 1 or set(phases) - {"before", "after"}:
+            raise SystemExit(f"error: {jid} needs exactly one full source hash before and one after its job")
+        b, a = before[0], after[0]
+        if not b.get("sha256") or not a.get("sha256"):
+            raise SystemExit(f"error: full source hash of {jid} failed: {b.get('error') or a.get('error')}")
+        if b.get("bytes") != j.get("sourceSize") or a.get("bytes") != j.get("sourceSize"):
+            raise SystemExit(f"error: full source hash of {jid} read a different number of bytes than the source size")
+        if b["sha256"] != a["sha256"]:
+            raise SystemExit(f"error: original of {jid} changed during the arm (before and after hashes differ)")
+        out[jid] = b["sha256"]
+        total_ms += int(b.get("hashMs") or 0) + int(a.get("hashMs") or 0)
+    if by_job:
+        raise SystemExit(f"error: source_hash records for jobs with no job record: {sorted(map(str, by_job))}")
+    return out, total_ms
+
+
 def ingest(manifest: dict[str, Any], arm: str, capture: str, batch: str, out_dir: str, scope: str = "manifest") -> dict[str, Any]:
     """Only admit a completed, identity-checked pilot. Historical logs belong in the summarizer."""
     problems = validate(manifest)
@@ -227,7 +267,8 @@ def ingest(manifest: dict[str, Any], arm: str, capture: str, batch: str, out_dir
                 or j.get("terminal") != "TRANSCODED_SMALLER"
                 or not 0 < (j.get("outputSize") or 0) < j["sourceSize"]):
             raise SystemExit(f"error: savings contradict final acceptance: {j['jobId']}")
-    rows = [_row(j) for j in jobs]
+    full_hashes, hash_ms = _full_source_hashes(records, jobs, scoring.get("fullSourceHash") is True)
+    rows = [dict(_row(j), sourceSha256=full_hashes.get(j.get("jobId") or j.get("id"))) for j in jobs]
     result = {"arm": arm, "batchId": batch, "capture": os.path.basename(capture), "scope": scope,
               "buildCommit": start["buildCommit"], "buildTag": start["buildTag"],
               "frozenGate": scoring["frozenGate"], "settings": settings,
@@ -235,6 +276,8 @@ def ingest(manifest: dict[str, Any], arm: str, capture: str, batch: str, out_dir
               "sourceManifestSha256": summary["sourceManifestSha256"],
               "batchWallMs": summary["totalElapsedMs"],
               "exhaustivePerceptualLossless": True,
+              "fullSourceHash": bool(full_hashes),
+              "sourceHashMs": hash_ms,
               "missing": [],
               "rows": rows}
     Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -287,6 +330,11 @@ def table(results: dict[str, dict[str, Any]], baseline: str, manifest: dict[str,
                       for res in results.values() for r in res["rows"] if r["jobId"] == jid}
         if len(identities) != 1 or any(v in (None, "", 0) for v in next(iter(identities))):
             raise SystemExit(f"error: source identity differs across arms: {jid}")
+        full = {r.get("sourceSha256") for res in results.values() if res.get("fullSourceHash")
+                for r in res["rows"] if r["jobId"] == jid}
+        if len(full) > 1:
+            raise SystemExit(f"error: full source hash differs across arms: {jid}")
+    hashed_arms = [label for label, res in results.items() if res.get("fullSourceHash")]
     if manifest is not None:
         baseline_rows = {r["jobId"]: r for r in results[baseline]["rows"]}
         for arm in manifest["arms"]:
@@ -325,6 +373,7 @@ def table(results: dict[str, dict[str, Any]], baseline: str, manifest: dict[str,
             # Wall time includes the app's thermal cooldowns; report them, and the thermal state
             # each measured job started in, beside the timing they confound.
             "summedCooldownMs": sum(r.get("precedingCooldownMs") or 0 for r in rows),
+            "sourceHashMs": results[label].get("sourceHashMs") or 0,
             "thermalAtJobStart": dict(Counter(r.get("thermalStart") for r in rows if r.get("thermalStart")).most_common()),
             "terminals": dict(Counter(r["terminal"] for r in rows).most_common()),
         }
@@ -341,7 +390,9 @@ def table(results: dict[str, dict[str, Any]], baseline: str, manifest: dict[str,
     snapshots = {label: result.get("learnedSnapshotSha256") for label, result in results.items()}
     if any(not value for value in snapshots.values()):
         raise SystemExit("error: starting learned snapshot is missing")
-    return {"matchedSources": len(common), "identity": "jobId, manifest name/size, required sampled sourceFingerprint and source-manifest digest",
+    return {"matchedSources": len(common), "identity": "jobId, manifest name/size, required sampled sourceFingerprint and source-manifest digest"
+            + ("; full SHA-256 before and after every job in " + ", ".join(hashed_arms) if hashed_arms else ""),
+            "fullSourceHashArms": hashed_arms,
             "sameStartingLearnedSnapshot": len(set(snapshots.values())) == 1,
             "startingLearnedSnapshots": snapshots, "comparisonBasis": "matched-source observational",
             "arms": arms, "changedSources": changed}
@@ -355,11 +406,16 @@ def markdown(t: dict[str, Any]) -> str:
             ("jobsRetried", "Jobs retried"), ("audioBitIdentical", "Audio bit-identical"),
             ("audioRequestedCopyNotShown", "Accepted, audio copy not shown"),
             ("batchWallMs", "Batch wall ms"), ("summedJobElapsedMs", "Sum of job elapsed ms"),
-            ("summedCooldownMs", "Thermal cooldown ms"), ("peakCandidateBytes", "Largest candidate bytes")]
+            ("summedCooldownMs", "Thermal cooldown ms"), ("sourceHashMs", "Source hashing ms"),
+            ("peakCandidateBytes", "Largest candidate bytes")]
     out = ["| Arm | Batch | " + " | ".join(c[1] for c in cols) + " |",
            "|---|---|" + "---:|" * len(cols)]
     for label, a in t["arms"].items():
         out.append(f"| {label} | `{a['batchId']}` | " + " | ".join(f"{a[k]:,}" for k, _ in cols) + " |")
+    hashed = t.get("fullSourceHashArms") or []
+    out += ["", ("Full source SHA-256 matched before and after every job, and across arms, in: " + ", ".join(hashed)
+                 + ". Batch wall time includes the hashing; job times do not.")
+            if hashed else "Full source hashes were not recorded; sources are matched by size and sampled fingerprint only."]
     out += ["", "Thermal state at the start of each measured job, by arm: "
             + "; ".join(f"{label}: " + (", ".join(f"{k} {v}" for k, v in a["thermalAtJobStart"].items()) or "not recorded")
                         for label, a in t["arms"].items()) + "."]
