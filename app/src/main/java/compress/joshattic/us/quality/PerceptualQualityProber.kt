@@ -852,14 +852,7 @@ class PerceptualQualityProber(private val context: Context) {
                     // A control that must be identical states its own verdict, so a capture cannot
                     // read 97.43 as a pass. Identical frames with real motion score 100; VMAF v0.6.1
                     // scores identical STATIC frames 97.43 on every frame, which names itself.
-                    val verdict = if (!expectIdentical) "" else {
-                        val worst = outcome.windows.minOf { it.min }
-                        when {
-                            worst >= 99.95 -> "PASS "
-                            outcome.windows.all { it.mean < 99.0 } -> "STATIC? (VMAF scores identical static frames ~97.43) "
-                            else -> "FAIL (min %.2f; a scorer or pairing defect) ".format(java.util.Locale.US, worst)
-                        }
-                    }
+                    val verdict = if (!expectIdentical) "" else SelfCheckVerdict.identity(outcome.windows)
                     verdict + outcome.windows.joinToString("; ") { w ->
                         "%.2f/%.2f/%.2f".format(java.util.Locale.US, w.mean, w.p5, w.min) +
                             (w.frameDiag?.let { " frames[${it.compact()}]" } ?: "") +
@@ -875,8 +868,8 @@ class PerceptualQualityProber(private val context: Context) {
             lines += "$label: $text"
             DiagLog.i(TAG, "self-check $label: $text")
         }
-        describe("source vs itself (expect 100 on every frame)", withContext(Dispatchers.IO) {
-            VmafPairScorer.score(context, sourceUri, sourceUri, certWindows)
+        describe("source vs itself (expect identical frames)", withContext(Dispatchers.IO) {
+            VmafPairScorer.score(context, sourceUri, sourceUri, certWindows, countIdenticalFrames = true)
         }, expectIdentical = true)
         val remux = File.createTempFile("selfcheck_remux_", ".mp4", context.cacheDir)
         try {
@@ -888,8 +881,8 @@ class PerceptualQualityProber(private val context: Context) {
                 }
             }
             if (remuxed.isSuccess) {
-                describe("source vs stream copy (expect 100 on every frame)", withContext(Dispatchers.IO) {
-                    VmafPairScorer.score(context, sourceUri, Uri.fromFile(remux), certWindows)
+                describe("source vs stream copy (expect identical frames)", withContext(Dispatchers.IO) {
+                    VmafPairScorer.score(context, sourceUri, Uri.fromFile(remux), certWindows, countIdenticalFrames = true)
                 }, expectIdentical = true)
             } else {
                 lines += "source vs stream copy: remux not possible for this container (${remuxed.exceptionOrNull()?.message})"
@@ -958,6 +951,42 @@ class PerceptualQualityProber(private val context: Context) {
                 onWindowScored = onWindowScored,
                 cancelled = { scoringJob?.isActive == false }
             )
+        }
+    }
+}
+
+/**
+ * The verdict of a self-check identity control (source vs itself, source vs its stream copy).
+ *
+ * VMAF v0.6.1 does not score identical frames 100 unconditionally: VIF and ADM are exactly 1 for
+ * identical frames, but the motion feature comes from the reference alone, and low motion lowers
+ * the prediction down to ~97.43 for a static frame. b182 and b184 self-checks on a 1080x1920 60 fps
+ * source read "FAIL (min 98.86; a scorer or pairing defect)" four times, with exact pairing (skew 0,
+ * no drops, equal frame counts) and a dip on a short run of low-motion frames: the metric, not a
+ * defect. So identity is decided by the decoded bytes when the scorer counted them
+ * (WindowPairingDiag.identicalFrames), and the score only describes it.
+ */
+object SelfCheckVerdict {
+    fun identity(windows: List<WindowScore>): String {
+        val worst = windows.minOf { it.min }
+        val counted = windows.mapNotNull { w -> w.pairing?.identicalFrames?.let { it to w.comparedFrames } }
+        if (counted.size == windows.size && windows.isNotEmpty()) {
+            val identical = counted.sumOf { it.first }
+            val scored = counted.sumOf { it.second }
+            return when {
+                identical < scored ->
+                    "FAIL (${scored - identical} of $scored scored frames differ from the source's bytes: " +
+                        "a decode, crop, rotation or pairing defect) "
+                worst >= 99.95 -> "PASS (all $scored frames byte-identical) "
+                else -> "PASS (all $scored frames byte-identical; VMAF v0.6.1 scores identical low-motion frames " +
+                    "97.43-100, min %.2f) ".format(java.util.Locale.US, worst)
+            }
+        }
+        // Not counted (older callers): the score alone cannot prove identity.
+        return when {
+            worst >= 99.95 -> "PASS "
+            windows.all { it.mean < 99.0 } -> "STATIC? (VMAF scores identical static frames ~97.43) "
+            else -> "UNPROVEN (min %.2f; identity not byte-checked) ".format(java.util.Locale.US, worst)
         }
     }
 }

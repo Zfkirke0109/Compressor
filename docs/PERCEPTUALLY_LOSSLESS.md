@@ -307,7 +307,7 @@ fails before producing a candidate now counts in the denominator. Stage events c
 | Probe clip scores encoder warm-up | every probe clip starts at a source keyframe ≥ 2 s before the window; the lead-in is decoded and paired but not scored |
 | Decoder output not 8-bit 4:2:0 | any other format fails closed to "unavailable" |
 | Rotation/crop mismatch | both sides are converted to display orientation with the crop rectangle applied; a geometry mismatch is "unavailable" |
-| A defect in the scorer itself | the self-check: source vs itself and source vs stream copy must score 100 on every frame, and it prints PASS or FAIL; its log is exported with the batch it ran next to. It caught one in b166 (next row) |
+| A defect in the scorer itself | the self-check: source vs itself and source vs stream copy must decode to byte-identical frames (counted per window), and it prints PASS or FAIL on that count. VMAF v0.6.1 scores identical low-motion frames 97.43-100, so a score below 100 on identical frames is reported, not failed (b184). Its log is exported with the batch it ran next to. It caught one in b166 (next row) |
 | Every window's first frame scored with zero motion | libvmaf gives the first frame of a session zero motion, and `vmaf_v0.6.1` then scores even an identical frame 97.43. Each window now feeds one pre-window pair as motion context and drops its score (`MotionContext`); the offline calibration scored whole clips, so this makes the device match it |
 | Probe passes that the full encode then fails | selection margin from measured probe-to-encode drift; re-measured in every capture |
 | Probe clip encoded differently from the full encode | one request shape (mode, keyframe interval, B-frames) for both |

@@ -221,3 +221,61 @@ Two record defects this run exposed, fixed after `093d98e`:
 
 Not shown by b182: the full-source hash (not in that build), the progress display (no recording),
 any single-factor effect (two switches on), and repeatability (one run).
+
+## 8. b184 (`pr44-b184`, merge `f5152fc` of `708012e`): why most sources do not pass
+
+Export `20260929-142625`. Two PL batches, both with longer keyframe interval, VMAF v1 shadow and
+the new full source hash on (so again not a pilot arm):
+
+- `batch_1790665769897`: stopped after 127 of 236 sources with no terminal record and no matching
+  process-exit record in the export; 15 accepted, 530,716,467 B before it stopped.
+- `batch_1790699126317`: complete. **22 accepted, 723,250,383 B** of 54.67 GB, all pixel-certified,
+  0 contradictory records. Every source hashed before and after its job: **236 of 236 originals
+  unchanged** (300.8 s of hashing). Identical to b182 source by source (236 of 236 terminals and
+  output sizes), although the starting learned state differed (33 vs 56 profiles).
+
+**What stops the other 180 (`SKIPPED_WOULD_DEGRADE`) is measured quality, not a defect.**
+
+| Source density (bits per pixel) | Sources | Accepted | Rejected by measurement |
+|---|---:|---:|---:|
+| < 0.04 | 72 | 0 | 54 |
+| 0.04–0.06 | 73 | 0 | 70 |
+| 0.06–0.08 | 42 | 2 | 34 |
+| 0.08–0.12 | 38 | 17 | 17 |
+| ≥ 0.12 | 11 | 3 | 5 |
+
+- 179 of the 180 are H.264 (median 0.050 bpp; accepted median 0.095). At the safest rung tried
+  (0.95 or 0.97 of the source's own bitrate) the worst window is a median **4.55 points** below the
+  bar (148 bound by the mean, 32 by p5); 23 are within 1 point, 81 more than 5 points below.
+- The self-check's encoder ceiling on one of them (`job_0b01f05b3686`, 1080x1920 at 60 fps): the
+  same window scores 93.16 mean at 0.90x, 93.48 at 0.95x and **97.06 at 2.00x the source bitrate**.
+  It clears the bar only at a bitrate above the source's own, which cannot make the file smaller.
+  On an HEVC 720p source the same pipeline reaches 100/100/100 at 2x, so the decode/encode path
+  itself is not losing quality; re-encoding dense-noise H.264 at a lower bitrate is.
+- Pairing is exact (the drift p10 of −0.36 / −0.77 / −0.86 is inside the selection margins), the
+  size prediction held on all 22 encodes (actual minus predicted −0.106 to +0.022), and the 2 certification failures and 2 discards were
+  kept as the original. Nothing here is recoverable by a fix without lowering the bar.
+
+Fixed from this capture: the self-check printed **"FAIL (min 98.86; a scorer or pairing defect)"**
+on the source compared with itself, four times, with exact pairing. VMAF v0.6.1 scores identical
+frames 97.43–100 depending on motion (VIF and ADM are exactly 1; motion comes from the reference
+alone), so a low-motion run scored 98.9 on identical frames. The identity controls now count
+byte-identical decoded frames and decide PASS/FAIL on that count; the score is only described.
+
+Not a defect, but noted: a 2 fps screen recording (`job_641d0183abbb`) reaches only 81 at 2x its
+bitrate. Five sources are below 15 fps (about 61 MB together), so rate control at very low frame
+rates is not a savings lever for this library.
+
+**Learned profiles: do not reset.** In Exhaustive mode every source is probed on every run, and the
+learned state did not change a single outcome: b177 PL-A and PL-B (different snapshots) probed the
+same rungs with the same proven ratios, and b182 and b184 (33 and 56 profiles) produced the same
+236 terminals and output sizes. A reset cannot make a measured rejection pass. It would discard
+the learned overshoot used when probes give too few windows, and it would break comparability with
+the recorded snapshots the pilot relies on. The experimental `;gopx2` profiles are kept apart
+under their own key and do not affect the baseline.
+
+What could still raise the accepted count, each unmeasured: the pilot's one-factor arms (A0 with
+the long keyframe interval and the shadow off, then A1/A2/A3), and an encoder operating point the
+app cannot yet request (CQ, complexity, another encoder). Lowering 95.5 / 91 / 84 would pass more
+files by redefining "perceptually lossless", which needs a blinded viewing study first
+(`docs/PERCEPTUALLY_LOSSLESS.md`).

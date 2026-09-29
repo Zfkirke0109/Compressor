@@ -143,7 +143,10 @@ data class WindowPairingDiag(
     // start the source's first frame sat. Null for windows normalised by the requested start.
     val leadUs: Long? = null,
     // Pairs consumed in the lead-in before the window and not scored (ScoreWindow.leadInUs).
-    val leadInPairsSkipped: Int = 0
+    val leadInPairsSkipped: Int = 0,
+    // Identity controls only (score(countIdenticalFrames = true)): scored pairs whose decoded
+    // planes were byte-identical. Null when not counted.
+    val identicalFrames: Int? = null
 ) {
     /**
      * Compact capture form: "ref=50,dist=52,extra=0/2,skewMs=first/maxAbs/meanAbs,drop=a/b".
@@ -156,7 +159,8 @@ data class WindowPairingDiag(
             skewFirstUs / 1000.0, skewMaxAbsUs / 1000.0, skewMeanAbsUs / 1000.0,
             refAlignDrops, distAlignDrops
         ) + (leadUs?.let { ",leadMs=%.1f".format(java.util.Locale.US, it / 1000.0) } ?: "") +
-            (if (leadInPairsSkipped > 0) ",leadIn=$leadInPairsSkipped" else "")
+            (if (leadInPairsSkipped > 0) ",leadIn=$leadInPairsSkipped" else "") +
+            (identicalFrames?.let { ",identical=$it" } ?: "")
 }
 
 /**
@@ -454,7 +458,11 @@ object VmafPairScorer {
         // checkpoint, releases the native sessions on this same thread, and throws
         // CancellationException out of [score]. A native call already running is never
         // interrupted and never closed from another thread.
-        cancelled: () -> Boolean = { false }
+        cancelled: () -> Boolean = { false },
+        // Self-check identity controls: also count scored pairs whose decoded planes are
+        // byte-identical (WindowPairingDiag.identicalFrames). A byte compare per pair; off for
+        // probes and certification.
+        countIdenticalFrames: Boolean = false
     ): PairScoreOutcome {
         if (!VmafNative.isAvailable) return PairScoreOutcome.Unavailable
         val refGeom = YuvFrameReader.displayGeometry(context, ref) ?: return PairScoreOutcome.Unavailable
@@ -471,7 +479,7 @@ object VmafPairScorer {
         }
 
         return collectWindows(windows, onWindowScored) { window ->
-            scoreWindow(context, ref, dist, window, width, height, collectBanding, shadowV1, cancelled)
+            scoreWindow(context, ref, dist, window, width, height, collectBanding, shadowV1, cancelled, countIdenticalFrames)
         }
     }
 
@@ -532,9 +540,11 @@ object VmafPairScorer {
         height: Int,
         collectBanding: Boolean,
         shadowV1: Boolean,
-        cancelled: () -> Boolean = { false }
+        cancelled: () -> Boolean = { false },
+        countIdenticalFrames: Boolean = false
     ): WindowOutcome {
         val wallStart = System.nanoTime()
+        var identicalFrames = 0
         val threadCpuStart = android.os.SystemClock.currentThreadTimeMillis()
         val processCpuStart = android.os.Process.getElapsedCpuTime()
         var queueWaitNanos = 0L
@@ -717,6 +727,7 @@ object VmafPairScorer {
                         val absSkew = kotlin.math.abs(skewUs)
                         if (absSkew > skewMaxAbsUs) skewMaxAbsUs = absSkew
                         skewAbsSumUs += absSkew
+                        if (countIdenticalFrames && r.data.contentEquals(d.data)) identicalFrames++
                         val v0Start = System.nanoTime()
                         val rc = VmafNative.readFrames(handle, r.data, d.data, width, height)
                         v0ReadNanos += System.nanoTime() - v0Start
@@ -813,7 +824,8 @@ object VmafPairScorer {
             leadUs = if (window.alignFirstFrames) {
                 refOrigin.originUs?.let { it - (window.startUs - window.leadInUs) }
             } else null,
-            leadInPairsSkipped = leadInPairsSkipped
+            leadInPairsSkipped = leadInPairsSkipped,
+            identicalFrames = if (countIdenticalFrames) identicalFrames else null
         )
         val frameDiag = WindowFrameDiag.fromPerFrame(perFrame)
         val ms = { nanos: Long -> nanos / 1_000_000L }
