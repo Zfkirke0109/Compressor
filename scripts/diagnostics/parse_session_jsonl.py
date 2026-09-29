@@ -337,10 +337,21 @@ _REPLAY_STAGES = ("plan", "probe_rung", "size_gate", "encode", "finalize", "veri
 
 
 def replay_coverage(session: dict[str, Any]) -> dict[str, Any]:
-    """Whether the capture could replay its policy decisions, and what is missing if not (b177 F4)."""
+    """Whether the capture could replay its policy decisions, and what is missing if not (b177 F4).
+
+    Coverage is judged per job: each job needs the stages its own record says it went through.
+    A stage no job reached is listed (`missingStages`) but is not a gap: b182's 12-source batch,
+    every source probe-rejected, has no encode to record and was labelled partial for it.
+    """
     stages = session.get("stages", [])
     seen = {ev.get("stage") for ev in stages}
     missing = [st for st in _REPLAY_STAGES if st not in seen]
+    # The size gate runs only when the ladder proved (or accepted as marginal) a ratio. The job's
+    # probeRungId is not that signal: it names the rung whose windows the record carries, which is
+    # the last measured rung even when none passed (b182 job_641d0183abbb, both rungs undecided).
+    # In b182 the gate ran for exactly the 29 of 236 jobs with a passed or marginal rung.
+    gated: set[Any] = {ev.get("jobId") for ev in stages
+                       if ev.get("stage") == "probe_rung" and ev.get("verdict") in ("passed", "marginal")}
     updates = session.get("learnedUpdates", 0)
     jobs = {j.get("jobId") or j.get("id"): j for j in session.get("jobs", [])}
     job_stages: dict[str, set[str]] = {jid: set() for jid in jobs if jid}
@@ -360,7 +371,7 @@ def replay_coverage(session: dict[str, Any]) -> dict[str, Any]:
             required.update(("plan", "encode"))
         if j.get("probedRatios"):
             required.add("probe_rung")
-        if j.get("probeRungId") or j.get("pixelProvenRatio") is not None:
+        if jid in gated or j.get("pixelProvenRatio") is not None:
             required.add("size_gate")
         if j.get("candidateBytes"):
             required.update(("finalize", "verify"))
@@ -377,7 +388,7 @@ def replay_coverage(session: dict[str, Any]) -> dict[str, Any]:
                         and ev.get("snapshotSha256") == snapshot and snapshot)
     update_indexes = [ev.get("updateIndex") for ev in captured_updates]
     valid_update_sequence = update_indexes == list(range(updates))
-    complete = (not missing and not missing_by_job and not orphan_stages and jobs
+    complete = (not missing_by_job and not orphan_stages and jobs
                 and updates == len(captured_updates) == valid_updates and valid_update_sequence
                 and session.get("learnedSnapshot") is not None and snapshot
                 and session.get("identity") is not None)
@@ -747,7 +758,9 @@ def render(s: dict[str, Any]) -> str:
                    f" ({legacy} with the pre-b177 mode label, which is not an observation)")
     cov = s.get("replayCoverage")
     if cov:
-        out.append(f"  replay         : {cov['label']}; missing stages {cov['missingStages'] or 'none'};"
+        out.append(f"  replay         : {cov['label']}; jobs missing stages {len(cov['missingJobStages'])}"
+                   f" {dict(list(cov['missingJobStages'].items())[:3]) or ''}; orphan stages {cov['orphanStages']};"
+                   f" stages no job reached {cov['missingStages'] or 'none'};"
                    f" learned updates linked {cov['learnedUpdatesLinked']}/{cov['learnedUpdates']};"
                    f" run identity {'yes' if cov['runIdentity'] else 'no'}")
     over = s.get("overshootPrediction")

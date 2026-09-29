@@ -105,6 +105,8 @@ class AttemptLedger {
         const val OPEN = "open"
         const val EXPORT_FAILED = "export_failed"
         const val STRUCTURAL_FAILED = "structural_failed"
+        /** Structurally verified, discarded because it may not replace the original (e.g. not smaller). */
+        const val REPLACEMENT_BLOCKED = "replacement_blocked"
         const val ACCEPTED = "accepted"
         const val CANCELLED = "cancelled"
         const val FAILED = "failed"

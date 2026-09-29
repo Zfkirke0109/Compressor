@@ -166,3 +166,58 @@ What each measure means:
   perceptual equivalence is made.
 - **Speed:** b177's timing varied up to 8x on identical work; no speed claim is possible without
   matched, repeated runs.
+
+## 7. First device run: b182 (`pr44-b182`, merge `f5deaa8` of `bd33cae`)
+
+Two exports (`20260928-015343`, `20260928-231408`) hold the same two b182 batches, byte-identical.
+Both ran with **longer keyframe interval (x2) on, VMAF v1 shadow calibration on**, safer-rung retry
+on, B-frames 2, Exhaustive on, replace-original off. Two experiment switches at once: this is an
+observational run of the long-GOP configuration, not a pilot arm, and it learned under `;gopx2`.
+
+| Batch | Sources | Result |
+|---|---:|---|
+| `batch_1790560725342` | 12 (all new since b177), 4.11 GB | 12 probe rejections, 175 s; created the first 5 `;gopx2` profiles |
+| `batch_1790570024266` | 236, 54.67 GB | 22 accepted, **723,250,383 B**, all pixel-certified, 0 contradictory records; audio 21 bit-identical + 1 none |
+
+On the 223 sources common to b177 (same name hash and size), observational, not controlled:
+
+| Run | Keyframe interval | Accepted | Accepted reduction | Summed job time | Batch wall (all sources) |
+|---|---|---:|---:|---:|---:|
+| b177 PL-A | source | 22 | 707,773,964 B | 6,996 s | 8,033 s (226) |
+| b177 PL-B | source | 23 | 708,868,481 B | 9,721 s | 10,677 s (226) |
+| b182 | source x2 | 22 | 723,250,383 B (+14,381,902 vs PL-B) | 7,972 s | 8,375 s (236) |
+
+The net +2.0 % is mixed, not uniform. `job_458aa0663c3e` (4K) passed at 0.70 where b177 failed at
+0.70 on the same short ladder (+14.3 MB; certification mean 95.7 against the 95.5 bar);
+`job_d127463b57d6` 0.75 → 0.70 (+15.5 MB); `job_dbe605676504` 0.75 → 0.68 (+6.5 MB). Against that,
+`job_34f35736a973` failed 0.75 and certified at 0.80 (−22.4 MB), and `job_c0f82bb62f94` passed its
+probe but measured 1.181 overshoot (b177: 1.076), so the size gate kept the original (−0.88 MB).
+Build changes since b177 and different learned states also differ between these runs.
+
+Also measured:
+- **Failures:** 2 measured certification failures (`job_01cf1624426d` at 0.95, `job_c92a4ca7e1be` at
+  0.97), each kept as the original; the retry was denied (no measured safer rung). 2 discarded
+  candidates kept the original: one lost its colour standard (`standardMatches`), one passed
+  every predicate but was 23,628 B larger than its source. 6 damaged sources, as in b177.
+- **Drift** probe → certification over 62 identity-joined windows: median −0.06 / −0.05 / −0.07,
+  p10 −0.36 / −0.77 / −0.86, inside the +0.5 / +1.25 / +1.0 selection margins. Marginal passes: 5
+  attempted, 2 certified.
+- **Timing** (this build's per-window instrumentation, 678 windows): 5,744 s of window wall time,
+  **89 % waiting for decoded frames**; VMAF v0 378 s; v1 shadow 216 s on its 24-window budget
+  (b177 PL-B's unbudgeted shadow: 748 s). 72 % of decoded frames are lead-in (decoded, paired,
+  never scored), the same share as b177 (72 %): it comes from the window plan, not the GOP.
+  Decoding, not scoring, is where scoring time goes; that is the speed lever, unmeasured so far.
+
+Two record defects this run exposed, fixed after `093d98e`:
+- `replay_coverage` called both batches partial: the 12-source batch because no job reached an
+  encode (a batch-wide stage list, not a per-job gap), and `job_641d0183abbb` because its record
+  names the last measured rung although both rungs were undecided and no size gate ran. Coverage
+  is now per job only, and the size gate is required when a rung passed or was marginal: in b182
+  that is exactly the 29 of 236 jobs with a `size_gate` event. Both batches now read
+  `REPLAYABLE_RECORD`.
+- The attempt ledger recorded `job_50d1ff00cad6` as `structural_failed` although verification
+  passed and only the replacement was blocked (not smaller). Such a discard is now
+  `replacement_blocked`; a structural failure stays `structural_failed`.
+
+Not shown by b182: the full-source hash (not in that build), the progress display (no recording),
+any single-factor effect (two switches on), and repeatability (one run).

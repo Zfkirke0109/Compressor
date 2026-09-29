@@ -2672,7 +2672,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         }
         val failureReason = verification.replacementBlockReason ?: verification.verdict
         s.diagnosticFallbackReason = failureReason
-        if (s.encodeAttempt != null) s.ledger.finish(AttemptLedger.STRUCTURAL_FAILED, outputSize, s.lastEncodeMs)
+        if (s.encodeAttempt != null) {
+            s.ledger.finish(PerceptualLosslessVerifier.discardedOutcome(verification), outputSize, s.lastEncodeMs)
+        }
         // Measured video bitrate of the DISCARDED encode (Media3's own report, else size/duration),
         // captured before the file is deleted, so the structured record shows whether the encode
         // undershot the floor or simply was not smaller.

@@ -1475,5 +1475,18 @@ class BatchQualitySafetyTest {
         )
 
         assertTrue(PerceptualLosslessVerifier.shouldFallbackToRemux(report, 100L, 100L))
+        assertEquals(AttemptLedger.STRUCTURAL_FAILED, PerceptualLosslessVerifier.discardedOutcome(report))
+
+        // b182 job_50d1ff00cad6: every predicate passed, but the output was not smaller, so the
+        // replacement was blocked. Still discarded; recorded as what it was, not a structural failure.
+        val notSmaller = report.copy(
+            verdict = "Perceptually Lossless Verified",
+            replacementSafe = false,
+            replacementBlockReason = "perceptually lossless output is not smaller than the source, so replacing the original is blocked",
+            criticalFieldsComplete = true,
+            verified = true
+        )
+        assertTrue(PerceptualLosslessVerifier.shouldFallbackToRemux(notSmaller, 4_604_039L, 4_627_667L))
+        assertEquals(AttemptLedger.REPLACEMENT_BLOCKED, PerceptualLosslessVerifier.discardedOutcome(notSmaller))
     }
 }

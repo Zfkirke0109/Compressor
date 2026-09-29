@@ -554,5 +554,40 @@ def test_replay_coverage_matches_what_each_terminal_path_emits():
     assert cov["label"] == "PARTIAL_OBSERVATIONAL_REPLAY"
     assert cov["missingJobStages"] == {"skip": ["accept"], "remux": ["finalize"], "rec": ["certify"]}
 
+def test_replay_coverage_judges_each_job_not_stages_no_job_reached():
+    """b182: a batch where every source was probe-rejected, and an undecided keep-original."""
+    from parse_session_jsonl import replay_coverage
+
+    def session(jobs, stages):
+        return {"jobs": jobs, "stages": stages, "learnedSnapshot": {"sha256": "s"}, "identity": {"scoring": {}},
+                "learnedUpdates": 0, "updates": []}
+
+    # batch_1790560725342: 12 sources, all SKIPPED_WOULD_DEGRADE. Nothing was encoded, so no job
+    # needed plan/size_gate/encode/finalize/verify/certify; the record is complete.
+    skipped = [{"jobId": f"j{i}", "terminal": "SKIPPED_WOULD_DEGRADE", "probedRatios": "0.95", "probeRungId": "0.95@c"}
+               for i in range(3)]
+    stages = [{"jobId": f"j{i}", "stage": st, "verdict": "failed" if st == "probe_rung" else None}
+              for i in range(3) for st in ("probe_rung", "accept")]
+    cov = replay_coverage(session(skipped, stages))
+    assert cov["label"] == "REPLAYABLE_RECORD", cov
+    assert "encode" in cov["missingStages"]          # still reported, no longer a gap
+
+    # job_641d0183abbb: both rungs undecided (too few frames), kept as the original. It names the
+    # last measured rung, but no ratio was proven, so the size gate never ran and is not required.
+    undecided = {"jobId": "u", "terminal": "ALREADY_HIGHLY_OPTIMIZED", "probedRatios": "0.90,0.95",
+                 "probeRungId": "0.95@edb0627715d8", "pixelProvenRatio": None}
+    ustages = [{"jobId": "u", "stage": "probe_rung", "verdict": "insufficient"},
+               {"jobId": "u", "stage": "probe_rung", "verdict": "insufficient"},
+               {"jobId": "u", "stage": "accept"}]
+    assert replay_coverage(session([undecided], ustages))["label"] == "REPLAYABLE_RECORD"
+
+    # A proven rung the size gate then kept as the original: the gate's event is required.
+    kept = {"jobId": "k", "terminal": "ALREADY_HIGHLY_OPTIMIZED", "probedRatios": "0.90", "probeRungId": "0.90@a"}
+    kstages = [{"jobId": "k", "stage": "probe_rung", "verdict": "passed"}, {"jobId": "k", "stage": "accept"}]
+    cov = replay_coverage(session([kept], kstages))
+    assert cov["missingJobStages"] == {"k": ["size_gate"]}
+    kstages.append({"jobId": "k", "stage": "size_gate"})
+    assert replay_coverage(session([kept], kstages))["label"] == "REPLAYABLE_RECORD"
+
 if __name__ == "__main__":
     raise SystemExit(_main())
