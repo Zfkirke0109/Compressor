@@ -134,8 +134,12 @@ class YuvFrameReader(
                         if (info.size > 0 && pts >= startUs && pts < endUs) {
                             val image = codec.getOutputImage(outIndex)
                                 ?: throw IllegalStateException("no output image")
-                            val frame = imageToDisplayI420(image, rotation, pts)
-                            codec.releaseOutputBuffer(outIndex, false)
+                            val frame = try {
+                                imageToDisplayI420(image, rotation, pts)
+                            } finally {
+                                image.close()
+                                codec.releaseOutputBuffer(outIndex, false)
+                            }
                             delivered++
                             keepGoing = onFrame(frame)
                             // onFrame blocks while the scorer's queue is full; that is the

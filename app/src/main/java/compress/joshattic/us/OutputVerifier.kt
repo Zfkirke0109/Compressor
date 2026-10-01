@@ -323,14 +323,14 @@ object OutputVerifier {
             else -> true
         }
         val audioBitratePass = when {
-            input.sourceTrackProbe.audioCodec == null -> input.outputTrackProbe.audioCodec == null || input.mode != BatchQualityMode.REMUX_ONLY
+            input.sourceTrackProbe.audioCodec == null -> input.outputTrackProbe.audioCodec == null || (input.mode != BatchQualityMode.REMUX_ONLY && input.mode != BatchQualityMode.PERCEPTUAL_LOSSLESS)
+            // No audio-transparency calibration exists. Neither a high bitrate nor absent
+            // bitrate metadata proves a second lossy generation is transparent.
+            input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS ->
+                input.audioPacketsIdentical && !input.audioPacketsDiffer && audioCodecMatches && audioShapeMatches
             // A stream-copied track carries the source packets verbatim, so bitrate parity holds
             // even when neither container exposes a numeric value.
             audioLooksStreamCopied -> true
-            input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS -> {
-                val floor = maxOf(input.source.audioBitrate, 256_000)
-                effectiveOutputAudioBitrate > 0 && effectiveOutputAudioBitrate >= floor * 0.9
-            }
             input.mode == BatchQualityMode.REMUX_ONLY -> {
                 if (input.sourceTrackProbe.audioBitrate <= 0) {
                     // Bitrate parity is unknowable when the source hides it; codec/shape/size
@@ -770,17 +770,15 @@ object OutputVerifier {
             MediaFormat.COLOR_STANDARD_BT709,
             allowMedia3SdrDefault
         )
-        // BT.601 has two tags, NTSC (4) and PAL (2). They share one YUV matrix and one transfer
-        // function; only the primaries tag differs. Media3's ColorInfo has a single BT.601 colour
-        // space, so every Media3 encode of a BT.601 NTSC source is written as PAL. That is a
-        // representational collapse, not a colour change, and it rejected 2 otherwise-passing
-        // encodes in the b161 captures ("Color standard: 4 -> 2"). Accepted for a Perceptually
-        // Lossless re-encode only. A remux must still copy the tag exactly.
+        // Media3 collapses the BT.601 tags, but NTSC/PAL have distinct primaries. Record
+        // this transition and reject it until a separate decoded-color proof exists.
         val bt601Variant = !exactOrDefaultStandard.first &&
             mode == BatchQualityMode.PERCEPTUAL_LOSSLESS &&
             source.colorStandard in BT601_STANDARDS &&
             output.colorStandard in BT601_STANDARDS
-        val standard = if (bt601Variant) true to ColorMatchBasis.EXACT else exactOrDefaultStandard
+        // NTSC/PAL primaries differ. Media3's abstraction losing that distinction is not
+        // decoded-color proof. Keep the diagnostic, but fail the metadata comparison.
+        val standard = exactOrDefaultStandard
         val range = compareColorField(
             source.colorRange,
             output.colorRange,

@@ -2301,7 +2301,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val verification = checkNotNull(s.verification) { "certification before verification" }
         val outputFile = checkNotNull(s.outputFile) { "certification before an output exists" }
         if (!(s.effectiveQuality == BatchQualityPreset.ORIGINAL &&
-                perceptualPlan != null && perceptualPlan.pixelCertifiable &&
+                perceptualPlan != null &&
                 !PerceptualLosslessVerifier.shouldFallbackToRemux(verification, item.originalSize, s.outputSize))
         ) {
             return CertStep.CONTINUE
@@ -2315,7 +2315,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             plannedWindows = QualityProbePolicy.probeWindows(item.durationMs * 1000L, QualityProbePolicy.windowDurationUs(item.originalFps.toDouble())).size,
             width = item.originalWidth, height = item.originalHeight
         )
-        val certOutcome = s.floorRecoveryCertScores?.let { PairScoreOutcome.Scored(it) }
+        val certOutcome = if (!perceptualPlan.pixelCertifiable) PairScoreOutcome.Unavailable else
+            s.floorRecoveryCertScores?.let { PairScoreOutcome.Scored(it) }
             ?: qualityProber.certify(
                 item.sourceUri, outputFile, item.durationMs, item.originalFps.toDouble(),
                 onWindowScored = { done, total -> s.phases.certifyStep(done, total) },
@@ -3617,7 +3618,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             hdrPixelTransparencyUnvalidated ->
                 "HDR re-encoding is not pixel-validated as lossless; kept exact stream copy to preserve HDR/color exactly."
             insufficientSourceBitDensity ->
-                "Source is already heavily compressed; a re-encode would visibly lose quality, so the exact stream copy was kept."
+                "Low source bit density predicts limited headroom; the original is kept unless pixel probes prove a smaller candidate."
             nearOptimal ->
                 "Source is already near optimal; kept exact stream copy."
             else -> null
@@ -3666,8 +3667,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             profileKey = profileKey,
             targetRatio = targetRatio,
             floorRatio = floorRatio,
-            preferRemux = remuxReason != null,
-            remuxReason = remuxReason,
+            preferRemux = remuxReason != null || !pixelCertifiable,
+            remuxReason = remuxReason ?: if (!pixelCertifiable) "PL measurement unavailable ($pixelCertifiableBlockReason); original retained." else null,
             remuxWasSourceEfficient = (preserveSourceCodec || nearOptimal) && !profilePrefersRemux,
             remuxWasEvidencePreferred = profilePrefersRemux,
             useCbrCeiling = useCbrCeiling,
@@ -3803,7 +3804,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 learningEngine.recordMeasuredProbeRejection(plan.profileKey)
                 probeTrace.copy(
                     preferRemux = true,
-                    skipReason = "On-device VMAF measured visible quality loss at every " +
+                    skipReason = "On-device VMAF fell below the current PL gate at every measured " +
                         "candidate ratio (${decision.probedRatios.joinToString { "%.2f".format(it) }}); " +
                         "original left untouched."
                 )

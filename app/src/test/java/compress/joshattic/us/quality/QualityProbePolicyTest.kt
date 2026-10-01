@@ -74,7 +74,7 @@ class QualityProbePolicyTest {
     fun certificationWithoutProbeBasisStillFailsOnMeasuredEvidence() {
         // Sources above the ladder bar never had a pixel-justified target, so merely-unavailable
         // evidence leaves the structural verdict standing (the behavior they already get today).
-        assertTrue(
+        assertFalse(
             QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(PairScoreOutcome.Unavailable)
         )
         // ...but measured evidence still rules in the negative direction, exactly as elsewhere.
@@ -99,7 +99,7 @@ class QualityProbePolicyTest {
         // may set pixelCertified, so a 4K output whose scoring failed still reads structural-only.
         val acceptedWithoutEvidence =
             QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis(PairScoreOutcome.Unavailable)
-        assertTrue(acceptedWithoutEvidence)
+        assertFalse(acceptedWithoutEvidence)
         assertFalse(
             QualityProbePolicy.isPixelCertified(acceptedWithoutEvidence, PairScoreOutcome.Unavailable)
         )
@@ -137,7 +137,7 @@ class QualityProbePolicyTest {
         assertFalse(QualityProbePolicy.certificationPasses(0.90, 0.90, failing))
 
         // Unmeasurable: the legacy default-ratio path keeps its structural verdict...
-        assertTrue(QualityProbePolicy.certificationPasses(0.90, 0.90, null))
+        assertFalse(QualityProbePolicy.certificationPasses(0.90, 0.90, null))
         // ...but a sub-default encode's only justification WAS pixel evidence -> fail closed.
         assertFalse(QualityProbePolicy.certificationPasses(0.70, 0.90, null))
     }
@@ -210,7 +210,7 @@ class QualityProbePolicyTest {
         assertFalse(QualityProbePolicy.certificationOutcomePasses(0.90, 0.90, failing))
 
         // Unavailable evidence keeps the legacy structural fallback semantics.
-        assertTrue(QualityProbePolicy.certificationOutcomePasses(0.90, 0.90, PairScoreOutcome.Unavailable))
+        assertFalse(QualityProbePolicy.certificationOutcomePasses(0.90, 0.90, PairScoreOutcome.Unavailable))
         assertFalse(QualityProbePolicy.certificationOutcomePasses(0.70, 0.90, PairScoreOutcome.Unavailable))
 
         // Measured misalignment is evidence AGAINST the output (frame loss/retiming):

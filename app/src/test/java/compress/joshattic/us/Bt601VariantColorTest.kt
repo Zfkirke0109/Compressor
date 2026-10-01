@@ -17,13 +17,13 @@ class Bt601VariantColorTest {
     )
 
     @Test
-    fun ntscToPalPassesForAPerceptuallyLosslessReEncode() {
+    fun ntscToPalRequiresColorEvidence() {
         val c = OutputVerifier.compareColorTransition(
             BatchQualityMode.PERCEPTUAL_LOSSLESS,
             probe(MediaFormat.COLOR_STANDARD_BT601_NTSC),
             probe(MediaFormat.COLOR_STANDARD_BT601_PAL)
         )
-        assertTrue(c.standardMatches)
+        assertFalse(c.standardMatches)
         assertTrue(c.standardIsBt601Variant)
     }
 

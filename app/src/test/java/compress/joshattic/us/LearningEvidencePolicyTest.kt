@@ -13,9 +13,9 @@ class LearningEvidencePolicyTest {
 
     @Test
     fun onlyAStarvedEncodeCountsAsQualityEvidence() {
-        assertEquals(LearningEvidencePolicy.Kind.QUALITY, LearningEvidencePolicy.classifyVerificationFailure(listOf("videoBitratePass")))
+        assertEquals(LearningEvidencePolicy.Kind.UNDECIDED, LearningEvidencePolicy.classifyVerificationFailure(listOf("videoBitratePass")))
         assertEquals(
-            LearningEvidencePolicy.Kind.QUALITY,
+            LearningEvidencePolicy.Kind.PIPELINE,
             LearningEvidencePolicy.classifyVerificationFailure(listOf("audioBitratePass", "videoBitratePass"))
         )
     }

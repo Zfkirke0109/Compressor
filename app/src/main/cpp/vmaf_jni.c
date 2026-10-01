@@ -139,6 +139,7 @@ Java_compress_joshattic_us_quality_VmafNative_nativeReadFrames(
     jbyte *dist = (*env)->GetByteArrayElements(env, distI420, NULL);
     if (!ref || !dist) {
         if (ref) (*env)->ReleaseByteArrayElements(env, refI420, ref, JNI_ABORT);
+        if (dist) (*env)->ReleaseByteArrayElements(env, distI420, dist, JNI_ABORT);
         return -3;
     }
 

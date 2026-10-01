@@ -37,7 +37,7 @@ enum class CertificationDecision(val wire: String) {
     MISALIGNED("misaligned");
 
     /** Evidence against this output: may be labelled a quality failure and may be learned. */
-    val isMeasuredNegative: Boolean get() = this == MEASURED_FAILURE || this == MISALIGNED
+    val isMeasuredNegative: Boolean get() = this == MEASURED_FAILURE
 
     companion object {
         fun of(outcome: PairScoreOutcome): CertificationDecision = when (outcome) {

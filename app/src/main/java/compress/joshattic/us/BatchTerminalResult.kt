@@ -37,7 +37,7 @@ enum class BatchTerminalResult(
     TRANSCODED_NOT_MEANINGFULLY_SMALLER("Re-encoded — no meaningful size win; original kept", countsAsRealCompression = false),
 
     /** Source was already efficient for its resolution/codec; kept the exact stream copy. */
-    ALREADY_HIGHLY_OPTIMIZED("Already efficient — kept original bytes", countsAsRealCompression = false),
+    ALREADY_HIGHLY_OPTIMIZED("Original kept — no verified smaller output", countsAsRealCompression = false),
 
     /**
      * The learning engine's measured evidence latched this device profile as remux-preferred
@@ -77,7 +77,7 @@ enum class BatchTerminalResult(
      * was skipped entirely: the original stays untouched and no stream-copy is written (a remux
      * of such a source saves nothing and costs full-file I/O).
      */
-    SKIPPED_WOULD_DEGRADE("Skipped — compression would visibly lose quality", countsAsRealCompression = false),
+    SKIPPED_WOULD_DEGRADE("Kept original — measured below the PL quality gate", countsAsRealCompression = false),
 
     /** User cancelled the batch before this item finished. */
     CANCELLED("Cancelled", countsAsRealCompression = false),

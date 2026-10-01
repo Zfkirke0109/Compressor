@@ -62,9 +62,9 @@ class AudioPassThroughVerificationTest {
     }
 
     @Test
-    fun unknownPacketIdentityKeepsExistingStructuralCopyInference() {
+    fun unknownPacketIdentityCannotProvePlAudio() {
         val report = OutputVerifier.verify(input(false).copy(outputTrackProbe = outputTracks.copy(audioBitrate = 0)))
-        assertFalse("audioBitratePass" in report.failingChecks())
+        assertTrue("audioBitratePass" in report.failingChecks())
         assertEquals(AudioPreservation.INFERRED_COPY, report.audioBasis)
     }
 

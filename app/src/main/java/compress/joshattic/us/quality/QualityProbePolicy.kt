@@ -109,14 +109,17 @@ object QualityProbePolicy {
      */
     enum class RungVerdict { UNMEASURED, INSUFFICIENT, FAILED, MARGINAL, PASSED }
 
-    private fun clears(w: WindowScore, bar: QualityBar) = w.mean >= bar.meanMin && w.p5 >= bar.p5Min && w.min >= bar.minMin
+    internal fun validScore(w: WindowScore) = listOf(w.mean, w.p5, w.min).all { it.isFinite() && it >= 0.0 }
+
+    private fun clears(w: WindowScore, bar: QualityBar) = validScore(w) && w.mean >= bar.meanMin && w.p5 >= bar.p5Min && w.min >= bar.minMin
 
     /** How a measured rung stands: clears bar and margin, clears only the bar, or fails the bar. */
     fun rungVerdict(scores: List<WindowScore>?): RungVerdict = when {
         scores.isNullOrEmpty() -> RungVerdict.UNMEASURED
         // A window with enough frames below the bar is a measurement, whatever the others hold.
-        scores.any { it.comparedFrames >= MIN_COMPARED_FRAMES_PER_WINDOW && !clears(it, PERCEPTUAL_LOSSLESS) } ->
+        scores.any { validScore(it) && it.comparedFrames >= MIN_COMPARED_FRAMES_PER_WINDOW && !clears(it, PERCEPTUAL_LOSSLESS) } ->
             RungVerdict.FAILED
+        scores.any { !validScore(it) } -> RungVerdict.UNMEASURED
         scores.any { it.comparedFrames < MIN_COMPARED_FRAMES_PER_WINDOW } -> RungVerdict.INSUFFICIENT
         windowsPass(scores, PROBE_SELECTION) -> RungVerdict.PASSED
         windowsPass(scores) -> RungVerdict.MARGINAL
@@ -329,7 +332,7 @@ object QualityProbePolicy {
     fun windowsPass(scores: List<WindowScore>?, bar: QualityBar): Boolean {
         if (scores.isNullOrEmpty()) return false
         return scores.all {
-            it.comparedFrames >= MIN_COMPARED_FRAMES_PER_WINDOW &&
+            validScore(it) && it.comparedFrames >= MIN_COMPARED_FRAMES_PER_WINDOW &&
                 it.mean >= bar.meanMin &&
                 it.p5 >= bar.p5Min &&
                 it.min >= bar.minMin
@@ -339,82 +342,21 @@ object QualityProbePolicy {
     /** True when every window clears the Perceptually Lossless bar. */
     fun windowsPass(scores: List<WindowScore>?): Boolean = windowsPass(scores, PERCEPTUAL_LOSSLESS)
 
-    /**
-     * Certification verdict for a completed full encode.
-     *
-     * @param usedRatio ratio the encode actually used
-     * @param defaultRatio the codec-appropriate default ratio
-     * @param scores sampled window scores of the final output vs the source, or null when
-     *   measurement was not possible
-     * @return true when the PL verdict may stand
-     *
-     * Rules:
-     *  - measured and passing -> certified
-     *  - measured and failing -> NOT certified (regardless of ratio)
-     *  - unmeasurable at the default ratio -> certified structurally (pre-pixel behavior;
-     *    pixel scoring is an upgrade, not a new requirement for the legacy path)
-     *  - unmeasurable below the default ratio -> NOT certified (the sub-default target was
-     *    justified only by pixel evidence, so its absence fails closed)
-     */
-    fun certificationPasses(usedRatio: Double, defaultRatio: Double, scores: List<WindowScore>?): Boolean {
-        if (scores != null) return windowsPass(scores)
-        return usedRatio >= defaultRatio - 1e-9
-    }
+    /** Legacy call signature retained for callers; target bitrate never substitutes for pixels. */
+    @Suppress("UNUSED_PARAMETER")
+    fun certificationPasses(usedRatio: Double, defaultRatio: Double, scores: List<WindowScore>?): Boolean =
+        windowsPass(scores)
 
-    /**
-     * Certification verdict for a tri-state scoring outcome. Measured misalignment is
-     * POSITIVE evidence the output's frames are not temporally comparable to the source
-     * (frame loss or retiming) — it always fails, and is never eligible for the structural
-     * default-ratio fallback that covers merely-unavailable evidence.
-     */
-    /**
-     * True ONLY when sampled pixels actually certified this output.
-     *
-     * Deliberately NOT the same thing as "certification passed": [certificationOutcomePasses]
-     * returns true for [PairScoreOutcome.Unavailable] at or above the default ratio via the
-     * structural fallback, which is an honest ACCEPTANCE but is NOT pixel evidence. It is also not
-     * the same as probe eligibility — an eligible item whose certification produced no measured
-     * windows was still accepted structurally. Only a passing [PairScoreOutcome.Scored] means real
-     * measured windows backed the result, so only that may wear the full perceptual label (QUAL-001).
-     */
+    /** Complete measured evidence is required on every path; structural checks are additional. */
     fun isPixelCertified(certificationPassed: Boolean, outcome: PairScoreOutcome): Boolean =
-        certificationPassed && outcome is PairScoreOutcome.Scored
+        certificationPassed && outcome is PairScoreOutcome.Scored && windowsPass(outcome.windows)
 
+    @Suppress("UNUSED_PARAMETER")
     fun certificationOutcomePasses(usedRatio: Double, defaultRatio: Double, outcome: PairScoreOutcome): Boolean =
-        when (outcome) {
-            is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
-            PairScoreOutcome.Unavailable -> certificationPasses(usedRatio, defaultRatio, null)
-            // What was scored must pass on its own; only then does the missing part fall back to
-            // the absent-evidence rule. A measured failure in a partial sample always rejects.
-            is PairScoreOutcome.Incomplete ->
-                windowsPass(outcome.scored) && certificationPasses(usedRatio, defaultRatio, null)
-            is PairScoreOutcome.MisalignmentRejected -> false
-        }
+        outcome is PairScoreOutcome.Scored && windowsPass(outcome.windows)
 
-    /**
-     * Certification verdict for an encode whose target ratio was NOT justified by probe pixels —
-     * the case for sources above [PROBE_LADDER_MAX_PIXELS], where no ladder ever runs and the
-     * target comes from the codec default plus the learning engine's floor-clamped ratio.
-     *
-     * Measured evidence still rules in the negative direction, exactly as everywhere else:
-     *  - measured and passing -> certified (and, being [PairScoreOutcome.Scored], pixel-proven)
-     *  - measured and failing -> NOT certified
-     *  - measured misalignment -> NOT certified
-     *  - unmeasurable -> the structural verdict stands, because no part of this encode's target
-     *    depended on pixel evidence in the first place. This is the pre-existing behavior for
-     *    these sources, so enabling certification for them can only ADD proof, never withdraw an
-     *    acceptance the app already grants today.
-     *
-     * The ratio-aware [certificationOutcomePasses] must keep being used wherever a ladder DID run:
-     * there a sub-default target was justified by pixels alone, so their absence has to fail closed.
-     */
     fun certificationOutcomePassesWithoutProbeBasis(outcome: PairScoreOutcome): Boolean =
-        when (outcome) {
-            is PairScoreOutcome.Scored -> windowsPass(outcome.windows)
-            PairScoreOutcome.Unavailable -> true
-            is PairScoreOutcome.Incomplete -> windowsPass(outcome.scored)
-            is PairScoreOutcome.MisalignmentRejected -> false
-        }
+        outcome is PairScoreOutcome.Scored && windowsPass(outcome.windows)
 
     /**
      * How to describe a ladder that ended without a proven ratio.

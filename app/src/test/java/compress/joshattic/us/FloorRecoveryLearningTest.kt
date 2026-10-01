@@ -82,17 +82,17 @@ class FloorRecoveryLearningTest {
     }
 
     @Test
-    fun withNoPixelMeasuredTheStructuralFloorStillTeachesTheLegacyStepUp() {
+    fun withNoPixelMeasuredTheStructuralFloorTeachesNothing() {
         for (decision in listOf(null, CertificationDecision.of(recovery(null, null, null)))) {
             val (kind, store) = apply(decision)
-            assertEquals("$decision", LearningEvidencePolicy.Kind.QUALITY, kind)
-            assertEquals(1, store.size)
+            assertEquals("$decision", LearningEvidencePolicy.Kind.UNDECIDED, kind)
+            assertTrue(store.isEmpty())
         }
     }
 
     @Test
     fun theLegacyOneArgumentRuleIsUnchanged() {
-        assertEquals(LearningEvidencePolicy.Kind.QUALITY, LearningEvidencePolicy.classifyVerificationFailure(floorOnly))
+        assertEquals(LearningEvidencePolicy.Kind.UNDECIDED, LearningEvidencePolicy.classifyVerificationFailure(floorOnly))
         assertEquals(LearningEvidencePolicy.Kind.PIPELINE, LearningEvidencePolicy.classifyVerificationFailure(listOf("playable")))
     }
 }

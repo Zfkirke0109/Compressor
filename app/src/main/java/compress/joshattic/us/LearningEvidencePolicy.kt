@@ -54,25 +54,16 @@ object LearningEvidencePolicy {
 
     fun classifyVerificationFailure(failingChecks: List<String>): Kind = classifyVerificationFailure(failingChecks, null)
 
-    /**
-     * [floorRecovery] is what the floor-recovery pixels were evidence of, or null when no recovery
-     * ran (b177 F6). The video-bitrate floor is a STRUCTURAL rule (the output's bitrate against a
-     * floor inferred from the source), not a pixel measurement:
-     *
-     *  - no recovery ran, or it scored nothing (UNAVAILABLE): structural evidence is all there is,
-     *    and it keeps teaching the conservative step-up it always did. That covers sources pixel
-     *    scoring cannot reach (above the geometry cap, codec downgrade, VMAF missing);
-     *  - the recovery measured a window below the bar, or misaligned frames: the pixels agree, QUALITY;
-     *  - the recovery measured and nothing failed (INSUFFICIENT_EVIDENCE, PARTIAL, PASSED):
-     *    UNDECIDED. Before b177 this stepped the profile up, so eleven frames scoring 99 taught a
-     *    "quality failure" no measurement had shown.
-     *
-     * Acceptance is not decided here: the item already failed verification and keeps its original.
+    /** Only measured visual failure with no unrelated integrity failure trains the quality ratio.
+     * A bitrate floor is an inference. Alignment, decoder, audio and color failures cannot say
+     * that more bitrate would help; all retain the original without quality learning.
      */
     fun classifyVerificationFailure(failingChecks: List<String>, floorRecovery: CertificationDecision?): Kind = when {
+        // A second failed integrity check makes the candidate unsuitable for visual learning.
+        failingChecks.any { it !in QUALITY_CHECKS } -> Kind.PIPELINE
         failingChecks.any { it in QUALITY_CHECKS } -> when (floorRecovery) {
-            null, CertificationDecision.UNAVAILABLE,
-            CertificationDecision.MEASURED_FAILURE, CertificationDecision.MISALIGNED -> Kind.QUALITY
+            CertificationDecision.MEASURED_FAILURE -> Kind.QUALITY
+            null, CertificationDecision.UNAVAILABLE, CertificationDecision.MISALIGNED,
             CertificationDecision.INSUFFICIENT_EVIDENCE, CertificationDecision.PARTIAL,
             CertificationDecision.PASSED -> Kind.UNDECIDED
         }

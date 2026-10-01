@@ -805,7 +805,7 @@ object VmafPairScorer {
                 }
         } else null
         closeV1()
-        if (perFrame == null || perFrame.isEmpty() || perFrame.any { it < 0 }) {
+        if (perFrame == null || perFrame.size != fed || perFrame.any { it < 0 || !it.isFinite() }) {
             DiagLog.w(TAG, "vmaf flush failed for window")
             return WindowOutcome.Unavailable
         }

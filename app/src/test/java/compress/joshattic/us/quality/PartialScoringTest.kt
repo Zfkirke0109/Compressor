@@ -87,8 +87,8 @@ class PartialScoringTest {
         // The pre-fix outcome for this sequence was bare Unavailable. It is still accepted
         // structurally at the default ratio (probe and no-probe bases): that is the legacy rule
         // for real absence of evidence, and why losing the first window was dangerous.
-        assertTrue(gate(CertificationGate.Basis.PROBE_BASIS, PairScoreOutcome.Unavailable).accepted)
-        assertTrue(gate(CertificationGate.Basis.NO_PROBE_BASIS, PairScoreOutcome.Unavailable).accepted)
+        assertFalse(gate(CertificationGate.Basis.PROBE_BASIS, PairScoreOutcome.Unavailable).accepted)
+        assertFalse(gate(CertificationGate.Basis.NO_PROBE_BASIS, PairScoreOutcome.Unavailable).accepted)
         assertFalse(gate(CertificationGate.Basis.MEASURED_REQUIRED, PairScoreOutcome.Unavailable).accepted)
     }
 
@@ -103,8 +103,8 @@ class PartialScoringTest {
         // Where missing evidence was already tolerated structurally, the partial positive sample is
         // tolerated the same way, and it is still not pixel certification.
         for (basis in bases) assertFalse(gate(basis, outcome).pixelCertified)
-        assertTrue(gate(CertificationGate.Basis.PROBE_BASIS, outcome).accepted)
-        assertTrue(gate(CertificationGate.Basis.NO_PROBE_BASIS, outcome).accepted)
+        assertFalse(gate(CertificationGate.Basis.PROBE_BASIS, outcome).accepted)
+        assertFalse(gate(CertificationGate.Basis.NO_PROBE_BASIS, outcome).accepted)
         // Below the default ratio a sub-default target rested on pixels alone: fails closed.
         assertFalse(CertificationGate.evaluate(CertificationGate.Basis.PROBE_BASIS, 0.85, 0.90, outcome).accepted)
         // Not a measured failure: kept original without "would degrade", and nothing learned.

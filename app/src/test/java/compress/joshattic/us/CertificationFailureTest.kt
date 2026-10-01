@@ -100,8 +100,8 @@ class CertificationFailureTest {
         val outcome = PairScoreOutcome.MisalignmentRejected("internal frame misalignment after 2 leading drops")
         assertEquals(CertificationDecision.MISALIGNED, CertificationDecision.of(outcome))
         assertNotEquals(CertificationDecision.of(outcome), CertificationDecision.of(PairScoreOutcome.Unavailable))
-        assertEquals(BatchTerminalResult.SKIPPED_WOULD_DEGRADE, CertificationFailure.terminalFor(CertificationDecision.MISALIGNED))
-        assertEquals(1, learnedAfter(CertificationDecision.MISALIGNED).size)
+        assertEquals(BatchTerminalResult.UNEXPECTED_REMUX, CertificationFailure.terminalFor(CertificationDecision.MISALIGNED))
+        assertTrue(learnedAfter(CertificationDecision.MISALIGNED).isEmpty())
     }
 
     @Test
@@ -124,7 +124,7 @@ class CertificationFailureTest {
     fun onlyMeasuredNegativesTeach() {
         for (d in CertificationDecision.entries) {
             val learned = learnedAfter(d)
-            if (d == CertificationDecision.MEASURED_FAILURE || d == CertificationDecision.MISALIGNED) {
+            if (d == CertificationDecision.MEASURED_FAILURE) {
                 assertEquals(d.name, 1, learned.size)
             } else {
                 assertTrue(d.name, learned.isEmpty())

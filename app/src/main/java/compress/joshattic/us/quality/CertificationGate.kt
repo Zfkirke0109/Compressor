@@ -1,25 +1,8 @@
 package compress.joshattic.us.quality
 
-/**
- * Whether a certification outcome lets a candidate stand, on the basis its plan was built on.
- * `BatchCompressorViewModel.certifyPixels` asks this and nothing else, so the rule is testable
- * without a device.
- *
- * The three bases are the three rules that existed before; this only puts them in one place and
- * adds [PairScoreOutcome.Incomplete] (b177 F1):
- *
- *  - [Basis.MEASURED_REQUIRED]: the encode overturned a keep-original decision and needs measured
- *    proof. Only a fully scored, passing sample stands ([ExhaustivePerceptualLosslessPolicy]).
- *  - [Basis.PROBE_BASIS]: a ladder ran. Measured evidence rules; absent evidence stands only at or
- *    above the codec default ratio, because a sub-default target rested on pixels alone
- *    ([QualityProbePolicy.certificationOutcomePasses]).
- *  - [Basis.NO_PROBE_BASIS]: no ladder ran (4K-class). Measured evidence rules; absent evidence
- *    leaves the structural verdict standing ([QualityProbePolicy.certificationOutcomePassesWithoutProbeBasis]).
- *
- * A partial sample is judged window by window first: a scored window with enough frames below the
- * bar rejects on every basis, and a scored window with too few frames rejects exactly as it does
- * in a complete sample. Only a partial sample whose every scored window passed falls back to the
- * absent-evidence rule of its basis. It is never pixel certification.
+/** Final PL transcodes require complete measured pixel evidence, independent of planning basis.
+ * Basis/ratios remain in the API and diagnostics to explain how the candidate was selected.
+ * They never authorize structural-only acceptance. Numeric gates are unchanged.
  */
 object CertificationGate {
 
