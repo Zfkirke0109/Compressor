@@ -413,12 +413,9 @@ class BatchQualitySafetyTest {
             outputMetadata = VideoMetadataSnapshot(rawDateTag = "tag", rotationDegrees = 90),
             sourceSize = sourceSize,
             outputSize = outputSize,
-            // AudioTrackIdentity compares the AAC packets of every PL output whose audio codec
-            // matches; on the S23 Ultra they are byte-identical (b184: 21 of 21 accepted outputs
-            // with audio). Since the October 1 review only that proof passes PL audio.
+            privacyMode = MetadataPrivacyMode.PRESERVE_ALL,
             audioPacketsIdentical = true,
-            audioPacketsCompared = 1_000,
-            privacyMode = MetadataPrivacyMode.PRESERVE_ALL
+            audioPacketsCompared = 4370
         )
     }
 
@@ -1115,9 +1112,6 @@ class BatchQualitySafetyTest {
         val report = OutputVerifier.verify(
             OutputVerifier.VerificationInput(
                 mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
-                // The AAC track is a proven copy (AudioTrackIdentity); PL audio needs that proof.
-                audioPacketsIdentical = true,
-                audioPacketsCompared = 3_826,
                 source = VideoSourceInfo(
                     width = 2160,
                     height = 3840,
@@ -1140,7 +1134,9 @@ class BatchQualitySafetyTest {
                 sourceSize = 689_308_985L,
                 outputSize = 607_807_388L,
                 privacyMode = MetadataPrivacyMode.PRESERVE_ALL,
-                sourceFrameCount = 5_323
+                sourceFrameCount = 5_323,
+                audioPacketsIdentical = true,
+                audioPacketsCompared = 3825
             )
         )
 
