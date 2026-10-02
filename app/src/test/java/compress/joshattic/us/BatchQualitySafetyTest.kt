@@ -413,7 +413,9 @@ class BatchQualitySafetyTest {
             outputMetadata = VideoMetadataSnapshot(rawDateTag = "tag", rotationDegrees = 90),
             sourceSize = sourceSize,
             outputSize = outputSize,
-            privacyMode = MetadataPrivacyMode.PRESERVE_ALL
+            privacyMode = MetadataPrivacyMode.PRESERVE_ALL,
+            audioPacketsIdentical = true,
+            audioPacketsCompared = 4370
         )
     }
 
@@ -1132,7 +1134,9 @@ class BatchQualitySafetyTest {
                 sourceSize = 689_308_985L,
                 outputSize = 607_807_388L,
                 privacyMode = MetadataPrivacyMode.PRESERVE_ALL,
-                sourceFrameCount = 5_323
+                sourceFrameCount = 5_323,
+                audioPacketsIdentical = true,
+                audioPacketsCompared = 3825
             )
         )
 

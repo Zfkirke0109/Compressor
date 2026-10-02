@@ -98,7 +98,9 @@ class PixelProvenFloorTest {
             sourceSize = 150_000_000L,
             outputSize = 105_000_000L,
             privacyMode = MetadataPrivacyMode.PRESERVE_ALL,
-            pixelProvenVideoBitrateFloor = provenFloor
+            pixelProvenVideoBitrateFloor = provenFloor,
+            audioPacketsIdentical = true,
+            audioPacketsCompared = 2813
         )
 
         // Classic behavior: 0.68x delivery is far below the 0.85 class floor -> fail.
