@@ -214,6 +214,7 @@ object DiagnosticsExporter {
                 if (logcat != null) addText(DiagnosticsArchivePlan.LOGCAT_ENTRY, logcat)
                 if (learned != null) {
                     addText(DiagnosticsArchivePlan.LEARNED_PROFILES_ENTRY, JsonText.render(learned))
+                    add("device/learning_evidence.jsonl", File(context.filesDir, "learning/evidence-v1.jsonl"))
                 }
                 // The manifest goes last so it can list everything above it, sizes included.
                 addText(

@@ -31,7 +31,12 @@ object CertificationFailure {
         usedRatio: Double,
         reason: String,
         floorRatio: Double,
-        measuredOvershoot: Double?
+        measuredOvershoot: Double?,
+        observation: LearningObservation? = null
     ): SmartPerceptualProfileEngine.LearnedEncodeProfile? =
-        if (teachesProfile(decision)) engine.recordFailure(key, usedRatio, reason, floorRatio, measuredOvershoot) else null
+        if (teachesProfile(decision)) engine.recordFailure(key, usedRatio, reason, floorRatio, measuredOvershoot,
+            observation = observation) else {
+            engine.recordNonTrainingObservation(key, observation?.copy(kind = LearningObservation.Kind.INSUFFICIENT))
+            null
+        }
 }

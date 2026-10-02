@@ -228,6 +228,7 @@ class PerceptualQualityProber(private val context: Context) {
                 rateFactors = (r as? RungResult.Measured)?.rateFactors.orEmpty(),
                 rateDiag = (r as? RungResult.Measured)?.rateDiag,
                 elapsedMs = (System.nanoTime() - rungMark) / 1_000_000L,
+                encoderNames = (r as? RungResult.Measured)?.encoderNames.orEmpty(),
                 reason = when (r) {
                     is RungResult.Misaligned -> r.reason
                     is RungResult.Unavailable -> r.reason
@@ -479,6 +480,7 @@ class PerceptualQualityProber(private val context: Context) {
         val collected = mutableListOf<WindowScore>()
         val rates = mutableListOf<String>()
         val factors = mutableListOf<Double>()
+        val encoderNames = linkedSetOf<String>()
         fun rateDiag() = rates.takeIf { it.isNotEmpty() }?.joinToString("|")
         for (window in windows) {
             val probeFile = File.createTempFile("probe_${"%.2f".format(ratio)}_", ".mp4", context.cacheDir)
@@ -498,6 +500,7 @@ class PerceptualQualityProber(private val context: Context) {
                     return RungResult.Unavailable("$EXPORT_TIMEOUT_PREFIX ${PROBE_EXPORT_TIMEOUT_MS}ms")
                 }
                 if (exported is ExportOutcome.Failed) return RungResult.Unavailable(exported.reason)
+                (exported as? ExportOutcome.Success)?.encoderName?.let { encoderNames += it }
                 // Verify, rather than assume, that the clip holds the window we asked for. See
                 // ProbeClipGeometry: if the clip does not start at the requested instant, the
                 // scorer pairs correct timestamps against the wrong pixels and no downstream
@@ -538,6 +541,7 @@ class PerceptualQualityProber(private val context: Context) {
                             "requestedRatio" to ratio, "requestedVideoBitrate" to videoBitrate,
                             "encodeConfigId" to EncodeConfigIdentity.of(outputMime, shape, videoBitrate),
                             "encodeShape" to shape.compact(), "outputMime" to outputMime,
+                            "encoderName" to (exported as? ExportOutcome.Success)?.encoderName,
                             "plannedWindows" to windows.map { "${it.startUs}-${it.endUs}" }
                         ))
                     )
@@ -566,12 +570,12 @@ class PerceptualQualityProber(private val context: Context) {
                 }
                 collected += scores
                 // Early exit: one failing window already rejects this ratio.
-                if (!QualityProbePolicy.windowsPass(scores)) return RungResult.Measured(collected, rateDiag(), factors.toList())
+                if (!QualityProbePolicy.windowsPass(scores)) return RungResult.Measured(collected, rateDiag(), factors.toList(), encoderNames.toList())
             } finally {
                 runCatching { probeFile.delete() }
             }
         }
-        return RungResult.Measured(collected, rateDiag(), factors.toList())
+        return RungResult.Measured(collected, rateDiag(), factors.toList(), encoderNames.toList())
     }
 
     /**
@@ -585,7 +589,7 @@ class PerceptualQualityProber(private val context: Context) {
      * export produces would be read as a timeout instead.
      */
     private sealed interface ExportOutcome {
-        object Success : ExportOutcome
+        data class Success(val encoderName: String?) : ExportOutcome
         data class Failed(val reason: String) : ExportOutcome
     }
 
@@ -594,7 +598,8 @@ class PerceptualQualityProber(private val context: Context) {
             val scores: List<WindowScore>,
             val rateDiag: String? = null,
             // ProbeClipBitrate.overshootFactor per scored window, in window order.
-            val rateFactors: List<Double> = emptyList()
+            val rateFactors: List<Double> = emptyList(),
+            val encoderNames: List<String> = emptyList()
         ) : RungResult
         /**
          * The probe clip and the source could not be paired in time. Not a quality result.
@@ -694,7 +699,7 @@ class PerceptualQualityProber(private val context: Context) {
                         // A "successful" export that wrote nothing is still a failure, and a
                         // different one from an error — say which.
                         val outcome = if (outputFile.length() > 0L) {
-                            ExportOutcome.Success
+                            ExportOutcome.Success(exportResult.videoEncoderName)
                         } else {
                             ExportOutcome.Failed("export produced an empty file")
                         }
@@ -913,7 +918,7 @@ class PerceptualQualityProber(private val context: Context) {
             when (exported) {
                 null -> lines += "source vs 2x-bitrate encode: export timed out"
                 is ExportOutcome.Failed -> lines += "source vs 2x-bitrate encode: ${exported.reason}"
-                ExportOutcome.Success -> describe(
+                is ExportOutcome.Success -> describe(
                     "source vs 2x-bitrate encode of window 1 (encoder ceiling; ratio 2.00, lead-in ${window.leadInUs / 1000} ms)",
                     withContext(Dispatchers.IO) {
                         VmafPairScorer.score(context, sourceUri, Uri.fromFile(clip), listOf(window.scoreWindowForProbeClip()), traceRequest = ScoringCandidateEvidence.attach(traceRequest?.at("hardware-2x-control"), clip))

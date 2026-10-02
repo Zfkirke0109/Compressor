@@ -278,25 +278,23 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
      * windows — positive pixel evidence that this profile class currently cannot re-encode
      * transparently. Resets the skip budget so the latch (if armed) starts a fresh cycle.
      */
-    fun recordMeasuredProbeRejection(key: EncodeProfileKey): LearnedEncodeProfile {
+    fun recordMeasuredProbeRejection(key: EncodeProfileKey, observation: LearningObservation? = null): LearnedEncodeProfile {
         val current = profile(key)
         val updated = current.copy(
             consecutiveMeasuredProbeRejections = current.consecutiveMeasuredProbeRejections + 1,
             probeSkipsSinceLastProbe = 0
         )
-        store.write(key.asKey(), updated.encode())
-        return updated
+        return if (store.writeObservation(key.asKey(), updated.encode(), observation)) updated else current
     }
 
     /** Records a probe ladder that pixel-proved some ratio: clears the probe-skip latch. */
-    fun recordProbePass(key: EncodeProfileKey): LearnedEncodeProfile {
+    fun recordProbePass(key: EncodeProfileKey, observation: LearningObservation? = null): LearnedEncodeProfile {
         val current = profile(key)
         val updated = current.copy(
             consecutiveMeasuredProbeRejections = 0,
             probeSkipsSinceLastProbe = 0
         )
-        store.write(key.asKey(), updated.encode())
-        return updated
+        return if (store.writeObservation(key.asKey(), updated.encode(), observation)) updated else current
     }
 
     /**
@@ -334,7 +332,8 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         outputToSourceBytesRatio: Double,
         floorRatio: Double,
         measuredOvershootFactor: Double? = null,
-        pixelCertified: Boolean = false
+        pixelCertified: Boolean = false,
+        observation: LearningObservation? = null
     ): LearnedEncodeProfile {
         val current = profile(key)
         val stepDown = if (pixelCertified) PIXEL_CERTIFIED_STEP_DOWN else SUCCESS_STEP_DOWN
@@ -355,8 +354,7 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             // This class has now PROVEN it can compress: never latch-suppress its probes again.
             everCompressed = true
         )
-        store.write(key.asKey(), updated.encode())
-        return updated
+        return if (store.writeObservation(key.asKey(), updated.encode(), observation)) updated else current
     }
 
     /**
@@ -373,7 +371,8 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         // False for a SIZE failure (LearningEvidencePolicy.Kind.SIZE): the output was not smaller,
         // so a higher ratio would only make the next one bigger. The ratio stays where it was;
         // the failure still counts toward the keep-original latch.
-        stepUp: Boolean = true
+        stepUp: Boolean = true,
+        observation: LearningObservation? = null
     ): LearnedEncodeProfile {
         val current = profile(key)
         val next = (if (stepUp) usedTargetRatio + FAILURE_STEP_UP else current.nextTargetRatio ?: usedTargetRatio)
@@ -392,8 +391,11 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
             measuredOvershootFactor = blendOvershoot(current, measuredOvershootFactor),
             overshootSamples = overshootSamplesAfter(current, measuredOvershootFactor)
         )
-        store.write(key.asKey(), updated.encode())
-        return updated
+        return if (store.writeObservation(key.asKey(), updated.encode(), observation)) updated else current
+    }
+
+    fun recordNonTrainingObservation(key: EncodeProfileKey, observation: LearningObservation?) {
+        if (observation != null && !observation.trains) store.writeObservation(key.asKey(), profile(key).encode(), observation)
     }
 
     // The mean of every measured encode for this profile, clamped into [MIN_OVERSHOOT_FACTOR,

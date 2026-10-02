@@ -60,7 +60,8 @@ data class RungEvidence(
     val rateDiag: String?,
     /** Wall time the rung took, monotonic clock. */
     val elapsedMs: Long,
-    val reason: String? = null
+    val reason: String? = null,
+    val encoderNames: List<String> = emptyList()
 ) {
     val id: String get() = String.format(Locale.US, "%.2f@%s", ratio, configId)
 

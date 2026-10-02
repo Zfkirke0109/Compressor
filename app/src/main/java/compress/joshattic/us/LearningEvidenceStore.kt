@@ -1,70 +1,81 @@
 package compress.joshattic.us
 
 import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
 
-/**
- * Evidence-aware adapter. The existing aggregate profile store is retained.
- *
- * Each aggregate update must be backed by one valid, trainable [LearningObservation], and the
- * observation's id (source, configuration, windows, stage, encoder, policy) may move the aggregate
- * once only. The id is reserved in an append-only JSONL journal before the aggregate is written,
- * and the journal is read back on construction, so a repeat of the same measurement (a rerun, a
- * retry, a new build, or a conflicting label for the same operating point) is kept out of the
- * aggregate across process restarts as well as within one. Writes without an observation, with an
- * invalid one (unbound source id, other policy epoch, no windows) or with one that does not train
- * (pipeline, colour, audio, parser, insufficient) never change the aggregate.
- */
+/** Evidence-aware adapter. The existing aggregate profile store is retained. */
 class LearningEvidenceStore(
     private val delegate: SmartPerceptualProfileEngine.ProfileStore,
     private val journal: File,
     private val onEvent: (Map<String, Any?>) -> Unit = {}
 ) : SmartPerceptualProfileEngine.ProfileStore by delegate {
+    private val seen = mutableSetOf<String>()
+    private var writable = true
+    private val idPattern = Regex("\\\"evidenceId\\\": \\\"([0-9a-f]{64})\\\"")
+    init {
+        runCatching {
+            if (journal.exists()) {
+                require(journal.length() <= MAX_BYTES) { "learning evidence journal exceeds bound" }
+                journal.bufferedReader().useLines { lines -> lines.forEach { line ->
+                    require(line.endsWith("}")) { "incomplete ledger tail; aggregate learning paused" }
+                    if (line.contains("\"ledgerEvent\": \"RESERVED\"")) {
+                        seen += checkNotNull(idPattern.find(line)?.groupValues?.get(1))
+                    }
+                    if (line.contains("\"ledgerEvent\": \"RESET\"")) seen.clear()
+                } }
+            }
+        }.onFailure { writable = false }
+    }
 
-    private val lock = Any()
-    private val reserved: MutableSet<String> by lazy { readJournalIds() }
-
+    /**
+     * Reserve durably BEFORE changing the aggregate: a crash cannot double-train on replay.
+     * RESERVED without APPLIED is explicitly uncertain, never a completed observation. The
+     * before/after snapshots allow offline reconstruction and targeted recovery; existing v4
+     * profiles are retained, with their legacy aggregate provenance rather than invented labels.
+     */
+    @Synchronized
     override fun writeObservation(key: String, value: String, observation: LearningObservation?): Boolean {
-        val refusal = when {
-            observation == null -> "no_observation"
-            !observation.valid -> "invalid_observation"
-            !observation.trains -> "non_training_kind"
-            else -> null
-        }
-        if (refusal != null) {
-            emit("refused", key, observation, refusal)
+        val fields = linkedMapOf<String, Any?>("ledgerVersion" to 1,
+            "eventId" to UUID.randomUUID().toString(), "timestampMs" to System.currentTimeMillis(),
+            "evidenceId" to observation?.id, "profileKey" to key,
+            "observation" to observation?.fields(), "before" to delegate.read(key), "proposedAfter" to value)
+        if (observation == null || !observation.valid || !observation.trains) {
+            append(fields + mapOf("ledgerEvent" to "IGNORED", "effectApplied" to false, "reason" to "unbound-incompatible-or-nonvisual-nonsize"))
             return false
         }
-        val id = observation!!.id
-        synchronized(lock) {
-            if (id in reserved) {
-                emit("duplicate", key, observation, "observation_already_applied")
-                return false
-            }
-            // Reserve first: a crash between the two writes leaves the aggregate one update short,
-            // never one update counted twice.
-            journal.parentFile?.mkdirs()
-            journal.appendText(line(id, key, observation) + "\n")
-            reserved += id
-            delegate.write(key, value)
+        if (observation.id in seen) {
+            append(fields + mapOf("ledgerEvent" to "DUPLICATE", "effectApplied" to false))
+            return false
         }
-        emit("applied", key, observation, null)
+        if (!append(fields + mapOf("ledgerEvent" to "RESERVED", "effectApplied" to null))) return false
+        seen += observation.id
+        delegate.write(key, value)
+        append(fields + mapOf("eventId" to UUID.randomUUID().toString(), "ledgerEvent" to "APPLIED", "effectApplied" to true, "after" to value))
         return true
     }
 
-    private fun line(id: String, key: String, observation: LearningObservation): String =
-        JsonText.render(linkedMapOf<String, Any?>("id" to id, "key" to key) + observation.fields(), 0)
-            .replace("\n", "")
-
-    private fun readJournalIds(): MutableSet<String> {
-        if (!journal.isFile) return mutableSetOf()
-        val idPattern = Regex("^\\{\\s*\"id\":\\s*\"([0-9a-f]{64})\"")
-        return journal.readLines().mapNotNullTo(mutableSetOf()) { idPattern.find(it)?.groupValues?.get(1) }
+    override fun clear() {
+        // The explicit reset operation retains its audit history; ordinary upgrades never call it.
+        if (append(mapOf("ledgerVersion" to 1, "ledgerEvent" to "RESET", "timestampMs" to System.currentTimeMillis()))) {
+            delegate.clear(); seen.clear()
+        }
     }
 
-    private fun emit(result: String, key: String, observation: LearningObservation?, reason: String?) {
-        runCatching {
-            onEvent(linkedMapOf("type" to "learning_observation", "result" to result, "key" to key,
-                "observationId" to observation?.id, "kind" to observation?.kind?.name, "reason" to reason))
-        }
+    private fun append(fields: Map<String, Any?>): Boolean {
+        val ok = writable && runCatching {
+            val bytes = (JsonText.render(fields).replace("\n", "") + "\n").toByteArray()
+            check(journal.length() + bytes.size <= MAX_BYTES) { "learning evidence journal full" }
+            journal.parentFile?.mkdirs()
+            FileOutputStream(journal, true).use { out -> out.write(bytes); out.fd.sync() }
+            true
+        }.getOrDefault(false)
+        if (!ok) writable = false
+        runCatching { onEvent(fields + mapOf("durablyJournaled" to ok)) }
+        return ok
+    }
+
+    companion object {
+        const val MAX_BYTES = 32L * 1024 * 1024
     }
 }

@@ -248,6 +248,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
     // SourceFingerprint per source of the running batch, read on the IO dispatcher at item start.
     private val sourceFingerprints = java.util.concurrent.ConcurrentHashMap<Uri, String>()
+    private val fullSourceHashes = java.util.concurrent.ConcurrentHashMap<Uri, String>()
 
     private var compressionJob: Job? = null
     private var selfCheckJob: Job? = null
@@ -298,9 +299,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         SmartPerceptualProfileEngine(
             // Every learned-state write goes to the running batch's capture, in order, so the
             // batch-start snapshot plus these updates reconstructs the state at any point.
-            RecordingProfileStore(SmartPerceptualProfileEngine.SharedPreferencesProfileStore(getApplication())) { key, before, after ->
-                activeDiagnostics?.learnedStateUpdate(key, before, after)
-            }
+            LearningEvidenceStore(
+                RecordingProfileStore(SmartPerceptualProfileEngine.SharedPreferencesProfileStore(getApplication())) { key, before, after ->
+                    activeDiagnostics?.learnedStateUpdate(key, before, after)
+                }, File(getApplication<Application>().filesDir, "learning/evidence-v1.jsonl")
+            ) { fields -> activeDiagnostics?.record("learning_evidence",
+                activeDiagnostics?.learningContext?.let { activeDiagnostics?.jobId(it.sourceKey) }, fields) }
         )
     }
 
@@ -918,6 +922,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         var verification: OutputVerificationReport? = null
         var measuredOvershoot: Double? = null
         var floorRecoveryCertScores: List<WindowScore>? = null
+        var certificationWindows: List<WindowScore> = emptyList()
         var failedFloorRecoveryStatus: String? = null
         // What the bitrate-floor recovery's pixels were evidence of, when it ran (b177 F6).
         var floorRecoveryDecision: compress.joshattic.us.quality.CertificationDecision? = null
@@ -1019,6 +1024,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // Scoring library/model identity and the encoder capability inventory (b177 F4/WP3).
         // Off the main thread: it hashes the native libraries and enumerates the codecs.
         sourceFingerprints.clear()
+        fullSourceHashes.clear()
         withContext(Dispatchers.IO) { runCatching {
             diagnostics.runIdentity(
                 ScoringIdentity.describe(context, VmafNative.version, compress.joshattic.us.quality.VmafNativeV1.modelName) +
@@ -1340,6 +1346,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 "sizeMatches=${result.bytes == item.originalSize}; ms=${result.elapsedMs}; error=${result.error ?: "none"}"
         )
         runCatching { run.diagnostics.sourceHash(item.sourceUri.toString(), phase, result) }
+        if (phase == "before") result.sha256?.let { fullSourceHashes[item.sourceUri] = it }
     }
 
     /**
@@ -1901,6 +1908,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         )
         s.encodeStartedAt = System.currentTimeMillis()
         val configId = encodeConfigId(s, encodePlan)
+        s.certificationWindows = emptyList()
         s.ledger.start(
             token = s.phases.token.attempt,
             ratio = plan?.targetRatio,
@@ -2179,6 +2187,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // Recorded whatever the outcome, partial samples included (b177 F1); only a complete,
             // passing sample recovers the floor.
             val recoveryScores = recoveryOutcome.scoredWindows
+            s.certificationWindows = recoveryScores.orEmpty()
             val recoveryDecision = CertificationDecision.of(recoveryOutcome)
             s.floorRecoveryDecision = recoveryDecision
             s.diagnosticCertWindowScores = compactWindowScores(recoveryScores)
@@ -2329,6 +2338,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         if (shadow.shadow) run.shadowWindowsUsed += certOutcome.scoredWindows?.size ?: 0
         // Every window that scored, including the scored part of a partial sample (b177 F1).
         val certScores = certOutcome.scoredWindows
+        s.certificationWindows = certScores.orEmpty()
         s.diagnosticCertWindowScores = compactWindowScores(certScores)
         s.diagnosticCertBandingDiag = compactBandingDiag(certScores)
         s.diagnosticCertV1Scores = compactV1Scores(certScores)
@@ -2416,7 +2426,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // else, whether or not a retry follows. A retry is a separate attempt at a separate ratio.
         val learned = CertificationFailure.learn(
             learningEngine, decision, perceptualPlan.profileKey, perceptualPlan.targetRatio,
-            certReason, perceptualPlan.floorRatio, s.measuredOvershoot
+            certReason, perceptualPlan.floorRatio, s.measuredOvershoot,
+            observationFor(s, LearningObservation.Kind.VISUAL_REJECT)
         )
         if (learned != null) {
             DiagLog.i(
@@ -2664,7 +2675,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     // Only a pixel-certified success may lower the next target. A structural-only
                     // pass keeps the strict no-step-down behavior, because the structural verifier
                     // cannot see perceptual damage.
-                    pixelCertified = s.pixelCertifiedThisRun
+                    pixelCertified = s.pixelCertifiedThisRun,
+                    observation = observationFor(s, LearningObservation.Kind.VISUAL_PASS)
                 )
                 DiagLog.i(
                     "CompressorLearning",
@@ -2712,7 +2724,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 usedRatio = perceptualPlan.targetRatio,
                 reason = failureReason,
                 floorRatio = perceptualPlan.floorRatio,
-                measuredOvershoot = s.measuredOvershoot
+                measuredOvershoot = s.measuredOvershoot,
+                observation = observationFor(s, LearningObservation.Kind.VISUAL_REJECT)
             )
             if (evidence == LearningEvidencePolicy.Kind.PIPELINE || evidence == LearningEvidencePolicy.Kind.UNDECIDED) {
                 DiagLog.i(
@@ -3696,6 +3709,27 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
      * Any probe failure leaves the conservative plan untouched. Probe-proven encodes must
      * additionally pass sampled pixel certification after the full encode (fail-closed).
      */
+    private fun probeObservation(item: BatchVideoItem, rung: RungEvidence?, kind: LearningObservation.Kind): LearningObservation? {
+        val sourceId = sourceFingerprints[item.sourceUri] ?: return null
+        if (rung == null) return null
+        return LearningObservation(sourceId, SourceFingerprint.BASIS, rung.configId, rung.scoredWindowIds,
+            "probe", kind, BuildConfig.GIT_COMMIT, rung.encoderNames.joinToString("|"), details =
+                StageEvent.windowFields("probe", rung.scores, rung.scoredWindowIds) + mapOf(
+                    "ratio" to rung.ratio, "requestedVideoBitrate" to rung.requestedVideoBitrate,
+                    "fullSourceSha256" to fullSourceHashes[item.sourceUri], "androidBuild" to android.os.Build.FINGERPRINT))
+    }
+
+    private fun observationFor(s: ItemRun, kind: LearningObservation.Kind): LearningObservation? {
+        val sourceId = sourceFingerprints[s.item.sourceUri] ?: return null
+        val configId = s.ledger.current?.configId ?: return null
+        return LearningObservation(sourceId, SourceFingerprint.BASIS, configId, s.certificationWindows.mapNotNull { it.windowId },
+            "full-encode", kind, BuildConfig.GIT_COMMIT, s.encodeAttempt?.videoEncoderName ?: "", details =
+                StageEvent.windowFields("cert", s.certificationWindows) + mapOf(
+                    "ratio" to s.perceptualPlan?.targetRatio, "candidateBytes" to s.outputSize,
+                    "overshoot" to s.measuredOvershoot, "fullSourceSha256" to fullSourceHashes[s.item.sourceUri],
+                    "androidBuild" to android.os.Build.FINGERPRINT))
+    }
+
     private fun frameTrace(item: BatchVideoItem, stage: String): compress.joshattic.us.quality.FrameTraceRequest? {
         if (!EncoderExperiments.isFrameTraceEnabled(getApplication())) return null
         val directory = DiagLog.attachedFile?.parentFile ?: return null
@@ -3707,6 +3741,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 "androidBuild" to android.os.Build.FINGERPRINT,
                 "sourceFingerprint" to sourceFingerprints[item.sourceUri],
                 "sourceFingerprintBasis" to SourceFingerprint.BASIS,
+                "fullSourceSha256" to fullSourceHashes[item.sourceUri],
                 "sourceFps" to item.originalFps, "sourceMime" to item.sourceVideoMime,
                 "retainEncodedCandidates" to EncoderExperiments.isRetainCandidatesEnabled(getApplication()))
         )
@@ -3824,7 +3859,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // entirely (original untouched, no stream copy). Unmeasurable probes change
             // nothing — the conservative inference decision stands, honestly labeled.
             return if (decision.highestCandidateMeasuredRejected) {
-                learningEngine.recordMeasuredProbeRejection(plan.profileKey)
+                learningEngine.recordMeasuredProbeRejection(plan.profileKey,
+                    probeObservation(item, scoredRung, LearningObservation.Kind.VISUAL_REJECT))
                 probeTrace.copy(
                     preferRemux = true,
                     skipReason = "On-device VMAF fell below the current PL gate at every measured " +
@@ -3836,7 +3872,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             }
         }
         // A pixel-proven rung clears the probe-skip latch: fresh evidence supersedes history.
-        learningEngine.recordProbePass(plan.profileKey)
+        learningEngine.recordProbePass(plan.profileKey, probeObservation(item, scoredRung, LearningObservation.Kind.VISUAL_PASS))
         // A proven ratio must still clear file-size measurement noise before overturning a
         // remux decision — a NOISE threshold, not a worthiness bar: verified 1-2% savings count.
         // The overshoot is the one this file's probe clips measured, bounded low (MeasuredOvershoot);

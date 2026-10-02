@@ -172,7 +172,8 @@ object EncoderInventory {
         val complexity: String?,
         val quality: String?,
         val profileLevels: Int,
-        val tenBit: Boolean
+        val tenBit: Boolean,
+        val geometry: List<String> = emptyList()
     ) {
         fun compact(): String = buildString {
             append(name).append('|').append(mime)
@@ -180,6 +181,7 @@ object EncoderInventory {
             append("|modes=").append(bitrateModes.joinToString("+").ifEmpty { "none" })
             append("|complexity=").append(complexity ?: "n/a").append("|quality=").append(quality ?: "n/a")
             append("|profiles=").append(profileLevels).append("|10bit=").append(tenBit)
+            append("|sizeRate=").append(geometry.joinToString(","))
         }
     }
 
@@ -190,11 +192,6 @@ object EncoderInventory {
         "CBR_FD".takeIf { Build.VERSION.SDK_INT >= 31 && supported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR_FD) }
     )
 
-    /**
-     * Profile numbers are per codec, not global: HEVCProfileMain10, AV1ProfileMain10,
-     * AVCProfileMain and VP9Profile1 are all 2. So the MIME type decides which numbers mean a
-     * 10-bit profile; an unknown MIME advertises none.
-     */
     internal fun advertisesTenBit(mime: String, profiles: List<Int>): Boolean {
         val tenBit = TEN_BIT_PROFILES[mime.lowercase(Locale.US)] ?: return false
         return profiles.any { it in tenBit }
@@ -243,11 +240,15 @@ object EncoderInventory {
                         complexity = enc.complexityRange?.let { "${it.lower}..${it.upper}" },
                         quality = if (q10) enc.qualityRange?.let { "${it.lower}..${it.upper}" } else null,
                         profileLevels = caps.profileLevels.size,
-                        tenBit = caps.profileLevels.any { pl ->
-                            pl.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10 ||
-                                pl.profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10 ||
-                                (Build.VERSION.SDK_INT >= 29 && pl.profile == MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10)
-                        }
+                        tenBit = advertisesTenBit(mime, caps.profileLevels.map { it.profile }),
+                        geometry = caps.videoCapabilities?.let { video ->
+                            listOf("widths=${video.supportedWidths}", "heights=${video.supportedHeights}",
+                                "alignment=${video.widthAlignment}x${video.heightAlignment}") +
+                                listOf(512 to 512, 1280 to 720, 1920 to 1080, 1080 to 1920, 3840 to 2160)
+                                    .flatMap { (w, h) -> listOf(30, 60).map { fps ->
+                                        "${w}x${h}@$fps=${runCatching { video.areSizeAndRateSupported(w, h, fps.toDouble()) }.getOrDefault(false)}"
+                                    } }
+                        }.orEmpty()
                     )
                 }.getOrNull()
             }

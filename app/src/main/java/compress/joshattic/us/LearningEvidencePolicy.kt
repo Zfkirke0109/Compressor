@@ -84,11 +84,15 @@ object LearningEvidencePolicy {
         usedRatio: Double,
         reason: String,
         floorRatio: Double,
-        measuredOvershoot: Double?
+        measuredOvershoot: Double?,
+        observation: LearningObservation? = null
     ): Kind {
         val kind = classifyVerificationFailure(failingChecks, floorRecovery)
         if (kind == Kind.QUALITY || kind == Kind.SIZE) {
-            engine.recordFailure(key, usedRatio, reason, floorRatio, measuredOvershoot, stepUp = kind == Kind.QUALITY)
+            engine.recordFailure(key, usedRatio, reason, floorRatio, measuredOvershoot, stepUp = kind == Kind.QUALITY,
+                observation = observation?.copy(kind = if (kind == Kind.SIZE) LearningObservation.Kind.SIZE else LearningObservation.Kind.VISUAL_REJECT))
+        } else {
+            engine.recordNonTrainingObservation(key, observation?.copy(kind = if (kind == Kind.PIPELINE) LearningObservation.Kind.PIPELINE else LearningObservation.Kind.INSUFFICIENT))
         }
         return kind
     }

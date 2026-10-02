@@ -19,7 +19,7 @@ data class LearningObservation(
 ) {
     enum class Kind { VISUAL_PASS, VISUAL_REJECT, SIZE, PIPELINE, COLOR, AUDIO, PARSER, INSUFFICIENT, HUMAN }
     val trains: Boolean get() = kind in setOf(Kind.VISUAL_PASS, Kind.VISUAL_REJECT, Kind.SIZE)
-    val valid: Boolean get() = sourceId.matches(Regex("[0-9a-f]{64}")) && configId.isNotBlank() &&
+    val valid: Boolean get() = sourceId.matches(Regex("[0-9a-f]{64}")) && configId.isNotBlank() && encoder.isNotBlank() &&
         policyEpoch == ScientificPolicy.EPOCH && (kind == Kind.SIZE || windowIds.isNotEmpty())
 
     /** Build and outcome do not create independent evidence about the same operating point. */
