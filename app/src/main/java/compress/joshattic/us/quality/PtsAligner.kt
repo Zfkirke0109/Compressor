@@ -40,11 +40,14 @@ package compress.joshattic.us.quality
  *    observed) are still scored. Narrowing the floor to reach them would trade the 4× margin
  *    above for ~1.5×, on a passing-window corpus of only three distinct clips; that needs a
  *    broader corpus first, not a guess.
- *  - When the frame interval is itself at or below the floor (> 250 fps, or VFR frames closer
- *    than 4 ms), a one-frame offset can still land inside the tolerance. The superseded rule
- *    behaved identically there — `max(4 ms, minGap/2)` is exactly 4 ms whenever minGap ≤ 8 ms —
- *    so this is pre-existing and unchanged, not a regression. [smallestFrameIntervalUs] records
- *    the observation a future calibration round would need to close it honestly.
+ *  - Closed in the October 1 review: when the frame interval was at or below the floor (> 250
+ *    fps, or VFR frames closer than 4 ms), a one-frame offset could land inside the tolerance.
+ *    The tolerance is now also capped at half the smallest frame interval observed on either
+ *    stream ([toleranceUs]). The cap only ever narrows it; at 120 fps and below it stays 4 ms.
+ *
+ * A repeated or reversed timestamp after a scored pair fails the window as well: a frame that does
+ * not advance the timeline is not a fresh frame, and scoring it again would count one picture
+ * twice (October 1 review).
  *
  * Drop-based repair is allowed ONLY at the window's leading boundary — before the first
  * scored pair (measured on device: the Transformer probe clip and the reference window
@@ -72,6 +75,8 @@ class PtsAligner(
     private var minRefGapUs = Long.MAX_VALUE
     private var minDistGapUs = Long.MAX_VALUE
     private var pairedAtLeastOnce = false
+    private var lastPairedRefUs = Long.MIN_VALUE
+    private var lastPairedDistUs = Long.MIN_VALUE
 
     var refDropped = 0
         private set
@@ -101,11 +106,13 @@ class PtsAligner(
     }
 
     /**
-     * The pairing tolerance: fixed at [toleranceFloorUs], independent of frame rate. See the
-     * class KDoc for why a correctly aligned pair's skew is bounded by stream addressing
-     * (≤ 999 µs) rather than by the frame interval.
+     * The pairing tolerance: [toleranceFloorUs], independent of frame rate, except that it never
+     * exceeds half the smallest frame interval observed on either stream. See the class KDoc for
+     * why a correctly aligned pair's skew is bounded by stream addressing (≤ 999 µs) rather than by
+     * the frame interval; the cap keeps a one-frame offset outside the tolerance when frames are
+     * closer together than the floor.
      */
-    fun toleranceUs(): Long = toleranceFloorUs
+    fun toleranceUs(): Long = smallestFrameIntervalUs()?.let { minOf(toleranceFloorUs, it / 2) } ?: toleranceFloorUs
 
     /**
      * Smallest frame interval observed on either stream so far, or null until two frames of one
@@ -120,7 +127,17 @@ class PtsAligner(
     fun decide(refNormUs: Long, distNormUs: Long): Action {
         val skew = refNormUs - distNormUs
         if (kotlin.math.abs(skew) <= toleranceUs()) {
+            // Within tolerance, but a head that does not advance past the last scored one is the
+            // same picture again (or an earlier one), not a fresh frame. An out-of-tolerance pair
+            // falls through to the misalignment path below, which reports its skew.
+            if (pairedAtLeastOnce && (refNormUs <= lastPairedRefUs || distNormUs <= lastPairedDistUs)) {
+                failureReason = "repeated or reversed presentation time after a scored pair" +
+                    " (ref ${lastPairedRefUs}->${refNormUs}us, dist ${lastPairedDistUs}->${distNormUs}us)"
+                return Action.FAIL
+            }
             pairedAtLeastOnce = true
+            lastPairedRefUs = refNormUs
+            lastPairedDistUs = distNormUs
             return Action.PAIR
         }
         if (pairedAtLeastOnce) {
