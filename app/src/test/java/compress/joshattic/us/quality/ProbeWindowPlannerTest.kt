@@ -54,13 +54,13 @@ class ProbeWindowPlannerTest {
     }
 
     @Test
-    fun aSingleKeyframeSourceGetsOneWindowNearTheStartInsteadOfNothing() {
-        // The b163 30-minute files: any window away from the start means decoding from 0.
+    fun aSingleKeyframeSourceHasNoReachableWindowsAndSaysSo() {
+        // The b163 30-minute files: any window away from the start means decoding from 0. Until the
+        // October 1 review every position collapsed onto one window of the opening scene; that is
+        // not the content the windows were planned for, so each is unplaceable instead.
         val plan = ProbeWindowPlanner.plan(durationUs = 30 * minute, index = singleKeyframe)
-        assertEquals(1, plan.windows.size)
-        val w = plan.windows.single()
-        assertEquals(0L, w.clipStartUs)
-        assertEquals(ProbeWindowPlanner.MIN_LEAD_IN_US, w.startUs)
+        assertTrue(plan.windows.isEmpty())
+        assertEquals(QualityProbePolicy.probeWindows(30 * minute, QualityProbePolicy.BASE_WINDOW_US).size, plan.unplaceable.size)
     }
 
     @Test

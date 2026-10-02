@@ -968,6 +968,8 @@ class PerceptualQualityProber(private val context: Context) {
  */
 object SelfCheckVerdict {
     fun identity(windows: List<WindowScore>): String {
+        // Nothing scored proves nothing; minOf would also throw on the empty list.
+        if (windows.isEmpty()) return "UNPROVEN (no window scored) "
         val worst = windows.minOf { it.min }
         val counted = windows.mapNotNull { w -> w.pairing?.identicalFrames?.let { it to w.comparedFrames } }
         if (counted.size == windows.size && windows.isNotEmpty()) {

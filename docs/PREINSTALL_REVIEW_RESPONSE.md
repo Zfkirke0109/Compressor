@@ -316,3 +316,22 @@ pixel-certified with decision `passed`; 21 carried a bit-identical audio copy an
 The certification and audio changes would have kept every one of them. The job record does not
 store the colour standard, so the BT.601 change cannot be counted from that capture; b161 had two
 such encodes. The learning changes alter only which discarded attempts move a profile.
+
+**`626e56c` (owner, four tests), fixed here.** `ScientificPipelineRegressionTest` failed four of
+four on `626e56c`:
+
+- `inaccessibleHardWindowsCannotCollapseOntoTheOpeningScene`: when neither keyframe was within
+  12 s of a wanted window, `ProbeWindowPlanner.place` fell back to the file's opening keyframe, so
+  every hard position of a long-GOP file collapsed onto one window of the opening scene. Such a
+  window is now unplaceable (absent evidence, which since `dc25a35` keeps the original).
+- `aDistantNextKeyframeDoesNotReplaceTheRequestedContent`: a next keyframe any distance away
+  replaced the wanted position. It must now be within 12 s of it, as the previous keyframe must.
+- `invalidShadowScoresAreAbsentDiagnostics`: `WindowV1Diag.fromPerFrame` rejected NaN and
+  negative scores but not infinities.
+- `emptySelfCheckCannotReportIdentity`: `SelfCheckVerdict.identity` (from `aa1b31a`) threw on an
+  empty window list instead of reporting UNPROVEN.
+
+`ProbeWindowPlannerTest` asserted the opening-keyframe fallback for a single-keyframe source and now
+asserts that every window is unplaceable. In b184 every accepted job's certification windows sit at
+about 20 / 50 / 80 % of its duration (one window for the two clips under 10 s), so no accepted output
+used the removed fallback.

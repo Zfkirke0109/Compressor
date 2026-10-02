@@ -77,7 +77,8 @@ data class WindowV1Diag(val mean: Double, val p5: Double, val min: Double) {
 
     companion object {
         fun fromPerFrame(perFrame: DoubleArray?): WindowV1Diag? {
-            if (perFrame == null || perFrame.isEmpty() || perFrame.any { it < 0 || it.isNaN() }) return null
+            // Infinite per-frame scores are as invalid as NaN or negative ones (October 1 review).
+            if (perFrame == null || perFrame.isEmpty() || perFrame.any { it < 0 || !it.isFinite() }) return null
             val sorted = perFrame.sortedArray()
             return WindowV1Diag(
                 mean = perFrame.average(),

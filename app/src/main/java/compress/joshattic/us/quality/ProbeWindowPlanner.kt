@@ -19,8 +19,13 @@ package compress.joshattic.us.quality
  *     ladders and both 30-minute files timed out at 60 s exporting a 1.2 s clip, which means the
  *     previous keyframe was minutes earlier. So the clip starts AT a keyframe, and the window is
  *     placed after it. If the nearest keyframe before the wanted position is more than
- *     [MAX_LEAD_IN_US] back, the window moves forward to the next keyframe instead; only when no
- *     keyframe is within reach is the window given up, with the reason recorded.
+ *     [MAX_LEAD_IN_US] back, the window moves forward to the next keyframe instead, provided that
+ *     keyframe is itself within [MAX_LEAD_IN_US] of the wanted position; otherwise the window is
+ *     given up, with the reason recorded. Until the October 1 review a window with no keyframe in
+ *     reach fell back to the file's opening keyframe, so every hard position of a long-GOP file
+ *     collapsed onto one window of the opening scene, and a next keyframe minutes away replaced
+ *     the requested content. A window that cannot measure the content it was planned for is
+ *     absent evidence, not a substitute.
  *
  * Certification uses the same windows (without a clip, so without a lead-in). That keeps the
  * probe and certification scores of one file directly comparable, frame for frame, and it means
@@ -117,19 +122,14 @@ object ProbeWindowPlanner {
             return PlannedWindow(previous, startFinal, startFinal + windowUs, Anchor.PREVIOUS_KEYFRAME)
         }
         val next = index.nextSyncUs(target)
-        if (next != null && next >= 0L && next + MIN_LEAD_IN_US <= latestStart) {
+        if (next != null && next >= 0L && next - wantedStartUs <= MAX_LEAD_IN_US &&
+            next + MIN_LEAD_IN_US <= latestStart
+        ) {
             val start = next + MIN_LEAD_IN_US
             return PlannedWindow(next, start, start + windowUs, Anchor.NEXT_KEYFRAME)
         }
-        // Neither the previous nor the next keyframe is usable (a single-keyframe file, or a
-        // window near the end). The keyframe at the head of the file is always reachable, so a
-        // long-GOP file still gets one measured window instead of none. Several wanted windows
-        // collapse onto it; the plan scores it once.
-        val head = index.previousSyncUs(0L) ?: 0L
-        if (head + MIN_LEAD_IN_US <= latestStart) {
-            val start = head + MIN_LEAD_IN_US
-            return PlannedWindow(head, start, start + windowUs, Anchor.NEXT_KEYFRAME)
-        }
+        // Neither keyframe is within reach of the wanted position (a single-keyframe file, a very
+        // long GOP, or a window near the end): unplaceable. The opening keyframe is not a stand-in.
         return null
     }
 }
