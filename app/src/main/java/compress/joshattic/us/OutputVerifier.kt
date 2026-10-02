@@ -483,7 +483,9 @@ object OutputVerifier {
             videoCodec = "${codecLabel(input.sourceTrackProbe.videoCodec)} -> ${codecLabel(input.outputTrackProbe.videoCodec)} ${statusSuffix(videoCodecMatches)}",
             audioCodec = "${codecLabel(input.sourceTrackProbe.audioCodec)} -> ${codecLabel(input.outputTrackProbe.audioCodec)} ${statusSuffix(audioCodecMatches)}",
             audioDetails = "${sampleRateLabel(input.sourceTrackProbe.audioSampleRate)}/${channelLabel(input.sourceTrackProbe.audioChannelCount)} -> ${sampleRateLabel(input.outputTrackProbe.audioSampleRate)}/${channelLabel(input.outputTrackProbe.audioChannelCount)} ${statusSuffix(audioShapeMatches)}",
-            audioBitrate = "${bitrateLabel(input.sourceTrackProbe.audioBitrate)} -> ${bitrateLabel(effectiveOutputAudioBitrate)}${if (audioLooksStreamCopied) " (stream copied)" else ""} ${statusSuffix(audioBitratePass)}",
+            // In PL only the packet comparison proves a copy (October 1 review), so an inferred copy
+            // is not labelled one beside the failing check it causes.
+            audioBitrate = "${bitrateLabel(input.sourceTrackProbe.audioBitrate)} -> ${bitrateLabel(effectiveOutputAudioBitrate)}${if (audioLooksStreamCopied && (input.mode != BatchQualityMode.PERCEPTUAL_LOSSLESS || input.audioPacketsIdentical)) " (stream copied)" else ""} ${statusSuffix(audioBitratePass)}",
             audioBasis = AudioPreservation.describe(
                 mode = input.mode,
                 sourceHasAudio = input.sourceTrackProbe.audioCodec != null,

@@ -279,3 +279,40 @@ the long keyframe interval and the shadow off, then A1/A2/A3), and an encoder op
 app cannot yet request (CQ, complexity, another encoder). Lowering 95.5 / 91 / 84 would pass more
 files by redefining "perceptually lossless", which needs a blinded viewing study first
 (`docs/PERCEPTUALLY_LOSSLESS.md`).
+
+## 9. October 1 adversarial tests (`5102f15`) and the fix (`dc25a35`)
+
+`ScientificEvidenceSafetyTest` (owner, nine tests) failed nine of nine on `aa1b31a`; `dc25a35`
+(owner) fixes all nine. Every change is stricter. The bar (95.5 / 91 / 84), the probe margins and
+the 12-frame rule are unchanged.
+
+| Test | What it caught | Change in `dc25a35` |
+|---|---|---|
+| `absentPixelsCannotAuthorizeAPlTranscodeAtAnyRatio` | An `Unavailable` certification kept a transcode at or above the default ratio (probe basis) and always (no probe basis) | Every basis needs a fully scored, passing sample. Sources that cannot be scored at all (`pixelCertifiable` false: HDR, codec downgrade, above the scoring cap, no scorer) are planned as keep-original |
+| `passingPrefixDoesNotProveTheMissingWindow` | A partial sample whose scored windows passed fell back to that rule | Partial samples keep the original on every basis |
+| `nonFiniteScoresAreUnavailableEvidence` | A NaN window read as a measured failure; +Infinity cleared every gate | `QualityProbePolicy.validScore`: non-finite or negative scores are unmeasured; the scorer returns unavailable when per-frame scores are missing or non-finite |
+| `pipelineFailureAlongsideBitrateFailureMustNotTrainQuality` | A floor failure beside an audio failure taught QUALITY | Any non-floor failure makes it PIPELINE |
+| `inferredBitrateFloorIsNotMeasuredVisualEvidence` | The structural floor alone taught QUALITY | Only recovery pixels measured below the bar teach QUALITY; otherwise UNDECIDED |
+| `misalignmentDoesNotProveBitrateStarvation` | Misalignment was "measured negative": labelled "would degrade" and learned | Still rejects; now UNEXPECTED_REMUX and not learned |
+| `highBitrateDoesNotMakeDifferentAudioPacketsTransparent` | A PL audio re-encode at ≥ 256 kbps (less 10 %) passed with packets known to differ | PL audio passes only on packet proof |
+| `unavailableAudioComparisonIsNotProofOfACopy` | Matching codec and shape with no exposed bitrate passed as an inferred copy | As above; Remux unchanged |
+| `differentBt601PrimariesNeedDecodedColorEvidence` | BT.601 NTSC → PAL was accepted for PL (`355d19f`) | A colour mismatch again; the report names the BT.601 cause |
+
+`dc25a35` also releases the distorted-frame buffer on a JNI early return and closes each decoded
+`Image`, and rewords three keep-original labels so a heuristic or a gate result is not described
+as visible loss.
+
+**Follow-up.** CI's `unit-tests` job failed on `dc25a35`: eight older tests still asserted the
+replaced behaviour (`BatchQualitySafetyTest` ×6, `PixelProvenFloorTest`,
+`ExhaustivePerceptualLosslessPolicyTest`). The verifier fixtures that model the S23 Ultra AAC
+pass-through now carry the packet proof the device produces, and the exhaustive test asserts the
+new rule. Three stale texts were corrected: the certification reason still said "unavailable for a
+sub-default-ratio encode" (absent pixels now reject at every ratio), `CertificationFailure` and a
+ViewModel comment still counted misalignment as measured, and a PL audio line still said "(stream
+copied)" for an uncompared inferred copy beside the failing check it caused.
+
+**Effect on the last device run.** In b184 (both full batches) all 22 accepted outputs were
+pixel-certified with decision `passed`; 21 carried a bit-identical audio copy and one had no audio.
+The certification and audio changes would have kept every one of them. The job record does not
+store the colour standard, so the BT.601 change cannot be counted from that capture; b161 had two
+such encodes. The learning changes alter only which discarded attempts move a profile.

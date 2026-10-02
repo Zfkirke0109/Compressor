@@ -2377,9 +2377,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             )
         )
         if (certOk) return CertStep.CONTINUE
-        // Only a certification that measured this output below the bar (or measured its frames
-        // out of time) may say the encode loses quality and teach the profile so. "Unavailable"
-        // and "too few frames in a window" are the absence of a decision: the original is still
+        // Only a certification that measured this output below the bar may say the encode loses
+        // quality and teach the profile so. Misaligned frames still reject but are not a quality
+        // measurement. "Unavailable", "partial" and "too few frames in a window" are the absence
+        // of a decision: the original is still
         // kept (the plan needed pixel proof and did not get it), but it is not labelled "would
         // visibly lose quality" and the learning engine is not told anything.
         val certMeasured = decision.isMeasuredNegative
@@ -2399,7 +2400,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 "pixel certification could not measure this output, and this encode " +
                     "overturned a keep-original decision, so it needs measured proof"
             certScores == null ->
-                "pixel certification unavailable for a sub-default-ratio encode"
+                "pixel certification could not measure this output, and a Perceptually " +
+                    "Lossless re-encode needs measured proof"
             else ->
                 "pixel certification failed (sampled VMAF below thresholds)"
         }

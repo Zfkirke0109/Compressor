@@ -65,6 +65,8 @@ class AudioPassThroughVerificationTest {
     fun unknownPacketIdentityCannotProvePlAudio() {
         val report = OutputVerifier.verify(input(false).copy(outputTrackProbe = outputTracks.copy(audioBitrate = 0)))
         assertTrue("audioBitratePass" in report.failingChecks())
+        // The record names the inference, but the bitrate line does not call it a copy.
+        assertFalse(report.audioBitrate.contains("stream copied"))
         assertEquals(AudioPreservation.INFERRED_COPY, report.audioBasis)
     }
 
@@ -127,8 +129,8 @@ class AudioPassThroughVerificationTest {
 
     @Test
     fun withoutPacketProofTheOldRuleStillApplies() {
-        // Nothing is loosened for a track that was not proven identical: a 128 kbps track that
-        // might be a re-encode still has to meet the re-encode rule.
+        // Nothing is loosened for a track that was not proven identical: since the October 1 review
+        // a PL track passes only on packet proof, whatever its bitrate.
         assertTrue("audioBitratePass" in verify(packetsIdentical = false).failingChecks())
     }
 

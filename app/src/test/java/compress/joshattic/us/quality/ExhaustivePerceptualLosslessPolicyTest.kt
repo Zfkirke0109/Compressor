@@ -65,14 +65,14 @@ class ExhaustivePerceptualLosslessPolicyTest {
 
     @Test
     fun anOverturnedGateIsNeverCertifiedOnStructureAlone() {
-        // The ordinary rule lets an unmeasurable certification pass at or above the default
-        // ratio. When probes overturned a heuristic that predicted visible loss, only measured
-        // passing windows may accept the output.
+        // When probes overturned a heuristic that predicted visible loss, only measured passing
+        // windows may accept the output. Since the October 1 review the ordinary rule agrees: an
+        // unmeasurable certification no longer passes at or above the default ratio either.
         assertFalse(ExhaustivePerceptualLosslessPolicy.measuredCertificationPasses(PairScoreOutcome.Unavailable))
         assertFalse(
             ExhaustivePerceptualLosslessPolicy.measuredCertificationPasses(PairScoreOutcome.MisalignmentRejected(null))
         )
-        assertTrue(
+        assertFalse(
             QualityProbePolicy.certificationOutcomePasses(0.97, 0.9, PairScoreOutcome.Unavailable)
         )
     }

@@ -135,7 +135,10 @@ make more files pass.** They may be moved only with the evidence Section 4 produ
 
 - Chroma. `vmaf_v0.6.1` scores luma only. A colour shift that leaves luma intact would pass.
   This is why a tag change such as an untagged SD source acquiring a BT.601 tag is still rejected
-  structurally: the scorer could not catch it.
+  structurally: the scorer could not catch it. The same holds for BT.601 NTSC written as PAL
+  (Media3 has one BT.601 colour space): accepted for PL from `355d19f`, rejected again since the
+  October 1 review, because the primaries differ and nothing decodes colour to show they render
+  the same.
 - Banding at 8 bit. CAMBI is recorded per window (`banding[...]`) but is not a gate: no
   calibration exists for it on this content.
 - Temporal artefacts longer than a window, and anything outside the three windows.
@@ -195,8 +198,14 @@ Audio is never covered by the video gate.
 - The summariser flags a job that requested a copy but is not recorded as one. In b177 PL-B one
   accepted PL output does this: `job_c0f82bb62f94` (877,194 bytes saved) requested
   `audio=copy(source=256000bps)` and its audio is recorded as a re-encode, not validated. It passed
-  the unchanged audio bitrate rule; whether Media3 re-encoded it or the packets merely differ is
+  the audio bitrate rule of the time; whether Media3 re-encoded it or the packets merely differ is
   not known from the log and needs the file.
+- **Only proof passes PL audio (October 1 review).** A Perceptually Lossless output whose source has
+  audio passes the audio check only when `AudioTrackIdentity` shows the packets byte-identical. A
+  re-encode at any bitrate (the old rule passed 256 kbps less 10 %), packets that differ, and an
+  inferred copy whose packets were not compared all keep the original. `job_c0f82bb62f94` would be
+  kept today. In b184 all 21 accepted outputs with audio were bit-identical copies, so this changes
+  none of them.
 
 ## 4. Validating the definition: a 2AFC / ABX procedure
 
@@ -312,8 +321,9 @@ fails before producing a candidate now counts in the denominator. Stage events c
 | Probe passes that the full encode then fails | selection margin from measured probe-to-encode drift; re-measured in every capture |
 | Probe clip encoded differently from the full encode | one request shape (mode, keyframe interval, B-frames) for both |
 | Media3 cannot parse the source, and never says so | an extractor error Media3 will not retry stops its loader for good, and during an export nothing reports it: six b167 files idled to the 60 s probe timeout and the 120 s muxer watchdog. The extractors are wrapped (`SourceParseFailure`); the export ends once it stops moving, the ladder stops, and the decision log shows the bytes at the failure. The file is then copied by the platform extractor and muxer (the Remux Only path) and Media3 reads the copy (`Media3InputNormalizer`). Windows, scoring reference, verification and certification stay on the original. A copy that ends early, an HDR source or too little free space keeps the original. b168 showed all six such files are damaged, not malformed: only zero bytes at every failure offset, and platform copies holding 2–16 % of the source's bytes, which cost 74 minutes and two muxing timeouts. A zero-filled failure offset or a copy under half the source's size now ends the attempt at once as a damaged source |
-| A later window that cannot be scored erasing earlier ones | b177 F1: the scorer used to return bare "unavailable" as soon as one window failed to score, discarding the windows already scored; at the default ratio (or without a probe basis) the structural fallback could then accept an output whose first window had measured below the bar. Every window is now attempted, the scored ones are kept (`PairScoreOutcome.Incomplete`), a measured failure among them rejects on every basis, too few frames rejects as before, and a clean partial sample is never pixel certification (`CertificationGate`, `PartialScoringTest`) |
-| A floor-recovery sample too small to decide teaching a quality failure | b177 F6: a bitrate-floor failure whose recovery pixels measured nothing below the bar (too few frames, partial, or a pass) now teaches nothing; with no pixel measured at all, the structural floor keeps its conservative step-up; a measured recovery failure steps up (`LearningEvidencePolicy`, `FloorRecoveryLearningTest`). The original is kept in every case |
+| A later window that cannot be scored erasing earlier ones | b177 F1: the scorer used to return bare "unavailable" as soon as one window failed to score, discarding the windows already scored; at the default ratio (or without a probe basis) the structural fallback could then accept an output whose first window had measured below the bar. Every window is now attempted, the scored ones are kept (`PairScoreOutcome.Incomplete`), a measured failure among them rejects on every basis, too few frames rejects as before, and a clean partial sample is never pixel certification (`CertificationGate`, `PartialScoringTest`). Since the October 1 review a partial sample and an unavailable one keep the original on every basis, at every ratio (`ScientificEvidenceSafetyTest`) |
+| A certification that measured nothing keeping a transcode | until the October 1 review an unavailable certification stood at or above the default ratio (probe basis) or always (no probe basis). Only a fully scored, passing sample now lets a PL transcode stand (`dc25a35`); NaN, infinite or negative window scores are absent evidence, not a measurement or a pass, and a window whose per-frame scores are incomplete is unavailable. Sources certification cannot reach at all (HDR, codec downgrade, above the scoring cap, no scorer) are now planned as keep-original instead of being encoded and accepted on structural checks |
+| A floor-recovery sample too small to decide teaching a quality failure | b177 F6: a bitrate-floor failure whose recovery pixels measured nothing below the bar (too few frames, partial, or a pass) now teaches nothing; a measured recovery failure steps up (`LearningEvidencePolicy`, `FloorRecoveryLearningTest`). Since the October 1 review the floor alone (no recovery, nothing scored, or misaligned frames) teaches nothing either, and a floor failure beside any other failed check is pipeline evidence. Misalignment still rejects but is not labelled "would degrade" and is not learned. The original is kept in every case |
 | A window that runs for minutes looking like a hung row | b177 WP2: per-window wall and CPU time by stage (`WindowTiming`: queue waits, v0, flush, CAMBI, v1, decoder threads, process CPU); a 10-minute wall ceiling per window checked between frame pairs (then "unavailable" with the reason); cooperative cancellation on the scoring thread that closes native sessions on that same thread and never races a running native call |
 | A metric that is not the definition | Section 4 |
 
@@ -339,8 +349,10 @@ fails before producing a candidate now counts in the denominator. Stage events c
 
 - **Perceptually Lossless Verified** — structural parity and sampled pixel measurement both passed
   on this output. Audio is stated separately.
-- **Perceptually Lossless — structural checks only (pixels not sampled)** — accepted under the
-  rules for sources that cannot be scored; no perceptual proof is claimed.
+- **Perceptually Lossless — structural checks only (pixels not sampled)** — no longer produced
+  for an accepted output since the October 1 review (`dc25a35`): a PL transcode stands only on
+  measured, passing windows, and a source that cannot be scored keeps its original. Older records
+  carry it for outputs accepted under the previous rules; no perceptual proof was claimed.
 - **Kept original, no copy written.** — the file was not re-encoded. The message names the basis:
   a measured rejection, a learned class-level decision, a heuristic, or "cannot be pixel-measured
   on this device" (HDR, above 4K, codec downgrade, scorer unavailable). Only a measurement may say
