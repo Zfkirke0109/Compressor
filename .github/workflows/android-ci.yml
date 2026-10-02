@@ -72,6 +72,12 @@ jobs:
           set -euo pipefail
           python3 scripts/ci/verify_native_alignment.py app/build/outputs/apk/debug/*.apk
 
+      - name: Gate generated DEX method sizes
+        run: python3 scripts/ci/verify_dex_method_budget.py app/build/outputs/apk/debug/*.apk
+
+      - name: Compile Android instrumentation tests
+        run: ./gradlew :app:compileDebugAndroidTestKotlin --console=plain
+
       - name: Remove signing material from runner
         if: always()
         shell: bash
@@ -154,3 +160,33 @@ jobs:
             echo "::endgroup::"
           done < <(git ls-files '*/test_*.py' | sort)
           test "$failed" -eq 0 || { echo "::error::One or more Python test suites failed."; exit 1; }
+
+  offline-scoring-controls:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - ref: 17a67b238ce0539bdeafdc95961abac64fa16ea8
+            version: '3.0.0'
+          - ref: 8e7a1ac4eb835a274fb32b2851e6db719fd10c7f
+            version: '3.2.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: Netflix/vmaf
+          ref: ${{ matrix.ref }}
+          path: vendor-vmaf
+      - name: Install native scoring tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg meson ninja-build xxd
+      - name: Build pinned Netflix scorer
+        run: |
+          meson setup vendor-vmaf/build vendor-vmaf/libvmaf --buildtype=release -Denable_asm=false -Denable_tests=false -Denable_docs=false -Denable_float=false -Dbuilt_in_models=true
+          ninja -C vendor-vmaf/build
+      - name: Run real offline controls (Android remains a separate device gate)
+        env:
+          COMPRESSOR_VMAF_VERSION: ${{ matrix.version }}
+        run: |
+          export COMPRESSOR_VMAF_BIN="$PWD/vendor-vmaf/build/tools/vmaf"
+          export COMPRESSOR_VMAF_MODEL="$PWD/vendor-vmaf/model/vmaf_v0.6.1.json"
+          python3 scripts/diagnostics/test_scoring_parity_integration.py
