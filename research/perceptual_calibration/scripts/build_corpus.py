@@ -5,7 +5,7 @@ Motivation (see ../NEXT_ROUND_INSTRUMENTATION.md): a corpus of already-efficient
 phone HEVC clips keeps concluding "nothing compresses" because for that
 distribution it is true. Calibrating the probe/window thresholds needs source
 clips spread across the source bits-per-pixel axis - especially the disputed
-[0.03, 0.069) band - with a ground-truth answer to "does this source actually
+[0.03, 0.069) band - with a policy-rule answer (label_basis.py: not human ground truth) to "does this source actually
 have perceptually-lossless headroom?"
 
 This tool has two phases:
@@ -16,8 +16,9 @@ This tool has two phases:
 
   label   For each source clip, produce a perceptually-lossless-style re-encode at
           one or more retreat ratios and score it with the repo's authoritative VMAF
-          harness (scripts/diagnostics/measure_quality.py). Attaches a ground-truth
-          "compressible" label using the production window floors. An encoder or
+          harness (scripts/diagnostics/measure_quality.py). Attaches a POLICY label,
+          "compressible", from the production window floors (b177 F9: it says what the
+          current gate would decide, not what a person would see; see label_basis.py). An encoder or
           measurement FAILURE is recorded as unlabeled, never as a quality-negative.
 
   plan    Dry run: report how many clips and how many bytes a build would produce,
@@ -28,7 +29,7 @@ an ffmpeg built with libvmaf. None of these are bundled. The pure planning/accou
 logic has no external dependency and is unit-tested in test_build_corpus.py.
 
 Nothing here decides a production verdict or writes into the app. It manufactures
-test inputs and an offline ground truth for the offline study.
+test inputs and offline POLICY labels for the offline study (not human ground truth).
 """
 from __future__ import annotations
 
@@ -700,7 +701,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add_common(sp_build)
     sp_build.set_defaults(func=cmd_build)
 
-    sp_label = sub.add_parser("label", help="attach offline VMAF ground-truth labels")
+    sp_label = sub.add_parser("label", help="attach offline VMAF policy labels (production floors; not human labels)")
     sp_label.add_argument("--out", required=True)
     sp_label.add_argument("--measure-quality", default=default_measure_quality_path(),
                           help="path to scripts/diagnostics/measure_quality.py")

@@ -37,7 +37,7 @@ enum class BatchTerminalResult(
     TRANSCODED_NOT_MEANINGFULLY_SMALLER("Re-encoded — no meaningful size win; original kept", countsAsRealCompression = false),
 
     /** Source was already efficient for its resolution/codec; kept the exact stream copy. */
-    ALREADY_HIGHLY_OPTIMIZED("Already efficient — kept original bytes", countsAsRealCompression = false),
+    ALREADY_HIGHLY_OPTIMIZED("Original kept — no verified smaller output", countsAsRealCompression = false),
 
     /**
      * The learning engine's measured evidence latched this device profile as remux-preferred
@@ -77,7 +77,7 @@ enum class BatchTerminalResult(
      * was skipped entirely: the original stays untouched and no stream-copy is written (a remux
      * of such a source saves nothing and costs full-file I/O).
      */
-    SKIPPED_WOULD_DEGRADE("Skipped — compression would visibly lose quality", countsAsRealCompression = false),
+    SKIPPED_WOULD_DEGRADE("Kept original — measured below the PL quality gate", countsAsRealCompression = false),
 
     /** User cancelled the batch before this item finished. */
     CANCELLED("Cancelled", countsAsRealCompression = false),
@@ -120,12 +120,38 @@ data class BatchTerminalInput(
      * being probed readable at retention time. Fails closed to OUTPUT_VALIDATION_FAILED when
      * the source itself could not be read.
      */
-    val retainedOriginalNoOutput: Boolean = false
+    val retainedOriginalNoOutput: Boolean = false,
+    /**
+     * Exhaustive Perceptually Lossless: a VERIFIED Perceptually Lossless encode that is smaller by
+     * any amount counts as a size win.
+     *
+     * Exhaustive mode exists to find small savings. It admits any encode predicted to come out
+     * smaller than the source (ExhaustivePerceptualLosslessPolicy.worthEncoding), so the 3 %
+     * [MIN_MEANINGFUL_SAVINGS] bar made it do the encode and the certification, and then throw a
+     * verified 1-2 % saving away as "no meaningful size win; original kept". The quality evidence
+     * is not touched: [verified] must still be true, and only the savings bar is lowered.
+     */
+    val acceptAnyVerifiedSaving: Boolean = false,
+    /**
+     * With [retainedOriginalNoOutput]: the original was kept AFTER a real re-encode attempt was
+     * discarded (verification rejected it, or the encoder failed), not because the plan chose to
+     * keep it up front. It must read as "re-encode could not be verified", never as "already
+     * efficient", because nothing established that the source was efficient. The encode was
+     * simply not accepted.
+     */
+    val retainedAfterFailedAttempt: Boolean = false
 ) {
-    /** Meaningful-savings threshold: at least this fraction smaller to call it a size win. */
+    /**
+     * Meaningful-savings threshold: at least [MIN_MEANINGFUL_SAVINGS] smaller to call it a size
+     * win, or any strict reduction under [acceptAnyVerifiedSaving] in Perceptually Lossless mode.
+     */
     val meaningfullySmaller: Boolean
-        get() = sourceSize > 0L && outputSize in 1 until sourceSize &&
-            (sourceSize - outputSize).toDouble() / sourceSize.toDouble() >= MIN_MEANINGFUL_SAVINGS
+        get() = if (acceptAnyVerifiedSaving && effectiveMode == BatchQualityMode.PERCEPTUAL_LOSSLESS) {
+            strictlySmaller
+        } else {
+            sourceSize > 0L && outputSize in 1 until sourceSize &&
+                (sourceSize - outputSize).toDouble() / sourceSize.toDouble() >= MIN_MEANINGFUL_SAVINGS
+        }
 
     val strictlySmaller: Boolean
         get() = sourceSize > 0L && outputSize in 1 until sourceSize
@@ -148,6 +174,9 @@ object BatchTerminalClassifier {
         if (input.retainedOriginalNoOutput) {
             return when {
                 !input.verified -> BatchTerminalResult.OUTPUT_VALIDATION_FAILED
+                // Same terminal the full stream-copy fallback produced for these cases. Only the
+                // wasted copy is gone.
+                input.retainedAfterFailedAttempt || input.encoderFailed -> BatchTerminalResult.UNEXPECTED_REMUX
                 input.preEncodeEvidencePreferredRemux -> BatchTerminalResult.REMUX_PREFERRED_BY_EVIDENCE
                 else -> BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED
             }

@@ -20,7 +20,8 @@ import androidx.core.content.ContextCompat
  * This service does NOT perform any compression — it only raises process priority and shows the
  * required ongoing notification for the batch's duration. It is started while the app is in the
  * foreground (the user taps Start, satisfying the Android 12+ background-start restriction) and
- * stopped in the batch's finally block. Start failures are swallowed by the caller so the batch can
+ * stopped in the batch's finally block. If that stop arrives before the service has called
+ * startForeground, [ForegroundStartStopGate] defers it to the service itself. Start failures are swallowed by the caller so the batch can
  * still proceed (just without the priority boost) rather than crash.
  */
 class BatchForegroundService : Service() {
@@ -44,11 +45,27 @@ class BatchForegroundService : Service() {
             // e.g. ForegroundServiceStartNotAllowedException if the app left the foreground before
             // the service attached. The batch continues without the priority boost.
             Log.w(TAG, "startForeground failed: ${t.message}")
+            gate.onForegroundFailed()
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (gate.onForegroundEntered()) {
+            // The batch ended before this service got to startForeground (a keep-original item can
+            // finish in 30 ms). stop() deferred to us instead of calling stopService, because
+            // stopping first is what kills the app. startForeground has run now, so the
+            // contract is met and the service can leave.
+            Log.i(TAG, "batch ended before the service reached the foreground; stopping now that it has")
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
             stopSelf()
         }
         // The batch state lives in the ViewModel, not here: if the process is killed there is nothing
         // for a restarted service to resume, so never recreate it.
         return START_NOT_STICKY
+    }
+
+    override fun onDestroy() {
+        gate.onServiceDestroyed()
+        super.onDestroy()
     }
 
     /**
@@ -76,16 +93,39 @@ class BatchForegroundService : Service() {
         private const val CHANNEL_ID = "batch_compression"
         private const val NOTIFICATION_ID = 4711
 
+        /**
+         * Orders stop against start. See [ForegroundStartStopGate] for the crash this prevents:
+         * build pr44-b158 on Android 17, where a 42 ms batch called stopService before the service
+         * had called startForeground.
+         */
+        private val gate = ForegroundStartStopGate()
+
         /** Starts the batch foreground service. Safe to call when already running (no-op restart). */
         fun start(context: Context) {
             val app = context.applicationContext
-            ContextCompat.startForegroundService(app, Intent(app, BatchForegroundService::class.java))
+            gate.onStartRequested()
+            try {
+                ContextCompat.startForegroundService(app, Intent(app, BatchForegroundService::class.java))
+            } catch (t: Throwable) {
+                gate.onStartFailed()
+                throw t
+            }
         }
 
-        /** Stops the batch foreground service. Safe to call when not running. */
+        /**
+         * Stops the batch foreground service. Safe to call when not running, and safe to call
+         * before the service has started: in that case the service stops itself as soon as it has
+         * called startForeground, instead of this call crashing the app.
+         */
         fun stop(context: Context) {
             val app = context.applicationContext
-            app.stopService(Intent(app, BatchForegroundService::class.java))
+            when (gate.onStopRequested()) {
+                ForegroundStartStopGate.StopAction.STOP_NOW ->
+                    app.stopService(Intent(app, BatchForegroundService::class.java))
+                ForegroundStartStopGate.StopAction.DEFER_UNTIL_FOREGROUND ->
+                    Log.i(TAG, "stop requested before startForeground; the service will stop itself once it has")
+                ForegroundStartStopGate.StopAction.NONE -> Unit
+            }
         }
 
         // The platform-level -> FGS-type decision lives in ForegroundServiceTypePolicy so it is pure

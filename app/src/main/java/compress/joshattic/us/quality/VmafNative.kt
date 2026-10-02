@@ -14,6 +14,9 @@ import android.util.Log
 object VmafNative {
     private const val TAG = "VmafNative"
 
+    /** libvmaf's own version string, or null when the library is not loaded. */
+    val version: String? by lazy { if (isAvailable) runCatching { nativeVersion() }.getOrNull() else null }
+
     val isAvailable: Boolean by lazy {
         try {
             System.loadLibrary("compressorvmaf")

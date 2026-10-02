@@ -19,6 +19,14 @@ object BatchCacheRetention {
     const val RECOVERY_FILE_PREFIX = "replace_recovery_"
 
     /**
+     * Where rollback copies are staged: a directory under `filesDir`, never the cache. The system
+     * reclaims app caches when storage runs low, which is the likeliest reason a replacement fails
+     * in the first place. The prefix rule above still protects any copy an older build left in the
+     * cache directory.
+     */
+    const val RECOVERY_DIRECTORY = "replace_recovery"
+
+    /**
      * @param fileAbsolutePath a file found in the batch cache directory.
      * @param preservePaths absolute paths the current UI state still references (live outputPaths).
      *   Empty means "preserve nothing" — the explicit user-initiated clear.

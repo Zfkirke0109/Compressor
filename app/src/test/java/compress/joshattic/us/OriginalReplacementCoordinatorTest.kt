@@ -30,7 +30,8 @@ class OriginalReplacementCoordinatorTest {
         val sizeAfterWrite: Long = 3_000L,
         val restoreThrows: Boolean = false,
         val sizeAfterRestore: Long = 5_000L,
-        val recoveryBytes: Long = 5_000L
+        val recoveryBytes: Long = 5_000L,
+        val outputContentMatches: Boolean = true, val recoveryContentMatches: Boolean = true
     ) : OriginalReplacementIo {
         var stageCalls = 0; private set
         var writeCalls = 0; private set
@@ -38,6 +39,8 @@ class OriginalReplacementCoordinatorTest {
         var discardCalls = 0; private set
         private var restored = false
 
+        override fun writtenOutputMatches() = outputContentMatches
+        override fun restoredOriginalMatches() = recoveryContentMatches
         override fun stageRecoveryCopy(): Long { stageCalls++; return stageResult }
         override fun writeOutputOverOriginal() {
             writeCalls++
@@ -192,4 +195,38 @@ class OriginalReplacementCoordinatorTest {
                 }
             }
     }
+    @Test fun equalLengthCorruptedWriteMustRestoreTheOriginal() {
+        val io = FakeIo(outputContentMatches = false)
+        assertEquals(ReplacementAttempt.OriginalIntact(ReplacementAttempt.Reason.WRITE_UNVERIFIED_RESTORED),
+            OriginalReplacementCoordinator.attempt(io, outputBytes, originalBytes))
+        assertEquals(1, io.restoreCalls)
+    }
+    @Test fun equalLengthCorruptedRestoreMustKeepTheRecoveryBytes() {
+        val io = FakeIo(writeThrows = true, recoveryContentMatches = false)
+        assertEquals(ReplacementAttempt.OriginalAtRisk, OriginalReplacementCoordinator.attempt(io, outputBytes, originalBytes))
+        assertEquals(0, io.discardCalls)
+    }
+    @Test fun partialRecoveryCannotAuthorizeATruncatingWrite() {
+        val io = FakeIo(stageResult = 3000)
+        assertEquals(ReplacementAttempt.OriginalIntact(ReplacementAttempt.Reason.RECOVERY_STAGING_FAILED),
+            OriginalReplacementCoordinator.attempt(io, outputBytes, originalBytes))
+        assertEquals(0, io.writeCalls)
+    }
+
+    @Test fun retriesAllocateUniqueRecoveryFilesAndPreserveOlderBytes() {
+        val dir = java.nio.file.Files.createTempDirectory("recovery-test").toFile()
+        try {
+            val prior = ReplacementContentProof.newRecoveryFile(dir, "same-job")
+            prior.writeBytes(byteArrayOf(1,2,3))
+            val next = ReplacementContentProof.newRecoveryFile(dir, "same-job")
+            assertFalse(prior == next)
+            assertTrue(prior.readBytes().contentEquals(byteArrayOf(1,2,3)))
+            assertFalse(BatchCacheRetention.isDeletable(prior.absolutePath, emptySet()))
+        } finally { dir.deleteRecursively() }
+    }
+    @Test fun sameLengthMutationChangesReplacementContentProof() {
+        assertFalse(ReplacementContentProof.sha256(byteArrayOf(1,2,3).inputStream()) ==
+            ReplacementContentProof.sha256(byteArrayOf(1,2,4).inputStream()))
+    }
+
 }

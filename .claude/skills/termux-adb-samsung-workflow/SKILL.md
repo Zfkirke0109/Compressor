@@ -56,6 +56,32 @@ Check file size and line count before committing a large log — see [[repo-safe
 ./gradlew :app:testDebugUnitTest
 ```
 
+## Compressor-specific commands
+
+```sh
+# Secure Folder profile (user 150): install and run there, not in user 0
+adb install -r -t --user 150 app-debug.apk
+adb shell pm list packages --user 150 | grep galaxycompressor
+
+# Real-device checks with a short SDR clip (pushes it to /data/local/tmp, runs PipelineDeviceTest)
+scripts/device/run-device-checks.sh /sdcard/Download/clip.mp4 150
+
+# Keep the app's decision tags while a batch runs (reconnecting wireless-ADB capture)
+bash scripts/diagnostics/resilient_capture.sh
+
+# Summarise a diagnostics export; always name the batch
+python3 scripts/diagnostics/parse_session_jsonl.py Compressor-*-Everything.zip --batch batch_<id>
+
+# Find the review's target files among local originals (hashes names locally)
+python3 scripts/device/map_targets.py ~/storage/dcim --out targets-local.csv
+```
+
+`run-device-checks.sh` runs Gradle, so from Termux use it only where a JDK and Android SDK are set
+up; otherwise build on a computer and run just the `adb install` / `am instrument` lines from the
+script. The CI debug APK (PR artifact, stable debug signing) installs as an update over earlier PR
+builds; a locally built debug APK has a different signature and must not replace it without an
+uninstall, which erases learned profiles.
+
 ## Rules
 
 - Give single copy-paste blocks when asked — don't split a simple sequence into multiple messages with commentary in between unless the user wants an explanation.
