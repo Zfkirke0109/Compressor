@@ -4887,10 +4887,28 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             override fun recoveryCopyLength(): Long = recoveryCopy.length()
 
             override fun discardRecoveryCopy() { runCatching { recoveryCopy.delete() } }
+
+            // Content proof: the original read back through the provider, digested and compared
+            // with the file it should now hold. A size match cannot catch equal-length corruption.
+            private fun sourceDigest(): String? = runCatching {
+                context.contentResolver.openInputStream(item.sourceUri)?.use { ReplacementContentProof.sha256(it) }
+            }.getOrNull()
+
+            override fun writtenOutputMatches(): Boolean {
+                val expected = runCatching { outputFile.inputStream().use { ReplacementContentProof.sha256(it) } }.getOrNull()
+                return expected != null && expected == sourceDigest()
+            }
+
+            override fun restoredOriginalMatches(): Boolean {
+                val expected = runCatching { recoveryCopy.inputStream().use { ReplacementContentProof.sha256(it) } }.getOrNull()
+                return expected != null && expected == sourceDigest()
+            }
         }
 
         val expectedLength = outputFile.length()
-        val attempt = OriginalReplacementCoordinator.attempt(replacementIo, expectedLength)
+        // The recovery copy must hold the whole original (item.originalSize, as indexed) before the
+        // truncating write may begin.
+        val attempt = OriginalReplacementCoordinator.attempt(replacementIo, expectedLength, item.originalSize.takeIf { it > 0L })
 
         if (attempt is ReplacementAttempt.OriginalIntact &&
             attempt.reason == ReplacementAttempt.Reason.RECOVERY_STAGING_FAILED

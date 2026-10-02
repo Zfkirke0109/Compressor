@@ -10,8 +10,14 @@ package compress.joshattic.us
  * whether a user keeps or loses their only copy, so they must be provable.
  */
 interface OriginalReplacementIo {
-    /** Content proof hooks, specified by adversarial replacement tests before wiring. */
+    /**
+     * Content proof after the write: the original's bytes read back equal the output's. A size
+     * match alone cannot catch an equal-length corruption. Defaults to true only for doubles that
+     * do not model content; the production IO compares SHA-256 digests.
+     */
     fun writtenOutputMatches(): Boolean = true
+
+    /** Content proof after a restore: the original's bytes read back equal the recovery copy's. */
     fun restoredOriginalMatches(): Boolean = true
 
     /** Copies the ORIGINAL bytes to a private recovery file. Returns staged bytes; <= 0 means failed. */
@@ -72,6 +78,11 @@ sealed interface ReplacementAttempt {
  * stage a rollback copy FIRST, only then truncate; require a byte-exact confirmation; restore on any
  * failure or unconfirmed result.
  *
+ * Confirmation is size AND content: the read-back size must match and the read-back bytes must equal
+ * the output (after the write) or the recovery copy (after a restore), so an equal-length
+ * corruption is restored, or, if the restore itself is corrupt, reported at risk with the recovery
+ * bytes kept. A recovery copy shorter than the known source size never authorizes the write.
+ *
  * An unconfirmed write is treated exactly like a failed one. That is deliberate and is the SAFE-001
  * defect: the previous implementation accepted an unknown size (`statSize <= 0`) as success, which
  * could leave an unverified write standing over the user's only copy.
@@ -80,7 +91,9 @@ object OriginalReplacementCoordinator {
 
     fun attempt(io: OriginalReplacementIo, expectedOutputBytes: Long, expectedSourceBytes: Long? = null): ReplacementAttempt {
         val staged = runCatching { io.stageRecoveryCopy() }.getOrDefault(-1L)
-        if (staged <= 0L) {
+        // A partial recovery copy cannot restore the original, so it cannot authorize the
+        // truncating write: when the source size is known, the copy must hold all of it.
+        if (staged <= 0L || (expectedSourceBytes != null && expectedSourceBytes > 0L && staged != expectedSourceBytes)) {
             // Nothing was truncated — the original is untouched. Clean up any partial recovery file.
             runCatching { io.discardRecoveryCopy() }
             return ReplacementAttempt.OriginalIntact(ReplacementAttempt.Reason.RECOVERY_STAGING_FAILED)
@@ -89,7 +102,7 @@ object OriginalReplacementCoordinator {
         var writeThrew = false
         val confirmed = runCatching {
             io.writeOutputOverOriginal()
-            ReplacementSizeCheck.verified(io.readBackOriginalSize(), expectedOutputBytes)
+            ReplacementSizeCheck.verified(io.readBackOriginalSize(), expectedOutputBytes) && io.writtenOutputMatches()
         }.onFailure { writeThrew = true }.getOrDefault(false)
 
         if (confirmed) {
@@ -100,7 +113,7 @@ object OriginalReplacementCoordinator {
         // Failed or unconfirmed: the source may now be truncated. Put the original bytes back.
         val restored = runCatching {
             io.restoreOriginalFromRecovery()
-            ReplacementSizeCheck.verified(io.readBackOriginalSize(), io.recoveryCopyLength())
+            ReplacementSizeCheck.verified(io.readBackOriginalSize(), io.recoveryCopyLength()) && io.restoredOriginalMatches()
         }.getOrDefault(false)
 
         if (!restored) {
@@ -115,5 +128,19 @@ object OriginalReplacementCoordinator {
             if (writeThrew) ReplacementAttempt.Reason.WRITE_FAILED_RESTORED
             else ReplacementAttempt.Reason.WRITE_UNVERIFIED_RESTORED
         )
+    }
+}
+
+/** SHA-256 of a stream, for the replacement's content proof. */
+object ReplacementContentProof {
+    fun sha256(input: java.io.InputStream): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(1 shl 20)
+        while (true) {
+            val n = input.read(buffer)
+            if (n < 0) break
+            digest.update(buffer, 0, n)
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 }
