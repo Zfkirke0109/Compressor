@@ -10,6 +10,10 @@ package compress.joshattic.us
  * whether a user keeps or loses their only copy, so they must be provable.
  */
 interface OriginalReplacementIo {
+    /** Content proof hooks, specified by adversarial replacement tests before wiring. */
+    fun writtenOutputMatches(): Boolean = true
+    fun restoredOriginalMatches(): Boolean = true
+
     /** Copies the ORIGINAL bytes to a private recovery file. Returns staged bytes; <= 0 means failed. */
     fun stageRecoveryCopy(): Long
 
@@ -74,7 +78,7 @@ sealed interface ReplacementAttempt {
  */
 object OriginalReplacementCoordinator {
 
-    fun attempt(io: OriginalReplacementIo, expectedOutputBytes: Long): ReplacementAttempt {
+    fun attempt(io: OriginalReplacementIo, expectedOutputBytes: Long, expectedSourceBytes: Long? = null): ReplacementAttempt {
         val staged = runCatching { io.stageRecoveryCopy() }.getOrDefault(-1L)
         if (staged <= 0L) {
             // Nothing was truncated — the original is untouched. Clean up any partial recovery file.
