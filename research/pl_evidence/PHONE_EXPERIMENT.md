@@ -1,6 +1,6 @@
 # Focused S23 Ultra validation — do not start with another 244-file batch
 
-Status: designed, not run. Use the exact APK/commit in `docs/reviews/PL_B184_VALIDATION.md`; do not use a moving branch APK. Retain the original APK/settings and exports for reproducibility. Keep app data and current learned profiles. Install as an update, not an uninstall/reinstall.
+Status: designed, not run. Use the matched app/instrumentation APK pair from the frozen Android CI run identified in the delivered validation evidence; record its full branch/merge SHA and APK hashes. `docs/reviews/PL_B184_VALIDATION.md` records the preceding verified code baseline. Do not use a moving branch APK. Retain the original APK/settings and exports for reproducibility. Keep app data and current learned profiles. Install as an update, not an uninstall/reinstall.
 
 ## Stage 0: non-destructive controls and evidence integrity
 
@@ -8,21 +8,20 @@ Settings: Perceptually Lossless, original resolution/fps, Auto/HEVC as in b184, 
 
 No learning reset: new evidence is source/config/window-bound. A repeat can test measurement stability but does not become another independent training observation. Keep each run's learned snapshot/ledger; experimental arms must keep distinct configuration identities. In Exhaustive mode the old skip latch does not suppress measurement. Compare actual requested configurations, not just toggle labels.
 
-First run the synthetic device controls, then the app self-check (source/self, stream copy, high-quality hardware encode) on a short SDR source. Commands from a matching checkout with Android SDK and adb:
+First run the synthetic device controls, then the app self-check (source/self, stream copy, high-quality hardware encode) on a short SDR source. Commands with adb and the matched signed app/instrumentation APK pair from the same CI artifact (or your existing authorized matching signing setup):
 
 ```bash
 python3 scripts/device/make_scoring_controls.py --out /tmp/compressor-controls
 adb push /tmp/compressor-controls /data/local/tmp/compressor-controls
-./gradlew :app:assembleDebug :app:assembleDebugAndroidTest
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb install -r app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+adb install -r app-debug.apk
+adb install -r app-debug-androidTest.apk
 adb shell am instrument --user 150 -w -r \
   -e class compress.joshattic.us.ScoringParityDeviceTest \
   -e scoringControls /data/local/tmp/compressor-controls \
   io.github.zfkirke0109.galaxycompressor.test/androidx.test.runner.AndroidJUnitRunner
 ```
 
-Use `--user 150` only if that is still the active Compressor profile (the exports used 150); determine it with `adb shell pm list users`. APK filenames/signatures must match the actual build outputs. A test skipped for missing fixture argument is **not** a pass.
+Use `--user 150` only if that is still the active Compressor profile (the exports used 150); determine it with `adb shell pm list users`. APK filenames/signatures must match the actual build outputs. Keep app data; do not uninstall to bypass a signing mismatch. The CI artifact supplies both APKs signed by the configured project key. A test skipped for missing fixture argument is **not** a pass.
 
 Controls cover identity, remux, lossless encoded control, 7-second PTS shift, internal frame deletion, one-frame offset, VFR jitter, context first frame, unchanged pixels with changed color tags, changed chroma and a synthetic corrupt MP4. The app self-check provides the separate very-high-quality hardware encode. It need not be smaller; it tests the instrument/encoder ceiling on that source only. Do not feed the damaged fixture into destructive replacement.
 

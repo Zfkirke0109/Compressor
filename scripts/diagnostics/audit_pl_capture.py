@@ -46,12 +46,24 @@ def window_rows(stage):
     series = {k: str(stage[prefix + k]).split(';') for k in keys}
     if len({len(s) for s in series.values()}) != 1: raise ValueError('inconsistent window series lengths')
     ids = str(stage.get(prefix + 'WindowIds') or '').split(';')
+    rates = str(stage.get('rateFactors') or '').split(';') if stage.get('rateFactors') else []
+    timings = str(stage.get(prefix + 'Timing') or '').split(';') if stage.get(prefix + 'Timing') else []
+    if rates and len(rates) != len(series['Mean']): raise ValueError('rate evidence does not match scored windows')
+    if timings and len(timings) != len(series['Mean']): raise ValueError('timing evidence does not match scored windows')
     rows = []
     for i in range(len(series['Mean'])):
         values = {k.lower(): float(series[k][i]) for k in keys}
         if not all(math.isfinite(x) for x in values.values()): raise ValueError('non-finite recorded score')
         row = {k: stage.get(k) for k in ['jobId', 'attempt', 'attemptIndex', 'sequence', 'stage', 'configId', 'rungId', 'ratio', 'requestedVideoBitrate']}
         row.update(values)
+        factor = float(rates[i]) if rates else None
+        if factor is not None and (not math.isfinite(factor) or factor <= 0): raise ValueError('invalid observed rate factor')
+        requested = stage.get('requestedVideoBitrate')
+        row.update(encoderOvershootFactor=factor,
+                   observedSteadyVideoBitrateDerived=requested * factor if requested and factor else None,
+                   observedRateBasis='recorded steady-window video rate factor times requested bitrate; not full-output bitrate' if factor else None,
+                   timingRaw=timings[i] if timings else None,
+                   actualEncoderNames=stage.get('actualEncoderNames'))
         row['windowId'] = ids[i] if i < len(ids) and ids[i] else None
         row['adequateFrames'] = row['frames'] >= 12
         row['margins'] = {k: row[k] - v for k, v in GATES.items()}
@@ -148,7 +160,12 @@ def analyze(records):
                 if min(deltas.values()) < -0.5:
                     monotonic.append(dict(jobId=j['jobId'], windowId=a['windowId'], lowerRatio=a['ratio'],
                                           higherRatio=b['ratio'], deltas=deltas, repeatRequired=True))
-        for w in ws: w.update(sourceSha256=identity, sourceSplit=row['proposedSourceSplit'])
+        for w in ws:
+            w.update(sourceSha256=identity, sourceSplit=row['proposedSourceSplit'],
+                     sourceCodec=j.get('sourceMime'), sourceWidth=j.get('w'), sourceHeight=j.get('h'),
+                     sourceFps=j.get('fps'), sourceBppEstimate=row['sourceBppEstimate'], sourceHdr=j.get('hdr'),
+                     requestedOutputCodec=j.get('plannedOutputMime'), sourceAudioCodec=j.get('audioMime'),
+                     sourceAudioBitrate=j.get('audioBitrate'))
         sources.append(row)
         windows.extend(ws)
     rejects = [s for s in sources if s['classification'] == 'measured_probe_failure']

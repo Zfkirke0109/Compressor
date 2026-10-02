@@ -32,5 +32,14 @@ class AuditTest(unittest.TestCase):
         self.assertEqual(source_split('a'*64), source_split('a'*64))
         self.assertIsNone(source_split(None))
 
+    def test_full_precision_rate_and_timing_join_stays_per_window(self):
+        stage=dict(stage='probe_rung',probeMean='96;97',probeP5='93;94',probeMin='90;91',probeFrames='36;36',
+                   probeWindowIds='1-2;3-4',requestedVideoBitrate=1000000,rateFactors='1.012345;0.987654',probeTiming='first;second')
+        rows=window_rows(stage)
+        self.assertAlmostEqual(rows[1]['observedSteadyVideoBitrateDerived'],987654)
+        self.assertEqual(rows[0]['timingRaw'],'first')
+        stage['rateFactors']='1.01'
+        with self.assertRaises(ValueError): window_rows(stage)
+
 
 if __name__ == '__main__': unittest.main()
