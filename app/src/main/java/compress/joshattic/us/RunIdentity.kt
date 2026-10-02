@@ -190,11 +190,39 @@ object EncoderInventory {
         "CBR_FD".takeIf { Build.VERSION.SDK_INT >= 31 && supported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR_FD) }
     )
 
-    internal fun advertisesTenBit(mime: String, profiles: List<Int>): Boolean = profiles.any {
-        it == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10 ||
-            it == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10 ||
-            it == MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10
+    /**
+     * Profile numbers are per codec, not global: HEVCProfileMain10, AV1ProfileMain10,
+     * AVCProfileMain and VP9Profile1 are all 2. So the MIME type decides which numbers mean a
+     * 10-bit profile; an unknown MIME advertises none.
+     */
+    internal fun advertisesTenBit(mime: String, profiles: List<Int>): Boolean {
+        val tenBit = TEN_BIT_PROFILES[mime.lowercase(Locale.US)] ?: return false
+        return profiles.any { it in tenBit }
     }
+
+    private val TEN_BIT_PROFILES: Map<String, Set<Int>> = mapOf(
+        "video/hevc" to setOf(
+            MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10,
+            MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10,
+            MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10Plus
+        ),
+        "video/av01" to setOf(
+            MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10,
+            MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10HDR10,
+            MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10HDR10Plus
+        ),
+        "video/x-vnd.on2.vp9" to setOf(
+            MediaCodecInfo.CodecProfileLevel.VP9Profile2,
+            MediaCodecInfo.CodecProfileLevel.VP9Profile3,
+            MediaCodecInfo.CodecProfileLevel.VP9Profile2HDR,
+            MediaCodecInfo.CodecProfileLevel.VP9Profile3HDR,
+            MediaCodecInfo.CodecProfileLevel.VP9Profile2HDR10Plus,
+            MediaCodecInfo.CodecProfileLevel.VP9Profile3HDR10Plus
+        ),
+        "video/avc" to setOf(
+            MediaCodecInfo.CodecProfileLevel.AVCProfileHigh10
+        )
+    )
 
     fun snapshot(): List<Entry> = runCatching {
         MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.filter { it.isEncoder }.flatMap { info ->
