@@ -86,6 +86,9 @@ data class StageEvent(
             if (windows.any { it.timing != null }) {
                 fields["${prefix}Timing"] = windows.joinToString(";") { it.timing?.compact() ?: "none" }
             }
+            if (windows.any { it.traceId != null }) {
+                fields["${prefix}TraceIds"] = windows.joinToString(";") { it.traceId ?: "none" }
+            }
             return fields
         }
 

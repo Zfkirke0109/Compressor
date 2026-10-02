@@ -766,7 +766,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     val mime = runCatching { chooseOutputMime(BatchCodecOption.AUTO, item, BatchQualityPreset.ORIGINAL) }
                         .getOrDefault(MimeTypes.VIDEO_H265)
                     DiagLog.i("CompressorProbe", "self-check start; job=${diagnosticJobId(item)}; source=${item.originalWidth}x${item.originalHeight}@${item.originalFps}; mime=${item.sourceVideoMime}")
-                    qualityProber.selfCheck(item.sourceUri, item.durationMs, item.toSourceInfo().videoBitrate, mime)
+                    qualityProber.selfCheck(item.sourceUri, item.durationMs, item.toSourceInfo().videoBitrate, mime, frameTrace(item, "selfcheck"))
                 } catch (e: CancellationException) {
                     DiagLog.i("CompressorProbe", "self-check cancelled; a batch is starting")
                     throw e
@@ -1028,7 +1028,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         "longGop" to EncoderExperiments.isLongGopEnabled(context),
                         "saferRungRetry" to EncoderExperiments.isSaferRungRetryEnabled(context),
                         "shadowCalibration" to EncoderExperiments.isShadowCalibrationEnabled(context),
-                        "fullSourceHash" to EncoderExperiments.isFullSourceHashEnabled(context)
+                        "fullSourceHash" to EncoderExperiments.isFullSourceHashEnabled(context),
+                        "fullFrameTrace" to EncoderExperiments.isFrameTraceEnabled(context),
+                        "measurementPolicyEpoch" to compress.joshattic.us.quality.ScientificPolicy.EPOCH
                     ),
                 EncoderInventory.snapshot()
             )
@@ -2171,7 +2173,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             s.phases.message("Certifying pixels: encoder undershot the bitrate floor, checking real quality…")
             val recoveryOutcome = qualityProber.certify(
                 item.sourceUri, outputFile, item.durationMs, item.originalFps.toDouble(),
-                onWindowScored = { done, total -> s.phases.certifyStep(done, total) }
+                onWindowScored = { done, total -> s.phases.certifyStep(done, total) },
+                traceRequest = frameTrace(item, "floor-recovery")
             )
             // Recorded whatever the outcome, partial samples included (b177 F1); only a complete,
             // passing sample recovers the floor.
@@ -2320,7 +2323,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             ?: qualityProber.certify(
                 item.sourceUri, outputFile, item.durationMs, item.originalFps.toDouble(),
                 onWindowScored = { done, total -> s.phases.certifyStep(done, total) },
-                shadowV1 = shadow.shadow
+                shadowV1 = shadow.shadow,
+                traceRequest = frameTrace(item, "certification")
             )
         if (shadow.shadow) run.shadowWindowsUsed += certOutcome.scoredWindows?.size ?: 0
         // Every window that scored, including the scored part of a partial sample (b177 F1).
@@ -3692,6 +3696,22 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
      * Any probe failure leaves the conservative plan untouched. Probe-proven encodes must
      * additionally pass sampled pixel certification after the full encode (fail-closed).
      */
+    private fun frameTrace(item: BatchVideoItem, stage: String): compress.joshattic.us.quality.FrameTraceRequest? {
+        if (!EncoderExperiments.isFrameTraceEnabled(getApplication())) return null
+        val directory = DiagLog.attachedFile?.parentFile ?: return null
+        val ctx = activeDiagnostics?.learningContext
+        return compress.joshattic.us.quality.FrameTraceRequest(
+            File(directory, "frames"), diagnosticJobId(item),
+            "${ctx?.token ?: 0}:${ctx?.attemptIndex ?: 0}", stage,
+            mapOf("appCommit" to BuildConfig.GIT_COMMIT, "appVersion" to BuildConfig.VERSION_NAME,
+                "androidBuild" to android.os.Build.FINGERPRINT,
+                "sourceFingerprint" to sourceFingerprints[item.sourceUri],
+                "sourceFingerprintBasis" to SourceFingerprint.BASIS,
+                "sourceFps" to item.originalFps, "sourceMime" to item.sourceVideoMime,
+                "retainEncodedCandidates" to EncoderExperiments.isRetainCandidatesEnabled(getApplication()))
+        )
+    }
+
     private suspend fun refinePlanWithPixelProbes(
         item: BatchVideoItem,
         outputMime: String,
@@ -3771,7 +3791,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             shape = shape,
             budgetMs = ExhaustivePerceptualLosslessPolicy.probeBudgetMs(plan.shortProbeLadder),
             sourceFps = item.originalFps.toDouble(),
-            transformerInputUri = transformerInputUri
+            transformerInputUri = transformerInputUri,
+            traceRequest = frameTrace(item, "probe")
         )
         DiagLog.i(
             "CompressorProbe",

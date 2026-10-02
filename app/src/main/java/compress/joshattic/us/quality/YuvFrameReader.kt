@@ -31,6 +31,7 @@ class YuvFrameReader(
     private val uri: Uri,
     private val startUs: Long,
     private val endUs: Long,
+    private val onFormat: ((Map<String, Any?>) -> Unit)? = null,
     private val onFrame: (I420Frame) -> Boolean // return false to stop early
 ) {
     companion object {
@@ -39,6 +40,15 @@ class YuvFrameReader(
         private const val OUTPUT_TIMEOUT_US = 10_000L
         // No decoded frame for this long means the decoder is stuck.
         private const val STALL_TIMEOUT_MS = 20_000L
+
+        /** Whitelisted technical fields only: never serialize vendor paths or whole formats. */
+        private fun describe(format: MediaFormat): Map<String, Any?> = buildMap {
+            put("mime", runCatching { format.getString(MediaFormat.KEY_MIME) }.getOrNull())
+            for (key in listOf("width", "height", "crop-left", "crop-top", "crop-right", "crop-bottom",
+                "rotation-degrees", "color-format", "color-standard", "color-range", "color-transfer", "profile")) {
+                if (format.containsKey(key)) put(key, runCatching { format.getInteger(key) }.getOrNull())
+            }
+        }
 
         /** Display-space dimensions (rotation applied) of the first video track. */
         fun displayGeometry(context: Context, uri: Uri): Triple<Int, Int, Int>? {
@@ -92,6 +102,7 @@ class YuvFrameReader(
             extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
 
             codec = MediaCodec.createDecoderByType(mime)
+            onFormat?.invoke(mapOf("decoder" to codec.name, "inputFormat" to describe(format)))
             codec.configure(format, null, null, 0)
             codec.start()
 
@@ -125,7 +136,10 @@ class YuvFrameReader(
                             throw IllegalStateException("decoder stalled")
                         }
                     }
-                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> lastProgressAt = System.currentTimeMillis()
+                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        lastProgressAt = System.currentTimeMillis()
+                        onFormat?.invoke(mapOf("outputFormat" to describe(codec.outputFormat)))
+                    }
                     else -> if (outIndex >= 0) {
                         lastProgressAt = System.currentTimeMillis()
                         val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0

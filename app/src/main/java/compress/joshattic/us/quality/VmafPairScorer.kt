@@ -30,7 +30,8 @@ data class WindowScore(
     val windowStartUs: Long? = null,
     val windowEndUs: Long? = null,
     // Where the window's time went (b177 F8/WP2). Telemetry only.
-    val timing: WindowTiming? = null
+    val timing: WindowTiming? = null,
+    val traceId: String? = null
 ) {
     val windowId: String? get() = if (windowStartUs != null && windowEndUs != null) "$windowStartUs-$windowEndUs" else null
 }
@@ -463,7 +464,8 @@ object VmafPairScorer {
         // Self-check identity controls: also count scored pairs whose decoded planes are
         // byte-identical (WindowPairingDiag.identicalFrames). A byte compare per pair; off for
         // probes and certification.
-        countIdenticalFrames: Boolean = false
+        countIdenticalFrames: Boolean = false,
+        traceRequest: FrameTraceRequest? = null
     ): PairScoreOutcome {
         if (!VmafNative.isAvailable) return PairScoreOutcome.Unavailable
         val refGeom = YuvFrameReader.displayGeometry(context, ref) ?: return PairScoreOutcome.Unavailable
@@ -480,7 +482,7 @@ object VmafPairScorer {
         }
 
         return collectWindows(windows, onWindowScored) { window ->
-            scoreWindow(context, ref, dist, window, width, height, collectBanding, shadowV1, cancelled, countIdenticalFrames)
+            scoreWindow(context, ref, dist, window, width, height, collectBanding, shadowV1, cancelled, countIdenticalFrames, traceRequest)
         }
     }
 
@@ -542,7 +544,8 @@ object VmafPairScorer {
         collectBanding: Boolean,
         shadowV1: Boolean,
         cancelled: () -> Boolean = { false },
-        countIdenticalFrames: Boolean = false
+        countIdenticalFrames: Boolean = false,
+        traceRequest: FrameTraceRequest? = null
     ): WindowOutcome {
         val wallStart = System.nanoTime()
         var identicalFrames = 0
@@ -556,9 +559,9 @@ object VmafPairScorer {
         // Plain vmaf_v0.6.1 (no phone transform): every threshold in QualityProbePolicy was
         // calibrated against the PC harness's default-model scores, and mixing models would
         // silently loosen the bar (the phone transform maps scores upward).
-        val handle = VmafNative.open(
+        val handle = runCatching { VmafNative.open(
             width, height, phoneModel = PRODUCTION_PHONE_MODEL, threads = SCORER_THREADS, collectBanding = collectBanding
-        )
+        ) }.getOrDefault(0L)
         if (handle == 0L) return WindowOutcome.Unavailable
         // Shadow v1 session over the SAME frame pairs. Zero when unavailable; every failure on
         // this path just drops the v1 diagnostic and never touches the verdict session.
@@ -573,6 +576,14 @@ object VmafPairScorer {
                 v1Handle = 0L
             }
         }
+        val trace = traceRequest?.let { FrameEvidenceTrace(it, window, width, height, mapOf(
+            "v0Library" to VmafNative.version, "v1Model" to if (shadowV1) VmafNativeV1.modelName else null,
+            "v1Library" to if (shadowV1) "3.2.0@86da14d0306a138fd3f01319860b905169746516" else null,
+            "v1Input" to if (shadowV1) "8bit-replicated-to-10bit;non-HFR" else null,
+            "memoryBefore" to ScorerMemory.snapshot()
+        )) }
+        val decodeFormats = java.util.concurrent.ConcurrentHashMap<String, Any?>()
+        try {
         val queueCapacity = queueCapacityFor(width, height)
         val refQueue = ScoringFrameQueue<I420Frame>(queueCapacity)
         val distQueue = ScoringFrameQueue<I420Frame>(queueCapacity)
@@ -585,7 +596,10 @@ object VmafPairScorer {
             thread(name = "vmaf-$label") {
                 val cpuStart = android.os.SystemClock.currentThreadTimeMillis()
                 try {
-                    YuvFrameReader(context, uri, startUs, startUs + decodeLenUs) { frame ->
+                    YuvFrameReader(context, uri, startUs, startUs + decodeLenUs,
+                        onFormat = if (trace != null) { fields -> fields.forEach { (key, value) ->
+                            if (value != null) decodeFormats["$label.$key"] = value
+                        } } else null) { frame ->
                         queue.send(frame) && error.get() == null
                     }.run()
                 } catch (t: Throwable) {
@@ -720,6 +734,7 @@ object VmafPairScorer {
                                 if (v1rc < 0) closeV1()
                             }
                             contextFed = 1
+                            runCatching { trace?.pair(cRef, cDist, refOrigin.normalize(cRef.ptsUs), distOrigin.normalize(cDist.ptsUs), true) }
                             contextRef = null
                             contextDist = null
                         }
@@ -746,6 +761,7 @@ object VmafPairScorer {
                             v1ReadNanos += spent
                             if (v1rc < 0) closeV1()
                         }
+                        runCatching { trace?.pair(r, d, refOrigin.normalize(r.ptsUs), distOrigin.normalize(d.ptsUs), false) }
                         fed++
                         pendingRef = null
                         pendingDist = null
@@ -779,27 +795,31 @@ object VmafPairScorer {
         if (err != null || fed == 0) {
             DiagLog.w(TAG, "window [${window.startUs}..${window.endUs}] failed: ${err ?: "no frames"}")
             // Same thread as every native call on these handles: nothing can still be using them.
-            VmafNative.close(handle)
-            closeV1()
+            runCatching { trace?.finish(null, null, null, if (misaligned) "MISALIGNED" else "UNAVAILABLE",
+                mapOf("reason" to (err ?: "no frames"), "refDecoded" to refSeen, "distDecoded" to distSeen,
+                    "formats" to decodeFormats.toMap(), "memoryAfter" to ScorerMemory.snapshot())) }
             if (err == CANCELLED_REASON) return WindowOutcome.Cancelled
             // Measured misalignment is positive evidence, not mere absence of evidence.
             return if (misaligned) WindowOutcome.Misaligned(aligner.failureReason) else WindowOutcome.Unavailable
         }
         // The context frame (if any) is scored by libvmaf like any other; its score is dropped here.
         val flushStart = System.nanoTime()
-        val perFrame = MotionContext.scoredSpan(VmafNative.flush(handle), contextFed)
+        val allV0 = runCatching { VmafNative.flush(handle) }.getOrNull()
+        val perFrame = MotionContext.scoredSpan(allV0, contextFed)
         val v0FlushNanos = System.nanoTime() - flushStart
         // Banding scores must be read AFTER the flush (which signals end-of-stream) and BEFORE
         // close. Telemetry only: any failure here yields a null diagnostic and never affects the
         // window's outcome.
         val cambiStart = System.nanoTime()
-        val perFrameCambi = if (collectBanding) MotionContext.scoredSpan(VmafNative.cambiScores(handle), contextFed) else null
+        val allCambi = if (collectBanding) runCatching { VmafNative.cambiScores(handle) }.getOrNull() else null
+        val perFrameCambi = MotionContext.scoredSpan(allCambi, contextFed)
         val cambiNanos = System.nanoTime() - cambiStart
-        VmafNative.close(handle)
         var v1FlushNanos = 0L
+        var allV1: DoubleArray? = null
         val v1Diag = if (v1Handle != 0L) {
             val v1Start = System.nanoTime()
-            WindowV1Diag.fromPerFrame(MotionContext.scoredSpan(runCatching { VmafNativeV1.flush(v1Handle) }.getOrNull(), contextFed))
+            allV1 = runCatching { VmafNativeV1.flush(v1Handle) }.getOrNull()?.takeIf { it.size == fed + contextFed }
+            WindowV1Diag.fromPerFrame(MotionContext.scoredSpan(allV1, contextFed))
                 .also {
                     v1FlushNanos = System.nanoTime() - v1Start
                     v1Nanos += v1FlushNanos
@@ -810,6 +830,13 @@ object VmafPairScorer {
             DiagLog.w(TAG, "vmaf flush failed for window")
             return WindowOutcome.Unavailable
         }
+        val traceFile = runCatching { trace?.finish(allV0, allV1, allCambi, "SCORED", mapOf(
+            "refDecoded" to refSeen, "distDecoded" to distSeen, "refExtra" to refExtra, "distExtra" to distExtra,
+            "refAlignDrops" to aligner.refDropped, "distAlignDrops" to aligner.distDropped,
+            "sourceOriginUs" to refOrigin.originUs, "candidateOriginUs" to distOrigin.originUs,
+            "leadInPairsSkipped" to leadInPairsSkipped, "contextFed" to contextFed,
+            "formats" to decodeFormats.toMap(), "memoryAfter" to ScorerMemory.snapshot()
+        )) }.onFailure { DiagLog.w(TAG, "frame trace write failed", it) }.getOrNull()
         val sorted = perFrame.sortedArray()
         val p5Index = ((sorted.size - 1) * 0.05).toInt()
         val pairing = WindowPairingDiag(
@@ -860,7 +887,8 @@ object VmafPairScorer {
             frameDiag = frameDiag,
             windowStartUs = window.startUs,
             windowEndUs = window.endUs,
-            timing = timing
+            timing = timing,
+            traceId = if (traceFile != null) trace?.id else null
         )
         DiagLog.i(
             TAG,
@@ -873,5 +901,13 @@ object VmafPairScorer {
                 " timing[${timing.compact()}]"
         )
         return WindowOutcome.Scored(result)
+        } catch (t: Throwable) {
+            DiagLog.w(TAG, "window scorer failed", t)
+            return WindowOutcome.Unavailable
+        } finally {
+            runCatching { VmafNative.close(handle) }
+            closeV1()
+            runCatching { trace?.finish(null, null, null, "UNAVAILABLE", mapOf("reason" to "scoring did not complete")) }
+        }
     }
 }

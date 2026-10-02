@@ -186,21 +186,29 @@ object DiagnosticsExporter {
                 fun add(path: String, file: File) {
                     if (!file.isFile || file.length() == 0L) return
                     zip.putNextEntry(ZipEntry(path).apply { time = file.lastModified() })
-                    file.inputStream().use { it.copyTo(zip) }
+                    val entry = file.inputStream().use { DiagnosticsArchivePlan.copyPayload(path, it, zip) }
                     zip.closeEntry()
-                    entries += DiagnosticsArchivePlan.Entry(path, file.length())
+                    entries += entry
                 }
                 fun addText(path: String, text: String) {
                     val bytes = text.toByteArray()
                     zip.putNextEntry(ZipEntry(path))
-                    zip.write(bytes)
+                    val entry = bytes.inputStream().use { DiagnosticsArchivePlan.copyPayload(path, it, zip) }
                     zip.closeEntry()
-                    entries += DiagnosticsArchivePlan.Entry(path, bytes.size.toLong())
+                    entries += entry
                 }
                 for (run in included) {
                     val dir = File(context.filesDir, "diagnostics/${run.batchId}")
                     add(DiagnosticsArchivePlan.runEntryPath(run.batchId, "session.jsonl"), File(dir, "session.jsonl"))
                     add(DiagnosticsArchivePlan.runEntryPath(run.batchId, "decisions.log"), File(dir, "decisions.log"))
+                    File(dir, "frames").listFiles().orEmpty().filter { it.name.endsWith(".jsonl.gz") }
+                        .sortedBy { it.name }.forEach { file ->
+                            add(DiagnosticsArchivePlan.runEntryPath(run.batchId, "frames/${file.name}"), file)
+                        }
+                    File(dir, "candidates").listFiles().orEmpty().filter { it.name.endsWith(".mp4") }
+                        .sortedBy { it.name }.forEach { file ->
+                            add(DiagnosticsArchivePlan.runEntryPath(run.batchId, "candidates/${file.name}"), file)
+                        }
                 }
                 for (name in crashes) add(DiagnosticsArchivePlan.crashEntryPath(name), File(crashDir, name))
                 if (logcat != null) addText(DiagnosticsArchivePlan.LOGCAT_ENTRY, logcat)

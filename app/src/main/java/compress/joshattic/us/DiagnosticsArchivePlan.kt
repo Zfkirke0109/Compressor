@@ -122,7 +122,21 @@ object DiagnosticsArchivePlan {
     fun includesLearnedProfiles(scope: Scope): Boolean = scope == Scope.EVERYTHING
 
     /** One line of the manifest's inventory. */
-    data class Entry(val path: String, val bytes: Long)
+    data class Entry(val path: String, val bytes: Long, val sha256: String? = null)
+
+    /** Hash the bytes actually exported, including when a live log grows during the copy. */
+    fun copyPayload(path: String, input: java.io.InputStream, output: java.io.OutputStream): Entry {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(64 * 1024)
+        var count = 0L
+        while (true) {
+            val n = input.read(buffer)
+            if (n < 0) break
+            if (n == 0) continue
+            output.write(buffer, 0, n); digest.update(buffer, 0, n); count += n
+        }
+        return Entry(path, count, digest.digest().joinToString("") { "%02x".format(it) })
+    }
 
     /**
      * The manifest. Every value is a technical identifier or a count; no file names or paths
@@ -139,7 +153,10 @@ object DiagnosticsArchivePlan {
         entries: List<Entry>
     ): String {
         val root = linkedMapOf<String, Any?>()
-        root["manifestVersion"] = 1
+        root["manifestVersion"] = 2
+        root["measurementPolicyEpoch"] = compress.joshattic.us.quality.ScientificPolicy.EPOCH
+        root["checksumAlgorithm"] = "SHA-256"
+        root["checksumScope"] = "uncompressed ZIP entry payload; manifest excludes itself"
         root["app"] = "Compressor"
         identity.forEach { (k, v) -> root[k] = v }
         root["exportedAt"] = exportedAt
@@ -148,7 +165,7 @@ object DiagnosticsArchivePlan {
         root["currentBatchId"] = currentBatchId
         root["previousBatchId"] = previousBatchId
         root["runs"] = includedRuns.map { linkedMapOf("batchId" to it.batchId, "startedAtMs" to it.startedAtMs) }
-        root["files"] = entries.map { linkedMapOf("path" to it.path, "bytes" to it.bytes) }
+        root["files"] = entries.map { linkedMapOf("path" to it.path, "bytes" to it.bytes, "sha256" to it.sha256) }
         return JsonText.render(root)
     }
 }

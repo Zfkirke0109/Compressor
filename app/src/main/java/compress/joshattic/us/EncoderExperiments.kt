@@ -81,6 +81,26 @@ object EncoderExperiments {
 
     private const val KEY_FULL_SOURCE_HASH = "full_source_hash"
 
+    /** Full scalar evidence for every attempted window; no raw frames. For focused research. */
+    fun isFrameTraceEnabled(context: Context): Boolean =
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean("full_frame_trace", false)
+
+    fun setFrameTraceEnabled(context: Context, enabled: Boolean) {
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean("full_frame_trace", enabled).apply()
+    }
+
+    /** Encoded probe clips, not decoded images. Explicit opt-in for exact offline comparisons. */
+    fun isRetainCandidatesEnabled(context: Context): Boolean =
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean("retain_encoded_candidates", false)
+
+    fun setRetainCandidatesEnabled(context: Context, enabled: Boolean) {
+        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean("retain_encoded_candidates", enabled).apply()
+    }
+
     /**
      * Opt-in, for the encoder pilot: hash every source in full (SHA-256 of all its bytes) before
      * its job and again after it, and record both (FullSourceHash). This is the on-device stand-in

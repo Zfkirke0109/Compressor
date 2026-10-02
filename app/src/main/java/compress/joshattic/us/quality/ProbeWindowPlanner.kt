@@ -103,7 +103,11 @@ object ProbeWindowPlanner {
             else unplaceable += Unplaceable(w.startUs, "no keyframe within ${MAX_LEAD_IN_US / 1_000_000} s before or after the window")
         }
         // Two wanted positions can collapse onto one keyframe (a long-GOP source); score it once.
-        return Plan(windows.distinctBy { it.startUs }, unplaceable)
+        val distinct = windows.distinctBy { it.startUs }
+        if (distinct.size != windows.size) {
+            unplaceable += Unplaceable(-1, "requested windows collapsed onto the same content")
+        }
+        return Plan(distinct, unplaceable)
     }
 
     internal fun place(wantedStartUs: Long, durationUs: Long, windowUs: Long, index: SyncSampleIndex?): PlannedWindow? {
@@ -122,14 +126,13 @@ object ProbeWindowPlanner {
             return PlannedWindow(previous, startFinal, startFinal + windowUs, Anchor.PREVIOUS_KEYFRAME)
         }
         val next = index.nextSyncUs(target)
-        if (next != null && next >= 0L && next - wantedStartUs <= MAX_LEAD_IN_US &&
-            next + MIN_LEAD_IN_US <= latestStart
-        ) {
+        if (next != null && next >= target && next - target <= MAX_LEAD_IN_US &&
+            next + MIN_LEAD_IN_US <= latestStart) {
             val start = next + MIN_LEAD_IN_US
             return PlannedWindow(next, start, start + windowUs, Anchor.NEXT_KEYFRAME)
         }
-        // Neither keyframe is within reach of the wanted position (a single-keyframe file, a very
-        // long GOP, or a window near the end): unplaceable. The opening keyframe is not a stand-in.
+        // Substituting the opening scene for every inaccessible window measures different
+        // content. Keep the coverage failure explicit; callers must not certify a reduced plan.
         return null
     }
 }

@@ -165,7 +165,8 @@ class PerceptualQualityProber(private val context: Context) {
         // What Media3 reads to cut the probe clips. The source itself unless it had to be
         // normalised (Media3InputNormalizer); the windows, the scoring reference and every
         // verdict stay on [sourceUri] either way.
-        transformerInputUri: Uri = sourceUri
+        transformerInputUri: Uri = sourceUri,
+        traceRequest: FrameTraceRequest? = null
     ): ProbeDecision {
         if (!VmafNative.isAvailable) return ProbeDecision(null, emptyList(), null, "vmaf unavailable")
         // Long enough to hold the minimum frame count at this frame rate (QualityProbePolicy).
@@ -175,10 +176,10 @@ class PerceptualQualityProber(private val context: Context) {
         }
         val plan = planWindows(sourceUri, durationMs, windowUs)
         val windows = plan.windows
-        if (windows.isEmpty()) {
+        if (windows.isEmpty() || plan.unplaceable.isNotEmpty()) {
             return ProbeDecision(
                 null, emptyList(), null,
-                "no probe window could be placed: " + plan.unplaceable.joinToString("; ") { it.reason }
+                "complete probe coverage unavailable: " + plan.unplaceable.joinToString("; ") { it.reason }
             )
         }
 
@@ -305,7 +306,7 @@ class PerceptualQualityProber(private val context: Context) {
             probed += ratio
             rungMark = System.nanoTime()
             val rung = probeOneRatio(
-                sourceUri, transformerInputUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows, shape, sourceFps
+                sourceUri, transformerInputUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows, shape, sourceFps, traceRequest
             )
             countRung(ratio, rung)
             if (rung is RungResult.Unavailable && rung.reason.startsWith(SourceParseFailure.REASON_PREFIX)) {
@@ -360,7 +361,7 @@ class PerceptualQualityProber(private val context: Context) {
                         rungMark = System.nanoTime()
                         val refinedRung = probeOneRatio(
                             sourceUri, transformerInputUri, outputMime, refined, targetBitrateForRatio(refined), audioBitrate,
-                            windows, shape, sourceFps
+                            windows, shape, sourceFps, traceRequest
                         )
                         countRung(refined, refinedRung)
                         val refinedScores = scoresOf(refinedRung)
@@ -431,7 +432,7 @@ class PerceptualQualityProber(private val context: Context) {
                 rungMark = System.nanoTime()
                 val upRung = probeOneRatio(
                     sourceUri, transformerInputUri, outputMime, upward, targetBitrateForRatio(upward), audioBitrate,
-                    windows, shape, sourceFps
+                    windows, shape, sourceFps, traceRequest
                 )
                 countRung(upward, upRung)
                 val upScores = scoresOf(upRung)
@@ -472,7 +473,8 @@ class PerceptualQualityProber(private val context: Context) {
         audioBitrate: Int,
         windows: List<ProbeWindowPlanner.PlannedWindow>,
         shape: ProbeEncodeShape,
-        sourceFps: Double
+        sourceFps: Double,
+        traceRequest: FrameTraceRequest?
     ): RungResult {
         val collected = mutableListOf<WindowScore>()
         val rates = mutableListOf<String>()
@@ -516,6 +518,10 @@ class PerceptualQualityProber(private val context: Context) {
                         )
                     )
                 }
+                val candidateTrace = withContext(Dispatchers.IO) {
+                    runCatching { ScoringCandidateEvidence.attach(traceRequest, probeFile) }
+                        .onFailure { DiagLog.w(TAG, "candidate evidence export failed", it) }.getOrDefault(traceRequest)
+                }
                 val scoringJob = currentCoroutineContext()[Job]
                 val outcome = withContext(Dispatchers.IO) {
                     VmafPairScorer.score(
@@ -527,7 +533,13 @@ class PerceptualQualityProber(private val context: Context) {
                         // time 0) and runs through the window. The two first frames are paired
                         // as origins, the lead-in is paired but not scored, and only the window
                         // is fed to VMAF. See ProbeWindowPlanner and ScoreWindow.leadInUs.
-                        windows = listOf(window.scoreWindowForProbeClip())
+                        windows = listOf(window.scoreWindowForProbeClip()),
+                        traceRequest = candidateTrace?.at("probe", mapOf(
+                            "requestedRatio" to ratio, "requestedVideoBitrate" to videoBitrate,
+                            "encodeConfigId" to EncodeConfigIdentity.of(outputMime, shape, videoBitrate),
+                            "encodeShape" to shape.compact(), "outputMime" to outputMime,
+                            "plannedWindows" to windows.map { "${it.startUs}-${it.endUs}" }
+                        ))
                     )
                 }
                 val scores = when (outcome) {
@@ -839,7 +851,8 @@ class PerceptualQualityProber(private val context: Context) {
         sourceUri: Uri,
         durationMs: Long,
         sourceVideoBitrate: Int,
-        outputMime: String
+        outputMime: String,
+        traceRequest: FrameTraceRequest? = null
     ): String {
         if (!VmafNative.isAvailable) return "self-check: VMAF is not available on this device build"
         val plan = planWindows(sourceUri, durationMs)
@@ -869,7 +882,7 @@ class PerceptualQualityProber(private val context: Context) {
             DiagLog.i(TAG, "self-check $label: $text")
         }
         describe("source vs itself (expect identical frames)", withContext(Dispatchers.IO) {
-            VmafPairScorer.score(context, sourceUri, sourceUri, certWindows, countIdenticalFrames = true)
+            VmafPairScorer.score(context, sourceUri, sourceUri, certWindows, countIdenticalFrames = true, traceRequest = traceRequest?.at("self-identity"))
         }, expectIdentical = true)
         val remux = File.createTempFile("selfcheck_remux_", ".mp4", context.cacheDir)
         try {
@@ -882,7 +895,7 @@ class PerceptualQualityProber(private val context: Context) {
             }
             if (remuxed.isSuccess) {
                 describe("source vs stream copy (expect identical frames)", withContext(Dispatchers.IO) {
-                    VmafPairScorer.score(context, sourceUri, Uri.fromFile(remux), certWindows, countIdenticalFrames = true)
+                    VmafPairScorer.score(context, sourceUri, Uri.fromFile(remux), certWindows, countIdenticalFrames = true, traceRequest = ScoringCandidateEvidence.attach(traceRequest?.at("remux-identity"), remux))
                 }, expectIdentical = true)
             } else {
                 lines += "source vs stream copy: remux not possible for this container (${remuxed.exceptionOrNull()?.message})"
@@ -903,7 +916,7 @@ class PerceptualQualityProber(private val context: Context) {
                 ExportOutcome.Success -> describe(
                     "source vs 2x-bitrate encode of window 1 (encoder ceiling; ratio 2.00, lead-in ${window.leadInUs / 1000} ms)",
                     withContext(Dispatchers.IO) {
-                        VmafPairScorer.score(context, sourceUri, Uri.fromFile(clip), listOf(window.scoreWindowForProbeClip()))
+                        VmafPairScorer.score(context, sourceUri, Uri.fromFile(clip), listOf(window.scoreWindowForProbeClip()), traceRequest = ScoringCandidateEvidence.attach(traceRequest?.at("hardware-2x-control"), clip))
                     }
                 )
             }
@@ -930,7 +943,8 @@ class PerceptualQualityProber(private val context: Context) {
         // never the verdict, and unconditionally it added 748 s to b177 PL-B.
         shadowV1: Boolean = false,
         // (windows scored, windows planned), for the row's "Certifying pixels 1 of 3 windows".
-        onWindowScored: ((done: Int, total: Int) -> Unit)? = null
+        onWindowScored: ((done: Int, total: Int) -> Unit)? = null,
+        traceRequest: FrameTraceRequest? = null
     ): PairScoreOutcome {
         if (!VmafNative.isAvailable) return PairScoreOutcome.Unavailable
         val windowUs = QualityProbePolicy.windowDurationUs(sourceFps)
@@ -938,7 +952,9 @@ class PerceptualQualityProber(private val context: Context) {
         // The SAME windows the ladder scored (same frame-rate-sized length), so probe and
         // certification scores of one file compare frame for frame; and each window follows a
         // source keyframe, so the reference decode does not have to run from a keyframe minutes earlier.
-        val windows = planWindows(sourceUri, durationMs, windowUs).windows.map { it.scoreWindowForCertification() }
+        val plan = planWindows(sourceUri, durationMs, windowUs)
+        if (plan.unplaceable.isNotEmpty()) return PairScoreOutcome.Unavailable
+        val windows = plan.windows.map { it.scoreWindowForCertification() }
         if (windows.isEmpty()) return PairScoreOutcome.Unavailable
         onWindowScored?.invoke(0, windows.size)
         val scoringJob = currentCoroutineContext()[Job]
@@ -949,7 +965,9 @@ class PerceptualQualityProber(private val context: Context) {
             VmafPairScorer.score(
                 context, sourceUri, Uri.fromFile(outputFile), windows, collectBanding = true, shadowV1 = shadowV1,
                 onWindowScored = onWindowScored,
-                cancelled = { scoringJob?.isActive == false }
+                cancelled = { scoringJob?.isActive == false },
+                traceRequest = runCatching { ScoringCandidateEvidence.attach(traceRequest, outputFile) }.getOrDefault(traceRequest)
+                    ?.let { it.copy(provenance = it.provenance + mapOf("plannedWindows" to windows.map { w -> "${w.startUs}-${w.endUs}" })) }
             )
         }
     }

@@ -599,6 +599,29 @@ private fun DiagnosticsExportCard(
 
             HorizontalDivider()
 
+            var frameTrace by remember { mutableStateOf(EncoderExperiments.isFrameTraceEnabled(context)) }
+            Text("Research: per-frame evidence", style = MaterialTheme.typography.labelLarge)
+            Text("Records frame hashes, timestamps and scores for every probe, certification and self-check window. " +
+                "Adds CPU and storage work. No decoded images are saved. Export the diagnostics ZIP after a focused test.",
+                style = MaterialTheme.typography.bodySmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(checked = frameTrace, enabled = !isCompressing,
+                    onCheckedChange = { on -> EncoderExperiments.setFrameTraceEnabled(context, on); frameTrace = on })
+                Spacer(Modifier.width(8.dp))
+                Text(if (frameTrace) "Per-frame evidence on" else "Per-frame evidence off", style = MaterialTheme.typography.bodySmall)
+            }
+            var retainCandidates by remember { mutableStateOf(EncoderExperiments.isRetainCandidatesEnabled(context)) }
+            Text("Research: include encoded probe clips", style = MaterialTheme.typography.labelLarge)
+            Text("Includes the actual short videos in the exported ZIP for offline scoring. The archive will contain video content " +
+                "and can be large (512 MiB of clips per run). Use with per-frame evidence on a small selected test.", style = MaterialTheme.typography.bodySmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(checked = retainCandidates, enabled = !isCompressing,
+                    onCheckedChange = { on -> EncoderExperiments.setRetainCandidatesEnabled(context, on); retainCandidates = on })
+                Spacer(Modifier.width(8.dp))
+                Text(if (retainCandidates) "Include encoded clips" else "Exclude encoded clips", style = MaterialTheme.typography.bodySmall)
+            }
+            HorizontalDivider()
+
             var fullSourceHash by remember { mutableStateOf(EncoderExperiments.isFullSourceHashEnabled(context)) }
             Text("Pilot: full source hash", style = MaterialTheme.typography.labelLarge)
             Text(
