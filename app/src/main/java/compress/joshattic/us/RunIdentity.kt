@@ -181,7 +181,9 @@ object EncoderInventory {
             append("|modes=").append(bitrateModes.joinToString("+").ifEmpty { "none" })
             append("|complexity=").append(complexity ?: "n/a").append("|quality=").append(quality ?: "n/a")
             append("|profiles=").append(profileLevels).append("|10bit=").append(tenBit)
-            append("|sizeRate=").append(geometry.joinToString(","))
+            // Only when measured: an entry without geometry keeps the compact form older captures
+            // recorded, so inventories stay comparable across runs.
+            if (geometry.isNotEmpty()) append("|sizeRate=").append(geometry.joinToString(","))
         }
     }
 

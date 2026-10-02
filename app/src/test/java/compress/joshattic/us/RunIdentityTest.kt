@@ -97,5 +97,10 @@ class RunIdentityTest {
             "c2.qti.hevc.encoder|video/hevc|hw=true|sw=false|vendor=true|modes=VBR+CBR+CQ|complexity=0..0|quality=0..100|profiles=12|10bit=true",
             e.compact()
         )
+        // Geometry limits, when the inventory measured them, follow the existing fields.
+        assertEquals(
+            e.compact() + "|sizeRate=widths=[64, 4096],1920x1080@60=true",
+            e.copy(geometry = listOf("widths=[64, 4096]", "1920x1080@60=true")).compact()
+        )
     }
 }
