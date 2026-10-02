@@ -178,10 +178,14 @@ class PipelineDeviceTest {
         // Certification reports real window counts.
         phases.enter(ItemPhase.CERTIFYING)
         val steps = mutableListOf<Pair<Int, Int>>()
-        val outcome = PerceptualQualityProber(context).certify(Uri.fromFile(source), out, durationMs(source)) { d, t ->
-            steps += d to t
-            phases.certifyStep(d, t)
-        }
+        // Named: certify's last parameter is now traceRequest, so a trailing lambda would bind there.
+        val outcome = PerceptualQualityProber(context).certify(
+            Uri.fromFile(source), out, durationMs(source),
+            onWindowScored = { d, t ->
+                steps += d to t
+                phases.certifyStep(d, t)
+            }
+        )
         if (outcome is PairScoreOutcome.Scored) {
             assertEquals(outcome.windows.size, steps.last().first)
             assertTrue(ItemProgressModel.describe(board.item(0)!!).startsWith("Certifying pixels"))
