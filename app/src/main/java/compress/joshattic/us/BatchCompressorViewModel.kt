@@ -4718,7 +4718,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 title = "Perceptually Lossless + HEVC",
                 expectedSavings = "20-35%",
                 qualityRisk = "Very low",
-                reason = "High-bitrate 4K Samsung-style video should benefit from HEVC while preserving resolution, FPS, HDR, and audio quality.",
+                reason = "Supported high-bitrate SDR video may benefit from HEVC. Every candidate must pass measured quality and preservation checks; HDR remains unsupported for PL certification.",
                 qualityPreset = BatchQualityPreset.ORIGINAL.label,
                 codecOption = BatchCodecOption.HEVC.label,
                 frameRateOption = BatchFrameRateOption.ORIGINAL.label
@@ -4832,7 +4832,6 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // exactly when Android deletes other apps' cache directories to free space. The cache was
         // the one place this file was not safe.
         val recoveryDir = File(context.filesDir, BatchCacheRetention.RECOVERY_DIRECTORY).apply { mkdirs() }
-        val recoveryCopy = File(recoveryDir, "${BatchCacheRetention.RECOVERY_FILE_PREFIX}${diagnosticJobId(item)}.mp4")
 
         // Free-space precheck. The recovery copy is a FULL copy of the original, so if the cache
         // volume cannot hold it we must not begin the destructive truncate-then-write at all — an
@@ -4857,11 +4856,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // it is exercised by OriginalReplacementCoordinatorTest, including the cases that cannot be
         // injected on a device (ENOSPC mid-write, a provider that will not report a size, a rollback
         // that itself fails). This object supplies only the raw IO.
+        val recoveryCopy = runCatching {
+            ReplacementContentProof.newRecoveryFile(recoveryDir, diagnosticJobId(item))
+        }.getOrNull() ?: return@withContext ReplacementResult(false,
+            "Replacement skipped: a recovery file could not be allocated. Original left untouched.")
         val replacementIo = object : OriginalReplacementIo {
             override fun stageRecoveryCopy(): Long {
-                if (recoveryCopy.exists()) recoveryCopy.delete()
                 val opened = context.contentResolver.openInputStream(item.sourceUri)?.use { input ->
-                    recoveryCopy.outputStream().use { output -> input.copyTo(output) }
+                    recoveryCopy.outputStream().use { output ->
+                        input.copyTo(output)
+                        output.fd.sync() // Recovery must be durable before the destructive open.
+                    }
                 }
                 return if (opened == null) -1L else recoveryCopy.length()
             }
@@ -4952,8 +4957,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val targetPath = resolveFilesystemPath(context, item.sourceUri)
             if (targetPath != null) {
                 val copied = ShizukuSupport.copyFileWithShizuku(outputFile.absolutePath, targetPath)
-                if (!copied) shizukuWriteFailed = true
-                if (copied) {
+                shizukuWriteFailed = true
+                if (copied && runCatching { replacementIo.writtenOutputMatches() }.getOrDefault(false)) {
                     runCatching { recoveryCopy.delete() }
                     val metadataReport = VideoMetadataPreserver.restoreAfterReplacement(
                         context = context,
@@ -4974,7 +4979,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // still hold — re-verify against the recovery bytes before reassuring the user.
         val originalStillWhole = if (shizukuWriteFailed && sourceRestored) {
             runCatching {
-                ReplacementSizeCheck.verified(replacementIo.readBackOriginalSize(), recoveryCopy.length())
+                ReplacementSizeCheck.verified(replacementIo.readBackOriginalSize(), recoveryCopy.length()) && replacementIo.restoredOriginalMatches()
             }.getOrDefault(false)
         } else {
             sourceRestored
@@ -5003,9 +5008,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // Only discard once the bytes exist somewhere else. If preserving them failed, this file
             // IS the user's last intact original — deleting it here would destroy it and make the
             // "don't clear the cache" advice below a lie. Keep it and say where it is.
-            if (originalPreserved) {
-                runCatching { recoveryCopy.delete() }
-            } else {
+            if (!originalPreserved) {
                 DiagLog.e(
                     "CompressorBatch",
                     "job=${diagnosticJobId(item)}; original may be incomplete and could not be preserved; " +

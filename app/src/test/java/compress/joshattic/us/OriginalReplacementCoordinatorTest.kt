@@ -213,4 +213,20 @@ class OriginalReplacementCoordinatorTest {
         assertEquals(0, io.writeCalls)
     }
 
+    @Test fun retriesAllocateUniqueRecoveryFilesAndPreserveOlderBytes() {
+        val dir = java.nio.file.Files.createTempDirectory("recovery-test").toFile()
+        try {
+            val prior = ReplacementContentProof.newRecoveryFile(dir, "same-job")
+            prior.writeBytes(byteArrayOf(1,2,3))
+            val next = ReplacementContentProof.newRecoveryFile(dir, "same-job")
+            assertFalse(prior == next)
+            assertTrue(prior.readBytes().contentEquals(byteArrayOf(1,2,3)))
+            assertFalse(BatchCacheRetention.isDeletable(prior.absolutePath, emptySet()))
+        } finally { dir.deleteRecursively() }
+    }
+    @Test fun sameLengthMutationChangesReplacementContentProof() {
+        assertFalse(ReplacementContentProof.sha256(byteArrayOf(1,2,3).inputStream()) ==
+            ReplacementContentProof.sha256(byteArrayOf(1,2,4).inputStream()))
+    }
+
 }

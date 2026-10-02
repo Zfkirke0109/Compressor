@@ -15,10 +15,10 @@ interface OriginalReplacementIo {
      * match alone cannot catch an equal-length corruption. Defaults to true only for doubles that
      * do not model content; the production IO compares SHA-256 digests.
      */
-    fun writtenOutputMatches(): Boolean = true
+    fun writtenOutputMatches(): Boolean
 
     /** Content proof after a restore: the original's bytes read back equal the recovery copy's. */
-    fun restoredOriginalMatches(): Boolean = true
+    fun restoredOriginalMatches(): Boolean
 
     /** Copies the ORIGINAL bytes to a private recovery file. Returns staged bytes; <= 0 means failed. */
     fun stageRecoveryCopy(): Long
@@ -133,6 +133,10 @@ object OriginalReplacementCoordinator {
 
 /** SHA-256 of a stream, for the replacement's content proof. */
 object ReplacementContentProof {
+    /** Atomic unique allocation: retries never truncate or discard an older recovery. */
+    fun newRecoveryFile(directory: java.io.File, jobId: String): java.io.File =
+        java.io.File.createTempFile("${BatchCacheRetention.RECOVERY_FILE_PREFIX}${jobId}_", ".mp4", directory)
+
     fun sha256(input: java.io.InputStream): String {
         val digest = java.security.MessageDigest.getInstance("SHA-256")
         val buffer = ByteArray(1 shl 20)
