@@ -1496,7 +1496,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         "rungMs" to rung.elapsedMs,
                         "plannedWindowIds" to rung.windows.joinToString(";") { it.id },
                         "rateFactors" to rung.rateFactors.joinToString(";") { StageEvent.full(it) },
-                        "rungReason" to rung.reason
+                        "rungReason" to rung.reason,
+                        "actualEncoderNames" to rung.encoderNames
                     ) + StageEvent.windowFields("probe", rung.scores, rung.scoredWindowIds)
                 )
             )
@@ -2267,7 +2268,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     "failedChecks" to verification.failingChecks().joinToString(","),
                     "candidateBytes" to s.outputSize,
                     "floorRecovery" to s.floorRecoveryDecision?.wire,
-                    "audioBasis" to verification.audioBasis
+                    "audioBasis" to verification.audioBasis,
+                    "structuralEvidence" to verification.structuralEvidence
                 )
             )
         )

@@ -35,6 +35,7 @@ class AudioPassThroughVerificationTest {
     private val outputTracks = sourceTracks.copy(videoCodec = MimeTypes.VIDEO_H265, videoBitrate = 800_000)
 
     private fun input(packetsIdentical: Boolean) = OutputVerifier.VerificationInput(
+            videoTimeline = MediaTimelineEvidence.Result(true, 300, 300, 0, 0),
             mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
             source = source,
             outputFileProbe = OutputVerifier.FileProbe(1356, 760, 10f, 128_105, 0),

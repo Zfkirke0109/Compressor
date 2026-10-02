@@ -5,8 +5,7 @@ package compress.joshattic.us.quality
  *
  * Both streams are normalized to window-relative time (ref: pts − windowStart; dist:
  * pts − distStart). Two head frames may be scored as a pair only when their normalized
- * timestamps sit within [TOLERANCE_FLOOR_US] — a FIXED tolerance that does not vary with
- * frame rate.
+ * timestamps sit within [TOLERANCE_FLOOR_US] — a maximum tolerance, narrowed when adjacent frames could be confused.
  *
  * Why fixed, and why 4 ms specifically. A correctly aligned pair's skew is bounded by how the
  * two streams were ADDRESSED, not by how far apart their frames are. The probe path is the
@@ -26,7 +25,7 @@ package compress.joshattic.us.quality
  * noise, narrow enough that a one-frame offset — ≥ 8.3 ms even at 120 fps — is never mistaken
  * for alignment.
  *
- * This is deliberately NOT adaptive. A superseded rule widened the tolerance to half the smallest
+ * This tolerance never widens with frame rate. A superseded rule widened the tolerance to half the smallest
  * observed frame interval, which grew it exactly where frames are furthest apart (20.0 ms at
  * 25 fps, 16.7 ms at 30 fps) and so scored frames up to half a frame out of step as if they were
  * aligned. Measured on device across 368 probe windows in five 219-file batches: every window
@@ -112,13 +111,11 @@ class PtsAligner(
      * the frame interval; the cap keeps a one-frame offset outside the tolerance when frames are
      * closer together than the floor.
      */
-    fun toleranceUs(): Long = smallestFrameIntervalUs()?.let { minOf(toleranceFloorUs, it / 2) } ?: toleranceFloorUs
+    fun toleranceUs(): Long = smallestFrameIntervalUs()?.let { minOf(toleranceFloorUs, (it - 1) / 2) } ?: toleranceFloorUs
 
     /**
      * Smallest frame interval observed on either stream so far, or null until two frames of one
-     * stream have been seen. Diagnostic only — no decision reads it. Recorded because the fixed
-     * tolerance's one known blind spot is content whose frame interval is at or below the floor,
-     * and closing that honestly needs this observation from real high-frame-rate content.
+     * stream have been seen. Also caps tolerance so adjacent VFR frames remain distinguishable.
      */
     fun smallestFrameIntervalUs(): Long? =
         minOf(minRefGapUs, minDistGapUs).takeIf { it != Long.MAX_VALUE }

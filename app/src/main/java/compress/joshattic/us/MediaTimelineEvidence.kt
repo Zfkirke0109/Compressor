@@ -1,5 +1,11 @@
 package compress.joshattic.us
 
+import android.content.Context
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.net.Uri
+import java.io.File
+
 /**
  * Pure presentation-timeline comparison, separate from quality evidence.
  *
@@ -16,6 +22,7 @@ object MediaTimelineEvidence {
         val maxSkewUs: Long = 0, val firstMismatch: Int? = null, val reason: String? = null)
 
     fun compare(source: LongArray, output: LongArray, toleranceUs: Long = 1000): Result {
+        require(toleranceUs >= 0)
         val sourceOrigin = source.firstOrNull()
         val outputOrigin = output.firstOrNull()
         fun result(matches: Boolean, maxSkew: Long = 0, first: Int? = null, reason: String? = null) =
@@ -40,4 +47,37 @@ object MediaTimelineEvidence {
 
     private fun strictlyIncreasingViolation(pts: LongArray): Int? =
         (1 until pts.size).firstOrNull { pts[it] <= pts[it - 1] }
+    /** Complete compressed-sample presentation timeline; no pixels or sample payloads retained. */
+    fun inspect(context: Context, source: Uri, output: File): Result = try {
+        compare(read(context, source), read(context, Uri.fromFile(output)))
+    } catch (e: Exception) {
+        Result(false, 0, 0, reason = "timeline unavailable: ${e.javaClass.simpleName}")
+    }
+
+    private fun read(context: Context, uri: Uri): LongArray {
+        val extractor = MediaExtractor()
+        try {
+            extractor.setDataSource(context, uri, null)
+            val videos = (0 until extractor.trackCount).filter {
+                extractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
+            }
+            require(videos.size == 1) { "exactly one video track required" }
+            extractor.selectTrack(videos.single())
+            val started = System.nanoTime()
+            val points = ArrayList<Long>()
+            while (extractor.sampleTime >= 0) {
+                require(points.size < 1_000_000) { "timeline sample budget exceeded" }
+                if (points.size % 1024 == 0) {
+                    check(System.nanoTime() - started < 30_000_000_000L) { "timeline time budget exceeded" }
+                    check(!Thread.currentThread().isInterrupted) { "timeline interrupted" }
+                }
+                points.add(extractor.sampleTime)
+                if (!extractor.advance()) break
+            }
+            // Extractor emits compressed samples in decode order when B-frames are present.
+            // The pure comparator consumes presentation order and rejects duplicate timestamps.
+            return points.toLongArray().apply { sort() }
+        } finally { extractor.release() }
+    }
+
 }

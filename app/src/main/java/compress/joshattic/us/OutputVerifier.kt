@@ -75,7 +75,9 @@ object OutputVerifier {
         // How many packets that proof compared (0 when it was not made).
         val audioPacketsCompared: Int = 0,
         // True when the packets were compared and differ: evidence of a re-encode, not a guess.
-        val audioPacketsDiffer: Boolean = false
+        val audioPacketsDiffer: Boolean = false,
+        val videoTimeline: MediaTimelineEvidence.Result? = null,
+        val audioEvidence: AudioTrackIdentity.Outcome? = null
     )
 
     fun verify(
@@ -114,10 +116,13 @@ object OutputVerifier {
         // Compared in every re-encoding mode, not only Perceptually Lossless: a lossy mode that
         // requested an audio copy is otherwise described by its mode name instead of by what its
         // output holds (b177 F5). A measurement only; it adds proof and removes no check.
+        val pl = BatchQualityMode.fromLabel(modeLabel) == BatchQualityMode.PERCEPTUAL_LOSSLESS
+        val timeline = if (pl) MediaTimelineEvidence.inspect(context, source.sourceUri, outputFile) else null
         val audioIdentity = if (BatchQualityMode.fromLabel(modeLabel) != BatchQualityMode.REMUX_ONLY &&
             sourceTracks.audioCodec != null && sourceTracks.audioCodec == outputTracks.audioCodec
         ) {
-            AudioTrackIdentity.compare(context, source.sourceUri, outputFile)
+            AudioTrackIdentity.compare(context, source.sourceUri, outputFile,
+                timeline?.sourceOriginUs, timeline?.outputOriginUs, requirePresentationProof = pl)
         } else {
             null
         }
@@ -157,7 +162,8 @@ object OutputVerifier {
             // A matching audio codec makes packet-copy proof possible in any encode mode.
             audioPacketsIdentical = audioIdentity?.result == AudioTrackIdentity.Result.IDENTICAL,
             audioPacketsCompared = audioIdentity?.packets ?: 0,
-            audioPacketsDiffer = audioIdentity?.result == AudioTrackIdentity.Result.DIFFERENT
+            audioPacketsDiffer = audioIdentity?.result == AudioTrackIdentity.Result.DIFFERENT,
+            videoTimeline = timeline, audioEvidence = audioIdentity
         )
     }
 
@@ -216,10 +222,13 @@ object OutputVerifier {
 
         // Frame-count parity (when the platform exposes it on both files) catches dropped or
         // duplicated frames that metadata-level FPS tolerance cannot see.
-        val frameCountMatches = input.sourceFrameCount <= 0 ||
+        val reportedFrameCountMatches = input.sourceFrameCount <= 0 ||
             input.outputFileProbe.frameCount <= 0 ||
             abs(input.outputFileProbe.frameCount - input.sourceFrameCount) <=
             maxOf(2, (input.sourceFrameCount * 0.01).toInt())
+
+        val frameCountMatches = reportedFrameCountMatches &&
+            (input.mode != BatchQualityMode.PERCEPTUAL_LOSSLESS || input.videoTimeline?.matches == true)
 
         val rotationMatches = sameDisplayOrientation(
             mode = input.mode,
@@ -434,7 +443,7 @@ object OutputVerifier {
         val blockReason = when {
             !playable -> "output did not pass playability verification"
             !durationMatches -> "output duration differs from the source (possible truncation)"
-            !frameCountMatches -> "output video frame count differs from the source"
+            !frameCountMatches -> "complete video timeline not verified: ${input.videoTimeline?.reason ?: "frame count or timeline evidence unavailable"}"
             input.mode == BatchQualityMode.REMUX_ONLY && !criticalFieldsComplete -> "stream-copy verification was incomplete"
             input.mode == BatchQualityMode.REMUX_ONLY && !videoMatches -> "remux output changed resolution"
             input.mode == BatchQualityMode.REMUX_ONLY && !rotationMatches -> "remux output changed display orientation"
@@ -448,7 +457,7 @@ object OutputVerifier {
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !rotationMatches -> "perceptually lossless output changed display orientation"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && fpsComparison != VerificationTransitionStatus.MATCH -> "perceptually lossless output changed FPS"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !bitratePass -> "perceptually lossless output bitrate fell below the verified safety threshold"
-            input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !audioBitratePass -> "perceptually lossless output audio bitrate fell below the verified safety threshold"
+            input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !audioBitratePass -> "audio packet, decoder configuration or A/V timing identity was not proven"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !(hdrMatches && standardMatches && rangeMatches) -> "perceptually lossless output lost HDR/color metadata"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !outputWithinTolerance -> "perceptually lossless output exceeded the allowed size growth tolerance"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !strictlySmaller -> "perceptually lossless output is not smaller than the source, so replacing the original is blocked"
@@ -524,6 +533,16 @@ object OutputVerifier {
             replacementBlockReason = blockReason,
             criticalFieldsComplete = criticalFieldsComplete,
             failedChecks = failedChecks,
+            structuralEvidence = mapOf("videoTimeline" to input.videoTimeline?.let { t -> mapOf(
+                "matches" to t.matches, "sourceFrames" to t.sourceFrames, "outputFrames" to t.outputFrames,
+                "sourceOriginUs" to t.sourceOriginUs, "outputOriginUs" to t.outputOriginUs,
+                "maxSkewUs" to t.maxSkewUs, "firstMismatch" to t.firstMismatch, "reason" to t.reason) },
+                "audioPacketEvidence" to input.audioEvidence?.let { a -> mapOf(
+                    "result" to a.result.name, "packets" to a.packets, "bytes" to a.evidence?.bytes,
+                    "sourceConfigSha256" to a.sourceConfigHash, "outputConfigSha256" to a.outputConfigHash,
+                    "sourcePayloadSha256" to a.evidence?.sourceHash, "outputPayloadSha256" to a.evidence?.outputHash,
+                    "maxSkewUs" to a.evidence?.maxSkewUs, "firstMismatch" to a.evidence?.firstMismatch,
+                    "reason" to a.evidence?.reason) }),
             verified = when (input.mode) {
                 BatchQualityMode.REMUX_ONLY -> remuxVerified
                 BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance

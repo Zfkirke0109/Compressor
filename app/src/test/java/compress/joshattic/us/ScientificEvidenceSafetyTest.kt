@@ -50,6 +50,7 @@ class ScientificEvidenceSafetyTest {
             colorStandard = MediaFormat.COLOR_STANDARD_BT709,
             colorRange = MediaFormat.COLOR_RANGE_LIMITED, colorTransfer = MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
         return OutputVerifier.VerificationInput(
+            videoTimeline = MediaTimelineEvidence.Result(true, 300, 300, 0, 0),
             mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
             source = VideoSourceInfo(width = 1280, height = 720, frameRate = 30f, durationMs = 10_000,
                 totalBitrate = 3_320_000, audioBitrate = 320_000, videoMime = MimeTypes.VIDEO_H264,
@@ -78,4 +79,15 @@ class ScientificEvidenceSafetyTest {
         val output = input.outputTrackProbe.copy(colorStandard = MediaFormat.COLOR_STANDARD_BT601_PAL)
         assertFalse(OutputVerifier.compareColorTransition(BatchQualityMode.PERCEPTUAL_LOSSLESS, source, output).matches)
     }
+    @Test fun absentOrFailedWholeVideoTimelineCannotPassPlStructure() {
+        val input = audioInput().copy(audioPacketsIdentical = true)
+        assertTrue(OutputVerifier.verify(input).verified)
+        for (timeline in listOf(null, MediaTimelineEvidence.Result(false, 300, 299, reason = "missing frame"))) {
+            val report = OutputVerifier.verify(input.copy(videoTimeline = timeline))
+            assertFalse(report.verified)
+            assertTrue("frameCountMatches" in report.failingChecks())
+            assertFalse(report.failedOnlyOnVideoBitrateFloor)
+        }
+    }
+
 }

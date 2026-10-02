@@ -334,6 +334,7 @@ class BatchQualitySafetyTest {
 
         val report = OutputVerifier.verify(
             OutputVerifier.VerificationInput(
+            videoTimeline = MediaTimelineEvidence.Result(true, 300, 300, 0, 0),
                 mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
                 source = VideoSourceInfo(
                     width = 3840,
@@ -390,6 +391,7 @@ class BatchQualitySafetyTest {
         // Real S23 Ultra Transformer+MediaMuxer output: same codec/shape/HDR/profile, bitrates hidden.
         val outputTracks = sourceTracks.copy(videoBitrate = 0, audioBitrate = 0, videoFrameRate = 59f)
         return OutputVerifier.VerificationInput(
+            videoTimeline = MediaTimelineEvidence.Result(true, 300, 300, 0, 0),
             mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
             source = VideoSourceInfo(
                 width = 2160,
@@ -475,6 +477,7 @@ class BatchQualitySafetyTest {
 
         val report = OutputVerifier.verify(
             OutputVerifier.VerificationInput(
+            videoTimeline = MediaTimelineEvidence.Result(true, 300, 300, 0, 0),
                 mode = BatchQualityMode.REMUX_ONLY,
                 source = VideoSourceInfo(
                     width = 3840,
@@ -640,6 +643,7 @@ class BatchQualitySafetyTest {
 
         val report = OutputVerifier.verify(
             OutputVerifier.VerificationInput(
+            videoTimeline = MediaTimelineEvidence.Result(true, 300, 300, 0, 0),
                 mode = BatchQualityMode.REMUX_ONLY,
                 source = VideoSourceInfo(
                     width = 1440,
@@ -1111,6 +1115,7 @@ class BatchQualitySafetyTest {
         )
         val report = OutputVerifier.verify(
             OutputVerifier.VerificationInput(
+            videoTimeline = MediaTimelineEvidence.Result(true, 300, 300, 0, 0),
                 mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
                 source = VideoSourceInfo(
                     width = 2160,
@@ -1281,6 +1286,7 @@ class BatchQualitySafetyTest {
     fun perceptuallyLosslessFailsVerificationOnHdrAndBitrateLoss() {
         val report = OutputVerifier.verify(
             OutputVerifier.VerificationInput(
+            videoTimeline = MediaTimelineEvidence.Result(true, 300, 300, 0, 0),
                 mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
                 source = VideoSourceInfo(
                     width = 3840,
@@ -1343,6 +1349,7 @@ class BatchQualitySafetyTest {
     fun remuxOnlyRequiresCompleteVerificationBeforeReplacement() {
         val report = OutputVerifier.verify(
             OutputVerifier.VerificationInput(
+            videoTimeline = MediaTimelineEvidence.Result(true, 300, 300, 0, 0),
                 mode = BatchQualityMode.REMUX_ONLY,
                 source = VideoSourceInfo(
                     width = 3840,
@@ -1414,6 +1421,7 @@ class BatchQualitySafetyTest {
     fun missingCriticalFieldsMakePerceptualLosslessUnverified() {
         val report = OutputVerifier.verify(
             OutputVerifier.VerificationInput(
+            videoTimeline = MediaTimelineEvidence.Result(true, 300, 300, 0, 0),
                 mode = BatchQualityMode.PERCEPTUAL_LOSSLESS,
                 source = VideoSourceInfo(width = 3840, height = 2160, frameRate = 60f, durationMs = 1_000, totalBitrate = 80_000_000, audioBitrate = 256_000),
                 outputFileProbe = OutputVerifier.FileProbe(3840, 2160, 0f, 1_000, 0),
@@ -1435,6 +1443,7 @@ class BatchQualitySafetyTest {
     fun dateWordingSeparatesMediaStoreAndMp4Metadata() {
         val report = OutputVerifier.verify(
             OutputVerifier.VerificationInput(
+            videoTimeline = MediaTimelineEvidence.Result(true, 300, 300, 0, 0),
                 mode = BatchQualityMode.HIGH_QUALITY,
                 source = VideoSourceInfo(width = 1920, height = 1080, frameRate = 30f, durationMs = 1_000, totalBitrate = 10_000_000, audioBitrate = 128_000),
                 outputFileProbe = OutputVerifier.FileProbe(1920, 1080, 30f, 1_000, 0),

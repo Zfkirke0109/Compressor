@@ -137,7 +137,8 @@ data class OutputVerificationReport(
     //   null - no scope-based derivation (legacy/synthetic report, or a mode with no scope)
     //   []   - derived: every predicate in scope passed
     //   [..] - derived: these predicates failed
-    val failedChecks: List<String>? = null
+    val failedChecks: List<String>? = null,
+    val structuralEvidence: Map<String, Any?> = emptyMap()
 ) {
     /**
      * Names of the per-field checks that did NOT pass, for diagnosing a rejection.
