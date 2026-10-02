@@ -38,6 +38,11 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         fun read(key: String): String?
         fun write(key: String, value: String)
 
+        fun writeObservation(key: String, value: String, observation: LearningObservation?): Boolean {
+            write(key, value)
+            return true
+        }
+
         /** Every stored entry, for recording an experiment's starting state. */
         fun snapshot(): Map<String, String>
 

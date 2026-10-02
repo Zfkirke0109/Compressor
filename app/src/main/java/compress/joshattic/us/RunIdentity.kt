@@ -190,6 +190,12 @@ object EncoderInventory {
         "CBR_FD".takeIf { Build.VERSION.SDK_INT >= 31 && supported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR_FD) }
     )
 
+    internal fun advertisesTenBit(mime: String, profiles: List<Int>): Boolean = profiles.any {
+        it == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10 ||
+            it == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10 ||
+            it == MediaCodecInfo.CodecProfileLevel.AV1ProfileMain10
+    }
+
     fun snapshot(): List<Entry> = runCatching {
         MediaCodecList(MediaCodecList.ALL_CODECS).codecInfos.filter { it.isEncoder }.flatMap { info ->
             info.supportedTypes.filter { it.lowercase(Locale.US) in MIMES }.mapNotNull { mime ->
