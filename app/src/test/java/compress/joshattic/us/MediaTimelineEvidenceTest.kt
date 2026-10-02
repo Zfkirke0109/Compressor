@@ -34,4 +34,35 @@ class MediaTimelineEvidenceTest {
     @Test fun changedPacketFlagsCannotProveTheSamePresentation() {
         assertFalse(AudioPacketEvidence.compare(packets(),packets(flags=0),"configA","configA",0,0).identical)
     }
+    @Test fun payloadHashesCoverTheFullStreamsWhenPacketCountsDiffer() {
+        val source = listOf(
+            AudioPacketEvidence.Packet(byteArrayOf(1, 2, 3), 0, 1),
+            AudioPacketEvidence.Packet(byteArrayOf(4, 5, 6), 23000, 1),
+            AudioPacketEvidence.Packet(byteArrayOf(7, 8, 9), 46000, 1),
+            AudioPacketEvidence.Packet(byteArrayOf(10, 11, 12), 69000, 1)
+        ).iterator()
+        val output = listOf(
+            AudioPacketEvidence.Packet(byteArrayOf(1, 2, 3), 0, 1),
+            AudioPacketEvidence.Packet(byteArrayOf(4, 5, 6), 23000, 1),
+            AudioPacketEvidence.Packet(byteArrayOf(7, 8, 9), 46000, 1)
+        ).iterator()
+        val compared = AudioPacketEvidence.compare(source, output, "configA", "configA", 0, 0)
+        val equalPrefixOnly = AudioPacketEvidence.compare(
+            listOf(
+                AudioPacketEvidence.Packet(byteArrayOf(1, 2, 3), 0, 1),
+                AudioPacketEvidence.Packet(byteArrayOf(4, 5, 6), 23000, 1),
+                AudioPacketEvidence.Packet(byteArrayOf(7, 8, 9), 46000, 1)
+            ).iterator(),
+            listOf(
+                AudioPacketEvidence.Packet(byteArrayOf(1, 2, 3), 0, 1),
+                AudioPacketEvidence.Packet(byteArrayOf(4, 5, 6), 23000, 1),
+                AudioPacketEvidence.Packet(byteArrayOf(7, 8, 9), 46000, 1)
+            ).iterator(),
+            "configA", "configA", 0, 0
+        )
+        assertFalse(compared.identical)
+        assertEquals("packet count differs", compared.reason)
+        assertNotEquals(equalPrefixOnly.sourceHash, compared.sourceHash)
+        assertEquals(equalPrefixOnly.outputHash, compared.outputHash)
+    }
 }

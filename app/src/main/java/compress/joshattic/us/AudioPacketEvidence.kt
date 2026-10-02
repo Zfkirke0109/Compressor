@@ -52,7 +52,12 @@ object AudioPacketEvidence {
             }
             packets++
         }
-        if (source.hasNext() || output.hasNext()) {
+        val countDiffers = source.hasNext() || output.hasNext()
+        // Keep payload digests bound to the full packet streams even when count differs. Prefix-only
+        // hashes lose provenance for the unmatched tail and can make two distinct mismatches look equal.
+        while (source.hasNext()) sourceDigest.update(source.next().payload)
+        while (output.hasNext()) outputDigest.update(output.next().payload)
+        if (countDiffers) {
             if (firstMismatch == null) firstMismatch = packets
             if (reason == null) reason = "packet count differs"
         }
