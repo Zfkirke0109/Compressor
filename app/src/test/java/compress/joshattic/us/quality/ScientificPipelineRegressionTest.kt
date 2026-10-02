@@ -4,6 +4,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ScientificPipelineRegressionTest {
+    @Test fun veryCloseVfrFramesCannotHideAnInternalOffsetInsideFourMilliseconds() {
+        val a = PtsAligner()
+        a.onRefFrame(0); a.onDistFrame(0); assertEquals(PtsAligner.Action.PAIR,a.decide(0,0))
+        a.onRefFrame(1000); a.onDistFrame(2000)
+        assertEquals(PtsAligner.Action.FAIL,a.decide(1000,2000))
+    }
+    @Test fun repeatedOrReversedPtsAreNotScoredAsFreshFrames() {
+        val a = PtsAligner()
+        a.onRefFrame(0); a.onDistFrame(0); a.decide(0,0)
+        a.onRefFrame(0); a.onDistFrame(0)
+        assertEquals(PtsAligner.Action.FAIL,a.decide(0,0))
+    }
     @Test fun inaccessibleHardWindowsCannotCollapseOntoTheOpeningScene() {
         val index = object : ProbeWindowPlanner.SyncSampleIndex {
             override fun previousSyncUs(targetUs: Long) = 0L
