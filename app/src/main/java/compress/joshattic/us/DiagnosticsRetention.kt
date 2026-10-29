@@ -12,6 +12,10 @@ object DiagnosticsRetention {
 
     const val MAX_RUNS = 30
 
+    /** Reserve the incoming directory without counting a resumed run twice. */
+    fun runsToPruneBeforeStart(runDirectoryNames: Collection<String>, incoming: String): List<String> =
+        runsToPrune((runDirectoryNames + incoming).distinct())
+
     /** Run directory names to delete: everything past the newest [keep], oldest first. */
     fun runsToPrune(runDirectoryNames: Collection<String>, keep: Int = MAX_RUNS): List<String> {
         require(keep >= 0) { "keep must be non-negative, was $keep" }

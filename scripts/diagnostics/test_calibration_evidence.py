@@ -13,6 +13,19 @@ class EvidenceTest(unittest.TestCase):
         self.assertEqual(len(r['accepted']),1);self.assertEqual(len(r['errors']),1)
         r=replay_ledger([self.event('RESERVED','PIPELINE'),self.event(kind='PIPELINE')], 'current')
         self.assertEqual(r['accepted'],[])
+    def test_same_encoder_point_on_different_device_profiles_replays_separately(self):
+        events=[]
+        for profile in ('samsung|sm-s918u1|37', 'samsung|sm-s948u|37'):
+            events.extend([dict(self.event('RESERVED'), profileKey=profile),
+                           dict(self.event(), profileKey=profile)])
+        r=replay_ledger(events, 'current')
+        self.assertEqual(r['errors'], [])
+        self.assertEqual(len(r['accepted']), 2)
+        self.assertEqual(set(r['finalProfiles']), {'samsung|sm-s918u1|37', 'samsung|sm-s948u|37'})
+    def test_another_devices_reservation_cannot_authorize_an_effect(self):
+        r=replay_ledger([self.event('RESERVED'),dict(self.event(), profileKey='other-device')], 'current')
+        self.assertTrue(r['errors'])
+        self.assertEqual(r['accepted'], [])
     def test_epochs_are_quarantined_and_unreserved_effects_are_invalid(self):
         r=replay_ledger([self.event('RESERVED',epoch='old'),self.event(epoch='old')], 'current')
         self.assertEqual(len(r['quarantined']),1)

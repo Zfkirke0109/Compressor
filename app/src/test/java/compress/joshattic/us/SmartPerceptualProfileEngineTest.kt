@@ -302,6 +302,21 @@ class SmartPerceptualProfileEngineTest {
         assertEquals(1.0, e.expectedOvershootFactor(keyFor(hdr1080pHevc, MimeTypes.VIDEO_H265)), 1e-9)
     }
 
+    @Test fun s23OvershootMeasurementsDoNotSeedTheS26OrOtherEncoders() {
+        val e = engine()
+        for ((manufacturer, model) in listOf("samsung" to "SM-S948U", "other" to "SM-S918B")) {
+            val k = SmartPerceptualProfileEngine.profileKeyFor(hdr4k60Source(), MimeTypes.VIDEO_H265,
+                manufacturer, model, 37)
+            assertEquals(1.0, e.expectedOvershootFactor(k), 1e-9)
+        }
+        val s23 = SmartPerceptualProfileEngine.profileKeyFor(hdr4k60Source(), MimeTypes.VIDEO_H265,
+            "samsung", "SM-S918U1", 37)
+        val s26 = s23.copy(model = "SM-S948U")
+        e.recordVerifiedSuccess(s23, 0.95, 0.90, 0.80, measuredOvershootFactor = 1.5)
+        assertEquals(1.0, e.expectedOvershootFactor(s26), 1e-9)
+        assertNotEquals(s23.asKey(), s26.asKey())
+    }
+
     @Test
     fun probeSkipLatchIsDecayingAndEvidenceOnly() {
         val e = engine()

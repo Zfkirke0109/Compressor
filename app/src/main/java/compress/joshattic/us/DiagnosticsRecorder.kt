@@ -598,7 +598,7 @@ class DiagnosticsRecorder private constructor(
             // are no longer wanted.
             runCatching {
                 val names = runDirectories(context).map { it.name }
-                DiagnosticsRetention.runsToPrune(names).forEach { name ->
+                DiagnosticsRetention.runsToPruneBeforeStart(names, batchId).forEach { name ->
                     File(context.filesDir, "diagnostics/$name").deleteRecursively()
                 }
             }

@@ -6,6 +6,13 @@ import org.junit.Test
 
 class DiagnosticsRetentionTest {
 
+    @Test fun startingTheThirtyFirstRunReservesASlotBeforeWriting() {
+        val names = (1..30).map { "batch_$it" }
+        assertEquals(listOf("batch_1"), DiagnosticsRetention.runsToPruneBeforeStart(names, "batch_31"))
+        assertTrue(DiagnosticsRetention.runsToPruneBeforeStart(names, "batch_30").isEmpty())
+        assertEquals(emptyList<String>(), DiagnosticsRetention.runsToPruneBeforeStart(names.take(29), "selfcheck_31"))
+    }
+
     @Test
     fun keepsTheNewestRunsAndNamesTheOldestToPruneFirst() {
         val names = (1..35).map { "batch_${1_790_000_000_000L + it * 1000}" } + "crashes"

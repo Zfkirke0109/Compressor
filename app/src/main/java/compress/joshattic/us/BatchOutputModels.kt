@@ -61,6 +61,8 @@ enum class MetadataPrivacyMode(
 }
 
 enum class BatchPresetOption(val label: String) {
+    S26_BEST("S26 Ultra Best Quality"),
+    S26_STORAGE("S26 Ultra Storage Saver"),
     S23_BEST("S23 Ultra Best Quality"),
     S23_STORAGE("S23 Ultra Storage Saver"),
     SOCIAL("Social Upload"),
@@ -68,6 +70,12 @@ enum class BatchPresetOption(val label: String) {
     HDR_SAFE("HDR Safe Mode");
 
     companion object {
+        fun forDevice(profile: DeviceCapabilityProfile): List<BatchPresetOption> = when {
+            profile.isGalaxyS26Ultra -> listOf(S26_BEST, S26_STORAGE, SOCIAL, ARCHIVE, HDR_SAFE)
+            profile.isGalaxyS23Ultra -> listOf(S23_BEST, S23_STORAGE, SOCIAL, ARCHIVE, HDR_SAFE)
+            else -> listOf(SOCIAL, ARCHIVE, HDR_SAFE)
+        }
+
         fun fromLabel(label: String): BatchPresetOption? {
             return entries.firstOrNull { it.label == label }
         }

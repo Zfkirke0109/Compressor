@@ -61,6 +61,7 @@ import compress.joshattic.us.quality.scoredWindows
 import compress.joshattic.us.quality.PairScoreOutcome
 import compress.joshattic.us.quality.SaferRungRetry
 import compress.joshattic.us.quality.PerceptualQualityProber
+import compress.joshattic.us.quality.PerceptualCodecFallbackPolicy
 import compress.joshattic.us.quality.QualityProbePolicy
 import compress.joshattic.us.quality.ExhaustivePerceptualLosslessPolicy
 import compress.joshattic.us.quality.KeyframeIntervalPolicy
@@ -490,19 +491,20 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             val largest = state.items.maxOfOrNull { it.originalSize } ?: 0L
             val highFps = state.items.any { it.originalFps >= 50f }
             val qualityLabel = when (preset) {
-                BatchPresetOption.S23_BEST -> BatchQualityPreset.ORIGINAL.label
-                BatchPresetOption.S23_STORAGE -> if (largest >= 900L * 1024L * 1024L) BatchQualityPreset.MEDIUM.label else BatchQualityPreset.HIGH.label
+                BatchPresetOption.S26_BEST, BatchPresetOption.S23_BEST -> BatchQualityPreset.ORIGINAL.label
+                BatchPresetOption.S26_STORAGE, BatchPresetOption.S23_STORAGE -> if (largest >= 900L * 1024L * 1024L) BatchQualityPreset.MEDIUM.label else BatchQualityPreset.HIGH.label
                 BatchPresetOption.SOCIAL -> BatchQualityPreset.MEDIUM.label
                 BatchPresetOption.ARCHIVE -> BatchQualityPreset.ORIGINAL.label
                 BatchPresetOption.HDR_SAFE -> BatchQualityPreset.ORIGINAL.label
             }
             val codecLabel = when (preset) {
                 BatchPresetOption.SOCIAL -> BatchCodecOption.H264.label
+                BatchPresetOption.S26_BEST, BatchPresetOption.S23_BEST -> BatchCodecOption.AUTO.label
                 else -> BatchCodecOption.HEVC.label
             }
             val fpsLabel = when (preset) {
                 BatchPresetOption.SOCIAL -> BatchFrameRateOption.FPS30.label
-                BatchPresetOption.S23_STORAGE -> if (largest >= 900L * 1024L * 1024L && highFps) BatchFrameRateOption.FPS30.label else BatchFrameRateOption.ORIGINAL.label
+                BatchPresetOption.S26_STORAGE, BatchPresetOption.S23_STORAGE -> if (largest >= 900L * 1024L * 1024L && highFps) BatchFrameRateOption.FPS30.label else BatchFrameRateOption.ORIGINAL.label
                 else -> BatchFrameRateOption.ORIGINAL.label
             }
             val quality = qualityFromLabel(qualityLabel)
@@ -1358,7 +1360,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val run = s.run
         val item = s.item
         val quality = run.quality
-        val resolvedMime = if (quality == BatchQualityPreset.REMUX_ONLY) {
+        var resolvedMime = if (quality == BatchQualityPreset.REMUX_ONLY) {
             null
         } else {
             chooseOutputMime(run.codec, item, quality)
@@ -1376,7 +1378,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 EncoderExperiments.isLongGopEnabled(run.context)
             )
         }
-        val perceptualPlan = if (quality == BatchQualityPreset.ORIGINAL && resolvedMime != null) {
+        var perceptualPlan = if (quality == BatchQualityPreset.ORIGINAL && resolvedMime != null) {
             val basePlan = buildPerceptualLosslessPlan(item, resolvedMime, run.exhaustivePerceptualLossless)
             if (basePlan.probeEligible) {
                 s.phases.enter(ItemPhase.PROBING)
@@ -1416,8 +1418,18 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         } else {
             null
         }
-        s.perceptualPlan = perceptualPlan
         perceptualPlan?.let { emitProbeEvidence(s, it) }
+        if (resolvedMime != null && perceptualPlan != null) {
+            val alternate = probeAlternateCodec(s, resolvedMime, perceptualPlan)
+            if (alternate != null) {
+                resolvedMime = MimeTypes.VIDEO_H264
+                perceptualPlan = alternate
+                s.resolvedMime = resolvedMime
+                s.diagnosticResolvedMime = resolvedMime
+                s.codecLabel = "H.264"
+            }
+        }
+        s.perceptualPlan = perceptualPlan
         s.diagnosticTargetRatio = perceptualPlan?.targetRatio
         s.diagnosticDecisionReason = perceptualPlan?.skipReason ?: perceptualPlan?.remuxReason
         s.diagnosticTargetVideoBitrate = resolvedMime?.let {
@@ -1469,6 +1481,43 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         return true
     }
 
+    /** Additional measured search only; manual codec requests and a winning HEVC plan stay put. */
+    private suspend fun probeAlternateCodec(
+        s: ItemRun,
+        primaryMime: String,
+        primary: PerceptualLosslessPlan
+    ): PerceptualLosslessPlan? {
+        val policy = PerceptualCodecFallbackPolicy
+        if (!policy.shouldProbeAvc(
+                source = s.item.toSourceInfo(), autoCodec = s.run.codec == BatchCodecOption.AUTO,
+                exhaustive = s.run.exhaustivePerceptualLossless, primaryMime = primaryMime,
+                primaryMeasuredRejected = primary.skipReason != null,
+                primaryPredictedNotSmaller = primary.sizeGateVerdict == "keep_original",
+                sourceParseFailed = primary.sourceParseFailure != null
+            ) || !hasEncoder(MimeTypes.VIDEO_H264, s.item.toSourceInfo())) return null
+        s.phases.message("Trying H.264: measuring another encoder against the same PL gate…")
+        val base = buildPerceptualLosslessPlan(s.item, MimeTypes.VIDEO_H264, exhaustive = true)
+        val alternate = refinePlanWithPixelProbes(
+            s.item, MimeTypes.VIDEO_H264, base, true, s.iFrameIntervalSeconds, s.transformerInputUri,
+            alternateCodecSearch = true
+        )
+        emitProbeEvidence(s, alternate)
+        val selected = policy.canSelect(alternate.pixelProvenRatio, alternate.preferRemux,
+            alternate.skipReason, alternate.sizeGateVerdict)
+        s.run.diagnostics.stage(StageEvent(
+            sourceKey = s.item.sourceUri.toString(), attempt = s.phases.token.attempt,
+            attemptIndex = s.ledger.currentIndex, stage = StageEvent.Stage.PLAN,
+            reasonCode = "alternate_codec_search", elapsedMs = s.elapsedMs,
+            fields = mapOf("primaryMime" to primaryMime, "alternateMime" to MimeTypes.VIDEO_H264,
+                "selectedMime" to if (selected) MimeTypes.VIDEO_H264 else primaryMime,
+                "alternateProbeRungId" to alternate.probeRungId, "alternateDetail" to alternate.probeDetail)
+        ))
+        return alternate.takeIf { selected }?.copy(
+            requiresMeasuredCertification = true,
+            probeDetail = "Auto selected H.264 after HEVC could not provide a measured smaller plan; ${alternate.probeDetail}"
+        )
+    }
+
     /**
      * One `probe_rung` event per rung the ladder tried, then the `size_gate` event when the gate
      * ran (b177 F4): production emissions, full precision, with window ids and the config id the
@@ -1488,6 +1537,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     elapsedMs = s.elapsedMs,
                     fields = linkedMapOf<String, Any?>(
                         "rungIndex" to i,
+                        "outputMime" to plan.profileKey.encoderMime.substringBefore(';'),
                         "rungId" to rung.id,
                         "ratio" to rung.ratio,
                         "verdict" to rung.verdict,
@@ -1510,6 +1560,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 reasonCode = if (verdict == "encode") StageEvent.Reason.GATE_ENCODE else StageEvent.Reason.GATE_KEEP_ORIGINAL,
                 elapsedMs = s.elapsedMs,
                 fields = mapOf(
+                    "outputMime" to plan.profileKey.encoderMime.substringBefore(';'),
                     "provenRatio" to plan.pixelProvenRatio,
                     "probeRungId" to plan.probeRungId,
                     "predictedBytes" to plan.sizeGatePredictedBytes,
@@ -1974,6 +2025,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
      * be made. At most one attempt per item.
      */
     private suspend fun normaliseMedia3Input(s: ItemRun, failure: SourceParseFailure): Boolean {
+        // The platform rewrite can drop internal samples. Only PL compares the entire output
+        // timeline and audio with the ORIGINAL; lossy playability alone cannot prove completeness.
+        if (s.run.quality != BatchQualityPreset.ORIGINAL) {
+            s.diagnosticMedia3Input = "normalisation blocked: this mode cannot prove complete source preservation"
+            return false
+        }
         if (s.media3InputAttempted) return s.media3Input != null
         s.media3InputAttempted = true
         val item = s.item
@@ -3756,7 +3813,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         exhaustive: Boolean,
         iFrameIntervalSeconds: Float,
         // What Media3 reads to cut the probe clips: the source, or its normalised copy.
-        transformerInputUri: Uri = item.sourceUri
+        transformerInputUri: Uri = item.sourceUri,
+        alternateCodecSearch: Boolean = false
     ): PerceptualLosslessPlan {
         if (!plan.probeEligible) return plan
         // HDR and codec-downgrade plans never probe; those gates are not inference.
@@ -3766,9 +3824,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // first-ever measured trials); far-below-gate sources get none — for them even a
         // safest-rung pass would save less than measurement noise, so inference stands.
         val bpp = BatchQualityBitratePolicy.sourceBitsPerPixelPerFrame(source)
-        val candidates = ExhaustivePerceptualLosslessPolicy.candidateRatios(
-            plan.defaultRatio, bpp, exhaustive, shortLadder = plan.shortProbeLadder
-        )
+        val candidates = if (alternateCodecSearch) {
+            PerceptualCodecFallbackPolicy.CANDIDATE_RATIOS
+        } else {
+            ExhaustivePerceptualLosslessPolicy.candidateRatios(
+                plan.defaultRatio, bpp, exhaustive, shortLadder = plan.shortProbeLadder
+            )
+        }
         if (candidates.isEmpty()) return plan
         if (plan.shortProbeLadder) {
             DiagLog.i(
@@ -3824,9 +3886,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 )
             },
             audioBitrate = calculateAudioBitrate(item, BatchQualityPreset.ORIGINAL),
-            allowDownwardRefinement = !plan.shortProbeLadder,
+            allowDownwardRefinement = !plan.shortProbeLadder && !alternateCodecSearch,
             shape = shape,
-            budgetMs = ExhaustivePerceptualLosslessPolicy.probeBudgetMs(plan.shortProbeLadder),
+            budgetMs = if (alternateCodecSearch) PerceptualCodecFallbackPolicy.PROBE_BUDGET_MS
+                else ExhaustivePerceptualLosslessPolicy.probeBudgetMs(plan.shortProbeLadder),
             sourceFps = item.originalFps.toDouble(),
             transformerInputUri = transformerInputUri,
             traceRequest = frameTrace(item, "probe")
@@ -4547,7 +4610,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 StageEvent.terminal(
                     sourceKey = item.sourceUri.toString(), attempt = stageAttempt,
                     attemptIndex = attempts?.currentIndex ?: 0, terminal = terminal,
-                    keptOutputBytes = recordedOutputSize, candidateBytes = acceptance.candidateBytes,
+                    keptOutputBytes = acceptance.acceptedOutputBytes, candidateBytes = acceptance.candidateBytes,
                     elapsedMs = elapsedMs
                 )
             )

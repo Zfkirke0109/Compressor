@@ -9,6 +9,18 @@ import org.junit.Test
 
 class DiagnosticEventsTest {
 
+    @Test fun retainedOriginalsHaveNoAcceptedOutputBytesInTheTerminalEvent() {
+        val final = FinalAcceptance.of(
+            BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED, null, 1_000_000L, null,
+            retainedVerdict = "Original retained", retainedReadable = true
+        )
+        val event = StageEvent.terminal("source", 1, 0, BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED,
+            final.acceptedOutputBytes, final.candidateBytes, 1L)
+        assertFalse(final.accepted)
+        assertEquals(0L, event.fields["keptBytes"])
+        assertEquals(StageEvent.Reason.REJECTED, event.reasonCode)
+    }
+
     @Test
     fun everyTerminalPathGetsAnAcceptEventThatSaysWhatWasKept() {
         // A probe skip: nothing produced, nothing kept.

@@ -155,7 +155,7 @@ private fun BatchCompressorScreen(
                     colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
                 ) {
                     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("Samsung Galaxy S23 Ultra optimized", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Text(state.deviceProfile, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                         Text(
                             "Default is Perceptually Lossless: keep 4K as 4K, keep source FPS/audio, and fall back to Remux Only if safety cannot be verified.",
                             style = MaterialTheme.typography.bodyMedium,
@@ -764,15 +764,11 @@ private fun BatchSettingsCard(
             val remuxOnly = state.qualityPreset == "Remux Only"
             Text("Batch settings", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
 
-            Text("S23 Ultra presets", style = MaterialTheme.typography.labelLarge)
+            val deviceProfile = remember { DeviceCapabilityProfiles.current() }
+            Text("${deviceProfile.presetFamily} presets", style = MaterialTheme.typography.labelLarge)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf(
-                    "S23 Ultra Best Quality",
-                    "S23 Ultra Storage Saver",
-                    "Social Upload",
-                    "Archive Mode",
-                    "HDR Safe Mode"
-                ).forEach { label ->
+                BatchPresetOption.forDevice(deviceProfile).forEach { preset ->
+                    val label = preset.label
                     FilterChip(
                         selected = state.selectedPreset == label,
                         onClick = { viewModel.applyPreset(label) },

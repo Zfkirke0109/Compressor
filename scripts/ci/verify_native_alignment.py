@@ -29,6 +29,7 @@ import zipfile
 PAGE = 16384
 ELF_MAGIC = b"\x7fELF"
 PT_LOAD = 1
+REQUIRED_LIBRARIES = {"lib/arm64-v8a/libcompressorvmaf.so"}
 
 
 def load_segment_alignments(blob: bytes) -> list[int]:
@@ -54,13 +55,18 @@ def data_offset(raw: bytes, info: zipfile.ZipInfo) -> int:
 
 
 def check(apk_path: str) -> bool:
-    raw = open(apk_path, "rb").read()
+    with open(apk_path, "rb") as source:
+        raw = source.read()
     ok = True
     with zipfile.ZipFile(apk_path) as z:
         sos = [i for i in z.infolist() if i.filename.endswith(".so")]
         if not sos:
             print("  FAIL  no native libraries packaged (expected at least libcompressorvmaf.so)")
             return False
+        missing = REQUIRED_LIBRARIES - {i.filename for i in sos}
+        if missing:
+            print(f"  FAIL  missing production native libraries: {', '.join(sorted(missing))}")
+            ok = False
         for info in sos:
             aligns = load_segment_alignments(z.read(info))
             off = data_offset(raw, info)

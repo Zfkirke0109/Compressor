@@ -13,6 +13,7 @@ class LearningEvidenceStore(
     private val seen = mutableSetOf<String>()
     private var writable = true
     private val idPattern = Regex("\\\"evidenceId\\\": \\\"([0-9a-f]{64})\\\"")
+    private val profilePattern = Regex(""""profileKey": ("(?:\\.|[^"\\])*")""")
     init {
         runCatching {
             if (journal.exists()) {
@@ -20,7 +21,9 @@ class LearningEvidenceStore(
                 journal.bufferedReader().useLines { lines -> lines.forEach { line ->
                     require(line.endsWith("}")) { "incomplete ledger tail; aggregate learning paused" }
                     if (line.contains("\"ledgerEvent\": \"RESERVED\"")) {
-                        seen += checkNotNull(idPattern.find(line)?.groupValues?.get(1))
+                        val id = checkNotNull(idPattern.find(line)?.groupValues?.get(1))
+                        val profileJson = checkNotNull(profilePattern.find(line)?.groupValues?.get(1))
+                        seen += scopedId(profileJson, id)
                     }
                     if (line.contains("\"ledgerEvent\": \"RESET\"")) seen.clear()
                 } }
@@ -44,12 +47,16 @@ class LearningEvidenceStore(
             append(fields + mapOf("ledgerEvent" to "IGNORED", "effectApplied" to false, "reason" to "unbound-incompatible-or-nonvisual-nonsize"))
             return false
         }
-        if (observation.id in seen) {
+        // A migrated S23 ledger must not suppress an S26 measurement merely because both
+        // platforms call their encoder c2.qti.hevc.encoder. The persisted profile includes
+        // manufacturer/model/SDK and configuration; preserve dedup within that profile.
+        val scopedId = scopedId(JsonText.render(key), observation.id)
+        if (scopedId in seen) {
             append(fields + mapOf("ledgerEvent" to "DUPLICATE", "effectApplied" to false))
             return false
         }
         if (!append(fields + mapOf("ledgerEvent" to "RESERVED", "effectApplied" to null))) return false
-        seen += observation.id
+        seen += scopedId
         delegate.write(key, value)
         append(fields + mapOf("eventId" to UUID.randomUUID().toString(), "ledgerEvent" to "APPLIED", "effectApplied" to true, "after" to value))
         return true
@@ -61,6 +68,8 @@ class LearningEvidenceStore(
             delegate.clear(); seen.clear()
         }
     }
+
+    private fun scopedId(profileJson: String, evidenceId: String): String = "$profileJson\u0000$evidenceId"
 
     private fun append(fields: Map<String, Any?>): Boolean {
         val ok = writable && runCatching {

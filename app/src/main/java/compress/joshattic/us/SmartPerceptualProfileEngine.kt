@@ -505,13 +505,15 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
          * measurement immediately supersedes the seed.
          */
         internal fun seededDefaultOvershoot(key: EncodeProfileKey): Double {
+            val measuredDevice = key.manufacturer.equals("samsung", ignoreCase = true) &&
+                key.model.startsWith("SM-S918", ignoreCase = true)
             // substringBefore: an experiment's key carries a configuration suffix (EncoderExperiments).
             val hevcToHevc = key.encoderMime.substringBefore(';').equals(MimeTypes.VIDEO_H265, ignoreCase = true) &&
                 key.sourceCodec.equals(MimeTypes.VIDEO_H265, ignoreCase = true)
             val highResolution = key.resolutionBucket == "4k" || key.resolutionBucket == "8k"
             val highFrameRate = key.fpsBucket == "60" || key.fpsBucket == "120"
             val hdr = key.hdrBucket.startsWith("pq") || key.hdrBucket.startsWith("hlg")
-            return if (hevcToHevc && highResolution && highFrameRate && hdr) {
+            return if (measuredDevice && hevcToHevc && highResolution && highFrameRate && hdr) {
                 SEEDED_NEAR_CEILING_OVERSHOOT
             } else {
                 DEFAULT_OVERSHOOT_FACTOR

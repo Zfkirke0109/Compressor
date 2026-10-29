@@ -45,6 +45,7 @@ class RungEvidenceTest {
         assertNotEquals(probe, EncodeConfigIdentity.of("video/hevc", "VBR", 3f, 2, 780_495))
         assertNotEquals(probe, EncodeConfigIdentity.of("video/hevc", "VBR", 3f, 0, 826_407))
         assertNotEquals(probe, EncodeConfigIdentity.of("video/hevc", "CBR", 3f, 2, 826_407))
+        assertNotEquals(probe, EncodeConfigIdentity.of("video/avc", "VBR", 3f, 2, 826_407))
         assertEquals(12, probe.length)
     }
 

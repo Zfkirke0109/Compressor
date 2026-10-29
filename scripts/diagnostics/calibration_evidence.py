@@ -15,6 +15,7 @@ def replay_ledger(events, epoch):
     for index, raw in enumerate(events):
         event = raw.get('fields', raw)
         kind, identity = event.get('ledgerEvent'), event.get('evidenceId')
+        scope = (event.get('profileKey'), identity)
         if kind == 'RESET':
             result['uncertain'].extend(reserved.values()); reserved.clear(); applied.clear(); final_profiles.clear()
             continue
@@ -24,20 +25,20 @@ def replay_ledger(events, epoch):
         if not identity or event.get('durablyJournaled') is False:
             result['errors'].append(dict(index=index,reason='missing identity or journal write failed')); continue
         if kind == 'RESERVED':
-            if identity in reserved or identity in applied:
+            if scope in reserved or scope in applied:
                 result['errors'].append(dict(index=index,reason='duplicate reservation',evidenceId=identity))
-            else: reserved[identity] = event
+            else: reserved[scope] = event
             continue
-        reservation = reserved.pop(identity, None)
-        if reservation is None or identity in applied:
+        reservation = reserved.pop(scope, None)
+        if reservation is None or scope in applied:
             result['errors'].append(dict(index=index,reason='unreserved or repeated effect',evidenceId=identity)); continue
-        applied.add(identity)
+        applied.add(scope)
         observation = event.get('observation') or {}
         if observation != reservation.get('observation') or event.get('after') != reservation.get('proposedAfter'):
             result['errors'].append(dict(index=index,reason='reservation/effect mismatch',evidenceId=identity)); continue
         if observation.get('kind') not in ('VISUAL_PASS','VISUAL_REJECT','SIZE'):
             result['errors'].append(dict(index=index,reason='non-training evidence changed aggregate',evidenceId=identity)); continue
-        row=dict(evidenceId=identity,**observation)
+        row=dict(observation, evidenceId=identity, profileKey=event.get('profileKey'))
         if observation.get('policyEpoch') != epoch: result['quarantined'].append(row)
         else:
             result['accepted'].append(row)

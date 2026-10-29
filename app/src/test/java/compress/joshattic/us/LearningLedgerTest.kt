@@ -45,4 +45,36 @@ class LearningLedgerTest {
         assertNotEquals(one.id, one.copy(configId="different-operating-point").id)
         assertNotEquals(one.id, one.copy(policyEpoch="next-measurement-policy").id)
     }
+
+    @Test fun aMigratedLedgerKeepsDeviceProfilesSeparateWithoutResettingTheS23() {
+        val directory = Files.createTempDirectory("ledger-migration").toFile()
+        try {
+            val base = SmartPerceptualProfileEngine.InMemoryProfileStore()
+            val file = directory.resolve("evidence.jsonl")
+            val s23 = "samsung|sm-s918u1|37|video/hevc"
+            val s26 = "samsung|sm-s948u|37|video/hevc"
+            // Existing v1 rows already carry the profile, so no erasure or id rewrite is needed.
+            file.writeText(JsonText.render(mapOf("ledgerVersion" to 1, "ledgerEvent" to "RESERVED",
+                "evidenceId" to evidence().id, "profileKey" to s23)).replace("\n", "") + "\n")
+            base.write(s23, "s23-history")
+            val migrated = LearningEvidenceStore(base, file)
+            assertFalse(migrated.writeObservation(s23, "duplicate", evidence()))
+            assertTrue(migrated.writeObservation(s26, "s26-measurement", evidence()))
+            assertEquals("s23-history", base.read(s23))
+            assertEquals("s26-measurement", base.read(s26))
+            assertFalse(LearningEvidenceStore(base, file).writeObservation(s26, "duplicate", evidence()))
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun escapedProfileKeysAlsoDeduplicateAfterRestart() {
+        val directory = Files.createTempDirectory("ledger-escaping").toFile()
+        try {
+            val base = SmartPerceptualProfileEngine.InMemoryProfileStore()
+            val file = directory.resolve("evidence.jsonl")
+            val key = "profile\"key\\with\ncontrols"
+            assertTrue(LearningEvidenceStore(base, file).writeObservation(key, "one", evidence()))
+            assertFalse(LearningEvidenceStore(base, file).writeObservation(key, "two", evidence()))
+            assertEquals("one", base.read(key))
+        } finally { directory.deleteRecursively() }
+    }
 }

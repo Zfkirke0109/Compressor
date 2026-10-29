@@ -307,20 +307,18 @@ object DiagnosticsExporter {
             val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
             val uri = runCatching { context.contentResolver.insert(collection, values) }.getOrNull()
                 ?: return ExportResult.Failed("Downloads is not writable on this device profile.")
-            val wrote = runCatching {
+            val wrote = DiagnosticsPublication.writeAndPublish(write = {
                 context.contentResolver.openOutputStream(uri)?.use { out ->
                     source.inputStream().use { it.copyTo(out) }
                 } ?: error("no output stream")
-            }
-            runCatching {
+            }, publish = {
                 values.clear()
                 values.put(MediaStore.Downloads.IS_PENDING, 0)
                 context.contentResolver.update(uri, values, null, null)
-            }
+            }, delete = { context.contentResolver.delete(uri, null, null) })
             return wrote.fold(
                 onSuccess = { ExportResult.Written(displayName, bytes, uri) },
                 onFailure = {
-                    runCatching { context.contentResolver.delete(uri, null, null) }
                     Log.w(TAG, "diagnostics archive write failed", it)
                     ExportResult.Failed("Could not write to Downloads: ${it.message ?: "unknown error"}")
                 }
@@ -361,20 +359,17 @@ object DiagnosticsExporter {
         val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val uri = runCatching { context.contentResolver.insert(collection, values) }.getOrNull()
             ?: return ExportResult.Failed("Downloads is not writable on this device profile.")
-        val wrote = runCatching {
+        val wrote = DiagnosticsPublication.writeAndPublish(write = {
             context.contentResolver.openOutputStream(uri)?.use { it.write(content.toByteArray()) }
                 ?: error("no output stream")
-        }
-        // Clear IS_PENDING regardless, so a partial write never leaves an invisible orphan row.
-        runCatching {
+        }, publish = {
             values.clear()
             values.put(MediaStore.Downloads.IS_PENDING, 0)
             context.contentResolver.update(uri, values, null, null)
-        }
+        }, delete = { context.contentResolver.delete(uri, null, null) })
         return wrote.fold(
             onSuccess = { ExportResult.Written(displayName, bytes, uri) },
             onFailure = {
-                runCatching { context.contentResolver.delete(uri, null, null) }
                 Log.w(TAG, "diagnostics export write failed", it)
                 ExportResult.Failed("Could not write to Downloads: ${it.message ?: "unknown error"}")
             }
