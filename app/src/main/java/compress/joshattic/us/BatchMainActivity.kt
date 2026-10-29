@@ -435,6 +435,18 @@ private fun DiagnosticsExportCard(
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !busy
             ) { Text("Save diagnostics ZIP to Downloads") }
+            OutlinedButton(
+                onClick = { runExport { DiagnosticsExporter.exportArchive(context, scope, includeEvidenceFiles = false) } },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !busy
+            ) { Text("Save log-only ZIP to Downloads") }
+            Text(
+                "Log-only keeps the records, decisions and crash reports for the selected scope. " +
+                    "Everything also includes the learned profiles and learning history. " +
+                    "Retained videos and per-frame traces stay on the device.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
             Text(
                 when (scope) {
                     DiagnosticsArchivePlan.Scope.CURRENT_RUN ->

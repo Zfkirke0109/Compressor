@@ -102,13 +102,27 @@ object DiagnosticsArchivePlan {
      *   Compressor-v1.6.163-20260924-132315-AllRuns.zip
      *   Compressor-v1.6.163-20260924-132315-batch_1790270611232.zip
      */
-    fun fileName(versionName: String, timestamp: String, scope: Scope, runs: List<Run>): String {
+    fun fileName(versionName: String, timestamp: String, scope: Scope, runs: List<Run>, includeEvidenceFiles: Boolean = true): String {
         val scopePart = when (scope) {
             Scope.CURRENT_RUN, Scope.PREVIOUS_RUN -> runs.firstOrNull()?.batchId ?: "NoRun"
             else -> scope.suffix
         }
-        return DiagnosticsExportPlan.sanitizeFileNamePart("Compressor-v$versionName-$timestamp-$scopePart") + ".zip"
+        val detail = if (includeEvidenceFiles) "" else "-LogsOnly"
+        return DiagnosticsExportPlan.sanitizeFileNamePart("Compressor-v$versionName-$timestamp-$scopePart$detail") + ".zip"
     }
+
+    /** Log-only exports never enumerate or read the potentially large evidence directories. */
+    fun runPayloads(directory: java.io.File, includeEvidenceFiles: Boolean): List<Pair<String, java.io.File>> = buildList {
+        add("session.jsonl" to java.io.File(directory, "session.jsonl"))
+        add("decisions.log" to java.io.File(directory, "decisions.log"))
+        if (includeEvidenceFiles) {
+            for ((folder, suffix) in listOf("frames" to ".jsonl.gz", "candidates" to ".mp4")) {
+                java.io.File(directory, folder).listFiles().orEmpty()
+                    .filter { it.isFile && it.name.endsWith(suffix) }.sortedBy { it.name }
+                    .forEach { add("$folder/${it.name}" to it) }
+            }
+        }
+    }.filter { it.second.isFile && it.second.length() > 0L }
 
     /** Paths inside the archive. */
     fun runEntryPath(batchId: String, fileName: String): String = "runs/$batchId/$fileName"
@@ -150,7 +164,8 @@ object DiagnosticsArchivePlan {
         currentBatchId: String?,
         previousBatchId: String?,
         includedRuns: List<Run>,
-        entries: List<Entry>
+        entries: List<Entry>,
+        includeEvidenceFiles: Boolean = true
     ): String {
         val root = linkedMapOf<String, Any?>()
         root["manifestVersion"] = 2
@@ -164,6 +179,7 @@ object DiagnosticsArchivePlan {
         root["scopeLabel"] = scope.label
         root["currentBatchId"] = currentBatchId
         root["previousBatchId"] = previousBatchId
+        root["includesEvidenceFiles"] = includeEvidenceFiles
         root["runs"] = includedRuns.map { linkedMapOf("batchId" to it.batchId, "startedAtMs" to it.startedAtMs) }
         root["files"] = entries.map { linkedMapOf("path" to it.path, "bytes" to it.bytes, "sha256" to it.sha256) }
         return JsonText.render(root)

@@ -150,7 +150,7 @@ object DiagnosticsExporter {
      * says which build and device produced it and what is inside. Built in the cache directory,
      * then streamed into Downloads, so a failed write never leaves a half archive there.
      */
-    fun exportArchive(context: Context, scope: DiagnosticsArchivePlan.Scope): ExportResult {
+    fun exportArchive(context: Context, scope: DiagnosticsArchivePlan.Scope, includeEvidenceFiles: Boolean = true): ExportResult {
         val runs = DiagnosticsArchivePlan.sortedNewestFirst(DiagnosticsRecorder.runDirectories(context).map { it.name })
         val included = DiagnosticsArchivePlan.runsFor(scope, runs)
         if (included.isEmpty() && scope != DiagnosticsArchivePlan.Scope.EVERYTHING) {
@@ -164,7 +164,7 @@ object DiagnosticsExporter {
         val identity = DiagnosticsRecorder.identityMap(context)
         val versionName = identity["appVersionName"]?.toString() ?: "unknown"
         val stamp = timestamp()
-        val displayName = DiagnosticsArchivePlan.fileName(versionName, stamp, scope, included)
+        val displayName = DiagnosticsArchivePlan.fileName(versionName, stamp, scope, included, includeEvidenceFiles)
         val crashDir = File(context.filesDir, "diagnostics/${CrashReportPlan.DIRECTORY}")
         val crashNames = crashDir.list()?.toList().orEmpty()
         val crashes = DiagnosticsArchivePlan.crashReportsFor(scope, included, runs, crashNames)
@@ -199,16 +199,9 @@ object DiagnosticsExporter {
                 }
                 for (run in included) {
                     val dir = File(context.filesDir, "diagnostics/${run.batchId}")
-                    add(DiagnosticsArchivePlan.runEntryPath(run.batchId, "session.jsonl"), File(dir, "session.jsonl"))
-                    add(DiagnosticsArchivePlan.runEntryPath(run.batchId, "decisions.log"), File(dir, "decisions.log"))
-                    File(dir, "frames").listFiles().orEmpty().filter { it.name.endsWith(".jsonl.gz") }
-                        .sortedBy { it.name }.forEach { file ->
-                            add(DiagnosticsArchivePlan.runEntryPath(run.batchId, "frames/${file.name}"), file)
-                        }
-                    File(dir, "candidates").listFiles().orEmpty().filter { it.name.endsWith(".mp4") }
-                        .sortedBy { it.name }.forEach { file ->
-                            add(DiagnosticsArchivePlan.runEntryPath(run.batchId, "candidates/${file.name}"), file)
-                        }
+                    for ((relativePath, file) in DiagnosticsArchivePlan.runPayloads(dir, includeEvidenceFiles)) {
+                        add(DiagnosticsArchivePlan.runEntryPath(run.batchId, relativePath), file)
+                    }
                 }
                 for (name in crashes) add(DiagnosticsArchivePlan.crashEntryPath(name), File(crashDir, name))
                 if (logcat != null) addText(DiagnosticsArchivePlan.LOGCAT_ENTRY, logcat)
@@ -226,7 +219,8 @@ object DiagnosticsExporter {
                         currentBatchId = DiagnosticsArchivePlan.batchesNewestFirst(runs).firstOrNull()?.batchId,
                         previousBatchId = DiagnosticsArchivePlan.batchesNewestFirst(runs).getOrNull(1)?.batchId,
                         includedRuns = included,
-                        entries = entries.toList()
+                        entries = entries.toList(),
+                        includeEvidenceFiles = includeEvidenceFiles
                     )
                 )
             }

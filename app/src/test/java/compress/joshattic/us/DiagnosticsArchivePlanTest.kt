@@ -8,6 +8,30 @@ import org.junit.Test
 
 class DiagnosticsArchivePlanTest {
 
+    @Test fun logOnlyPayloadsKeepCoreRecordsAndLeaveAllEvidenceUntouched() {
+        val dir = java.nio.file.Files.createTempDirectory("diagnostics-log-only").toFile()
+        try {
+            for (path in listOf("session.jsonl", "decisions.log", "frames/window.jsonl.gz", "candidates/window.mp4")) {
+                java.io.File(dir, path).apply { parentFile!!.mkdirs(); writeText(path) }
+            }
+            val logs = DiagnosticsArchivePlan.runPayloads(dir, includeEvidenceFiles = false)
+            assertEquals(listOf("session.jsonl", "decisions.log"), logs.map { it.first })
+            val full = DiagnosticsArchivePlan.runPayloads(dir, includeEvidenceFiles = true)
+            assertEquals(listOf("session.jsonl", "decisions.log", "frames/window.jsonl.gz", "candidates/window.mp4"), full.map { it.first })
+            for ((path, file) in full) assertEquals(path, file.readText())
+        } finally { dir.deleteRecursively() }
+    }
+
+    @Test fun logOnlyExportsAreNamedAndDeclaredSeparately() {
+        val name = DiagnosticsArchivePlan.fileName("1.6.271", "20261029-161040", Scope.EVERYTHING, runs,
+            includeEvidenceFiles = false)
+        assertEquals("Compressor-v1.6.271-20261029-161040-Everything-LogsOnly.zip", name)
+        val manifest = DiagnosticsArchivePlan.manifest(emptyMap(), "20261029-161040", Scope.EVERYTHING,
+            "batch_1", null, runs, emptyList(), includeEvidenceFiles = false)
+        assertTrue(manifest.contains("\"includesEvidenceFiles\": false"))
+        assertTrue(manifest.contains("\"scope\": \"EVERYTHING\""))
+    }
+
     private val runs = DiagnosticsArchivePlan.sortedNewestFirst(
         listOf("batch_1790263711162", "batch_1790273169359", "batch_1790270611232", "batch_1790262412832")
     )

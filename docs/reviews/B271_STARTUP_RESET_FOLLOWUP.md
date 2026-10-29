@@ -14,6 +14,10 @@ The requested Secure Folder capture is `Compressor-v1.6.271-20261029-161040-Ever
 
 These changes improve cancellation and repeatability of experiments. Compression gains and comparative speed for the supplied runs remain unmeasured. Existing PL thresholds, codec search, audio/timeline/color checks and smaller-file requirements are unchanged.
 
+## Log-only export
+
+The diagnostics panel now offers **Save log-only ZIP to Downloads** alongside the full archive. It uses the selected run scope, preserves the original session and decision logs plus the same crash/device/profile/learning records, and does not enumerate or read retained video and per-frame evidence directories. Its filename ends in `-LogsOnly.zip`; the manifest declares `includesEvidenceFiles=false`. The existing full export remains available. Exporting does not delete or alter the retained evidence.
+
 ## Verification
 
 - Regression coverage: explicit reset permits the same measurement to train again after restart; duplicate protection resumes after retraining; a journal failure preserves profiles and reports failure; an interrupted aggregate reset pauses further learning after restart; offline replay distinguishes incomplete and completed resets.
@@ -31,5 +35,7 @@ A log-only archive below 256 MiB is sufficient for the first pass. Preserve the 
 - `crashes/`
 
 Retained encoded candidates and `frames/` traces can be supplied separately if a specific quality/parity investigation needs them. For the original `.7z`, extracting these paths and recompressing them as a new ZIP keeps the original capture intact. Alternatively, provide consecutive archive volumes under 200 MB each.
+
+With the updated APK, the easier route is to open the same Secure Folder installation, select **Diagnostics → Everything → Save log-only ZIP to Downloads**, and provide that ZIP. Installing an update preserves the prior recorded runs; there is no need to rerun the videos to export them.
 
 Once those logs are available, reconstruct each batch independently, identify its recorded toggle values and source identities, compare matched sources, classify measured failures separately from unavailable evidence, and trace the actual time spent in decode, scoring, encoding, verification, hashing and cooldown. No setting is credited with a speed or yield change before that comparison.
