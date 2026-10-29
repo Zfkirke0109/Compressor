@@ -13,7 +13,7 @@ Primary target: Galaxy S26 Ultra SM-S948U. Galaxy S23 Ultra SM-S918 models remai
 | Medium | Diagnostics exports claimed success after failed/zero-row publication. | ZIP and text exports require exactly one published MediaStore row; failed writes stay unpublished and cleanup is attempted. |
 | Medium | Pruning before creating a run kept 31 directories under a documented 30-run limit. | Include the incoming run when choosing retention victims; resuming an existing run does not count it twice. |
 | Medium | The S23 high-resolution HDR HEVC overshoot seed applied to all devices. | Scope that 1.25 seed to Samsung SM-S918 models. The S26 starts at 1.0 and learns its own measured overshoot. Existing measured profiles are retained. |
-| Medium | An imported learning ledger could suppress S26 observations because its encoder name/config/source matched an S23 observation. | Scope deduplication to the persisted technical profile (including model and SDK). Existing v1 reservations remain effective for their original profile. Offline replay uses the same scope. |
+| Medium | An imported learning ledger could suppress S26 observations because its encoder name/config/source matched an S23 observation. | Scope deduplication to the persisted technical profile (including model and SDK). Existing v1 reservations remain effective for their original profile. Offline replay and partitioning use the same scope; matching source families stay in the same partition across devices. |
 
 ## Compression changes
 
@@ -29,7 +29,7 @@ This expands the measured search space; no increase in device yield or speed is 
 
 ## Validation
 
-- Local Python: 20 suites / 235 tests passed, including the new production-library and per-device ledger replay regressions.
+- Local Python: 20 suites / 236 tests passed, including the new production-library, per-device ledger replay and source-family partition regressions.
 - Local Android validation: `:app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest` passed; **647 JVM tests / 91 suites**, zero failures/errors/skips. The app and instrumentation APKs build. The first validation caught a missing assertion import in a new test; it was corrected before the successful run.
 - All packaged native libraries pass the 16 KB ELF and APK ZIP-alignment gate, including the required production scorer. The DEX regression gate passes: largest app method **8,076 code units**, below the 10,000 limit.
 - Code under test matches `c0210fd` (the preceding `82fee72` application changes plus the test import). The final PR update links GitHub CI and the signed artifact; local APKs use a local signing key and are not the update deliverable.

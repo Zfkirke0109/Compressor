@@ -56,6 +56,24 @@ def family_partition(source_id, reviewed_families):
     return 'calibration' if bucket<6 else 'validation' if bucket<8 else 'holdout'
 
 
+def partition_rows(rows, reviewed_families):
+    output, seen = [], set()
+    for raw in rows:
+        row = dict(raw)
+        source = row.get('sourceSha256') or row.get('sourceId')
+        identity = row.get('evidenceId') or (source, row.get('attempt'), row.get('windowId'), row.get('policyEpoch'))
+        # Distinct device measurements remain distinct, but the same source family always
+        # stays in one partition; hardware migration must never introduce holdout leakage.
+        identity = (row.get('profileKey'), identity)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        row['reviewedFamilyId'] = reviewed_families.get(source)
+        row['split'] = family_partition(source, reviewed_families)
+        output.append(row)
+    return output
+
+
 def upper_binomial(correct, total, alpha=.05):
     """One-sided exact Clopper-Pearson bound; requires pre-specified independent Bernoulli trials.
     Repeated trials clustered within viewers/videos need a hierarchical/cluster analysis instead.
@@ -105,11 +123,8 @@ def main():
     args=p.parse_args()
     if args.command=='ledger': out=replay_ledger([json.loads(l) for l in args.jsonl.read_text().splitlines() if l.strip()],args.epoch)
     elif args.command=='partition':
-        families=json.loads(args.families.read_text());out=[];seen=set()
-        for line in args.rows.read_text().splitlines():
-            row=json.loads(line);source=row.get('sourceSha256') or row.get('sourceId');identity=row.get('evidenceId') or (source,row.get('attempt'),row.get('windowId'),row.get('policyEpoch'))
-            if identity in seen:continue
-            seen.add(identity);row['reviewedFamilyId']=families.get(source);row['split']=family_partition(source,families);out.append(row)
+        out=partition_rows([json.loads(line) for line in args.rows.read_text().splitlines()],
+                           json.loads(args.families.read_text()))
     elif args.command=='abx-bound':out=dict(upperCorrectProbability=upper_binomial(args.correct,args.total,args.alpha),alpha=args.alpha,assumption='pre-specified independent trials; clustered repeats need separate analysis',acceptancePolicyChanged=False)
     else:out=hard_windows(json.loads(args.features.read_text()))
     print(json.dumps(out,indent=2,allow_nan=False))

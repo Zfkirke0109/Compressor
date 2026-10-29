@@ -1,5 +1,5 @@
 import unittest
-from calibration_evidence import replay_ledger, family_partition, upper_binomial, hard_windows
+from calibration_evidence import replay_ledger, family_partition, partition_rows, upper_binomial, hard_windows
 
 class EvidenceTest(unittest.TestCase):
     def event(self, event='APPLIED', kind='VISUAL_PASS', epoch='current'):
@@ -33,6 +33,13 @@ class EvidenceTest(unittest.TestCase):
     def test_family_split_requires_reviewed_identity(self):
         self.assertEqual(family_partition('a',{'a':'family','b':'family'}),family_partition('b',{'a':'family','b':'family'}))
         with self.assertRaises(ValueError): family_partition('c',{'a':'family'})
+    def test_partition_preserves_device_measurements_without_source_family_leakage(self):
+        row=dict(sourceId='source',evidenceId='point',profileKey='s23')
+        rows=partition_rows([row,dict(row),dict(row,profileKey='s26')],{'source':'same-video-family'})
+        self.assertEqual(len(rows),2)
+        self.assertEqual({r['profileKey'] for r in rows},{'s23','s26'})
+        self.assertEqual(len({r['split'] for r in rows}),1)
+        self.assertNotIn('split',row)
     def test_non_significance_is_not_equivalence(self):
         self.assertGreater(upper_binomial(30,60),.60)
         self.assertLess(upper_binomial(60,120),.60)
