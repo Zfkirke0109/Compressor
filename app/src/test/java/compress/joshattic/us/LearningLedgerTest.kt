@@ -77,4 +77,56 @@ class LearningLedgerTest {
             assertEquals("one", base.read(key))
         } finally { directory.deleteRecursively() }
     }
+
+    @Test fun anExplicitResetAllowsTheSameMeasurementToTrainAgainAndSurvivesRestart() {
+        val directory = Files.createTempDirectory("ledger-reset").toFile()
+        try {
+            val base = SmartPerceptualProfileEngine.InMemoryProfileStore()
+            val file = directory.resolve("evidence.jsonl")
+            val store = LearningEvidenceStore(base, file)
+            val engine = SmartPerceptualProfileEngine(store)
+            assertTrue(store.writeObservation("profile", "before", evidence()))
+            engine.resetLearnedState()
+            assertEquals("empty", engine.learnedStateIdentity())
+            assertTrue(file.readText().contains("\"ledgerEvent\": \"RESET\""))
+            assertTrue(LearningEvidenceStore(base, file).writeObservation("profile", "after", evidence()))
+            assertFalse(LearningEvidenceStore(base, file).writeObservation("profile", "duplicate", evidence()))
+            assertEquals("after", base.read("profile"))
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun aFailedDurableResetIsReportedAndLeavesProfilesIntact() {
+        val directory = Files.createTempDirectory("ledger-reset-failure").toFile()
+        try {
+            val base = SmartPerceptualProfileEngine.InMemoryProfileStore()
+            base.write("profile", "keep")
+            val store = LearningEvidenceStore(base, directory) // A directory cannot be an append-only journal.
+            try {
+                SmartPerceptualProfileEngine(store).resetLearnedState()
+                fail("Reset must not claim success without a durable RESET record")
+            } catch (expected: IllegalStateException) {
+                assertTrue(expected.message!!.contains("profiles were kept unchanged"))
+            }
+            assertEquals("keep", base.read("profile"))
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun anInterruptedResetCannotSilentlyReenableTrainingAfterRestart() {
+        val directory = Files.createTempDirectory("ledger-reset-interrupted").toFile()
+        try {
+            val base = SmartPerceptualProfileEngine.InMemoryProfileStore()
+            val file = directory.resolve("evidence.jsonl")
+            val failing = object : SmartPerceptualProfileEngine.ProfileStore by base {
+                override fun clear() { error("profile persistence failed") }
+            }
+            val store = LearningEvidenceStore(failing, file)
+            assertTrue(store.writeObservation("profile", "before", evidence()))
+            try { store.clear(); fail("Failed persistence must propagate") }
+            catch (expected: IllegalStateException) { assertEquals("profile persistence failed", expected.message) }
+            val after = evidence().copy(configId = "new-operating-point")
+            assertFalse(store.writeObservation("profile", "unsafe", after))
+            assertFalse(LearningEvidenceStore(base, file).writeObservation("profile", "unsafe", after))
+            assertEquals("before", base.read("profile"))
+        } finally { directory.deleteRecursively() }
+    }
 }

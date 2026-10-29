@@ -76,7 +76,7 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         // commit(), not apply(): an experiment arm must not start until the reset is on disk.
         @Suppress("ApplySharedPref")
         override fun clear() {
-            prefs.edit().clear().commit()
+            check(prefs.edit().clear().commit()) { "Could not persist the learned-profile reset." }
         }
     }
 

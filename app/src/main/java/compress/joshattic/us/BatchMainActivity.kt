@@ -186,7 +186,8 @@ private fun BatchCompressorScreen(
                     state.isCompressing,
                     state.items.any { !it.isAlreadyCompressed },
                     state.isSelfChecking,
-                    viewModel::runScorerSelfCheck
+                    viewModel::runScorerSelfCheck,
+                    viewModel::resetLearnedProfiles
                 )
             }
             if (state.items.isNotEmpty()) {
@@ -332,7 +333,8 @@ private fun DiagnosticsExportCard(
     isCompressing: Boolean,
     hasSelection: Boolean,
     isSelfChecking: Boolean,
-    onRunScorerSelfCheck: (Context) -> Unit
+    onRunScorerSelfCheck: (Context) -> Unit,
+    onResetLearnedProfiles: ((Result<String>) -> Unit) -> Unit
 ) {
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
@@ -360,16 +362,17 @@ private fun DiagnosticsExportCard(
     var confirmReset by remember { mutableStateOf(false) }
 
     fun resetLearnedProfiles() {
-        runCatching {
-            SmartPerceptualProfileEngine(
-                SmartPerceptualProfileEngine.SharedPreferencesProfileStore(context.applicationContext)
-            ).also { it.resetLearnedState(); learnedState = it.learnedStateIdentity() }
-        }.onSuccess {
-            isError = false
-            message = "Learned profiles cleared. The next batch starts from the default targets."
-        }.onFailure {
-            isError = true
-            message = "Could not clear learned profiles: ${it.message ?: "unknown error"}"
+        busy = true
+        onResetLearnedProfiles { result ->
+            busy = false
+            result.onSuccess {
+                learnedState = it
+                isError = false
+                message = "Learned profiles and measurement history reset. The next batch starts from the default targets."
+            }.onFailure {
+                isError = true
+                message = "Could not reset learned profiles: ${it.message ?: "unknown error"}"
+            }
         }
     }
 
@@ -670,8 +673,9 @@ private fun DiagnosticsExportCard(
                     title = { Text("Reset learned profiles?") },
                     text = {
                         Text(
-                            "This erases every learned target and probe skip on this device. It cannot be " +
-                                "undone; the next batch probes every file from the defaults."
+                            "This erases every learned target and probe skip on this device and resets " +
+                                "which measurements may train again. It cannot be undone; the next batch " +
+                                "starts from the default targets."
                         )
                     },
                     confirmButton = {

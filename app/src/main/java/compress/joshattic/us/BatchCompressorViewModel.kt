@@ -286,6 +286,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         }
     }
     private var activeTransformer: Transformer? = null
+    private var profileResetJob: Job? = null
 
     // Brackets a running batch with foreground protection + a CPU wake lock (see PERF-001). Holds
     // application context only (via AndroidViewModel.getApplication), so it is safe as a field and
@@ -794,6 +795,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // hours. Nothing in the batch needs an Activity, so it runs on the application context.
         val context = callerContext.applicationContext
         val current = _uiState.value
+        if (profileResetJob?.isCompleted == false) {
+            _uiState.update { it.copy(statusMessage = "Finishing the learned-profile reset. Start again when it completes.") }
+            return
+        }
         if (current.items.isEmpty() || current.isCompressing || compressionJob?.isCompleted == false) return
         if (current.compressibleCount == 0) {
             _uiState.update { it.copy(statusMessage = "All selected videos already look compressed by Compressor, so nothing was recompressed.") }
@@ -805,6 +810,27 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // the batch. The batch wins: the self-check stops first, at its next suspension point.
             selfCheckJob?.takeIf { it.isActive }?.cancelAndJoin()
             runBatch(context)
+        }
+    }
+
+    /** Reset the same evidence-aware engine used by batches, while excluding a new batch. */
+    fun resetLearnedProfiles(onResult: (Result<String>) -> Unit) {
+        if (_uiState.value.isCompressing || compressionJob?.isCompleted == false || profileResetJob?.isCompleted == false) {
+            onResult(Result.failure(IllegalStateException("Wait for the current operation to finish before resetting profiles.")))
+            return
+        }
+        profileResetJob = viewModelScope.launch {
+            val result = try {
+                Result.success(withContext(Dispatchers.IO) {
+                    learningEngine.resetLearnedState()
+                    learningEngine.learnedStateIdentity()
+                })
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+            onResult(result)
         }
     }
 
@@ -1027,22 +1053,6 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // Off the main thread: it hashes the native libraries and enumerates the codecs.
         sourceFingerprints.clear()
         fullSourceHashes.clear()
-        withContext(Dispatchers.IO) { runCatching {
-            diagnostics.runIdentity(
-                ScoringIdentity.describe(context, VmafNative.version, compress.joshattic.us.quality.VmafNativeV1.modelName) +
-                    mapOf(
-                        "learningKeySuffix" to EncoderExperiments.learningKeySuffix(context),
-                        "maxBFrames" to EncoderExperiments.maxBFrames(context),
-                        "longGop" to EncoderExperiments.isLongGopEnabled(context),
-                        "saferRungRetry" to EncoderExperiments.isSaferRungRetryEnabled(context),
-                        "shadowCalibration" to EncoderExperiments.isShadowCalibrationEnabled(context),
-                        "fullSourceHash" to EncoderExperiments.isFullSourceHashEnabled(context),
-                        "fullFrameTrace" to EncoderExperiments.isFrameTraceEnabled(context),
-                        "measurementPolicyEpoch" to compress.joshattic.us.quality.ScientificPolicy.EPOCH
-                    ),
-                EncoderInventory.snapshot()
-            )
-        } }
         activeDiagnostics = diagnostics
         val run = BatchRun(
             context = context,
@@ -1083,6 +1093,25 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // its effects are best-effort, so this can never abort the batch. Only cheap pre-try
             // setup (cache clear, state init) runs before this — never an encode.
             batchGuard.begin()
+            // This is the first suspending setup step. It belongs inside the same cleanup
+            // bracket as encoding, so cancelling here releases protection, closes the capture,
+            // emits session_cancelled, and returns the UI to idle.
+            withContext(Dispatchers.IO) { runCatching {
+                diagnostics.runIdentity(
+                    ScoringIdentity.describe(context, VmafNative.version, compress.joshattic.us.quality.VmafNativeV1.modelName) +
+                        mapOf(
+                            "learningKeySuffix" to EncoderExperiments.learningKeySuffix(context),
+                            "maxBFrames" to EncoderExperiments.maxBFrames(context),
+                            "longGop" to EncoderExperiments.isLongGopEnabled(context),
+                            "saferRungRetry" to EncoderExperiments.isSaferRungRetryEnabled(context),
+                            "shadowCalibration" to EncoderExperiments.isShadowCalibrationEnabled(context),
+                            "fullSourceHash" to EncoderExperiments.isFullSourceHashEnabled(context),
+                            "fullFrameTrace" to EncoderExperiments.isFrameTraceEnabled(context),
+                            "measurementPolicyEpoch" to compress.joshattic.us.quality.ScientificPolicy.EPOCH
+                        ),
+                    EncoderInventory.snapshot()
+                )
+            } }
             // Post-item thermal cooldown that was applied BEFORE the current item started (i.e. the
             // cooldown after the previous item). Carried across iterations so each item's structured
             // record shows the handoff delay that preceded it. Timing telemetry only.

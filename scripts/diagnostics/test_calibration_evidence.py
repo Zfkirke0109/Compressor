@@ -8,6 +8,14 @@ class EvidenceTest(unittest.TestCase):
     def test_reserved_is_uncertain_not_a_completed_observation(self):
         r=replay_ledger([self.event('RESERVED')], 'current')
         self.assertEqual(r['accepted'],[]);self.assertEqual(len(r['uncertain']),1)
+    def test_an_incomplete_reset_is_uncertain_until_completion(self):
+        events=[self.event('RESERVED'),self.event(),dict(ledgerEvent='RESET_STARTED')]
+        r=replay_ledger(events, 'current')
+        self.assertEqual(r['status'],'REQUIRES_REVIEW')
+        self.assertEqual(len(r['uncertain']),1)
+        completed=replay_ledger(events+[dict(ledgerEvent='RESET')], 'current')
+        self.assertEqual(completed['status'],'REPLAYED')
+        self.assertEqual(completed['finalProfiles'],{})
     def test_duplicates_and_nonvisual_evidence_cannot_be_training_rows(self):
         r=replay_ledger([self.event('RESERVED'),self.event(),self.event()], 'current')
         self.assertEqual(len(r['accepted']),1);self.assertEqual(len(r['errors']),1)

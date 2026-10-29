@@ -11,13 +11,18 @@ from pathlib import Path
 
 def replay_ledger(events, epoch):
     reserved, applied, final_profiles = {}, set(), {}
+    pending_reset = None
     result = dict(accepted=[], uncertain=[], quarantined=[], errors=[], ignored=0, finalProfiles=final_profiles)
     for index, raw in enumerate(events):
         event = raw.get('fields', raw)
         kind, identity = event.get('ledgerEvent'), event.get('evidenceId')
         scope = (event.get('profileKey'), identity)
+        if kind == 'RESET_STARTED':
+            pending_reset = event
+            continue
         if kind == 'RESET':
             result['uncertain'].extend(reserved.values()); reserved.clear(); applied.clear(); final_profiles.clear()
+            pending_reset = None
             continue
         if kind in ('IGNORED', 'DUPLICATE'):
             result['ignored'] += 1; continue
@@ -44,6 +49,8 @@ def replay_ledger(events, epoch):
             result['accepted'].append(row)
             final_profiles[event['profileKey']] = event['after']
     result['uncertain'].extend(reserved.values())
+    if pending_reset is not None:
+        result['uncertain'].append(pending_reset)
     result['status'] = 'REQUIRES_REVIEW' if result['errors'] or result['uncertain'] else 'REPLAYED'
     result['legacyAggregateIsHumanEvidence'] = False
     return result

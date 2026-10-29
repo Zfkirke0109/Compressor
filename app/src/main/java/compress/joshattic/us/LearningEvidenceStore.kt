@@ -16,6 +16,7 @@ class LearningEvidenceStore(
     private val profilePattern = Regex(""""profileKey": ("(?:\\.|[^"\\])*")""")
     init {
         runCatching {
+            var resetPending = false
             if (journal.exists()) {
                 require(journal.length() <= MAX_BYTES) { "learning evidence journal exceeds bound" }
                 journal.bufferedReader().useLines { lines -> lines.forEach { line ->
@@ -25,9 +26,14 @@ class LearningEvidenceStore(
                         val profileJson = checkNotNull(profilePattern.find(line)?.groupValues?.get(1))
                         seen += scopedId(profileJson, id)
                     }
-                    if (line.contains("\"ledgerEvent\": \"RESET\"")) seen.clear()
+                    if (line.contains("\"ledgerEvent\": \"RESET_STARTED\"")) resetPending = true
+                    if (line.contains("\"ledgerEvent\": \"RESET\"")) {
+                        seen.clear()
+                        resetPending = false
+                    }
                 } }
             }
+            check(!resetPending) { "incomplete profile reset; aggregate learning paused" }
         }.onFailure { writable = false }
     }
 
@@ -62,11 +68,22 @@ class LearningEvidenceStore(
         return true
     }
 
+    @Synchronized
     override fun clear() {
         // The explicit reset operation retains its audit history; ordinary upgrades never call it.
-        if (append(mapOf("ledgerVersion" to 1, "ledgerEvent" to "RESET", "timestampMs" to System.currentTimeMillis()))) {
-            delegate.clear(); seen.clear()
+        check(append(mapOf("ledgerVersion" to 1, "ledgerEvent" to "RESET_STARTED", "timestampMs" to System.currentTimeMillis()))) {
+            "Learning history could not record the reset; profiles were kept unchanged."
         }
+        try {
+            delegate.clear()
+            check(append(mapOf("ledgerVersion" to 1, "ledgerEvent" to "RESET", "timestampMs" to System.currentTimeMillis()))) {
+                "Profile reset completion could not be recorded; learning is paused."
+            }
+        } catch (e: Exception) {
+            writable = false
+            throw e
+        }
+        seen.clear()
     }
 
     private fun scopedId(profileJson: String, evidenceId: String): String = "$profileJson\u0000$evidenceId"
