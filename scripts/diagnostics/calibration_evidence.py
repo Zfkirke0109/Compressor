@@ -17,6 +17,9 @@ def replay_ledger(events, epoch):
         event = raw.get('fields', raw)
         kind, identity = event.get('ledgerEvent'), event.get('evidenceId')
         scope = (event.get('profileKey'), identity)
+        if kind in ('RESET_STARTED', 'RESET') and event.get('durablyJournaled') is False:
+            result['errors'].append(dict(index=index, reason='reset journal write failed'))
+            continue
         if kind == 'RESET_STARTED':
             pending_reset = event
             continue

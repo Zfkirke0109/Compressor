@@ -20,7 +20,7 @@ The diagnostics panel now offers **Save log-only ZIP to Downloads** alongside th
 
 ## Verification
 
-- Regression coverage: explicit reset permits the same measurement to train again after restart; duplicate protection resumes after retraining; a journal failure preserves profiles and reports failure; an interrupted aggregate reset pauses further learning after restart; offline replay distinguishes incomplete and completed resets.
+- Regression coverage: explicit reset permits the same measurement to train again after restart; duplicate protection resumes after retraining; a journal failure preserves profiles and reports failure; an interrupted aggregate reset pauses further learning after restart; offline replay distinguishes incomplete, failed-journal and completed resets. Log-only export tests verify scope/filename/manifest and evidence exclusion without altering retained files.
 - Validate the Android build, JVM tests, instrumentation compile, 16 KB native packaging and DEX budget through Android CI on the updated PR head. The PR description carries the final run links and results.
 - Device check still needed: cancel during initialization, then start another batch; explicitly confirm reset while idle, repeat a small fixed source set, and verify new training is not rejected as pre-reset duplication. Do not reset learning merely to compare toggle settings without first preserving its exported state.
 

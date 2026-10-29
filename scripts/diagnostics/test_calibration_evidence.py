@@ -16,6 +16,14 @@ class EvidenceTest(unittest.TestCase):
         completed=replay_ledger(events+[dict(ledgerEvent='RESET')], 'current')
         self.assertEqual(completed['status'],'REPLAYED')
         self.assertEqual(completed['finalProfiles'],{})
+    def test_a_failed_reset_record_cannot_authorize_replay_or_clear_profiles(self):
+        events=[self.event('RESERVED'),self.event(),dict(ledgerEvent='RESET_STARTED'),
+                dict(ledgerEvent='RESET',durablyJournaled=False)]
+        r=replay_ledger(events, 'current')
+        self.assertEqual(r['status'],'REQUIRES_REVIEW')
+        self.assertEqual(r['finalProfiles'],{'p':'next'})
+        self.assertEqual(len(r['uncertain']),1)
+        self.assertEqual(r['errors'][0]['reason'],'reset journal write failed')
     def test_duplicates_and_nonvisual_evidence_cannot_be_training_rows(self):
         r=replay_ledger([self.event('RESERVED'),self.event(),self.event()], 'current')
         self.assertEqual(len(r['accepted']),1);self.assertEqual(len(r['errors']),1)
