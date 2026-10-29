@@ -30,7 +30,9 @@ This expands the measured search space; no increase in device yield or speed is 
 ## Validation
 
 - Local Python: 20 suites / 235 tests passed, including the new production-library and per-device ledger replay regressions.
-- Android/JVM build and APK alignment/DEX checks are in progress; the final PR update records the exact results and signed CI artifact.
+- Local Android validation: `:app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest` passed; **647 JVM tests / 91 suites**, zero failures/errors/skips. The app and instrumentation APKs build. The first validation caught a missing assertion import in a new test; it was corrected before the successful run.
+- All packaged native libraries pass the 16 KB ELF and APK ZIP-alignment gate, including the required production scorer. The DEX regression gate passes: largest app method **8,076 code units**, below the 10,000 limit.
+- Code under test matches `c0210fd` (the preceding `82fee72` application changes plus the test import). The final PR update links GitHub CI and the signed artifact; local APKs use a local signing key and are not the update deliverable.
 - No phone installation, full media batch or hardware benchmark has been run in this pass. Historical device/parity/provider-recovery merge blockers still apply.
 
 ## Focused phone validation
