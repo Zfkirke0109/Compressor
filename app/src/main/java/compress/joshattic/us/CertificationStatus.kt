@@ -1,5 +1,6 @@
 package compress.joshattic.us
 
+import compress.joshattic.us.quality.CertificationDecision
 import compress.joshattic.us.quality.PairScoreOutcome
 
 /**
@@ -18,6 +19,12 @@ object CertificationStatus {
     const val SCORED = "ran_scored"
     const val UNAVAILABLE = "ran_unavailable"
     const val MISALIGNED = "ran_misalignment_rejected"
+    // Scored, but a window held fewer than QualityProbePolicy.MIN_COMPARED_FRAMES_PER_WINDOW frames
+    // and no adequately sampled window failed: not a measurement (CertificationDecision).
+    const val SCORED_INSUFFICIENT = "ran_scored_insufficient_frames"
+    // Some windows scored, at least one produced nothing (PairScoreOutcome.Incomplete). The
+    // decision says whether the scored part held a measured failure.
+    const val SCORED_PARTIAL = "ran_scored_partial"
 
     // Ran as the bitrate-floor RECOVERY attempt and did not pass, so the encode fell back. A
     // separate family from the ones above because the two certification sites are different
@@ -31,6 +38,8 @@ object CertificationStatus {
     const val RECOVERY_SCORED_FAILED = "ran_floor_recovery_scored_below_bar"
     const val RECOVERY_UNAVAILABLE = "ran_floor_recovery_unavailable"
     const val RECOVERY_MISALIGNED = "ran_floor_recovery_misalignment_rejected"
+    const val RECOVERY_INSUFFICIENT = "ran_floor_recovery_insufficient_frames"
+    const val RECOVERY_PARTIAL = "ran_floor_recovery_partial"
 
     // Did not run. Each names the specific gate that stopped it.
     const val SKIPPED_NOT_PL_MODE = "skipped_effective_mode_not_perceptually_lossless"
@@ -63,9 +72,11 @@ object CertificationStatus {
 
     /** The status for a certification attempt that actually ran. */
     fun forOutcome(outcome: PairScoreOutcome): String = when (outcome) {
-        is PairScoreOutcome.Scored -> SCORED
+        is PairScoreOutcome.Scored ->
+            if (CertificationDecision.of(outcome) == CertificationDecision.INSUFFICIENT_EVIDENCE) SCORED_INSUFFICIENT else SCORED
+        is PairScoreOutcome.Incomplete -> SCORED_PARTIAL
         PairScoreOutcome.Unavailable -> UNAVAILABLE
-        PairScoreOutcome.MisalignmentRejected -> MISALIGNED
+        is PairScoreOutcome.MisalignmentRejected -> MISALIGNED
     }
 
     /**
@@ -74,9 +85,12 @@ object CertificationStatus {
      * whose [forOutcome] status is the one that describes the accepted output.
      */
     fun forFailedRecoveryOutcome(outcome: PairScoreOutcome): String = when (outcome) {
-        is PairScoreOutcome.Scored -> RECOVERY_SCORED_FAILED
+        is PairScoreOutcome.Scored ->
+            if (CertificationDecision.of(outcome) == CertificationDecision.INSUFFICIENT_EVIDENCE) RECOVERY_INSUFFICIENT else RECOVERY_SCORED_FAILED
+        is PairScoreOutcome.Incomplete ->
+            if (CertificationDecision.of(outcome) == CertificationDecision.MEASURED_FAILURE) RECOVERY_SCORED_FAILED else RECOVERY_PARTIAL
         PairScoreOutcome.Unavailable -> RECOVERY_UNAVAILABLE
-        PairScoreOutcome.MisalignmentRejected -> RECOVERY_MISALIGNED
+        is PairScoreOutcome.MisalignmentRejected -> RECOVERY_MISALIGNED
     }
 
     /** True when the status means certification never executed. */

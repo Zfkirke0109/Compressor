@@ -1,6 +1,7 @@
 package compress.joshattic.us.quality
 
 import android.content.Context
+import android.graphics.ImageFormat
 import android.media.Image
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -30,12 +31,25 @@ class YuvFrameReader(
     private val uri: Uri,
     private val startUs: Long,
     private val endUs: Long,
+    private val onFormat: ((Map<String, Any?>) -> Unit)? = null,
+    private val onPreparationNanos: ((Long) -> Unit)? = null,
     private val onFrame: (I420Frame) -> Boolean // return false to stop early
 ) {
     companion object {
         private const val TAG = "YuvFrameReader"
-        private const val DEQUEUE_TIMEOUT_US = 50_000L
-        private const val MAX_DRY_LOOPS = 400 // ~20s of no progress -> abort
+        // How long one output poll may block. Short, because inputs are only fed between polls.
+        private const val OUTPUT_TIMEOUT_US = 10_000L
+        // No decoded frame for this long means the decoder is stuck.
+        private const val STALL_TIMEOUT_MS = 20_000L
+
+        /** Whitelisted technical fields only: never serialize vendor paths or whole formats. */
+        private fun describe(format: MediaFormat): Map<String, Any?> = buildMap {
+            put("mime", runCatching { format.getString(MediaFormat.KEY_MIME) }.getOrNull())
+            for (key in listOf("width", "height", "crop-left", "crop-top", "crop-right", "crop-bottom",
+                "rotation-degrees", "color-format", "color-standard", "color-range", "color-transfer", "profile")) {
+                if (format.containsKey(key)) put(key, runCatching { format.getInteger(key) }.getOrNull())
+            }
+        }
 
         /** Display-space dimensions (rotation applied) of the first video track. */
         fun displayGeometry(context: Context, uri: Uri): Triple<Int, Int, Int>? {
@@ -89,45 +103,66 @@ class YuvFrameReader(
             extractor.seekTo(startUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
 
             codec = MediaCodec.createDecoderByType(mime)
+            onFormat?.invoke(mapOf("decoder" to codec.name, "inputFormat" to describe(format)))
             codec.configure(format, null, null, 0)
             codec.start()
 
             val info = MediaCodec.BufferInfo()
             var inputDone = false
             var outputDone = false
-            var dryLoops = 0
+            var lastProgressAt = System.currentTimeMillis()
             while (!outputDone) {
-                if (!inputDone) {
-                    val inIndex = codec.dequeueInputBuffer(DEQUEUE_TIMEOUT_US)
-                    if (inIndex >= 0) {
-                        val buffer = codec.getInputBuffer(inIndex)!!
-                        val sampleSize = extractor.readSampleData(buffer, 0)
-                        if (sampleSize < 0 || extractor.sampleTime > endUs + 500_000L) {
-                            codec.queueInputBuffer(inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                            inputDone = true
-                        } else {
-                            codec.queueInputBuffer(inIndex, 0, sampleSize, extractor.sampleTime, 0)
-                            extractor.advance()
-                        }
+                // Fill every free input buffer before waiting on output. The old loop queued ONE
+                // sample and then waited up to 50 ms for a frame; a decoder that must hold several
+                // samples before its first output (B-frame reordering, hardware pipeline depth)
+                // spent that whole wait on every sample. In b166, with B-frames in every probe
+                // clip, scoring went from 0.034 s to 0.094 s per frame at the median (0.109 s to
+                // 0.383 s at p90), and three ladders ran out of budget before their safest rung.
+                while (!inputDone) {
+                    val inIndex = codec.dequeueInputBuffer(0L)
+                    if (inIndex < 0) break
+                    val buffer = codec.getInputBuffer(inIndex)!!
+                    val sampleSize = extractor.readSampleData(buffer, 0)
+                    if (sampleSize < 0 || extractor.sampleTime > endUs + 500_000L) {
+                        codec.queueInputBuffer(inIndex, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        inputDone = true
+                    } else {
+                        codec.queueInputBuffer(inIndex, 0, sampleSize, extractor.sampleTime, 0)
+                        extractor.advance()
                     }
                 }
-                when (val outIndex = codec.dequeueOutputBuffer(info, DEQUEUE_TIMEOUT_US)) {
+                when (val outIndex = codec.dequeueOutputBuffer(info, OUTPUT_TIMEOUT_US)) {
                     MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                        if (++dryLoops > MAX_DRY_LOOPS) throw IllegalStateException("decoder stalled")
+                        if (System.currentTimeMillis() - lastProgressAt > STALL_TIMEOUT_MS) {
+                            throw IllegalStateException("decoder stalled")
+                        }
                     }
-                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> dryLoops = 0
+                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        lastProgressAt = System.currentTimeMillis()
+                        onFormat?.invoke(mapOf("outputFormat" to describe(codec.outputFormat)))
+                    }
                     else -> if (outIndex >= 0) {
-                        dryLoops = 0
+                        lastProgressAt = System.currentTimeMillis()
                         val eos = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                         val pts = info.presentationTimeUs
                         var keepGoing = true
                         if (info.size > 0 && pts >= startUs && pts < endUs) {
                             val image = codec.getOutputImage(outIndex)
                                 ?: throw IllegalStateException("no output image")
-                            val frame = imageToDisplayI420(image, rotation, pts)
-                            codec.releaseOutputBuffer(outIndex, false)
+                            val frame = try {
+                                val startedAt = System.nanoTime()
+                                imageToDisplayI420(image, rotation, pts).also {
+                                    onPreparationNanos?.invoke(System.nanoTime() - startedAt)
+                                }
+                            } finally {
+                                image.close()
+                                codec.releaseOutputBuffer(outIndex, false)
+                            }
                             delivered++
                             keepGoing = onFrame(frame)
+                            // onFrame blocks while the scorer's queue is full; that is the
+                            // consumer's time, not a decoder stall.
+                            lastProgressAt = System.currentTimeMillis()
                         } else {
                             codec.releaseOutputBuffer(outIndex, false)
                         }
@@ -144,95 +179,30 @@ class YuvFrameReader(
     }
 
     private fun imageToDisplayI420(image: Image, rotation: Int, ptsUs: Long): I420Frame {
+        // Only 8-bit 4:2:0 can be copied byte-for-byte. A 10-bit stream (Main10, including SDR
+        // BT.709 Main10) decodes to YCBCR_P010 on Android 13+: 16-bit little-endian samples, so
+        // the byte copier below would read every sample's LOW byte, which holds noise bits. The
+        // scorer would then compare garbage against a clean frame, and a collapsed score is
+        // indistinguishable from a real measured rejection. It would be recorded as "would visibly
+        // lose quality" and would feed the learning latch. Refusing the frame routes the window to
+        // "evidence unavailable", which is the truth: the scorer is calibrated on 8-bit frames
+        // only and has no validated 10-bit path.
+        if (image.format != ImageFormat.YUV_420_888) {
+            throw IllegalStateException(
+                "unsupported decoder output format 0x${Integer.toHexString(image.format)} " +
+                    "(only 8-bit YUV_420_888 can be scored)"
+            )
+        }
         val crop = image.cropRect
         val w = crop.width() and 1.inv()
         val h = crop.height() and 1.inv()
-        val packed = ByteArray(w * h * 3 / 2)
-        // Y
-        copyPlane(image.planes[0], crop.left, crop.top, w, h, packed, 0, w)
-        // U, V (chroma at half resolution)
-        val cw = w / 2
-        val ch = h / 2
-        copyPlane(image.planes[1], crop.left / 2, crop.top / 2, cw, ch, packed, w * h, cw)
-        copyPlane(image.planes[2], crop.left / 2, crop.top / 2, cw, ch, packed, w * h + cw * ch, cw)
-        return when (rotation) {
-            90 -> rotate(packed, w, h, clockwise = true, ptsUs)
-            270 -> rotate(packed, w, h, clockwise = false, ptsUs)
-            180 -> rotate180(packed, w, h, ptsUs)
-            else -> I420Frame(packed, w, h, ptsUs)
+        val planes = image.planes.mapIndexed { index, plane ->
+            I420Packing.Plane(plane.buffer, plane.rowStride, plane.pixelStride,
+                if (index == 0) crop.left else crop.left / 2,
+                if (index == 0) crop.top else crop.top / 2)
         }
-    }
-
-    private fun copyPlane(
-        plane: Image.Plane,
-        cropLeft: Int,
-        cropTop: Int,
-        outW: Int,
-        outH: Int,
-        dest: ByteArray,
-        destOffset: Int,
-        destStride: Int
-    ) {
-        val buf = plane.buffer
-        val rowStride = plane.rowStride
-        val pixStride = plane.pixelStride
-        val base = buf.position()
-        for (row in 0 until outH) {
-            val srcRow = base + (cropTop + row) * rowStride + cropLeft * pixStride
-            var d = destOffset + row * destStride
-            if (pixStride == 1) {
-                val tmp = ByteArray(outW)
-                buf.position(srcRow)
-                buf.get(tmp, 0, outW)
-                System.arraycopy(tmp, 0, dest, d, outW)
-            } else {
-                for (col in 0 until outW) {
-                    dest[d++] = buf.get(srcRow + col * pixStride)
-                }
-            }
-        }
-        buf.position(base)
-    }
-
-    private fun rotate(src: ByteArray, w: Int, h: Int, clockwise: Boolean, ptsUs: Long): I420Frame {
-        val out = ByteArray(src.size)
-        rotatePlane(src, 0, w, h, out, 0, clockwise)
-        val cw = w / 2
-        val ch = h / 2
-        rotatePlane(src, w * h, cw, ch, out, w * h, clockwise)
-        rotatePlane(src, w * h + cw * ch, cw, ch, out, w * h + cw * ch, clockwise)
-        return I420Frame(out, h, w, ptsUs)
-    }
-
-    private fun rotatePlane(
-        src: ByteArray, srcOff: Int, w: Int, h: Int,
-        dst: ByteArray, dstOff: Int, clockwise: Boolean
-    ) {
-        // Output plane is h x w.
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val v = src[srcOff + y * w + x]
-                if (clockwise) {
-                    dst[dstOff + x * h + (h - 1 - y)] = v
-                } else {
-                    dst[dstOff + (w - 1 - x) * h + y] = v
-                }
-            }
-        }
-    }
-
-    private fun rotate180(src: ByteArray, w: Int, h: Int, ptsUs: Long): I420Frame {
-        val out = ByteArray(src.size)
-        flipPlane(src, 0, w, h, out, 0)
-        val cw = w / 2
-        val ch = h / 2
-        flipPlane(src, w * h, cw, ch, out, w * h)
-        flipPlane(src, w * h + cw * ch, cw, ch, out, w * h + cw * ch)
-        return I420Frame(out, w, h, ptsUs)
-    }
-
-    private fun flipPlane(src: ByteArray, srcOff: Int, w: Int, h: Int, dst: ByteArray, dstOff: Int) {
-        val n = w * h
-        for (i in 0 until n) dst[dstOff + i] = src[srcOff + n - 1 - i]
+        val packed = I420Packing.pack(planes, w, h, rotation)
+        return if (rotation == 90 || rotation == 270) I420Frame(packed, h, w, ptsUs)
+            else I420Frame(packed, w, h, ptsUs)
     }
 }

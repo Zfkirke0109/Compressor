@@ -108,6 +108,11 @@ jobs:
           COMPRESSOR_DEBUG_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           COMPRESSOR_DEBUG_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           COMPRESSOR_DEBUG_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          # Monotonic build identity. run_number increases with every run of this workflow, so
+          # two APKs can be ordered at a glance — which a PR merge SHA cannot be, since GitHub
+          # recomputes it. Reaches versionName, the APK filename, and every session_start record.
+          COMPRESSOR_BUILD_NUMBER: ${{ github.run_number }}
+          COMPRESSOR_BUILD_LABEL: pr${{ env.PR_NUMBER }}
         run: |
           set -o pipefail
           ./gradlew assembleDebug --stacktrace | tee build.log
@@ -117,7 +122,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: compressor-debug-pr-${{ env.PR_NUMBER }}
+          name: compressor-debug-pr-${{ env.PR_NUMBER }}-b${{ github.run_number }}
           path: app/build/outputs/apk/debug/app-debug.apk
           retention-days: 5
 

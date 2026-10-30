@@ -61,6 +61,8 @@ enum class MetadataPrivacyMode(
 }
 
 enum class BatchPresetOption(val label: String) {
+    S26_BEST("S26 Ultra Best Quality"),
+    S26_STORAGE("S26 Ultra Storage Saver"),
     S23_BEST("S23 Ultra Best Quality"),
     S23_STORAGE("S23 Ultra Storage Saver"),
     SOCIAL("Social Upload"),
@@ -68,6 +70,12 @@ enum class BatchPresetOption(val label: String) {
     HDR_SAFE("HDR Safe Mode");
 
     companion object {
+        fun forDevice(profile: DeviceCapabilityProfile): List<BatchPresetOption> = when {
+            profile.isGalaxyS26Ultra -> listOf(S26_BEST, S26_STORAGE, SOCIAL, ARCHIVE, HDR_SAFE)
+            profile.isGalaxyS23Ultra -> listOf(S23_BEST, S23_STORAGE, SOCIAL, ARCHIVE, HDR_SAFE)
+            else -> listOf(SOCIAL, ARCHIVE, HDR_SAFE)
+        }
+
         fun fromLabel(label: String): BatchPresetOption? {
             return entries.firstOrNull { it.label == label }
         }
@@ -110,6 +118,10 @@ data class OutputVerificationReport(
     val criticalFieldsComplete: Boolean = false,
     val verified: Boolean = false,
     val durationParity: String = "",
+    // What happened to the audio, stated separately from the video verdict: see AudioPreservation.
+    // A Perceptually Lossless verdict is a claim about the pixels; the audio is either a proven
+    // bit-identical copy, or it was re-encoded and NOT validated as perceptually lossless.
+    val audioBasis: String? = null,
     // True only when a Perceptually Lossless output failed SOLELY on the inferred video
     // bitrate floor — every structural, color, audio, timing, and metadata check passed.
     // That one case may be re-judged by sampled pixel certification (measured pixels
@@ -133,7 +145,8 @@ data class OutputVerificationReport(
     //   null - no scope-based derivation (legacy/synthetic report, or a mode with no scope)
     //   []   - derived: every predicate in scope passed
     //   [..] - derived: these predicates failed
-    val failedChecks: List<String>? = null
+    val failedChecks: List<String>? = null,
+    val structuralEvidence: Map<String, Any?> = emptyMap()
 ) {
     /**
      * Names of the per-field checks that did NOT pass, for diagnosing a rejection.
@@ -210,7 +223,8 @@ data class OutputVerificationReport(
             "Location: $location",
             "Rotation: $rotation",
             "Size: $fileSize"
-        ) + (if (durationParity.isNotBlank()) listOf("Duration/frames: $durationParity") else emptyList())
+        ) + (if (durationParity.isNotBlank()) listOf("Duration/frames: $durationParity") else emptyList()) +
+            (audioBasis?.let { listOf("Audio preservation: $it") } ?: emptyList())
 
     /**
      * Records whether sampled pixel scoring ACTUALLY certified this output, and qualifies the
@@ -282,17 +296,44 @@ data class BatchMetricsSummary(
     val failedCount: Int,
     val skippedCount: Int,
     val cancelledCount: Int,
-    val totalSavedBytes: Long
+    val totalSavedBytes: Long,
+    // Real compressions whose original was actually replaced, and whether a backup was kept.
+    val originalsReplacedCount: Int = 0,
+    val backupsKept: Boolean = false
 ) {
     val summaryLines: List<String>
-        get() = listOf(
+        get() = listOfNotNull(
             "Elapsed: ${String.format(Locale.US, "%.1f min", totalElapsedMs.coerceAtLeast(0L) / 60000.0)}",
             "Cooldown used: ${totalCooldownMs / 1000}s",
-            "Saved by real compression: ${formatFileSize(totalSavedBytes.coerceAtLeast(0L))}",
+            "${AcceptedReduction.LABEL}: ${formatFileSize(totalSavedBytes.coerceAtLeast(0L))}",
+            AcceptedReduction.storageNote(realCompressionCount, originalsReplacedCount, backupsKept),
             "Processed: $processedCount • Real compressions: $realCompressionCount",
             "Remuxed/kept/no size win: $nonCompressionCount",
             "Failed: $failedCount • Skipped: $skippedCount • Cancelled: $cancelledCount"
         )
+}
+
+/**
+ * What the batch total means. It is the size reduction of accepted real compressions (source
+ * minus kept output), not storage freed: an output saved beside its original, or an original
+ * replaced after a backup copy, frees nothing. The pilot runs with replacement off, where
+ * "Saved by real compression" (the previous label) read as space that was never reclaimed.
+ */
+object AcceptedReduction {
+    const val LABEL = "Accepted size reduction (real compression)"
+
+    fun storageNote(realCompressions: Int, originalsReplaced: Int, backupsKept: Boolean): String? {
+        if (realCompressions <= 0) return null
+        val replaced = originalsReplaced.coerceIn(0, realCompressions)
+        val parts = buildList {
+            val copies = realCompressions - replaced
+            if (copies > 0) add("$copies of $realCompressions accepted output${if (realCompressions == 1) " is a copy" else "s are copies"} beside the original")
+            if (replaced > 0 && backupsKept) {
+                add(if (replaced == 1) "a backup of the replaced original is kept" else "backups of $replaced replaced originals are kept")
+            }
+        }
+        return if (parts.isEmpty()) null else "Not free space yet: ${parts.joinToString("; ")}"
+    }
 }
 
 fun VideoMetadataSnapshot.filteredForPrivacy(mode: MetadataPrivacyMode): VideoMetadataSnapshot {
