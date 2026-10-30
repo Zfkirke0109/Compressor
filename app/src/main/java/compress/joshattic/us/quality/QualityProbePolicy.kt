@@ -283,6 +283,16 @@ object QualityProbePolicy {
         return (Math.round(midpoint * 100.0) / 100.0).coerceAtLeast(HARD_RATIO_FLOOR)
     }
 
+    /** Exhaustive-only extra trial after a successful bisection with no measured lower failure.
+     * The S26 capture stopped at 0.65 with ample margin without ever testing the allowed 0.60
+     * floor. One measured floor trial can reclaim that gap; failure keeps the existing winner.
+     */
+    fun floorRefinementCandidate(refinedRatio: Double, highestFailedBelow: Double?,
+                                 scores: List<WindowScore>?): Double? =
+        if (refinedRatio.isFinite() && refinedRatio <= SAFEST_RATIO_CEILING &&
+            refinedRatio - HARD_RATIO_FLOOR >= 0.04 - 1e-9 && highestFailedBelow == null &&
+            rungVerdict(scores) == RungVerdict.PASSED) HARD_RATIO_FLOOR else null
+
     /**
      * How far the WORST window falls below the acceptance bars, in VMAF points: > 0 means it fails
      * by that margin, <= 0 means every window passes. Null when there is nothing measured. Used to

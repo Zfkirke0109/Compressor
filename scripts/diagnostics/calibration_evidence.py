@@ -42,6 +42,9 @@ def replay_ledger(events, epoch):
             result['errors'].append(dict(index=index,reason='unreserved or repeated effect',evidenceId=identity)); continue
         applied.add(scope)
         observation = event.get('observation') or {}
+        if not isinstance(observation, dict):
+            result['errors'].append(dict(index=index, reason='observation is not structured JSON', evidenceId=identity))
+            continue
         if observation != reservation.get('observation') or event.get('after') != reservation.get('proposedAfter'):
             result['errors'].append(dict(index=index,reason='reservation/effect mismatch',evidenceId=identity)); continue
         if observation.get('kind') not in ('VISUAL_PASS','VISUAL_REJECT','SIZE'):

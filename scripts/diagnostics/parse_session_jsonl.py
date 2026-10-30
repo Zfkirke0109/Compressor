@@ -211,7 +211,7 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "terminals": dict(terminals.most_common()),
         "effectiveModes": dict(modes.most_common()),
         "materialization": dict(materialization.most_common()),
-        "elapsedMs": (summary or session.get("terminal") or {}).get("elapsedMs"),
+        "elapsedMs": session_elapsed(summary or session.get("terminal") or {}),
         "exhaustivePerceptualLossless": (start or {}).get("exhaustivePerceptualLossless"),
         "buildTag": (start or {}).get("buildTag"),
         "v1ShadowPairs": v1_shadow_pairs(jobs),
@@ -404,6 +404,10 @@ def replay_coverage(session: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def session_elapsed(terminal: dict[str, Any]) -> Any:
+    return terminal.get("totalElapsedMs", terminal.get("elapsedMs"))
+
+
 def session_end(summary: dict[str, Any] | None, terminal: dict[str, Any] | None) -> dict[str, Any]:
     """How the batch ended, from its own terminal record.
 
@@ -418,7 +422,7 @@ def session_end(summary: dict[str, Any] | None, terminal: dict[str, Any] | None)
         return {
             "kind": "cancelled" if kind == "session_cancelled" else "failed",
             "reason": terminal.get("reason"),
-            "elapsedMs": terminal.get("totalElapsedMs", terminal.get("elapsedMs")),
+            "elapsedMs": session_elapsed(terminal),
             "cancelledJobs": terminal.get("cancelled"),
         }
     return {"kind": "unfinished"}

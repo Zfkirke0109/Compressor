@@ -235,6 +235,15 @@ def test_a_cancelled_batch_is_reported_as_cancelled_not_as_unfinished():
     assert "did not finish" not in text
 
 
+def test_current_batch_duration_uses_the_recorded_total_elapsed_field():
+    path = write([start(batchId="b1"), job("a"),
+                  {"type": "session_summary", "batchId": "b1", "totalElapsedMs": 691973}])
+    assert summarize(path)["elapsedMs"] == 691973
+    legacy = write([start(batchId="b1"), job("a"),
+                    {"type": "session_summary", "batchId": "b1", "elapsedMs": 10}])
+    assert summarize(legacy)["elapsedMs"] == 10
+
+
 def test_a_failed_batch_names_its_failure():
     from parse_session_jsonl import render
     path = write([

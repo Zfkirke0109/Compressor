@@ -32,6 +32,7 @@ class YuvFrameReader(
     private val startUs: Long,
     private val endUs: Long,
     private val onFormat: ((Map<String, Any?>) -> Unit)? = null,
+    private val onPreparationNanos: ((Long) -> Unit)? = null,
     private val onFrame: (I420Frame) -> Boolean // return false to stop early
 ) {
     companion object {
@@ -149,7 +150,10 @@ class YuvFrameReader(
                             val image = codec.getOutputImage(outIndex)
                                 ?: throw IllegalStateException("no output image")
                             val frame = try {
-                                imageToDisplayI420(image, rotation, pts)
+                                val startedAt = System.nanoTime()
+                                imageToDisplayI420(image, rotation, pts).also {
+                                    onPreparationNanos?.invoke(System.nanoTime() - startedAt)
+                                }
                             } finally {
                                 image.close()
                                 codec.releaseOutputBuffer(outIndex, false)
@@ -192,90 +196,13 @@ class YuvFrameReader(
         val crop = image.cropRect
         val w = crop.width() and 1.inv()
         val h = crop.height() and 1.inv()
-        val packed = ByteArray(w * h * 3 / 2)
-        // Y
-        copyPlane(image.planes[0], crop.left, crop.top, w, h, packed, 0, w)
-        // U, V (chroma at half resolution)
-        val cw = w / 2
-        val ch = h / 2
-        copyPlane(image.planes[1], crop.left / 2, crop.top / 2, cw, ch, packed, w * h, cw)
-        copyPlane(image.planes[2], crop.left / 2, crop.top / 2, cw, ch, packed, w * h + cw * ch, cw)
-        return when (rotation) {
-            90 -> rotate(packed, w, h, clockwise = true, ptsUs)
-            270 -> rotate(packed, w, h, clockwise = false, ptsUs)
-            180 -> rotate180(packed, w, h, ptsUs)
-            else -> I420Frame(packed, w, h, ptsUs)
+        val planes = image.planes.mapIndexed { index, plane ->
+            I420Packing.Plane(plane.buffer, plane.rowStride, plane.pixelStride,
+                if (index == 0) crop.left else crop.left / 2,
+                if (index == 0) crop.top else crop.top / 2)
         }
-    }
-
-    private fun copyPlane(
-        plane: Image.Plane,
-        cropLeft: Int,
-        cropTop: Int,
-        outW: Int,
-        outH: Int,
-        dest: ByteArray,
-        destOffset: Int,
-        destStride: Int
-    ) {
-        val buf = plane.buffer
-        val rowStride = plane.rowStride
-        val pixStride = plane.pixelStride
-        val base = buf.position()
-        for (row in 0 until outH) {
-            val srcRow = base + (cropTop + row) * rowStride + cropLeft * pixStride
-            var d = destOffset + row * destStride
-            if (pixStride == 1) {
-                buf.position(srcRow)
-                buf.get(dest, d, outW)
-            } else {
-                for (col in 0 until outW) {
-                    dest[d++] = buf.get(srcRow + col * pixStride)
-                }
-            }
-        }
-        buf.position(base)
-    }
-
-    private fun rotate(src: ByteArray, w: Int, h: Int, clockwise: Boolean, ptsUs: Long): I420Frame {
-        val out = ByteArray(src.size)
-        rotatePlane(src, 0, w, h, out, 0, clockwise)
-        val cw = w / 2
-        val ch = h / 2
-        rotatePlane(src, w * h, cw, ch, out, w * h, clockwise)
-        rotatePlane(src, w * h + cw * ch, cw, ch, out, w * h + cw * ch, clockwise)
-        return I420Frame(out, h, w, ptsUs)
-    }
-
-    private fun rotatePlane(
-        src: ByteArray, srcOff: Int, w: Int, h: Int,
-        dst: ByteArray, dstOff: Int, clockwise: Boolean
-    ) {
-        // Output plane is h x w.
-        for (y in 0 until h) {
-            for (x in 0 until w) {
-                val v = src[srcOff + y * w + x]
-                if (clockwise) {
-                    dst[dstOff + x * h + (h - 1 - y)] = v
-                } else {
-                    dst[dstOff + (w - 1 - x) * h + y] = v
-                }
-            }
-        }
-    }
-
-    private fun rotate180(src: ByteArray, w: Int, h: Int, ptsUs: Long): I420Frame {
-        val out = ByteArray(src.size)
-        flipPlane(src, 0, w, h, out, 0)
-        val cw = w / 2
-        val ch = h / 2
-        flipPlane(src, w * h, cw, ch, out, w * h)
-        flipPlane(src, w * h + cw * ch, cw, ch, out, w * h + cw * ch)
-        return I420Frame(out, w, h, ptsUs)
-    }
-
-    private fun flipPlane(src: ByteArray, srcOff: Int, w: Int, h: Int, dst: ByteArray, dstOff: Int) {
-        val n = w * h
-        for (i in 0 until n) dst[dstOff + i] = src[srcOff + n - 1 - i]
+        val packed = I420Packing.pack(planes, w, h, rotation)
+        return if (rotation == 90 || rotation == 270) I420Frame(packed, h, w, ptsUs)
+            else I420Frame(packed, w, h, ptsUs)
     }
 }

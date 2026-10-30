@@ -3921,7 +3921,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 else ExhaustivePerceptualLosslessPolicy.probeBudgetMs(plan.shortProbeLadder),
             sourceFps = item.originalFps.toDouble(),
             transformerInputUri = transformerInputUri,
-            traceRequest = frameTrace(item, "probe")
+            traceRequest = frameTrace(item, "probe"),
+            allowFloorRefinement = exhaustive && !plan.shortProbeLadder && !alternateCodecSearch
         )
         DiagLog.i(
             "CompressorProbe",

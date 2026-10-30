@@ -64,12 +64,17 @@ data class WindowTiming(
     val width: Int,
     val height: Int,
     val scorerThreads: Int,
-    val shadowThreads: Int
+    val shadowThreads: Int,
+    val refPreparationMs: Long = 0,
+    val distPreparationMs: Long = 0,
+    val refDecoder: String? = null,
+    val distDecoder: String? = null
 ) {
     fun compact(): String =
         "wall=$wallMs,queue=$queueWaitMs,v0=$v0ReadMs+$v0FlushMs,cambi=$cambiMs,v1=$v1ReadMs+$v1FlushMs," +
             "cpu[thread=$scorerThreadCpuMs,process=$processCpuMs,refDec=$refDecodeCpuMs,distDec=$distDecodeCpuMs]," +
-            "frames=$refFramesDecoded/$distFramesDecoded,${width}x$height,threads=$scorerThreads/$shadowThreads"
+            "frames=$refFramesDecoded/$distFramesDecoded,${width}x$height,threads=$scorerThreads/$shadowThreads," +
+            "prep=$refPreparationMs/$distPreparationMs,decoder=$refDecoder/$distDecoder"
 }
 
 /** VMAF v1 shadow scores for one window. See [VmafNativeV1]: evidence, never a gate. */
@@ -556,6 +561,8 @@ object VmafPairScorer {
         var v1ReadNanos = 0L
         val refDecodeCpu = java.util.concurrent.atomic.AtomicLong(0L)
         val distDecodeCpu = java.util.concurrent.atomic.AtomicLong(0L)
+        val refPreparation = java.util.concurrent.atomic.AtomicLong(0L)
+        val distPreparation = java.util.concurrent.atomic.AtomicLong(0L)
         // Plain vmaf_v0.6.1 (no phone transform): every threshold in QualityProbePolicy was
         // calibrated against the PC harness's default-model scores, and mixing models would
         // silently loosen the bar (the phone transform maps scores upward).
@@ -592,14 +599,15 @@ object VmafPairScorer {
         // lies inside the window are scored (see the PAIR branch below).
         val decodeLenUs = window.contextUs + window.leadInUs + (window.endUs - window.startUs)
 
-        fun reader(uri: Uri, startUs: Long, queue: ScoringFrameQueue<I420Frame>, label: String, cpu: java.util.concurrent.atomic.AtomicLong) =
+        fun reader(uri: Uri, startUs: Long, queue: ScoringFrameQueue<I420Frame>, label: String,
+                   cpu: java.util.concurrent.atomic.AtomicLong, preparation: java.util.concurrent.atomic.AtomicLong) =
             thread(name = "vmaf-$label") {
                 val cpuStart = android.os.SystemClock.currentThreadTimeMillis()
                 try {
                     YuvFrameReader(context, uri, startUs, startUs + decodeLenUs,
-                        onFormat = if (trace != null) { fields -> fields.forEach { (key, value) ->
+                        onFormat = { fields -> fields.forEach { (key, value) ->
                             if (value != null) decodeFormats["$label.$key"] = value
-                        } } else null) { frame ->
+                        } }, onPreparationNanos = { preparation.addAndGet(it) }) { frame ->
                         queue.send(frame) && error.get() == null
                     }.run()
                 } catch (t: Throwable) {
@@ -610,8 +618,8 @@ object VmafPairScorer {
                 }
             }
 
-        val refThread = reader(ref, (window.startUs - window.leadInUs - window.contextUs).coerceAtLeast(0L), refQueue, "ref", refDecodeCpu)
-        val distThread = reader(dist, (window.distStartUs - window.contextUs).coerceAtLeast(0L), distQueue, "dist", distDecodeCpu)
+        val refThread = reader(ref, (window.startUs - window.leadInUs - window.contextUs).coerceAtLeast(0L), refQueue, "ref", refDecodeCpu, refPreparation)
+        val distThread = reader(dist, (window.distStartUs - window.contextUs).coerceAtLeast(0L), distQueue, "dist", distDecodeCpu, distPreparation)
         var leadInPairsSkipped = 0
         // The last aligned pair before the window: fed to VMAF as motion context, never scored.
         // See MotionContext.
@@ -874,7 +882,9 @@ object VmafPairScorer {
             width = width,
             height = height,
             scorerThreads = SCORER_THREADS,
-            shadowThreads = if (shadowV1) SHADOW_THREADS else 0
+            shadowThreads = if (shadowV1) SHADOW_THREADS else 0,
+            refPreparationMs = ms(refPreparation.get()), distPreparationMs = ms(distPreparation.get()),
+            refDecoder = decodeFormats["ref.decoder"] as? String, distDecoder = decodeFormats["dist.decoder"] as? String
         )
         val result = WindowScore(
             comparedFrames = perFrame.size,

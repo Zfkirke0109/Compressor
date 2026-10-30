@@ -38,6 +38,9 @@ jobs:
       - name: Make Gradle executable
         run: chmod +x ./gradlew
 
+      - name: Check lossless frame packing with native sanitizers and JNI parity
+        run: bash scripts/ci/test_yuv_packing.sh
+
       - name: Restore and validate shared signing key
         shell: bash
         env:

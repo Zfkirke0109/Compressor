@@ -10,6 +10,27 @@ class QualityProbePolicyTest {
 
     private fun good(frames: Int = 30) = WindowScore(frames, mean = 97.0, p5 = 93.0, min = 88.0)
 
+    @Test fun anUnopposedPassingBisectionCanMeasureTheExistingHardFloor() {
+        val scores = List(3) { WindowScore(36, 98.53, 93.69, 90.0) }
+        assertEquals(0.60, QualityProbePolicy.floorRefinementCandidate(0.65, null, scores)!!, 0.0)
+        assertNull(QualityProbePolicy.floorRefinementCandidate(0.65, 0.60, scores))
+        assertNull(QualityProbePolicy.floorRefinementCandidate(0.60, null, scores))
+    }
+
+    @Test fun floorTrialsRequireCompleteMeasuredSelectionMargin() {
+        assertNull(QualityProbePolicy.floorRefinementCandidate(0.65, null, null))
+        for (scores in listOf(listOf(good(5)), listOf(WindowScore(36, 95.6, 92.0, 87.0)),
+                listOf(WindowScore(36, 94.0, 92.0, 87.0)), listOf(WindowScore(36, Double.NaN, 95.0, 90.0)))) {
+            assertNull(QualityProbePolicy.floorRefinementCandidate(0.65, null, scores))
+        }
+    }
+
+    @Test fun floorTrialsCannotExpandTheAllowedRatioRange() {
+        for (ratio in listOf(Double.NaN, Double.POSITIVE_INFINITY, 0.5, 0.61, 0.98)) {
+            assertNull(QualityProbePolicy.floorRefinementCandidate(ratio, null, listOf(good())))
+        }
+    }
+
     @Test
     fun candidateLadderIsLowestFirstClampedToHardFloor() {
         assertEquals(listOf(0.70, 0.80, 0.90), QualityProbePolicy.candidateRatios(0.90, allowBelowDefault = true))

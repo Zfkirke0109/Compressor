@@ -82,7 +82,7 @@ class DiagnosticsRecorder private constructor(
         obj.put("timestampMs", System.currentTimeMillis())
         obj.put("androidUserId", identity.androidUserId)
         obj.put("profileKind", identity.profileKind)
-        for ((k, v) in fields) obj.put(k, v ?: JSONObject.NULL)
+        putFields(obj, fields)
         val line = obj.toString()
         Log.i(TAG, line)
         runCatching { sessionFile?.appendText(line + "\n") }
@@ -501,6 +501,11 @@ class DiagnosticsRecorder private constructor(
 
     companion object {
         const val TAG = "CompressorDiag"
+        internal fun putFields(obj: JSONObject, fields: Map<String, Any?>) {
+            // put(Object) stringifies raw Kotlin maps on Android. The ledger uses real JSON;
+            // per-session observations and nested window details must preserve the same types.
+            for ((key, value) in fields) obj.put(key, JSONObject.wrap(value) ?: JSONObject.NULL)
+        }
         const val SCHEMA_VERSION = 3
         private const val APP_ID = "io.github.zfkirke0109.galaxycompressor"
         // Per-process random-free salt: a fixed app salt keeps hashes stable across the before/after

@@ -50,10 +50,11 @@ class ShadowCalibrationTest {
 
     @Test
     fun timingIsCompactAndComplete() {
-        val t = WindowTiming(170_000, 1_200, 20_000, 300, 50, 140_000, 6_800, 9_000, 400_000, 30_000, 31_000, 44, 44, 3840, 2160, 4, 2)
+        val t = WindowTiming(170_000, 1_200, 20_000, 300, 50, 140_000, 6_800, 9_000, 400_000, 30_000, 31_000, 44, 44, 3840, 2160, 4, 2,
+            refPreparationMs = 1200, distPreparationMs = 2300, refDecoder = "ref.decoder", distDecoder = "dist.decoder")
         assertEquals(
             "wall=170000,queue=1200,v0=20000+300,cambi=50,v1=140000+6800,cpu[thread=9000,process=400000,refDec=30000,distDec=31000]," +
-                "frames=44/44,3840x2160,threads=4/2",
+                "frames=44/44,3840x2160,threads=4/2,prep=1200/2300,decoder=ref.decoder/dist.decoder",
             t.compact()
         )
     }

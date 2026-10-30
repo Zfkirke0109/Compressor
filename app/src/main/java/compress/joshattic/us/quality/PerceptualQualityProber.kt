@@ -166,7 +166,8 @@ class PerceptualQualityProber(private val context: Context) {
         // normalised (Media3InputNormalizer); the windows, the scoring reference and every
         // verdict stay on [sourceUri] either way.
         transformerInputUri: Uri = sourceUri,
-        traceRequest: FrameTraceRequest? = null
+        traceRequest: FrameTraceRequest? = null,
+        allowFloorRefinement: Boolean = false
     ): ProbeDecision {
         if (!VmafNative.isAvailable) return ProbeDecision(null, emptyList(), null, "vmaf unavailable")
         // Long enough to hold the minimum frame count at this frame rate (QualityProbePolicy).
@@ -369,6 +370,24 @@ class PerceptualQualityProber(private val context: Context) {
                         when (QualityProbePolicy.rungVerdict(refinedScores)) {
                             QualityProbePolicy.RungVerdict.PASSED -> {
                                 DiagLog.i(TAG, "refinement %.2f pixel-proven (bisection below %.2f)".format(refined, ratio))
+                                val floor = if (allowFloorRefinement && !overBudget()) {
+                                    QualityProbePolicy.floorRefinementCandidate(refined, highestFailedBelow, refinedScores)
+                                } else null
+                                if (floor != null) {
+                                    probed += floor
+                                    rungMark = System.nanoTime()
+                                    val floorRung = probeOneRatio(
+                                        sourceUri, transformerInputUri, outputMime, floor, targetBitrateForRatio(floor),
+                                        audioBitrate, windows, shape, sourceFps, traceRequest
+                                    )
+                                    countRung(floor, floorRung)
+                                    if (QualityProbePolicy.rungVerdict(scoresOf(floorRung)) == QualityProbePolicy.RungVerdict.PASSED) {
+                                        DiagLog.i(TAG, "floor refinement %.2f pixel-proven; keeping %.2f as the measured fallback".format(floor, refined))
+                                        return proven(floor, floorRung, " (measured floor)")
+                                            .copy(saferPassingRatio = refined, saferPassingRateFactors = factorsOf(refinedRung))
+                                    }
+                                    DiagLog.i(TAG, "floor refinement %.2f did not clear the selection margin; keeping proven %.2f".format(floor, refined))
+                                }
                                 // The rung above stays on record as a measured, passing fallback.
                                 return proven(refined, refinedRung, " (refined)")
                                     .copy(saferPassingRatio = ratio, saferPassingRateFactors = factorsOf(rung))

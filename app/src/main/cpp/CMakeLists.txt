@@ -15,7 +15,9 @@ endif()
 add_library(vmaf STATIC IMPORTED)
 set_target_properties(vmaf PROPERTIES IMPORTED_LOCATION ${VMAF_PREBUILT_DIR}/libvmaf.a)
 
-add_library(compressorvmaf SHARED vmaf_jni.c)
+add_library(compressorvmaf SHARED vmaf_jni.c yuv_packing.c yuv_jni.c)
+# Frame preparation is a production hot path even in the signed debug APKs used for captures.
+set_source_files_properties(yuv_packing.c PROPERTIES COMPILE_OPTIONS "-O3")
 set_target_properties(compressorvmaf PROPERTIES LINKER_LANGUAGE CXX)
 target_include_directories(compressorvmaf PRIVATE ${VMAF_INCLUDE_DIR})
 # Android 15+/16 devices with 16 KB memory pages require ELF segments aligned to 16384;

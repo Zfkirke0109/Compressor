@@ -42,6 +42,14 @@ class EvidenceTest(unittest.TestCase):
         r=replay_ledger([self.event('RESERVED'),dict(self.event(), profileKey='other-device')], 'current')
         self.assertTrue(r['errors'])
         self.assertEqual(r['accepted'], [])
+    def test_legacy_stringified_session_observations_are_reported_not_replayed(self):
+        events=[dict(self.event('RESERVED'),observation='{kind=VISUAL_PASS}'),
+                dict(self.event(),observation='{kind=VISUAL_PASS}')]
+        r=replay_ledger(events, 'current')
+        self.assertEqual(r['status'],'REQUIRES_REVIEW')
+        self.assertEqual(r['accepted'],[])
+        self.assertEqual(r['finalProfiles'],{})
+        self.assertEqual(r['errors'][0]['reason'],'observation is not structured JSON')
     def test_epochs_are_quarantined_and_unreserved_effects_are_invalid(self):
         r=replay_ledger([self.event('RESERVED',epoch='old'),self.event(epoch='old')], 'current')
         self.assertEqual(len(r['quarantined']),1)
