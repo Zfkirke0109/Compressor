@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Estimate per-window scoring time from a decisions.log (b177 WP2). Standard library only.
+"""Report scoring-window wall time from a decisions.log. Standard library only.
 
-Builds before b177 logged no per-window timing, only each window's score line. The interval from
-the line that starts a window's work (`probe rate;` for a probe clip, `window plan;` or the
-previous score line for certification) to its `VmafPairScorer: window` line bounds that window's
-decode + pairing + scoring time. It is an ESTIMATE from log timestamps (1 ms resolution, includes
-any logging and scheduling delay), labelled as such. From b177 the score line carries
-`timing[...]` measured on the monotonic clock; prefer that when present.
+Use the scorer's monotonic timing when present. Legacy score lines can use a log interval
+when their work marker is identifiable. An interval estimate includes logging and scheduling
+delay. Older measured rows with ambiguous phase are reported as unknown.
 
 Usage: python3 window_timing_from_log.py decisions.log [more.log ...] [--json out.json]
 """
@@ -20,6 +17,10 @@ import statistics
 from typing import Any, Iterable
 
 _TS = re.compile(r"^(\d\d-\d\d \d\d:\d\d:\d\d\.\d+) ")
+_SCORE = re.compile(r"VmafPairScorer: window \[(\d+)ms\.\.(\d+)ms\] frames=(\d+)\b")
+_PROBE_MARK = re.compile(r"CompressorProbe: probe rate;.*?window=\[(\d+)\.\.(\d+)ms\]")
+_PHASE = re.compile(r"; phase=(probe|cert|self-check)(?:;|$)")
+_WALL = re.compile(r"\btiming\[wall=(\d+)(?:,|\])")
 
 
 def _time(line: str) -> datetime.datetime | None:
@@ -28,37 +29,88 @@ def _time(line: str) -> datetime.datetime | None:
 
 
 def windows(lines: Iterable[str]) -> list[dict[str, Any]]:
-    out, mark = [], None
+    out = []
+    phase = None
+    cert_mark = None
+    probe_mark = None
     for line in lines:
-        t = _time(line)
-        if t is None:
+        if "CompressorProbe: window plan;" in line:
+            declared_phase = _PHASE.search(line)
+            phase = declared_phase.group(1) if declared_phase else None
+            cert_mark = _time(line)
+            probe_mark = None
             continue
-        if "VmafPairScorer: window" in line:
-            frames = re.search(r"frames=(\d+)", line)
-            v1 = re.search(r"v1shadow\[[^\]]*ms=(\d+)\]", line)
-            kind = "cert" if ("banding[" in line or "v1shadow[" in line) else "probe"
-            if mark is not None and frames:
-                out.append({"kind": kind, "seconds": (t - mark).total_seconds(), "frames": int(frames.group(1)),
-                            "v1Seconds": int(v1.group(1)) / 1000 if v1 else 0.0})
-            mark = t
-        elif "probe rate;" in line or "window plan;" in line:
-            mark = t
+
+        probe = _PROBE_MARK.search(line)
+        if probe:
+            probe_mark = (probe.groups(), _time(line))
+            continue
+
+        score = _SCORE.search(line)
+        if not score:
+            continue
+        probe_match = probe_mark is not None and probe_mark[0] == score.group(1, 2)
+        if phase is not None:
+            kind = phase
+        elif " banding[" in line or " v1shadow[" in line:
+            kind = "cert"
+        elif probe_match:
+            kind = "probe"
+        else:
+            kind = "unknown"
+
+        t = _time(line)
+        mark = None
+        if kind == "cert":
+            mark = cert_mark
+            cert_mark = t
+        else:
+            cert_mark = None
+            if kind == "probe" and probe_match:
+                mark = probe_mark[1]
+        probe_mark = None
+
+        frames = int(score.group(3))
+        if frames == 0:
+            continue
+        wall = _WALL.search(line)
+        if wall:
+            seconds = int(wall.group(1)) / 1000
+        elif t is not None and mark is not None and t >= mark:
+            seconds = (t - mark).total_seconds()
+        else:
+            continue
+
+        v1 = re.search(r"v1shadow\[[^\]]*ms=(\d+)\]", line)
+        out.append({
+            "kind": kind,
+            "seconds": seconds,
+            "measured": wall is not None,
+            "frames": frames,
+            "v1Seconds": int(v1.group(1)) / 1000 if v1 else 0.0,
+        })
     return out
 
 
 def summarize(ws: list[dict[str, Any]]) -> dict[str, Any]:
     res: dict[str, Any] = {}
-    for kind in ("probe", "cert"):
+    for kind in ("probe", "cert", "self-check", "unknown"):
         xs = [w for w in ws if w["kind"] == kind]
         if not xs:
             continue
         spf = sorted(w["seconds"] / w["frames"] for w in xs)
+        measured = [w for w in xs if w["measured"]]
+        estimated = [w for w in xs if not w["measured"]]
         res[kind] = {"windows": len(xs), "totalSeconds": round(sum(w["seconds"] for w in xs), 1),
+                     "measuredWindows": len(measured),
+                     "measuredSeconds": round(sum(w["seconds"] for w in measured), 1),
+                     "estimatedWindows": len(estimated),
+                     "estimatedSeconds": round(sum(w["seconds"] for w in estimated), 1),
                      "v1Seconds": round(sum(w["v1Seconds"] for w in xs), 1),
                      "secondsPerFrameMedian": round(statistics.median(spf), 3),
                      "secondsPerFrameP90": round(spf[int(len(spf) * 0.9)], 3),
                      "secondsPerFrameMax": round(spf[-1], 3)}
-    res["basis"] = "log-timestamp interval estimate (decode + pairing + scoring), not a measured duration"
+    res["basis"] = "scorer wall time plus any legacy log-timestamp interval estimates, reported separately"
     return res
 
 

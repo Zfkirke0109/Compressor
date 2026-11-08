@@ -176,7 +176,7 @@ class PerceptualQualityProber(private val context: Context) {
         if (QualityProbePolicy.probeWindows(durationMs * 1000L, windowUs).isEmpty()) {
             return ProbeDecision(null, emptyList(), null, "clip too short to probe")
         }
-        val plan = planWindows(sourceUri, durationMs, windowUs)
+        val plan = planWindows(sourceUri, durationMs, phase = "probe", windowUs = windowUs)
         val windows = plan.windows
         if (windows.isEmpty() || plan.unplaceable.isNotEmpty()) {
             return ProbeDecision(
@@ -841,6 +841,7 @@ class PerceptualQualityProber(private val context: Context) {
     private suspend fun planWindows(
         sourceUri: Uri,
         durationMs: Long,
+        phase: String,
         windowUs: Long = QualityProbePolicy.BASE_WINDOW_US
     ): ProbeWindowPlanner.Plan =
         withContext(Dispatchers.IO) {
@@ -853,7 +854,7 @@ class PerceptualQualityProber(private val context: Context) {
                         "[${it.startUs / 1000}..${it.endUs / 1000}ms clip@${it.clipStartUs / 1000}ms ${it.anchor}]"
                     } + (if (plan.unplaceable.isEmpty()) "" else "; unplaceable=" + plan.unplaceable.joinToString(",") {
                         "${it.wantedStartUs / 1000}ms(${it.reason})"
-                    })
+                    }) + "; phase=$phase"
                 )
                 plan
             } finally {
@@ -894,7 +895,7 @@ class PerceptualQualityProber(private val context: Context) {
         traceRequest: FrameTraceRequest? = null
     ): String {
         if (!VmafNative.isAvailable) return "self-check: VMAF is not available on this device build"
-        val plan = planWindows(sourceUri, durationMs)
+        val plan = planWindows(sourceUri, durationMs, phase = "self-check")
         if (plan.windows.isEmpty()) return "self-check: no window could be placed (clip too short or no keyframe in reach)"
         val certWindows = plan.windows.map { it.scoreWindowForCertification() }
         val lines = mutableListOf<String>()
@@ -991,7 +992,7 @@ class PerceptualQualityProber(private val context: Context) {
         // The SAME windows the ladder scored (same frame-rate-sized length), so probe and
         // certification scores of one file compare frame for frame; and each window follows a
         // source keyframe, so the reference decode does not have to run from a keyframe minutes earlier.
-        val plan = planWindows(sourceUri, durationMs, windowUs)
+        val plan = planWindows(sourceUri, durationMs, phase = "cert", windowUs = windowUs)
         if (plan.unplaceable.isNotEmpty()) return PairScoreOutcome.Unavailable
         val windows = plan.windows.map { it.scoreWindowForCertification() }
         if (windows.isEmpty()) return PairScoreOutcome.Unavailable

@@ -31,7 +31,7 @@ This engine exists to make repeated encodes on the same device/content class sma
 
 - **Local-only.** No upload, no network call, no internet permission. Stored in app SharedPreferences.
 - **Profile key is technical buckets only** — manufacturer/model/SDK, encoder mime, source codec, resolution bucket, FPS bucket, HDR bucket, bitrate buckets. No private paths, no location, no per-file identifiers. If you see a change that would let a file path, GPS coordinate, or filename leak into a stored profile key, that's a privacy regression — stop and flag it (see [[android-security-privacy-review]]).
-- **Adjusts target ratios cautiously.** Small steps down after a verified success (e.g., 0.95 → 0.93), steps up after a failed/discarded attempt. Two consecutive near-max-ratio failures mark the profile "remux-preferred"; a later verified success clears that flag.
+- **Adjust target ratios cautiously.** Take small steps down after a verified success and step up after measured visual failure. Size-only failures can count toward the near-max-ratio keep-original preference while preserving the target ratio. Pipeline and evidence failures leave the learned profile unchanged.
 - **Clamped above safety floors, always.** Known floors from this codebase: HDR 120fps ≥ 0.90, HDR 4K60 ≥ 0.80, SDR 120fps ≥ 0.88 (120fps floors are intentionally stricter than 60fps — don't collapse these into one ">50fps" bucket), plus absolute floors (8K ≥ 100 Mbps, 4K ≥ 48 Mbps). A corrupted or tampered stored value must not be able to push a recommendation below its floor — the clamp has to be enforced at read time, not just at write time.
 - **Never bypasses verification.** The learning engine only ever picks a *target*, it does not and must not decide "verified." `OutputVerifier` is the only source of truth for that word, always, for every encode it touches.
 
@@ -41,7 +41,7 @@ The PL verdict now also needs measured pixels, not just structure. Read `docs/PE
 
 - **The bar** (`QualityProbePolicy`): every sampled window must hold ≥ 12 compared frames and score `vmaf_v0.6.1` mean ≥ 95.5, 5th percentile ≥ 91, minimum ≥ 84. Scoring is native libvmaf with `phoneModel = false` (`VmafPairScorer.PRODUCTION_PHONE_MODEL`). VMAF v1 is shadow telemetry only.
 - **Probe selection margins** (+0.5 / +1.25 / +1.0) apply only to choosing a probe rung, never to certification. They were calibrated from measured probe→encode drift; re-measure it (`probe->cert` in the summariser) before touching them.
-- **Evidence types** (`CertificationDecision`): passed, measured failure, insufficient (a window under 12 frames), unavailable, misaligned. Only a measured failure or misalignment may say "would visibly lose quality" or teach the learning engine. Insufficient/unavailable keeps the original as "could not be verified".
+- **Evidence types** (`CertificationDecision`). Only an adequately sampled window below the bar can say "would visibly lose quality" and train the target ratio. Misaligned, partial, insufficient, and unavailable decisions keep the original as unverified and leave the learned profile unchanged.
 - **Final verdict ≠ structural verdict** (`FinalAcceptance`): a candidate discarded by certification must be recorded as rejected, never verified or replaceable.
 - **Size gate**: a file's own probe overshoot bound outranks the learned bucket value (`MeasuredOvershoot`); never restore `max(learned, bound)`.
 - **One plan** (`ResolvedEncodePlan`): the encoder request, the estimate and the plan log must come from the same resolved value.
