@@ -50,6 +50,18 @@ class SaferRungRetryTest {
     }
 
     @Test
+    fun aFailedMarginalTrialCanReturnToTheOriginalMeasuredPlan() {
+        val trial = job478c().copy(marginalRefinementTrial = true)
+        for (decision in listOf(null, CertificationDecision.MEASURED_FAILURE, CertificationDecision.PARTIAL,
+            CertificationDecision.MISALIGNED, CertificationDecision.UNAVAILABLE, CertificationDecision.INSUFFICIENT_EVIDENCE)) {
+            assertEquals("$decision", SaferRungRetry.Decision.Allowed(0.90), SaferRungRetry.decide(trial.copy(decision = decision)))
+        }
+        assertEquals("not_a_measured_quality_failure", denial(trial.copy(decision = CertificationDecision.PASSED)))
+        assertEquals("not_a_measured_quality_failure", denial(job478c().copy(decision = null)))
+        assertEquals("thermal", denial(trial.copy(decision = null, thermalStatus = SaferRungRetry.THERMAL_STATUS_LIMIT)))
+    }
+
+    @Test
     fun atMostOneRetryPerFileAndFivePerBatch() {
         assertEquals("item_retry_limit", denial(job478c().copy(retriesThisItem = 1)))
         assertEquals("batch_retry_limit", denial(job478c().copy(retriesThisBatch = SaferRungRetry.MAX_RETRIES_PER_BATCH)))

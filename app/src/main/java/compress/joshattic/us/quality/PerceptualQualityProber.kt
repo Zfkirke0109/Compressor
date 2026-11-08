@@ -63,8 +63,7 @@ data class ProbeDecision(
     val rungsMisaligned: Int = 0,
     val rungsUnavailable: Int = 0,
     // True when [provenRatio] cleared the certification bar but not the probe selection margin
-    // (QualityProbePolicy.PROBE_SELECTION): no safer rung did better, so this one is attempted
-    // and certification decides. Recorded so a capture can count how such attempts fare.
+    // (QualityProbePolicy.PROBE_SELECTION). The full encode still needs certification.
     val marginal: Boolean = false,
     // Per-rung probe clip bitrate telemetry (ProbeClipBitrate.compact), in ladder order.
     val rateDiag: String? = null,
@@ -78,7 +77,7 @@ data class ProbeDecision(
     // caller must not start it on this input.
     val sourceParseFailure: SourceParseFailure? = null,
     // A HIGHER rung that also passed with the selection margin, when [provenRatio] came from a
-    // successful downward refinement below it: the measured fallback the opt-in safer-rung retry
+    // downward refinement below it: the measured fallback the opt-in safer-rung retry
     // may use if the proven rung's full encode fails certification (SaferRungRetry). Null otherwise;
     // it never changes which rung is selected.
     val saferPassingRatio: Double? = null,
@@ -167,7 +166,9 @@ class PerceptualQualityProber(private val context: Context) {
         // verdict stay on [sourceUri] either way.
         transformerInputUri: Uri = sourceUri,
         traceRequest: FrameTraceRequest? = null,
-        allowFloorRefinement: Boolean = false
+        allowFloorRefinement: Boolean = false,
+        // Set only on the primary full Exhaustive ladder when the safer-rung retry is enabled.
+        preferMarginalRefinement: ((lower: RungEvidence, safer: RungEvidence) -> Boolean)? = null
     ): ProbeDecision {
         if (!VmafNative.isAvailable) return ProbeDecision(null, emptyList(), null, "vmaf unavailable")
         // Long enough to hold the minimum frame count at this frame rate (QualityProbePolicy).
@@ -351,14 +352,15 @@ class PerceptualQualityProber(private val context: Context) {
                     )
                     // One bounded bisection between this pass and the measured failure below it:
                     // an extra probe encode may reclaim up to half the rung gap in real savings.
-                    // The passing result above is ALWAYS kept as the fallback; a failed, marginal
-                    // or unmeasurable refinement changes nothing.
+                    // A failed or unmeasurable refinement keeps this result. A marginal
+                    // refinement can be tried when the caller can use this result as a fallback.
                     val refined = if (allowDownwardRefinement) {
                         QualityProbePolicy.refinementCandidate(ratio, highestFailedBelow)
                     } else {
                         null
                     }
                     if (refined != null && !overBudget()) {
+                        val saferEvidence = rungEvidence.last()
                         probed += refined
                         rungMark = System.nanoTime()
                         val refinedRung = probeOneRatio(
@@ -392,11 +394,21 @@ class PerceptualQualityProber(private val context: Context) {
                                 return proven(refined, refinedRung, " (refined)")
                                     .copy(saferPassingRatio = ratio, saferPassingRateFactors = factorsOf(rung))
                             }
-                            QualityProbePolicy.RungVerdict.MARGINAL -> DiagLog.i(
-                                TAG,
-                                "refinement %.2f cleared the bar by only %.2f, below the selection margin; keeping proven %.2f"
-                                    .format(refined, QualityProbePolicy.barMargin(refinedScores!!), ratio)
-                            )
+                            QualityProbePolicy.RungVerdict.MARGINAL -> {
+                                if (preferMarginalRefinement?.invoke(rungEvidence.last(), saferEvidence) == true) {
+                                    DiagLog.i(
+                                        TAG, "trying marginal refinement %.2f with measured fallback %.2f; certification decides"
+                                            .format(refined, ratio)
+                                    )
+                                    return proven(refined, refinedRung, " (marginal refinement; certification decides)")
+                                        .copy(marginal = true, saferPassingRatio = ratio, saferPassingRateFactors = factorsOf(rung))
+                                }
+                                DiagLog.i(
+                                    TAG,
+                                    "refinement %.2f cleared the bar by only %.2f, below the selection margin; keeping proven %.2f"
+                                        .format(refined, QualityProbePolicy.barMargin(refinedScores!!), ratio)
+                                )
+                            }
                             else -> DiagLog.i(TAG, "refinement %.2f rejected; keeping proven %.2f".format(refined, ratio))
                         }
                     }
@@ -706,7 +718,10 @@ class PerceptualQualityProber(private val context: Context) {
                 .setVideoMimeType(outputMime)
                 .setAssetLoaderFactory(
                     ExoPlayerAssetLoader.Factory(
-                        context, DefaultDecoderFactory.Builder(context).build(), Clock.DEFAULT, inputProbe.mediaSourceFactory()
+                        context,
+                        DefaultDecoderFactory.Builder(context).setEnableDecoderFallback(true).build(),
+                        Clock.DEFAULT,
+                        inputProbe.mediaSourceFactory()
                     )
                 )
                 .setEncoderFactory(encoderFactory)

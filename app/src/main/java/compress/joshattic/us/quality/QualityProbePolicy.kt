@@ -90,8 +90,9 @@ object QualityProbePolicy {
     // The margins are the 10th-percentile drift. They are NOT a change to the acceptance bar:
     // certification still judges the real output against PERCEPTUAL_LOSSLESS, unchanged. They
     // change which rung the ladder SELECTS: a rung that clears the bar but not the margin is
-    // "marginal", the ladder moves on to the next, safer rung, and only when no rung clears the
-    // margin is the highest marginal rung attempted, labelled as such, for certification to decide.
+    // "marginal", so the ladder keeps looking for a safer pass. A complete marginal refinement
+    // may be tried with a measured fallback in Exhaustive mode when safer-rung retry is enabled.
+    // If no rung clears the margin, certification still decides on the highest marginal rung.
     const val PROBE_SELECTION_MARGIN_MEAN = 0.5
     const val PROBE_SELECTION_MARGIN_P5 = 1.25
     const val PROBE_SELECTION_MARGIN_MIN = 1.0

@@ -41,16 +41,28 @@ internal class FrameEvidenceTrace(
 ) {
     companion object {
         const val MAX_PAIRS = 4096
-        fun sha256(bytes: ByteArray, offset: Int = 0, count: Int = bytes.size): String =
-            MessageDigest.getInstance("SHA-256").run {
-                update(bytes, offset, count)
-                digest().joinToString("") { "%02x".format(it) }
-            }
         internal fun planeHashes(data: ByteArray, width: Int, height: Int): Map<String, String> {
             val y = width * height
             require(width > 0 && height > 0 && width % 2 == 0 && height % 2 == 0 && data.size == y * 3 / 2)
-            return linkedMapOf("i420" to sha256(data), "y" to sha256(data, 0, y),
-                "u" to sha256(data, y, y / 4), "v" to sha256(data, y + y / 4, y / 4))
+            val digest = MessageDigest.getInstance("SHA-256")
+            fun hash(offset: Int, count: Int): String {
+                digest.update(data, offset, count)
+                return digest.digest().toHexString()
+            }
+            // I420 starts with the complete Y plane. Finalize a copy of that state for Y
+            // while the original continues through U and V for the full-frame hash.
+            digest.update(data, 0, y)
+            val yHash = try {
+                (digest.clone() as MessageDigest).digest().toHexString()
+            } catch (_: CloneNotSupportedException) {
+                null
+            }
+            return linkedMapOf(
+                "i420" to hash(y, data.size - y),
+                "y" to (yHash ?: hash(0, y)),
+                "u" to hash(y, y / 4),
+                "v" to hash(y + y / 4, y / 4)
+            )
         }
     }
 

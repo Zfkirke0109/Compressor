@@ -70,6 +70,15 @@ data class RungEvidence(
     /** The ids of the windows that were actually scored, aligned with [scores]. */
     val scoredWindowIds: List<String> get() = windows.take(scores.size).map { it.id }
 
+    /** A below-margin refinement can only replace the safer plan as a full-encode trial. */
+    internal fun isSmallerMarginalTrialThan(safer: RungEvidence, predictedBytes: Long, saferPredictedBytes: Long): Boolean =
+        measured && verdict == "marginal" && safer.measured && safer.verdict == "passed" &&
+            windows.isNotEmpty() && windows == safer.windows &&
+            scores.size == windows.size && safer.scores.size == windows.size &&
+            encoderNames.size == 1 && encoderNames == safer.encoderNames &&
+            ratio < safer.ratio && requestedVideoBitrate < safer.requestedVideoBitrate &&
+            predictedBytes in 1 until saferPredictedBytes
+
     companion object {
         const val MEASURED = "measured"
         const val MISALIGNED = "misaligned"

@@ -5,6 +5,7 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.nio.file.Files
+import java.security.MessageDigest
 import java.util.zip.GZIPInputStream
 
 class FrameEvidenceTraceTest {
@@ -44,6 +45,22 @@ class FrameEvidenceTraceTest {
         assertEquals(ah["y"], bh["y"])
         assertNotEquals(ah["v"], bh["v"])
         assertNotEquals(ah["i420"], bh["i420"])
+    }
+    @Test fun planeHashesMatchIndependentDigestsWithPartialAndWholeHashBlocks() {
+        for (side in listOf(2, 16)) {
+            val y = side * side
+            val data = ByteArray(y * 3 / 2) { (it * 29 + 127).toByte() }
+            fun sha(bytes: ByteArray) = MessageDigest.getInstance("SHA-256").digest(bytes)
+                .joinToString("") { "%02x".format(it) }
+            assertEquals(
+                mapOf(
+                    "i420" to sha(data), "y" to sha(data.copyOfRange(0, y)),
+                    "u" to sha(data.copyOfRange(y, y + y / 4)),
+                    "v" to sha(data.copyOfRange(y + y / 4, data.size))
+                ),
+                FrameEvidenceTrace.planeHashes(data, side, side)
+            )
+        }
     }
     @Test fun manifestHashAndLengthDescribeExactlyTheCopiedBytes() {
         val out = ByteArrayOutputStream()

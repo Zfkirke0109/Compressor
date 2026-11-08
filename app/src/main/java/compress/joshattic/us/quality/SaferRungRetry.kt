@@ -2,7 +2,8 @@ package compress.joshattic.us.quality
 
 /**
  * Opt-in experiment: one full-encode retry at a higher, already-measured ratio after a measured
- * certification failure. Pure: the caller supplies every fact and runs the encode.
+ * certification failure. A marginal refinement trial can also return to its prior measured
+ * plan after candidate verification or incomplete certification. The caller runs the encode.
  *
  * Motivating case, b169 `job_478c2fa19100` (1356x760, 10 fps): the ladder measured 0.70, 0.80,
  * 0.90 (passed) and refined down to 0.85 (passed). The 0.85 full encode's third certification
@@ -34,7 +35,8 @@ object SaferRungRetry {
 
     data class Input(
         val enabled: Boolean,
-        val decision: CertificationDecision,
+        /** Null when candidate verification rejected the output before final certification. */
+        val decision: CertificationDecision?,
         val usedRatio: Double,
         /** The higher rung the same ladder measured as passing, or null. */
         val saferPassingRatio: Double?,
@@ -52,7 +54,8 @@ object SaferRungRetry {
         val thermalStatus: Int?,
         /** Usable bytes where the output is written, or null when unknown. */
         val freeBytes: Long?,
-        val sourceBytes: Long
+        val sourceBytes: Long,
+        val marginalRefinementTrial: Boolean = false
     )
 
     sealed interface Decision {
@@ -60,24 +63,33 @@ object SaferRungRetry {
         data class Denied(val reasonCode: String) : Decision
     }
 
+    internal fun failureAllowsRetry(decision: CertificationDecision?, marginalRefinementTrial: Boolean): Boolean =
+        decision == CertificationDecision.MEASURED_FAILURE ||
+            (marginalRefinementTrial && decision != CertificationDecision.PASSED)
+
+    internal fun resourceDenial(
+        itemElapsedMs: Long, lastEncodeMs: Long, thermalStatus: Int?, freeBytes: Long?, sourceBytes: Long
+    ): String? = when {
+        itemElapsedMs + lastEncodeMs > ITEM_BUDGET_MS -> "item_time_budget"
+        thermalStatus != null && thermalStatus >= THERMAL_STATUS_LIMIT -> "thermal"
+        freeBytes != null && freeBytes < sourceBytes + FREE_SPACE_MARGIN_BYTES -> "storage"
+        else -> null
+    }
+
     fun decide(i: Input): Decision {
         fun deny(code: String) = Decision.Denied(code)
         val safer = i.saferPassingRatio
         return when {
             !i.enabled -> deny("experiment_off")
-            // Only an adequately measured below-bar result is a reason to try more bits. Misalignment
-            // is temporal, not rate; insufficient/unavailable evidence is not a measurement.
-            i.decision != CertificationDecision.MEASURED_FAILURE -> deny("not_a_measured_quality_failure")
+            !failureAllowsRetry(i.decision, i.marginalRefinementTrial) -> deny("not_a_measured_quality_failure")
             safer == null || !safer.isFinite() -> deny("no_measured_safer_rung")
             safer <= i.usedRatio -> deny("safer_rung_not_higher")
             !i.sameSourceAndConfig -> deny("source_or_config_changed")
             i.retriesThisItem >= MAX_RETRIES_PER_ITEM -> deny("item_retry_limit")
             i.retriesThisBatch >= MAX_RETRIES_PER_BATCH -> deny("batch_retry_limit")
             !i.worthEncoding -> deny("size_check_predicts_no_saving")
-            i.itemElapsedMs + i.lastEncodeMs > ITEM_BUDGET_MS -> deny("item_time_budget")
-            i.thermalStatus != null && i.thermalStatus >= THERMAL_STATUS_LIMIT -> deny("thermal")
-            i.freeBytes != null && i.freeBytes < i.sourceBytes + FREE_SPACE_MARGIN_BYTES -> deny("storage")
-            else -> Decision.Allowed(safer)
+            else -> resourceDenial(i.itemElapsedMs, i.lastEncodeMs, i.thermalStatus, i.freeBytes, i.sourceBytes)
+                ?.let { deny(it) } ?: Decision.Allowed(safer)
         }
     }
 }

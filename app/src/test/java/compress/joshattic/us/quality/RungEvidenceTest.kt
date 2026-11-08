@@ -1,8 +1,10 @@
 package compress.joshattic.us.quality
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /** b177 F2: per-rung probe evidence, and the join keys that stop two rungs being mixed. */
@@ -15,7 +17,8 @@ class RungEvidenceTest {
         requestedVideoBitrate = (ratio * 1_000_000).toInt(),
         configId = EncodeConfigIdentity.of("video/hevc", ProbeEncodeShape(iFrameIntervalSeconds = 3f, maxBFrames = 2), (ratio * 1_000_000).toInt()),
         windows = listOf(WindowRef(12_000_000, 13_200_000), WindowRef(64_000_000, 65_200_000), WindowRef(102_000_000, 103_200_000)),
-        scores = means.map { w(it) }, rateFactors = emptyList(), rateDiag = null, elapsedMs = 1
+        scores = means.map { w(it) }, rateFactors = emptyList(), rateDiag = null, elapsedMs = 1,
+        encoderNames = listOf("c2.qti.hevc.encoder")
     )
 
     @Test
@@ -35,6 +38,37 @@ class RungEvidenceTest {
         val stopped = rung(0.80, 94.0)
         assertEquals(listOf("12000000-13200000"), stopped.scoredWindowIds)
         assertEquals(3, stopped.windows.size)
+    }
+
+    @Test
+    fun completeLowerMarginalRefinementCanTryForMoreSavings() {
+        val safer = rung(0.80, 96.590, 98.119, 96.484)
+        val lower = rung(0.75, 96.446, 97.493, 95.963).copy(verdict = "marginal")
+        assertTrue(lower.isSmallerMarginalTrialThan(safer, 33_366_670L, 35_531_863L))
+    }
+
+    @Test
+    fun marginalRefinementNeedsBothCompleteRungsAndARealPredictedImprovement() {
+        val safer = rung(0.80, 96.590, 98.119, 96.484)
+        val lower = rung(0.75, 96.446, 97.493, 95.963).copy(verdict = "marginal")
+        assertFalse(lower.isSmallerMarginalTrialThan(safer, 35_531_863L, 35_531_863L))
+        assertFalse(lower.isSmallerMarginalTrialThan(safer, 36_000_000L, 35_531_863L))
+        assertFalse(lower.copy(ratio = 0.85).isSmallerMarginalTrialThan(safer, 33_366_670L, 35_531_863L))
+        assertFalse(lower.copy(scores = lower.scores.dropLast(1)).isSmallerMarginalTrialThan(safer, 33_366_670L, 35_531_863L))
+        assertFalse(lower.copy(verdict = "failed").isSmallerMarginalTrialThan(safer, 33_366_670L, 35_531_863L))
+        assertFalse(lower.isSmallerMarginalTrialThan(safer.copy(verdict = "marginal"), 33_366_670L, 35_531_863L))
+        assertFalse(lower.isSmallerMarginalTrialThan(safer.copy(scores = safer.scores.dropLast(1)), 33_366_670L, 35_531_863L))
+        assertFalse(lower.isSmallerMarginalTrialThan(safer.copy(windows = safer.windows.reversed()), 33_366_670L, 35_531_863L))
+    }
+
+    @Test
+    fun marginalRefinementNeedsTheSameMeasuredEncoderOnBothRungs() {
+        val safer = rung(0.80, 96.590, 98.119, 96.484)
+        val lower = rung(0.75, 96.446, 97.493, 95.963).copy(verdict = "marginal")
+        for (names in listOf(emptyList(), listOf("c2.android.hevc.encoder"),
+            listOf("c2.qti.hevc.encoder", "c2.android.hevc.encoder"))) {
+            assertFalse(lower.copy(encoderNames = names).isSmallerMarginalTrialThan(safer, 33_366_670L, 35_531_863L))
+        }
     }
 
     @Test
