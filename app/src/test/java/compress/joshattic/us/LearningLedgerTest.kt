@@ -18,12 +18,31 @@ class LearningLedgerTest {
             assertEquals("first", base.read("profile"))
         } finally { directory.deleteRecursively() }
     }
-    @Test fun deduplicationSurvivesProcessRestart() {
+    @Test fun liveStoresShareReservationsAndResetBoundaries() {
+        val directory = Files.createTempDirectory("ledger-live-stores").toFile()
+        try {
+            val base = SmartPerceptualProfileEngine.InMemoryProfileStore()
+            val file = directory.resolve("evidence.jsonl")
+            val first = LearningEvidenceStore(base, file)
+            val second = LearningEvidenceStore(base, directory.resolve("./evidence.jsonl"))
+            assertTrue(first.writeObservation("p", "first", evidence()))
+            assertFalse(second.writeObservation("p", "duplicate", evidence()))
+            assertEquals("first", base.read("p"))
+            second.clear()
+            assertNull(base.read("p"))
+            assertTrue(first.writeObservation("p", "after reset", evidence()))
+            assertFalse(second.writeObservation("p", "duplicate after reset", evidence()))
+            assertEquals("after reset", base.read("p"))
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun deduplicationSurvivesJournalReplay() {
         val directory = Files.createTempDirectory("ledger").toFile()
         try {
             val base = SmartPerceptualProfileEngine.InMemoryProfileStore(); val file = directory.resolve("evidence.jsonl")
             LearningEvidenceStore(base, file).writeObservation("p", "one", evidence())
-            assertFalse(LearningEvidenceStore(base, file).writeObservation("p", "two", evidence()))
+            val replay = file.copyTo(directory.resolve("reopened.jsonl"))
+            assertFalse(LearningEvidenceStore(base, replay).writeObservation("p", "two", evidence()))
             assertEquals("one", base.read("p"))
         } finally { directory.deleteRecursively() }
     }
@@ -73,7 +92,8 @@ class LearningLedgerTest {
             val file = directory.resolve("evidence.jsonl")
             val key = "profile\"key\\with\ncontrols"
             assertTrue(LearningEvidenceStore(base, file).writeObservation(key, "one", evidence()))
-            assertFalse(LearningEvidenceStore(base, file).writeObservation(key, "two", evidence()))
+            val replay = file.copyTo(directory.resolve("reopened.jsonl"))
+            assertFalse(LearningEvidenceStore(base, replay).writeObservation(key, "two", evidence()))
             assertEquals("one", base.read(key))
         } finally { directory.deleteRecursively() }
     }
@@ -125,7 +145,8 @@ class LearningLedgerTest {
             catch (expected: IllegalStateException) { assertEquals("profile persistence failed", expected.message) }
             val after = evidence().copy(configId = "new-operating-point")
             assertFalse(store.writeObservation("profile", "unsafe", after))
-            assertFalse(LearningEvidenceStore(base, file).writeObservation("profile", "unsafe", after))
+            val replay = file.copyTo(directory.resolve("reopened.jsonl"))
+            assertFalse(LearningEvidenceStore(base, replay).writeObservation("profile", "unsafe", after))
             assertEquals("before", base.read("profile"))
         } finally { directory.deleteRecursively() }
     }

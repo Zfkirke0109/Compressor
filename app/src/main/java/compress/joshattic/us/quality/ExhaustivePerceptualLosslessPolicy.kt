@@ -28,11 +28,8 @@ package compress.joshattic.us.quality
  * measured an SDR 4K camera clip. Whether such clips compress transparently is an empirical
  * question, and the short ladder is how it gets asked.
  *
- * It adds one safeguard of its own: a plan that overturned a heuristic "keep original" decision
- * must be certified by MEASURED full-output windows. Ordinarily a certification that cannot be
- * scored may still pass structurally when the ratio is at or above the codec default; that is
- * reasonable when the heuristic itself predicted headroom, but not when the heuristic predicted
- * visible loss and only sampled probe windows overruled it.
+ * Every re-encode candidate needs complete, passing measured windows on its final output.
+ * This applies to plans selected by the ladder and plans at the codec default.
  *
  * Pure Kotlin, no Android dependencies, so every rule is unit-tested.
  */

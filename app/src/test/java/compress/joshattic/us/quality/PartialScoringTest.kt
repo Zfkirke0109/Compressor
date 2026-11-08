@@ -83,10 +83,8 @@ class PartialScoringTest {
     }
 
     @Test
-    fun beforeTheFixTheSameSequenceWasAcceptedStructurally() {
-        // The pre-fix outcome for this sequence was bare Unavailable. It is still accepted
-        // structurally at the default ratio (probe and no-probe bases): that is the legacy rule
-        // for real absence of evidence, and why losing the first window was dangerous.
+    fun unavailableCertificationIsRejectedOnEveryBasis() {
+        // The earlier scorer erased the failing prefix. Every basis now requires complete evidence.
         assertFalse(gate(CertificationGate.Basis.PROBE_BASIS, PairScoreOutcome.Unavailable).accepted)
         assertFalse(gate(CertificationGate.Basis.NO_PROBE_BASIS, PairScoreOutcome.Unavailable).accepted)
         assertFalse(gate(CertificationGate.Basis.MEASURED_REQUIRED, PairScoreOutcome.Unavailable).accepted)
@@ -98,13 +96,11 @@ class PartialScoringTest {
         assertTrue(outcome is PairScoreOutcome.Incomplete)
         assertEquals(CertificationDecision.PARTIAL, CertificationDecision.of(outcome))
         assertFalse(CertificationDecision.PARTIAL.isMeasuredNegative)
-        // Where the plan needed measured proof, a partial sample is not proof.
-        assertFalse(gate(CertificationGate.Basis.MEASURED_REQUIRED, outcome).accepted)
-        // Where missing evidence was already tolerated structurally, the partial positive sample is
-        // tolerated the same way, and it is still not pixel certification.
-        for (basis in bases) assertFalse(gate(basis, outcome).pixelCertified)
-        assertFalse(gate(CertificationGate.Basis.PROBE_BASIS, outcome).accepted)
-        assertFalse(gate(CertificationGate.Basis.NO_PROBE_BASIS, outcome).accepted)
+        for (basis in bases) {
+            val verdict = gate(basis, outcome)
+            assertFalse(verdict.accepted)
+            assertFalse(verdict.pixelCertified)
+        }
         // Below the default ratio a sub-default target rested on pixels alone: fails closed.
         assertFalse(CertificationGate.evaluate(CertificationGate.Basis.PROBE_BASIS, 0.85, 0.90, outcome).accepted)
         // Not a measured failure: kept original without "would degrade", and nothing learned.

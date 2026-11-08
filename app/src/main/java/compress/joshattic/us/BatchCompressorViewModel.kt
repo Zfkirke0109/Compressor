@@ -767,7 +767,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             return
         }
         selfCheckJob = viewModelScope.launch(Dispatchers.Main) {
-            val started = ExportDebugTracing.tryRunExport {
+            val started = ExportDebugTracing.tryRunExclusive {
                 _uiState.update { it.copy(isSelfChecking = true, statusMessage = "Scorer self-check running on ${item.originalName}…") }
                 val stamp = System.currentTimeMillis()
                 val log = DiagLog.attach(context, "selfcheck_$stamp")
@@ -789,7 +789,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     _uiState.update { it.copy(isSelfChecking = false) }
                 }
             }
-            if (!started) _uiState.update { it.copy(statusMessage = "Wait for the batch or scorer self-check in the other window to finish.") }
+            if (!started) _uiState.update { it.copy(statusMessage = "Wait for the current batch, scorer self-check, or profile reset to finish.") }
         }
     }
 
@@ -814,8 +814,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // A running self-check would share the encoder, the scorer and the decision log with
             // the batch. The batch wins: the self-check stops first, at its next suspension point.
             selfCheckJob?.takeIf { it.isActive }?.cancelAndJoin()
-            val started = ExportDebugTracing.tryRunExport(consumeTraceArm = true) { runBatch(context) }
-            if (!started) _uiState.update { it.copy(statusMessage = "Wait for the batch or scorer self-check in the other window to finish.") }
+            val started = ExportDebugTracing.tryRunExclusive(consumeTraceArm = true) { runBatch(context) }
+            if (!started) _uiState.update { it.copy(statusMessage = "Wait for the current batch, scorer self-check, or profile reset to finish.") }
         }
     }
 
@@ -826,17 +826,22 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             return
         }
         profileResetJob = viewModelScope.launch {
-            val result = try {
-                Result.success(withContext(Dispatchers.IO) {
-                    learningEngine.resetLearnedState()
-                    learningEngine.learnedStateIdentity()
-                })
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Result.failure(e)
+            val started = ExportDebugTracing.tryRunExclusive {
+                val result = try {
+                    Result.success(withContext(Dispatchers.IO) {
+                        learningEngine.resetLearnedState()
+                        learningEngine.learnedStateIdentity()
+                    })
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Result.failure(e)
+                }
+                onResult(result)
             }
-            onResult(result)
+            if (!started) {
+                onResult(Result.failure(IllegalStateException("Wait for the current batch, scorer self-check, or profile reset to finish.")))
+            }
         }
     }
 
@@ -2520,8 +2525,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         s.diagnosticCertWindowScores = compactWindowScores(certScores)
         s.diagnosticCertBandingDiag = compactBandingDiag(certScores)
         s.diagnosticCertV1Scores = compactV1Scores(certScores)
-        // The rule for this plan's basis (CertificationGate, unit-tested): measured evidence rules
-        // on every basis; absent evidence only where the basis already tolerated it.
+        // Every plan basis requires a complete, passing sample. Keep the basis for diagnostics.
         val gate = CertificationGate.evaluate(
             basis = CertificationGate.basisOf(perceptualPlan.requiresMeasuredCertification, perceptualPlan.probeEligible),
             usedRatio = perceptualPlan.targetRatio,
@@ -2990,13 +2994,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val outputUri = checkNotNull(s.outputUri) { "finalize before an output exists" }
         val remuxResult = checkNotNull(s.remuxResult) { "finalize before an output exists" }
         val outputSize = s.outputSize
-        // QUAL-001 — label honesty. OutputVerifier decides "Perceptually Lossless Verified" from
-        // STRUCTURAL checks alone, and it runs BEFORE pixel certification, so on its own that
-        // wording would imply pixel proof even when no pixels were ever scored (source above the
-        // VMAF geometry cap, VMAF unavailable, HDR/codec-downgrade, or a certification that
-        // returned no measured evidence and was accepted structurally). Record what was actually
-        // proven and qualify the wording when it was structural only. Nothing here relaxes
-        // acceptance: a measured cert FAILURE already skipped this item.
+        // Record the actual certification basis. PL transcodes arrive here with a complete,
+        // passing sample. Structural checks still apply to stream-copy and lossy modes.
         val verification = checkNotNull(s.verification) { "finalize before verification" }
             .withCertificationBasis(s.pixelCertifiedThisRun)
         s.verification = verification

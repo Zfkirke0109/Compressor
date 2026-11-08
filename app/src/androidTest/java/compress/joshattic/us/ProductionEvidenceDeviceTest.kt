@@ -56,16 +56,16 @@ class ProductionEvidenceDeviceTest {
         ExportDebugTracing.armNextBatch()
         assertEquals(ExportDebugTracing.State.ARMED, ExportDebugTracing.state.value)
         assertFalse(DebugTraceUtil.enableTracing)
-        assertTrue(ExportDebugTracing.tryRunExport { assertFalse(DebugTraceUtil.enableTracing) })
+        assertTrue(ExportDebugTracing.tryRunExclusive { assertFalse(DebugTraceUtil.enableTracing) })
         assertEquals(ExportDebugTracing.State.ARMED, ExportDebugTracing.state.value)
         val cancellation = CancellationException("end traced test batch")
         try {
-            ExportDebugTracing.tryRunExport(consumeTraceArm = true) {
+            ExportDebugTracing.tryRunExclusive(consumeTraceArm = true) {
                 assertTrue(DebugTraceUtil.enableTracing)
-                assertFalse(ExportDebugTracing.tryRunExport(consumeTraceArm = true) {
+                assertFalse(ExportDebugTracing.tryRunExclusive(consumeTraceArm = true) {
                     throw AssertionError("another batch entered the active trace")
                 })
-                assertFalse(ExportDebugTracing.tryRunExport {
+                assertFalse(ExportDebugTracing.tryRunExclusive {
                     throw AssertionError("a scorer self-check entered the active trace")
                 })
                 throw cancellation
@@ -75,10 +75,10 @@ class ProductionEvidenceDeviceTest {
             assertEquals(cancellation, e)
         }
         assertEquals(ExportDebugTracing.State.IDLE, ExportDebugTracing.state.value)
-        assertTrue(ExportDebugTracing.tryRunExport(consumeTraceArm = true) { assertFalse(DebugTraceUtil.enableTracing) })
+        assertTrue(ExportDebugTracing.tryRunExclusive(consumeTraceArm = true) { assertFalse(DebugTraceUtil.enableTracing) })
 
         ExportDebugTracing.armNextBatch()
-        assertTrue(ExportDebugTracing.tryRunExport(consumeTraceArm = true) { assertTrue(DebugTraceUtil.enableTracing) })
+        assertTrue(ExportDebugTracing.tryRunExclusive(consumeTraceArm = true) { assertTrue(DebugTraceUtil.enableTracing) })
         assertFalse(DebugTraceUtil.enableTracing)
         assertEquals(ExportDebugTracing.State.IDLE, ExportDebugTracing.state.value)
     }

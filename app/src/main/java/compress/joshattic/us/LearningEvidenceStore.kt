@@ -2,40 +2,16 @@ package compress.joshattic.us
 
 import java.io.File
 import java.io.FileOutputStream
+import java.lang.ref.WeakReference
 import java.util.UUID
 
 /** Evidence-aware adapter. The existing aggregate profile store is retained. */
 class LearningEvidenceStore(
     private val delegate: SmartPerceptualProfileEngine.ProfileStore,
-    private val journal: File,
+    journal: File,
     private val onEvent: (Map<String, Any?>) -> Unit = {}
 ) : SmartPerceptualProfileEngine.ProfileStore by delegate {
-    private val seen = mutableSetOf<String>()
-    private var writable = true
-    private val idPattern = Regex("\\\"evidenceId\\\": \\\"([0-9a-f]{64})\\\"")
-    private val profilePattern = Regex(""""profileKey": ("(?:\\.|[^"\\])*")""")
-    init {
-        runCatching {
-            var resetPending = false
-            if (journal.exists()) {
-                require(journal.length() <= MAX_BYTES) { "learning evidence journal exceeds bound" }
-                journal.bufferedReader().useLines { lines -> lines.forEach { line ->
-                    require(line.endsWith("}")) { "incomplete ledger tail; aggregate learning paused" }
-                    if (line.contains("\"ledgerEvent\": \"RESERVED\"")) {
-                        val id = checkNotNull(idPattern.find(line)?.groupValues?.get(1))
-                        val profileJson = checkNotNull(profilePattern.find(line)?.groupValues?.get(1))
-                        seen += scopedId(profileJson, id)
-                    }
-                    if (line.contains("\"ledgerEvent\": \"RESET_STARTED\"")) resetPending = true
-                    if (line.contains("\"ledgerEvent\": \"RESET\"")) {
-                        seen.clear()
-                        resetPending = false
-                    }
-                } }
-            }
-            check(!resetPending) { "incomplete profile reset; aggregate learning paused" }
-        }.onFailure { writable = false }
-    }
+    private val state = journalState(journal)
 
     /**
      * Reserve durably BEFORE changing the aggregate: a crash cannot double-train on replay.
@@ -43,33 +19,31 @@ class LearningEvidenceStore(
      * before/after snapshots allow offline reconstruction and targeted recovery; existing v4
      * profiles are retained, with their legacy aggregate provenance rather than invented labels.
      */
-    @Synchronized
-    override fun writeObservation(key: String, value: String, observation: LearningObservation?): Boolean {
+    override fun writeObservation(key: String, value: String, observation: LearningObservation?): Boolean = synchronized(state) {
         val fields = linkedMapOf<String, Any?>("ledgerVersion" to 1,
             "eventId" to UUID.randomUUID().toString(), "timestampMs" to System.currentTimeMillis(),
             "evidenceId" to observation?.id, "profileKey" to key,
             "observation" to observation?.fields(), "before" to delegate.read(key), "proposedAfter" to value)
         if (observation == null || !observation.valid || !observation.trains) {
             append(fields + mapOf("ledgerEvent" to "IGNORED", "effectApplied" to false, "reason" to "unbound-incompatible-or-nonvisual-nonsize"))
-            return false
+            return@synchronized false
         }
         // A migrated S23 ledger must not suppress an S26 measurement merely because both
         // platforms call their encoder c2.qti.hevc.encoder. The persisted profile includes
         // manufacturer/model/SDK and configuration; preserve dedup within that profile.
         val scopedId = scopedId(JsonText.render(key), observation.id)
-        if (scopedId in seen) {
+        if (scopedId in state.seen) {
             append(fields + mapOf("ledgerEvent" to "DUPLICATE", "effectApplied" to false))
-            return false
+            return@synchronized false
         }
-        if (!append(fields + mapOf("ledgerEvent" to "RESERVED", "effectApplied" to null))) return false
-        seen += scopedId
+        if (!append(fields + mapOf("ledgerEvent" to "RESERVED", "effectApplied" to null))) return@synchronized false
+        state.seen += scopedId
         delegate.write(key, value)
         append(fields + mapOf("eventId" to UUID.randomUUID().toString(), "ledgerEvent" to "APPLIED", "effectApplied" to true, "after" to value))
-        return true
+        true
     }
 
-    @Synchronized
-    override fun clear() {
+    override fun clear() = synchronized(state) {
         // The explicit reset operation retains its audit history; ordinary upgrades never call it.
         check(append(mapOf("ledgerVersion" to 1, "ledgerEvent" to "RESET_STARTED", "timestampMs" to System.currentTimeMillis()))) {
             "Learning history could not record the reset; profiles were kept unchanged."
@@ -80,28 +54,70 @@ class LearningEvidenceStore(
                 "Profile reset completion could not be recorded; learning is paused."
             }
         } catch (e: Exception) {
-            writable = false
+            state.writable = false
             throw e
         }
-        seen.clear()
+        state.seen.clear()
     }
 
-    private fun scopedId(profileJson: String, evidenceId: String): String = "$profileJson\u0000$evidenceId"
-
     private fun append(fields: Map<String, Any?>): Boolean {
-        val ok = writable && runCatching {
+        val journal = state.journal
+        val ok = state.writable && runCatching {
             val bytes = (JsonText.render(fields).replace("\n", "") + "\n").toByteArray()
             check(journal.length() + bytes.size <= MAX_BYTES) { "learning evidence journal full" }
             journal.parentFile?.mkdirs()
             FileOutputStream(journal, true).use { out -> out.write(bytes); out.fd.sync() }
             true
         }.getOrDefault(false)
-        if (!ok) writable = false
+        if (!ok) state.writable = false
         runCatching { onEvent(fields + mapOf("durablyJournaled" to ok)) }
         return ok
     }
 
+    private class JournalState(val journal: File) {
+        val seen = mutableSetOf<String>()
+        var writable = true
+
+        init {
+            runCatching {
+                var resetPending = false
+                if (journal.exists()) {
+                    require(journal.length() <= MAX_BYTES) { "learning evidence journal exceeds bound" }
+                    journal.bufferedReader().useLines { lines -> lines.forEach { line ->
+                        require(line.endsWith("}")) { "incomplete ledger tail; aggregate learning paused" }
+                        if (line.contains("\"ledgerEvent\": \"RESERVED\"")) {
+                            val id = checkNotNull(idPattern.find(line)?.groupValues?.get(1))
+                            val profileJson = checkNotNull(profilePattern.find(line)?.groupValues?.get(1))
+                            seen += scopedId(profileJson, id)
+                        }
+                        if (line.contains("\"ledgerEvent\": \"RESET_STARTED\"")) resetPending = true
+                        if (line.contains("\"ledgerEvent\": \"RESET\"")) {
+                            seen.clear()
+                            resetPending = false
+                        }
+                    } }
+                }
+                check(!resetPending) { "incomplete profile reset; aggregate learning paused" }
+            }.onFailure { writable = false }
+        }
+    }
+
     companion object {
         const val MAX_BYTES = 32L * 1024 * 1024
+        private val journals = mutableMapOf<File, WeakReference<JournalState>>()
+        private val idPattern = Regex("\\\"evidenceId\\\": \\\"([0-9a-f]{64})\\\"")
+        private val profilePattern = Regex(""""profileKey": ("(?:\\.|[^"\\])*")""")
+
+        private fun scopedId(profileJson: String, evidenceId: String): String = "$profileJson\u0000$evidenceId"
+
+        private fun journalState(file: File): JournalState {
+            val path = runCatching { file.canonicalFile }.getOrElse { file.absoluteFile.normalize() }
+            return synchronized(journals) {
+                // Keep the same reservation set for every live adapter. Reload durable evidence
+                // when there is no live adapter, as on a process restart.
+                journals.entries.removeAll { it.value.get() == null }
+                journals[path]?.get() ?: JournalState(path).also { journals[path] = WeakReference(it) }
+            }
+        }
     }
 }

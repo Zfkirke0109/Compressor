@@ -161,8 +161,8 @@ object QualityProbePolicy {
     /**
      * True only when a source of these display dimensions can actually be pixel-scored by
      * [VmafPairScorer] (its geometry is at or below the 4K-class scoring cap). Above the cap the
-     * scorer returns Unavailable, so the output can only ever be accepted structurally and can
-     * never earn the pixel-certified label. Pure so it is unit-testable without a device.
+     * scorer returns Unavailable and Perceptually Lossless keeps the source. Pure so it is
+     * unit-testable without a device.
      */
     fun isPixelScoreableGeometry(width: Int, height: Int): Boolean =
         width > 0 && height > 0 && width.toLong() * height.toLong() <= VmafPairScorer.MAX_COMPARE_PIXELS

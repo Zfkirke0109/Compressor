@@ -298,12 +298,10 @@ internal class StreamOrigin(fixedUs: Long?) {
 /**
  * Scoring result. The distinction between the failure cases is load-bearing:
  * [Unavailable] means no window produced evidence (native lib missing, geometry mismatch,
- * decoder failure) — legacy "no evidence" semantics, eligible for the structural default-ratio
- * certification fallback. [MisalignmentRejected] is POSITIVE evidence that the two streams'
- * frames are not temporally comparable (frame loss or retiming) — it must always fail closed
- * and is NEVER eligible for any structural fallback. [Incomplete] is some windows scored and at
- * least one not: what was scored is kept, so a measured failure in it still rules
- * (CertificationDecision).
+ * decoder failure). [MisalignmentRejected] means the frames are temporally incomparable.
+ * [Incomplete] keeps any scored windows when another window produced no evidence. An adequately
+ * sampled failure among the available windows can still reject the candidate. Final certification
+ * requires a complete, passing sample.
  */
 sealed interface PairScoreOutcome {
     data class Scored(val windows: List<WindowScore>) : PairScoreOutcome
