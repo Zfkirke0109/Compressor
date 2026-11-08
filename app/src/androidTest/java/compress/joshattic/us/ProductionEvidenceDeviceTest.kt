@@ -154,6 +154,12 @@ class ProductionEvidenceDeviceTest {
         }
         val stages = records.filter { type(it) == "stage" }
         assertTrue("stage events without attemptIndex", stages.all { it.has("attemptIndex") })
+        if (job.optString("materializationMode") == "REUSED_SOURCE") {
+            assertEquals(0L, job.getLong("outputSize"))
+            assertEquals(0L, job.getLong("rawByteDelta"))
+            assertFalse(job.getBoolean("finalAccepted"))
+            assertEquals(0L, stages.last { it.optString("stage") == "accept" }.getLong("keptBytes"))
+        }
         if (!job.isNull("encodePlan")) {
             assertTrue(stages.any { it.optString("stage") == "encode" })
             assertTrue(stages.any { it.optString("stage") == "verify" })

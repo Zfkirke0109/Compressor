@@ -74,7 +74,7 @@ object OutputVerifier {
         val audioPacketsIdentical: Boolean = false,
         // How many packets that proof compared (0 when it was not made).
         val audioPacketsCompared: Int = 0,
-        // True when the packets were compared and differ: evidence of a re-encode, not a guess.
+        // True when the packet comparison or its decoder-configuration or timing proof differs.
         val audioPacketsDiffer: Boolean = false,
         val videoTimeline: MediaTimelineEvidence.Result? = null,
         val audioEvidence: AudioTrackIdentity.Outcome? = null
@@ -98,8 +98,10 @@ object OutputVerifier {
         outputFile: File,
         modeLabel: String,
         privacyMode: MetadataPrivacyMode,
-        pixelProvenVideoBitrateFloor: Int? = null
+        pixelProvenVideoBitrateFloor: Int? = null,
+        cancellationCheck: () -> Unit = {}
     ): VerificationInput {
+        cancellationCheck()
         val rawOutputProbe = readFileProbe(outputFile)
         val sourceTracks = probeTracks(context, source.sourceUri)
         val outputTracks = readTrackProbe(outputFile.absolutePath)
@@ -117,12 +119,13 @@ object OutputVerifier {
         // requested an audio copy is otherwise described by its mode name instead of by what its
         // output holds (b177 F5). A measurement only; it adds proof and removes no check.
         val pl = BatchQualityMode.fromLabel(modeLabel) == BatchQualityMode.PERCEPTUAL_LOSSLESS
-        val timeline = if (pl) MediaTimelineEvidence.inspect(context, source.sourceUri, outputFile) else null
+        val timeline = if (pl) MediaTimelineEvidence.inspect(context, source.sourceUri, outputFile, cancellationCheck) else null
         val audioIdentity = if (BatchQualityMode.fromLabel(modeLabel) != BatchQualityMode.REMUX_ONLY &&
             sourceTracks.audioCodec != null && sourceTracks.audioCodec == outputTracks.audioCodec
         ) {
             AudioTrackIdentity.compare(context, source.sourceUri, outputFile,
-                timeline?.sourceOriginUs, timeline?.outputOriginUs, requirePresentationProof = pl)
+                timeline?.sourceOriginUs, timeline?.outputOriginUs, requirePresentationProof = pl,
+                cancellationCheck = cancellationCheck)
         } else {
             null
         }
@@ -501,7 +504,8 @@ object OutputVerifier {
                 packetsIdentical = input.audioPacketsIdentical,
                 packetsCompared = input.audioPacketsCompared,
                 inferredStreamCopy = audioLooksStreamCopied && !input.audioPacketsIdentical,
-                packetsDiffer = input.audioPacketsDiffer
+                packetsDiffer = input.audioPacketsDiffer,
+                identityFailure = input.audioEvidence?.evidence?.reason
             ),
             hdr = "${input.sourceTrackProbe.hdrLabel} -> ${input.outputTrackProbe.hdrLabel}" +
                 if (colorComparison.basis == ColorMatchBasis.MEDIA3_ASSUMED_SDR) {

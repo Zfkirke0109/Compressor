@@ -414,6 +414,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val requestedBitrateModeLabel: String,
         val videoEncoderName: String?,
         val reportedAverageVideoBitrate: Int,
+        val audioConversion: String,
+        val audioEncoderName: String?,
         // Requested vs actual encoder configuration. Media3 format fallback substitutes an
         // unsupported MIME or resolution and still reports success, and a resolution substitution
         // would trip videoMatches inside the PL verification scope - so a rejection could be
@@ -1931,6 +1933,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         }
         s.remuxResult = remuxResult
         s.outputFile = remuxResult.outputFile
+        s.candidateFiles += remuxResult.outputFile
         s.outputUri = Uri.fromFile(remuxResult.outputFile)
         // The closed, rewritten file: the first size that means anything. Still only a candidate.
         s.outputSize = remuxResult.outputFile.length()
@@ -1949,7 +1952,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     "predictedBytes" to plan?.estimatedBytes,
                     "requestedVideoBitrate" to plan?.requestedVideoBitrate,
                     "reportedVideoBitrate" to s.encodeAttempt?.reportedAverageVideoBitrate,
-                    "encoderName" to s.encodeAttempt?.videoEncoderName
+                    "encoderName" to s.encodeAttempt?.videoEncoderName,
+                    "metadataRemuxed" to remuxResult.didRemux
                 )
             )
         )
@@ -2032,6 +2036,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         "encoderName" to result.videoEncoderName,
                         "requestedBitrateMode" to result.requestedBitrateModeLabel,
                         "reportedVideoBitrate" to result.reportedAverageVideoBitrate,
+                        "audioConversion" to result.audioConversion,
+                        "audioEncoderName" to result.audioEncoderName,
                         "encoderConfig" to result.configDelta?.compact(),
                         "input" to if (s.media3Input != null) "platform-normalised" else "source"
                     )
@@ -2216,7 +2222,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val run = s.run
         val item = s.item
         val context = run.context
-        val outputFile = checkNotNull(s.outputFile) { "verification before an output exists" }
+        val firstCandidate = checkNotNull(s.outputFile) { "verification before an output exists" }
         val perceptualPlan = s.perceptualPlan
         // A pixel-proven ratio replaces the class-level verification floor with the proven one
         // minus the encoder-undershoot tolerance measured in the field (requests land within ~6%
@@ -2225,12 +2231,17 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             ((proven - PIXEL_PROVEN_UNDERSHOOT_TOLERANCE) *
                 item.toSourceInfo().videoBitrate).toInt().coerceAtLeast(1)
         }
-        val verificationInput = withContext(Dispatchers.IO) {
+        var verificationInput = withContext(Dispatchers.IO) {
+            val ioContext = currentCoroutineContext()
             OutputVerifier.captureInput(
-                context, item, outputFile, s.effectiveQuality.label, run.privacyMode,
-                pixelProvenVideoBitrateFloor = pixelProvenVerifierFloor
+                context, item, firstCandidate, s.effectiveQuality.label, run.privacyMode,
+                pixelProvenVideoBitrateFloor = pixelProvenVerifierFloor,
+                cancellationCheck = { ioContext.ensureActive() }
             )
         }
+        val corrected = restoreFirstVideoTimestamp(s, firstCandidate, verificationInput)
+        if (corrected != null) verificationInput = corrected
+        val outputFile = checkNotNull(s.outputFile)
         var verification = OutputVerifier.verify(verificationInput)
         // Measured request-vs-actual encoder behavior for this attempt. Prefer Media3's own
         // reported average; fall back to the size/duration measurement.
@@ -2372,6 +2383,86 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             ) -> CertificationStatus.SKIPPED_FELL_BACK_TO_REMUX
             else -> null
         }
+    }
+
+    /** Recover Media3's zeroed first video PTS only after the whole timeline and audio prove the repair. */
+    private suspend fun restoreFirstVideoTimestamp(
+        s: ItemRun,
+        candidate: File,
+        input: OutputVerifier.VerificationInput
+    ): OutputVerifier.VerificationInput? {
+        val pts = input.videoTimeline?.firstVideoPtsToRestoreUs ?: return null
+        if (s.outputSize !in 1 until s.item.originalSize || input.sourceTrackProbe.audioCodec == null) return null
+        val run = s.run
+        val context = run.context
+        val item = s.item
+        val directory = candidate.parentFile ?: context.cacheDir
+        val repairedFile = File(directory, "pl-timing-${System.nanoTime()}.mp4")
+        s.candidateFiles += repairedFile
+        val repaired = withContext(Dispatchers.IO) {
+            val ioContext = currentCoroutineContext()
+            if (directory.usableSpace - SaferRungRetry.FREE_SPACE_MARGIN_BYTES < input.outputSize) {
+                return@withContext null
+            }
+            val audio = AudioTrackIdentity.compare(
+                context, item.sourceUri, candidate, input.videoTimeline.sourceOriginUs, pts,
+                requirePresentationProof = true,
+                cancellationCheck = { ioContext.ensureActive() }
+            )
+            if (audio.result != AudioTrackIdentity.Result.IDENTICAL) return@withContext null
+
+            try {
+                val remux = Mp4MetadataRemuxer.remuxSourceWithoutReencode(
+                    context, Uri.fromFile(candidate), repairedFile,
+                    item.metadataSnapshot.filteredForPrivacy(run.privacyMode).copy(
+                        rotationDegrees = Mp4MetadataRemuxer.orientationHintForTranscodedRemux(input.outputFileProbe.rotationDegrees)
+                    ),
+                    cancellationCheck = { ioContext.ensureActive() },
+                    restoreFirstVideoPtsUs = pts
+                )
+                val repairedInput = OutputVerifier.captureInput(
+                    context, item, remux.outputFile, s.effectiveQuality.label, run.privacyMode,
+                    pixelProvenVideoBitrateFloor = input.pixelProvenVideoBitrateFloor,
+                    cancellationCheck = { ioContext.ensureActive() }
+                )
+                val report = OutputVerifier.verify(repairedInput)
+                if (repairedInput.outputSize in 1 until item.originalSize &&
+                    (report.verified || report.failedOnlyOnVideoBitrateFloor)
+                ) {
+                    remux to repairedInput
+                } else {
+                    repairedFile.delete()
+                    DiagLog.w("CompressorVerification", "first video timestamp repair failed verification; job=${diagnosticJobId(item)}")
+                    null
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                runCatching { repairedFile.delete() }
+                DiagLog.w("CompressorVerification", "first video timestamp repair failed; job=${diagnosticJobId(item)}", e)
+                null
+            }
+        } ?: return null
+
+        val (remux, repairedInput) = repaired
+        s.remuxResult = remux.copy(message = "Restored source video start time")
+        s.outputFile = remux.outputFile
+        s.outputUri = Uri.fromFile(remux.outputFile)
+        s.outputSize = repairedInput.outputSize
+        s.phases.candidateReady(s.outputSize)
+        runCatching { candidate.delete() }
+        run.diagnostics.stage(
+            StageEvent(
+                sourceKey = item.sourceUri.toString(), attempt = s.phases.token.attempt, attemptIndex = s.ledger.currentIndex,
+                stage = StageEvent.Stage.FINALIZE, reasonCode = StageEvent.Reason.CANDIDATE_FINALIZED,
+                elapsedMs = s.elapsedMs,
+                fields = mapOf(
+                    "operation" to "restore_first_video_timestamp", "candidateBytes" to s.outputSize,
+                    "restoredFirstVideoPtsUs" to pts
+                )
+            )
+        )
+        return repairedInput
     }
 
     /**
@@ -4194,7 +4285,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // Requesting audio encoder settings forces Media3 to decode, mix and re-encode the
             // audio track. For an AAC source that would only add a lossy generation — see
             // BatchQualityBitratePolicy.shouldPassThroughAudio — so the audio request is left at
-            // its default and Media3 copies the track bit-exactly.
+            // its default. Verification checks whether the output actually preserved the source.
             // The same rule, applied once in ResolvedEncodePlan.audioPlan.
             val passThroughAudio = plan.audio is ResolvedEncodePlan.AudioPlan.Copy
             val maxBFrames = EncoderExperiments.maxBFrames(context)
@@ -4282,6 +4373,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                     requestedBitrateModeLabel = bitrateModeLabel,
                                     videoEncoderName = exportResult.videoEncoderName,
                                     reportedAverageVideoBitrate = exportResult.averageVideoBitrate,
+                                    audioConversion = when (exportResult.audioConversionProcess) {
+                                        ExportResult.CONVERSION_PROCESS_NA -> "none"
+                                        ExportResult.CONVERSION_PROCESS_TRANSCODED -> "transcoded"
+                                        ExportResult.CONVERSION_PROCESS_TRANSMUXED -> "transmuxed"
+                                        ExportResult.CONVERSION_PROCESS_TRANSMUXED_AND_TRANSCODED -> "mixed"
+                                        else -> "unknown"
+                                    },
+                                    audioEncoderName = exportResult.audioEncoderName,
                                     configDelta = configDelta
                                 )
                             )
@@ -4649,7 +4748,6 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             retainedVerdict = retainedValidation?.verdict,
             retainedReadable = retainedValidation?.readableAtDecisionTime
         )
-        val recordedOutputSize = if (retainedValidation != null) outputSize else acceptance.acceptedOutputBytes
         if (!acceptStageEmitted) {
             diagnostics.stage(
                 StageEvent.terminal(
@@ -4700,7 +4798,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     verification.replacementBlockReason ?: fallbackReason ?: acceptance.verdict
                 else -> verification?.replacementBlockReason
             },
-            outputSize = recordedOutputSize,
+            outputSize = acceptance.acceptedOutputBytes,
             terminal = terminal,
             elapsedMs = elapsedMs,
             fallbackReason = fallbackReason,

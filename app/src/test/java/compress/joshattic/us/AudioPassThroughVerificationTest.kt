@@ -59,7 +59,7 @@ class AudioPassThroughVerificationTest {
         ))
         assertTrue("audioBitratePass" in report.failingChecks())
         assertFalse(report.audioBitrate.contains("stream copied"))
-        assertEquals(AudioPreservation.RE_ENCODED_NOT_VALIDATED, report.audioBasis)
+        assertEquals(AudioPreservation.PL_IDENTITY_UNPROVEN, report.audioBasis)
     }
 
     @Test

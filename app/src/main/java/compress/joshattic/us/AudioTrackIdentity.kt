@@ -6,6 +6,7 @@ import android.media.MediaFormat
 import android.net.Uri
 import java.io.File
 import java.nio.ByteBuffer
+import java.util.concurrent.CancellationException
 
 /** Packet, decoder-configuration and A/V-timing evidence. Unknown evidence never proves PL audio. */
 object AudioTrackIdentity {
@@ -41,7 +42,9 @@ object AudioTrackIdentity {
     /** With video origins supplied, proves decoder configuration and presentation as well as bytes. */
     fun compare(context: Context, sourceUri: Uri, outputFile: File,
                 sourceVideoOriginUs: Long? = null, outputVideoOriginUs: Long? = null,
-                requirePresentationProof: Boolean = false): Outcome {
+                requirePresentationProof: Boolean = false,
+                cancellationCheck: () -> Unit = {}): Outcome {
+        cancellationCheck()
         if (requirePresentationProof && (sourceVideoOriginUs == null || outputVideoOriginUs == null))
             return Outcome(Result.UNAVAILABLE, 0)
         val sourceExtractor = MediaExtractor()
@@ -55,16 +58,21 @@ object AudioTrackIdentity {
             val of = outputExtractor.getTrackFormat(outputTrack)
             if (sourceVideoOriginUs == null || outputVideoOriginUs == null) {
                 // Legacy lossy-mode diagnostic only; this branch cannot prove PL audio.
-                compareCounted(packets(sourceExtractor, capacityOf(sf)), packets(outputExtractor, capacityOf(of)))
+                compareCounted(
+                    packets(sourceExtractor, capacityOf(sf), cancellationCheck),
+                    packets(outputExtractor, capacityOf(of), cancellationCheck)
+                )
             } else {
                 val sc = configHash(sf); val oc = configHash(of)
                 val evidence = AudioPacketEvidence.compare(
-                    timedPackets(sourceExtractor, capacityOf(sf)), timedPackets(outputExtractor, capacityOf(of)),
+                    timedPackets(sourceExtractor, capacityOf(sf), cancellationCheck),
+                    timedPackets(outputExtractor, capacityOf(of), cancellationCheck),
                     sc, oc, sourceVideoOriginUs, outputVideoOriginUs)
                 Outcome(if (evidence.identical) Result.IDENTICAL else if (sc == null || oc == null)
                     Result.UNAVAILABLE else Result.DIFFERENT, evidence.packets, evidence, sc, oc)
             }
-        } catch (_: Exception) { Outcome(Result.UNAVAILABLE, 0) }
+        } catch (e: CancellationException) { throw e }
+        catch (_: Exception) { Outcome(Result.UNAVAILABLE, 0) }
         finally {
             runCatching { sourceExtractor.release() }
             runCatching { outputExtractor.release() }
@@ -96,12 +104,15 @@ object AudioTrackIdentity {
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
-    private fun timedPackets(extractor: MediaExtractor, capacity: Int): Iterator<AudioPacketEvidence.Packet> {
+    private fun timedPackets(
+        extractor: MediaExtractor, capacity: Int, cancellationCheck: () -> Unit
+    ): Iterator<AudioPacketEvidence.Packet> {
         val buffer = ByteBuffer.allocate(capacity)
         val started = System.nanoTime()
         return iterator {
             var count = 0
             while (true) {
+                if (count % 256 == 0) cancellationCheck()
                 check(count++ < 2_000_000 && System.nanoTime() - started < 30_000_000_000L) { "audio evidence budget exceeded" }
                 buffer.clear()
                 val size = extractor.readSampleData(buffer, 0)
@@ -121,10 +132,12 @@ object AudioTrackIdentity {
             DEFAULT_SAMPLE_CAPACITY
         }
 
-    private fun packets(extractor: MediaExtractor, capacity: Int): Iterator<ByteArray> {
+    private fun packets(extractor: MediaExtractor, capacity: Int, cancellationCheck: () -> Unit): Iterator<ByteArray> {
         val buffer = ByteBuffer.allocate(capacity)
         return iterator {
+            var count = 0
             while (true) {
+                if (count++ % 256 == 0) cancellationCheck()
                 buffer.clear()
                 val size = extractor.readSampleData(buffer, 0)
                 if (size < 0) break

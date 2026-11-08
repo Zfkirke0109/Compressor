@@ -5,15 +5,13 @@ package compress.joshattic.us
  *
  * "Perceptually Lossless Verified" is decided by structural checks plus sampled VMAF, and VMAF
  * scores pixels. It says nothing about the audio. In this app the audio of a PL output is one of
- * three things, and the record must say which:
+ * several evidence states:
  *
  *  - a BIT-IDENTICAL copy of the source's compressed audio, proven by comparing every packet
  *    ([AudioTrackIdentity]). Nothing was decoded or re-encoded, so nothing could have been lost;
  *  - an inferred stream copy: codec, channels and sample rate match and the muxer exposes no
  *    bitrate, the pre-b162 rule. Almost certainly a copy, but not proven packet by packet;
- *  - a RE-ENCODE (a non-AAC source such as Opus, or an AAC source the pipeline chose to
- *    re-encode). A second lossy generation. No listening test or audio metric validates it here,
- *    so it is never called perceptually lossless; it is called what it is.
+ *  - an unverified copy, with any measured difference in packets, codec configuration or timing.
  *
  * The lossy modes (High Quality, Storage Saver) are described by what was OBSERVED, never by the
  * mode's name. b177 F5: both HDR High Quality jobs requested `audio=copy(source=256000bps)` in
@@ -26,7 +24,7 @@ package compress.joshattic.us
 object AudioPreservation {
 
     const val NO_AUDIO = "no audio track"
-    const val RE_ENCODED_NOT_VALIDATED = "re-encoded (a new lossy generation), not validated as perceptually lossless"
+    const val PL_IDENTITY_UNPROVEN = "audio packet, decoder configuration or A/V timing identity could not be verified"
     const val INFERRED_COPY = "stream copy inferred from matching codec, channels and sample rate (packets not compared)"
     const val LOSSY_PACKETS_DIFFER = "re-encoded or altered (lossy mode): the output's audio packets differ from the source's"
     const val LOSSY_NOT_SHOWN_AS_COPY =
@@ -40,17 +38,19 @@ object AudioPreservation {
         packetsIdentical: Boolean,
         packetsCompared: Int,
         inferredStreamCopy: Boolean,
-        // AudioTrackIdentity compared the packets and found a difference.
-        packetsDiffer: Boolean = false
+        // AudioTrackIdentity found a difference in the available evidence.
+        packetsDiffer: Boolean = false,
+        identityFailure: String? = null
     ): String? {
         if (!sourceHasAudio) return NO_AUDIO
         return when (mode) {
             BatchQualityMode.REMUX_ONLY -> "stream copy (Remux Only never re-encodes audio)"
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> when {
                 packetsIdentical -> bitIdentical(packetsCompared)
-                packetsDiffer -> RE_ENCODED_NOT_VALIDATED
+                identityFailure != null -> "audio preservation could not be verified ($identityFailure)"
+                packetsDiffer -> PL_IDENTITY_UNPROVEN
                 inferredStreamCopy -> INFERRED_COPY
-                else -> RE_ENCODED_NOT_VALIDATED
+                else -> PL_IDENTITY_UNPROVEN
             }
             else -> when {
                 packetsIdentical -> bitIdentical(packetsCompared)

@@ -13,7 +13,7 @@ class AudioPreservationTest {
             assertEquals(AudioPreservation.LOSSY_PACKETS_DIFFER,
                 AudioPreservation.describe(mode, true, false, 3, true, packetsDiffer = true))
         }
-        assertEquals(AudioPreservation.RE_ENCODED_NOT_VALIDATED,
+        assertEquals(AudioPreservation.PL_IDENTITY_UNPROVEN,
             AudioPreservation.describe(BatchQualityMode.PERCEPTUAL_LOSSLESS, true, false, 3, true, packetsDiffer = true))
     }
 
@@ -26,10 +26,20 @@ class AudioPreservationTest {
     }
 
     @Test
-    fun aReEncodeInPerceptuallyLosslessIsNeverCalledPerceptuallyLossless() {
+    fun missingAudioEvidenceDoesNotImplyReencoding() {
         val d = AudioPreservation.describe(BatchQualityMode.PERCEPTUAL_LOSSLESS, true, false, 0, inferredStreamCopy = false)
-        assertEquals(AudioPreservation.RE_ENCODED_NOT_VALIDATED, d)
-        assertTrue(d!!.contains("not validated"))
+        assertEquals(AudioPreservation.PL_IDENTITY_UNPROVEN, d)
+    }
+
+    @Test
+    fun aTimelineMismatchIsReportedAsTimingRatherThanAsReencoding() {
+        assertEquals(
+            "audio preservation could not be verified (presentation time differs against video by 14277us)",
+            AudioPreservation.describe(
+                BatchQualityMode.PERCEPTUAL_LOSSLESS, true, false, 1927, false, packetsDiffer = true,
+                identityFailure = "presentation time differs against video by 14277us"
+            )
+        )
     }
 
     @Test

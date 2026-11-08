@@ -261,7 +261,7 @@ class DiagnosticsRecorder private constructor(
     ) {
         val accountingEntry = BatchTerminalAccountingEntry(terminal, sourceSize, outputSize)
         outcomes += accountingEntry
-        val rawByteDelta = sourceSize - outputSize
+        val rawByteDelta = if (outputSize > 0L) sourceSize - outputSize else 0L
         val savedBytes = BatchTerminalAccounting.savedBytes(accountingEntry)
         val savedPct = if (sourceSize > 0 && terminal.countsAsRealCompression) {
             savedBytes.toDouble() / sourceSize.toDouble()

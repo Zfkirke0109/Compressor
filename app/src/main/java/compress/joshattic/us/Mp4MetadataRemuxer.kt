@@ -31,6 +31,7 @@ object Mp4MetadataRemuxer {
         // Called between samples; throw (e.g. ensureActive) to stop. Media3InputNormalizer uses it
         // so a cancelled batch does not finish copying a multi-gigabyte file.
         cancellationCheck: () -> Unit = {},
+        restoreFirstVideoPtsUs: Long? = null,
         // Every video sample written, by presentation time, so a caller can tell a complete copy
         // from one the extractor ended early (readSampleData < 0 ends the loop silently).
         onVideoSample: (presentationTimeUs: Long) -> Unit = {}
@@ -86,6 +87,7 @@ object Mp4MetadataRemuxer {
             var copiedBytes = 0L
             val videoTrack = videoTracks.single()
             var samples = 0L
+            var restored = false
 
             while (true) {
                 if (samples++ % 256L == 0L) cancellationCheck()
@@ -107,7 +109,13 @@ object Mp4MetadataRemuxer {
                 val sampleSize = extractor.readSampleData(buffer, 0)
                 if (sampleSize < 0) break
 
-                bufferInfo.set(0, sampleSize, extractor.sampleTime, flags)
+                val pts = extractor.sampleTime
+                val restoredPts = restoreFirstVideoPtsUs?.takeIf { inputTrackIndex == videoTrack && !restored }
+                if (restoredPts != null) {
+                    check(pts == 0L && restoredPts > 0L) { "unexpected first video timestamp" }
+                    restored = true
+                }
+                bufferInfo.set(0, sampleSize, restoredPts ?: pts, flags)
                 muxer.writeSampleData(outputTrackIndex, buffer, bufferInfo)
                 copiedBytes += sampleSize
                 if (inputTrackIndex == videoTrack) onVideoSample(bufferInfo.presentationTimeUs)
@@ -115,7 +123,8 @@ object Mp4MetadataRemuxer {
                 extractor.advance()
             }
 
-            runCatching { muxer.stop() }
+            check(restoreFirstVideoPtsUs == null || restored) { "first video timestamp is missing" }
+            muxer.stop()
             muxerStarted = false
             muxer.release()
             muxer = null
@@ -263,7 +272,7 @@ object Mp4MetadataRemuxer {
                 extractor.advance()
             }
 
-            runCatching { muxer.stop() }
+            muxer.stop()
             muxerStarted = false
             muxer.release()
             muxer = null

@@ -5,6 +5,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
 import java.io.File
+import java.util.concurrent.CancellationException
 
 /**
  * Pure presentation-timeline comparison, separate from quality evidence.
@@ -19,7 +20,8 @@ import java.io.File
 object MediaTimelineEvidence {
     data class Result(val matches: Boolean, val sourceFrames: Int, val outputFrames: Int,
         val sourceOriginUs: Long? = null, val outputOriginUs: Long? = null,
-        val maxSkewUs: Long = 0, val firstMismatch: Int? = null, val reason: String? = null)
+        val maxSkewUs: Long = 0, val firstMismatch: Int? = null, val reason: String? = null,
+        val firstVideoPtsToRestoreUs: Long? = null)
 
     fun compare(source: LongArray, output: LongArray, toleranceUs: Long = 1000): Result {
         require(toleranceUs >= 0)
@@ -42,19 +44,33 @@ object MediaTimelineEvidence {
                 "frame count ${source.size} -> ${output.size}")
         }
         return if (firstMismatch == null) result(true, maxSkew)
-        else result(false, maxSkew, firstMismatch, "frame $firstMismatch retimed beyond ${toleranceUs}us")
+        else {
+            // Media3 1.11's MuxerWrapper can zero the first video PTS when audio is present.
+            // Identify that exact pattern while continuing to reject the original candidate.
+            val restore = sourceOrigin?.takeIf { origin ->
+                firstMismatch == 1 && outputOrigin == 0L && origin > toleranceUs &&
+                    origin < output[1] && (1 until source.size).all { i ->
+                        kotlin.math.abs(source[i] - output[i]) <= toleranceUs
+                    }
+            }
+            result(false, maxSkew, firstMismatch, "frame $firstMismatch retimed beyond ${toleranceUs}us")
+                .copy(firstVideoPtsToRestoreUs = restore)
+        }
     }
 
     private fun strictlyIncreasingViolation(pts: LongArray): Int? =
         (1 until pts.size).firstOrNull { pts[it] <= pts[it - 1] }
     /** Complete compressed-sample presentation timeline; no pixels or sample payloads retained. */
-    fun inspect(context: Context, source: Uri, output: File): Result = try {
-        compare(read(context, source), read(context, Uri.fromFile(output)))
+    fun inspect(context: Context, source: Uri, output: File, cancellationCheck: () -> Unit = {}): Result = try {
+        compare(read(context, source, cancellationCheck), read(context, Uri.fromFile(output), cancellationCheck))
+    } catch (e: CancellationException) {
+        throw e
     } catch (e: Exception) {
         Result(false, 0, 0, reason = "timeline unavailable: ${e.javaClass.simpleName}")
     }
 
-    private fun read(context: Context, uri: Uri): LongArray {
+    private fun read(context: Context, uri: Uri, cancellationCheck: () -> Unit): LongArray {
+        cancellationCheck()
         val extractor = MediaExtractor()
         try {
             extractor.setDataSource(context, uri, null)
@@ -68,6 +84,7 @@ object MediaTimelineEvidence {
             while (extractor.sampleTime >= 0) {
                 require(points.size < 1_000_000) { "timeline sample budget exceeded" }
                 if (points.size % 1024 == 0) {
+                    cancellationCheck()
                     check(System.nanoTime() - started < 30_000_000_000L) { "timeline time budget exceeded" }
                     check(!Thread.currentThread().isInterrupted) { "timeline interrupted" }
                 }
