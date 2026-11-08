@@ -14,16 +14,22 @@
 #   ANDROID_USER  optional user id (150 for the Secure Folder profile the batches run in). The
 #                 debug APK and its test APK must be installed for that user.
 #
-# Writes the instrumentation output next to the clip as CLIP.device-checks.txt. Runs alongside
+# Writes the instrumentation output next to the clip as CLIP.device-checks.txt.
+# Exit 2 means the validation was incomplete (skipped tests, zero tests or missing results).
+# Runs alongside
 # scripts/diagnostics/resilient_capture.sh; start that first to keep the Compressor* log tags.
 set -euo pipefail
 CLIP="${1:?usage: run-device-checks.sh CLIP.mp4 [ANDROID_USER]}"
+CLIP_DIR="$(cd -- "$(dirname -- "$CLIP")" && pwd -P)"
+CLIP="$CLIP_DIR/$(basename -- "$CLIP")"
 USER_ID="${2:-}"
 PKG=io.github.zfkirke0109.galaxycompressor
-REMOTE=/data/local/tmp/compressor_smoke.mp4
+REMOTE="/data/local/tmp/compressor_smoke_$$.mp4"
 OUT="${CLIP%.*}.device-checks.txt"
+CLIP_SHA="$(sha256sum "$CLIP" | cut -c1-16)"
 
 adb get-state >/dev/null
+trap 'adb shell rm -f "$REMOTE" >/dev/null || true' EXIT
 adb push "$CLIP" "$REMOTE" >/dev/null
 adb shell chmod 644 "$REMOTE"
 
@@ -36,18 +42,22 @@ adb install -r -t "${USER_ARGS[@]}" app/build/outputs/apk/androidTest/debug/app-
 
 adb logcat -c || true
 {
-  echo "# device checks $(date -u +%FT%TZ) clip=$(basename "$CLIP") sha256=$(sha256sum "$CLIP" | cut -c1-16) user=${USER_ID:-0}"
+  echo "# device checks $(date -u +%FT%TZ) clip=$(basename "$CLIP") sha256=$CLIP_SHA user=${USER_ID:-0}"
   adb shell getprop ro.product.model
   adb shell am instrument -w -r "${USER_ARGS[@]}" \
     -e class compress.joshattic.us.PipelineDeviceTest,compress.joshattic.us.ProductionEvidenceDeviceTest \
     -e sourceVideo "$REMOTE" \
     "$PKG.test/androidx.test.runner.AndroidJUnitRunner"
 } | tee "$OUT"
-adb shell rm -f "$REMOTE"
-grep -q "FAILURES!!!" "$OUT" && { echo "device checks FAILED; see $OUT"; exit 1; }
-grep -q "OK (" "$OUT" || { echo "device checks did not report OK; see $OUT"; exit 1; }
-# A skipped test is not a pass: show how many ran versus were skipped (assumption failures).
-grep -E "INSTRUMENTATION_STATUS_CODE: -3|AssumptionViolated" "$OUT" >/dev/null && echo "note: some tests were SKIPPED (see $OUT)"
+if grep -Eq 'FAILURES!!!|INSTRUMENTATION_FAILED:|^INSTRUMENTATION_STATUS_CODE: -[12][[:space:]]*$' "$OUT"; then
+  echo "device checks failed. See $OUT"
+  exit 1
+fi
+if grep -Eq '^INSTRUMENTATION_STATUS_CODE: -[34][[:space:]]*$|AssumptionViolated' "$OUT" ||
+   ! grep -Eq '^[[:space:]]*OK \([1-9][0-9]* tests?\)[[:space:]]*$' "$OUT"; then
+  echo "device checks incomplete. See $OUT"
+  exit 2
+fi
 # The b177 tests print what the platform reported (durations, window starts, record fields) to
 # System.out, which lands in logcat rather than the instrumentation output.
 adb logcat -d -s System.out:I | grep -E "b177-(fixture|evidence)" | tee -a "$OUT" || true

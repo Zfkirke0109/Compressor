@@ -115,5 +115,24 @@ def test_a_diagnostics_zip_reads_every_run_newest_first_and_its_manifest():
         assert read_manifest(os.path.join(tmp, "plain.txt")) is None
 
 
+def test_zip_member_identity_supplies_legacy_ids_and_rejects_conflicts():
+    import zipfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "capture.zip")
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("runs/batch_2/session.jsonl", json.dumps(JOB))
+        assert read_records(path) == [dict(JOB, batchId="batch_2")]
+
+        with zipfile.ZipFile(path, "a") as archive:
+            archive.writestr("runs/batch_1/session.jsonl", json.dumps(dict(JOB, batchId="batch_2")))
+        try:
+            read_records(path)
+        except ValueError as e:
+            assert "runs/batch_1/session.jsonl" in str(e)
+        else:
+            raise AssertionError("a record must belong to the batch in its archive member path")
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

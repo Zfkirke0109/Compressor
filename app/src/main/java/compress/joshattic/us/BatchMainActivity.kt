@@ -492,21 +492,20 @@ private fun DiagnosticsExportCard(
 
             HorizontalDivider()
 
-            var tracingArmed by remember { mutableStateOf(ExportDebugTracing.isEnabled) }
+            val traceState by ExportDebugTracing.state.collectAsState()
             Text("Media3 export trace", style = MaterialTheme.typography.labelLarge)
             Text(
-                if (tracingArmed)
-                    "Trace armed — the next batch will record per-stage pipeline events. " +
-                        "Avoid on multi-hour sources; the summary appears in export failure messages."
-                else
-                    "Not armed. Enable only for a targeted diagnostic batch to avoid accumulating " +
-                        "event data on long or high-frame-rate exports.",
+                when (traceState) {
+                    ExportDebugTracing.State.ARMED -> "Trace armed for the next batch. The summary appears in export failure messages."
+                    ExportDebugTracing.State.ACTIVE -> "Recording per-stage pipeline events for this batch."
+                    ExportDebugTracing.State.IDLE -> "Arm only for a targeted diagnostic batch. Long or high-frame-rate exports can accumulate substantial trace data."
+                },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            if (!tracingArmed) {
+            if (traceState == ExportDebugTracing.State.IDLE) {
                 OutlinedButton(
-                    onClick = { ExportDebugTracing.enable(); tracingArmed = true },
+                    onClick = ExportDebugTracing::armNextBatch,
                     modifier = Modifier.fillMaxWidth(),
                     enabled = !isCompressing
                 ) { Text("Arm trace for next batch") }

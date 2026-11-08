@@ -767,26 +767,29 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             return
         }
         selfCheckJob = viewModelScope.launch(Dispatchers.Main) {
-            _uiState.update { it.copy(isSelfChecking = true, statusMessage = "Scorer self-check running on ${item.originalName}…") }
-            val stamp = System.currentTimeMillis()
-            val log = DiagLog.attach(context, "selfcheck_$stamp")
-            try {
-                val report = try {
-                    val mime = runCatching { chooseOutputMime(BatchCodecOption.AUTO, item, BatchQualityPreset.ORIGINAL) }
-                        .getOrDefault(MimeTypes.VIDEO_H265)
-                    DiagLog.i("CompressorProbe", "self-check start; job=${diagnosticJobId(item)}; source=${item.originalWidth}x${item.originalHeight}@${item.originalFps}; mime=${item.sourceVideoMime}")
-                    qualityProber.selfCheck(item.sourceUri, item.durationMs, item.toSourceInfo().videoBitrate, mime, frameTrace(item, "selfcheck"))
-                } catch (e: CancellationException) {
-                    DiagLog.i("CompressorProbe", "self-check cancelled; a batch is starting")
-                    throw e
-                } catch (e: Exception) {
-                    "self-check failed: ${e.message ?: e.javaClass.simpleName}"
+            val started = ExportDebugTracing.tryRunExport {
+                _uiState.update { it.copy(isSelfChecking = true, statusMessage = "Scorer self-check running on ${item.originalName}…") }
+                val stamp = System.currentTimeMillis()
+                val log = DiagLog.attach(context, "selfcheck_$stamp")
+                try {
+                    val report = try {
+                        val mime = runCatching { chooseOutputMime(BatchCodecOption.AUTO, item, BatchQualityPreset.ORIGINAL) }
+                            .getOrDefault(MimeTypes.VIDEO_H265)
+                        DiagLog.i("CompressorProbe", "self-check start; job=${diagnosticJobId(item)}; source=${item.originalWidth}x${item.originalHeight}@${item.originalFps}; mime=${item.sourceVideoMime}")
+                        qualityProber.selfCheck(item.sourceUri, item.durationMs, item.toSourceInfo().videoBitrate, mime, frameTrace(item, "selfcheck"))
+                    } catch (e: CancellationException) {
+                        DiagLog.i("CompressorProbe", "self-check cancelled; a batch is starting")
+                        throw e
+                    } catch (e: Exception) {
+                        "self-check failed: ${e.message ?: e.javaClass.simpleName}"
+                    }
+                    _uiState.update { it.copy(statusMessage = "Scorer self-check (${item.originalName}):\n$report") }
+                } finally {
+                    DiagLog.detach(log)
+                    _uiState.update { it.copy(isSelfChecking = false) }
                 }
-                _uiState.update { it.copy(statusMessage = "Scorer self-check (${item.originalName}):\n$report") }
-            } finally {
-                DiagLog.detach(log)
-                _uiState.update { it.copy(isSelfChecking = false) }
             }
+            if (!started) _uiState.update { it.copy(statusMessage = "Wait for the batch or scorer self-check in the other window to finish.") }
         }
     }
 
@@ -811,7 +814,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // A running self-check would share the encoder, the scorer and the decision log with
             // the batch. The batch wins: the self-check stops first, at its next suspension point.
             selfCheckJob?.takeIf { it.isActive }?.cancelAndJoin()
-            runBatch(context)
+            val started = ExportDebugTracing.tryRunExport(consumeTraceArm = true) { runBatch(context) }
+            if (!started) _uiState.update { it.copy(statusMessage = "Wait for the batch or scorer self-check in the other window to finish.") }
         }
     }
 

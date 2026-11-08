@@ -8,6 +8,7 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.effect.DebugTraceUtil
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import compress.joshattic.us.quality.CertificationDecision
@@ -27,6 +28,7 @@ import org.junit.runner.RunWith
 import java.io.File
 import java.io.FileInputStream
 import java.security.MessageDigest
+import java.util.concurrent.CancellationException
 
 /**
  * b177 device checks of what the JVM cannot run: the platform extractor on a file with no track
@@ -47,6 +49,38 @@ class ProductionEvidenceDeviceTest {
     @After
     fun tearDown() {
         scratch.forEach { runCatching { it.delete() } }
+    }
+
+    @Test
+    fun aTraceArmAppliesToOneBatchAndEndsOnCancellation() = runBlocking {
+        ExportDebugTracing.armNextBatch()
+        assertEquals(ExportDebugTracing.State.ARMED, ExportDebugTracing.state.value)
+        assertFalse(DebugTraceUtil.enableTracing)
+        assertTrue(ExportDebugTracing.tryRunExport { assertFalse(DebugTraceUtil.enableTracing) })
+        assertEquals(ExportDebugTracing.State.ARMED, ExportDebugTracing.state.value)
+        val cancellation = CancellationException("end traced test batch")
+        try {
+            ExportDebugTracing.tryRunExport(consumeTraceArm = true) {
+                assertTrue(DebugTraceUtil.enableTracing)
+                assertFalse(ExportDebugTracing.tryRunExport(consumeTraceArm = true) {
+                    throw AssertionError("another batch entered the active trace")
+                })
+                assertFalse(ExportDebugTracing.tryRunExport {
+                    throw AssertionError("a scorer self-check entered the active trace")
+                })
+                throw cancellation
+            }
+            throw AssertionError("cancellation did not escape the batch")
+        } catch (e: CancellationException) {
+            assertEquals(cancellation, e)
+        }
+        assertEquals(ExportDebugTracing.State.IDLE, ExportDebugTracing.state.value)
+        assertTrue(ExportDebugTracing.tryRunExport(consumeTraceArm = true) { assertFalse(DebugTraceUtil.enableTracing) })
+
+        ExportDebugTracing.armNextBatch()
+        assertTrue(ExportDebugTracing.tryRunExport(consumeTraceArm = true) { assertTrue(DebugTraceUtil.enableTracing) })
+        assertFalse(DebugTraceUtil.enableTracing)
+        assertEquals(ExportDebugTracing.State.IDLE, ExportDebugTracing.state.value)
     }
 
     private fun asset(name: String): File {

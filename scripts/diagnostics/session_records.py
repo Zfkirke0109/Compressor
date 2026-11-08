@@ -82,11 +82,20 @@ def _read_zip_records(path: str) -> list[dict[str, Any]]:
 
     records: list[dict[str, Any]] = []
     with zipfile.ZipFile(path) as archive:
-        for name in zip_session_entries(path):
+        names = zip_session_entries(path)
+        if len(set(names)) != len(names):
+            raise ValueError(f"{path} contains duplicate session members")
+        for name in names:
+            batch_id = name.split("/")[1]
+            if not batch_id or name != f"runs/{batch_id}/session.jsonl":
+                raise ValueError(f"{path} contains an invalid session member: {name}")
             with archive.open(name) as fh:
                 for raw in fh:
                     rec = decode_record(raw.decode("utf-8", "replace"))
                     if rec is not None:
+                        if rec.get("batchId") not in (None, "", batch_id):
+                            raise ValueError(f"{path}: batch ID conflicts with {name}")
+                        rec["batchId"] = batch_id
                         records.append(rec)
     return records
 

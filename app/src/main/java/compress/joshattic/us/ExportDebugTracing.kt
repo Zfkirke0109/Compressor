@@ -1,6 +1,10 @@
 package compress.joshattic.us
 
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.effect.DebugTraceUtil
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.sync.Mutex
 
 /**
  * Turns on Media3's own per-component export trace.
@@ -20,26 +24,43 @@ import androidx.media3.common.util.UnstableApi
  * Tracing is NOT enabled unconditionally. Media3's DebugTraceUtil is debugging instrumentation,
  * not a bounded ring: on a long or high-frame-rate export it can accumulate substantial event data
  * and allocation overhead, potentially causing the same process loss it was intended to diagnose.
- * Call [enable] only from an explicit diagnostic batch — e.g. one the user arms after opening
- * the diagnostics panel — not from every batch init.
+ * [armNextBatch] schedules a single diagnostic batch. [tryRunExport] scopes the flag and
+ * releases the accumulated trace when that batch ends.
  *
  * The trace reaches captures for free: the summary is embedded in the `ExportException` message,
  * and that message is already recorded by the batch's failure handler under `CompressorBatch`.
  */
 object ExportDebugTracing {
 
-    @Volatile
-    private var enabled = false
+    enum class State { IDLE, ARMED, ACTIVE }
 
-    /** True once [enable] has been called for this process. */
-    val isEnabled: Boolean get() = enabled
+    private val _state = MutableStateFlow(State.IDLE)
+    val state = _state.asStateFlow()
+    private val exportLock = Mutex()
 
-    /** Idempotent; safe to call from any export entry point. */
+    fun armNextBatch() {
+        _state.compareAndSet(State.IDLE, State.ARMED)
+    }
+
+    /** Keep batches and scorer self-checks from sharing Media3's process-wide trace and log. */
     @androidx.annotation.OptIn(UnstableApi::class)
-    @Synchronized
-    fun enable() {
-        if (enabled) return
-        androidx.media3.effect.DebugTraceUtil.enableTracing = true
-        enabled = true
+    suspend fun tryRunExport(consumeTraceArm: Boolean = false, export: suspend () -> Unit): Boolean {
+        if (!exportLock.tryLock()) return false
+        try {
+            val traceThisBatch = consumeTraceArm && _state.compareAndSet(State.ARMED, State.ACTIVE)
+            try {
+                if (traceThisBatch) DebugTraceUtil.enableTracing = true
+                export()
+            } finally {
+                if (traceThisBatch) {
+                    DebugTraceUtil.enableTracing = false
+                    DebugTraceUtil.reset()
+                    _state.value = State.IDLE
+                }
+            }
+            return true
+        } finally {
+            exportLock.unlock()
+        }
     }
 }
