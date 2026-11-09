@@ -50,7 +50,7 @@ if "$INSTALL_LOCAL"; then
   adb install -r -t "${USER_ARGS[@]}" app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk >/dev/null
 fi
 
-LOG_START="$(adb shell 'date "+%m-%d %H:%M:%S.000"' | tr -d '\r')"
+LOG_START="$(adb shell 'date +%s.%N' | tr -d '\r')"
 {
   echo "# device checks $(date -u +%FT%TZ) clip=$(basename "$CLIP") sha256=$CLIP_SHA user=${USER_ID:-0}"
   adb shell getprop ro.product.model

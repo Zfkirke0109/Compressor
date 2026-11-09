@@ -28,7 +28,7 @@ class DeviceChecksTest(unittest.TestCase):
                 'if [[ "$1" == install && "$ALREADY_INSTALLED" == 1 ]]; then\n'
                 '  echo INSTALL_FAILED_VERSION_DOWNGRADE >&2; exit 1\n'
                 'fi\n'
-                'if [[ "$1 $2" == "shell date "* ]]; then printf "11-08 20:20:30.000\\r\\n"; fi\n'
+                'if [[ "$1 $2" == "shell date +%s.%N" ]]; then printf "1794198030.123456789\\r\\n"; fi\n'
                 'if [[ "$1 $2 $3" == "shell am instrument" ]]; then printf "%s\\n" "$TEST_RESULT"; fi\n'
             )
             adb.chmod(0o755)
@@ -80,7 +80,7 @@ class DeviceChecksTest(unittest.TestCase):
         instrument = next(call for call in calls if call.startswith("shell am instrument "))
         self.assertIn("compress.joshattic.us.FramePackingDeviceTest", instrument)
         self.assertNotIn("logcat -c", calls)
-        self.assertTrue(any("logcat -t " in call and "11-08 20:20:30.000" in call for call in calls))
+        self.assertTrue(any("logcat -t 1794198030.123456789 " in call for call in calls))
 
 
 if __name__ == "__main__":
