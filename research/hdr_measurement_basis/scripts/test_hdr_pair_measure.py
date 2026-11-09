@@ -343,10 +343,15 @@ def _encode_known_frames(tmp, name, y, cb, cr, color_range, frames_n=6, fps=5, w
     chroma_r = np.full((hgt // 2, w // 2), cr, dtype="<u2")
     raw = (luma.tobytes() + chroma_b.tobytes() + chroma_r.tobytes()) * frames_n
     path = os.path.join(tmp, name)
+    # Set frame tags and use the same encoder range to preserve the raw sample codes.
+    color_tags = (
+        f"setparams=range={color_range}:color_primaries=bt2020:"
+        "color_trc=smpte2084:colorspace=bt2020nc"
+    )
     subprocess.run(
         ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p10le", "-s", f"{w}x{hgt}",
-         "-r", str(fps), "-i", "-", "-c:v", "ffv1", "-color_primaries", "bt2020", "-color_trc", "smpte2084",
-         "-colorspace", "bt2020nc", "-color_range", color_range, path],
+         "-r", str(fps), "-i", "-", "-vf", color_tags, "-c:v", "ffv1",
+         "-color_range", color_range, path],
         input=raw, check=True, capture_output=True, timeout=60)
     return path
 
