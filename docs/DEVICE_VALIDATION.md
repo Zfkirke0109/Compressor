@@ -38,8 +38,17 @@ to the phone over ADB, and deleted from `/data/local/tmp` after use.
 scripts/device/run-device-checks.sh /path/to/short_sdr_clip.mp4 150   # 150 = the Secure Folder user
 ```
 
-It builds and installs the debug and test APKs for that user, runs `PipelineDeviceTest`, and
-writes `short_sdr_clip.device-checks.txt`. Without a clip every test is skipped, not passed.
+The default command builds and installs the local debug and test APKs for that user. When testing
+an Android CI build, install the matched app and test APKs from its `pl-device-controls-ci-<run>`
+artifact, then run the checks against that installed pair:
+
+```sh
+scripts/device/run-device-checks.sh --installed /path/to/short_sdr_clip.mp4 0
+```
+
+The command runs the pipeline, production-evidence and native frame-packing controls. It writes
+`short_sdr_clip.device-checks.txt` and reads the relevant log entries from the start of the run.
+A short clip is required. Any skipped test makes the run incomplete.
 
 **Find the 44 target files locally (names never leave the machine):**
 
