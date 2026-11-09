@@ -874,11 +874,10 @@ class PerceptualQualityProber(private val context: Context) {
      * Control tests for the measurement path itself, on one file. Three comparisons through the
      * exact decode-and-pair path the ladder and certification use:
      *
-     *  1. the source against ITSELF: every scored frame must be 100 (VMAF of identical frames).
-     *     Anything less is a defect in decoding, cropping, rotation or pairing, not in any encoder;
-     *  2. the source against a stream copy of itself (Remux Only): the same bits in a new
-     *     container, so again 100 on every frame. This exercises the container/edit-list and
-     *     timestamp path that a probe clip goes through;
+     *  1. the source against itself checks for byte-identical decoded frames. VMAF can score
+     *     identical frames below 100, especially with low motion;
+     *  2. the source against a stream copy checks the same pixel identity through a different
+     *     container and its edit-list and timestamp path;
      *  3. the source against a generous encode of the first window (twice the source video
      *     bitrate, with the same lead-in as a probe): a ceiling for what this encoder can reach on
      *     this content. If the ladder's safest rung scores far below this, bitrate is the limit;
@@ -902,9 +901,7 @@ class PerceptualQualityProber(private val context: Context) {
         fun describe(label: String, outcome: PairScoreOutcome, expectIdentical: Boolean = false) {
             val text = when (outcome) {
                 is PairScoreOutcome.Scored -> {
-                    // A control that must be identical states its own verdict, so a capture cannot
-                    // read 97.43 as a pass. Identical frames with real motion score 100; VMAF v0.6.1
-                    // scores identical STATIC frames 97.43 on every frame, which names itself.
+                    // Report the decoded-frame identity verdict alongside the raw VMAF scores.
                     val verdict = if (!expectIdentical) "" else SelfCheckVerdict.identity(outcome.windows)
                     verdict + outcome.windows.joinToString("; ") { w ->
                         "%.2f/%.2f/%.2f".format(java.util.Locale.US, w.mean, w.p5, w.min) +

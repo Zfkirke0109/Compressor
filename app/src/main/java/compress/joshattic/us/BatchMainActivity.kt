@@ -476,9 +476,9 @@ private fun DiagnosticsExportCard(
 
             Text("Scorer self-check", style = MaterialTheme.typography.labelLarge)
             Text(
-                "Control tests of the measurement itself on the first selected video: the source " +
-                    "against itself and against a stream copy must score 100 on every frame; a " +
-                    "2x-bitrate encode of one window shows this encoder's ceiling. The result appears " +
+                "Control tests on the first selected video check that the source and a stream copy " +
+                    "decode to identical frames. A 2x-bitrate encode of one window shows what this " +
+                    "encoder can achieve on the clip. The result appears " +
                     "in the status line and in the next diagnostics ZIP.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant

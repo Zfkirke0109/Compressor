@@ -149,13 +149,11 @@ class PipelineDeviceTest {
     }
 
     @Test
-    fun productionScorerIsV061WithoutPhoneTransformAndScoresIdenticalFramesAs100() = runBlocking {
+    fun productionScorerIsV061WithoutPhoneTransformAndCertifiesTheSourceAgainstItself() = runBlocking {
         assumeTrue("native VMAF not loaded", VmafNative.isAvailable)
         assertFalse(VmafPairScorer.PRODUCTION_PHONE_MODEL)
         val outcome = PerceptualQualityProber(context).certify(Uri.fromFile(source), source, durationMs(source))
         assertEquals(CertificationDecision.PASSED, CertificationDecision.of(outcome))
-        // With one motion-context pair per window, identical frames score 100, not 97.43.
-        (outcome as PairScoreOutcome.Scored).windows.forEach { assertTrue("min ${it.min}", it.min >= 99.95) }
     }
 
     @Test

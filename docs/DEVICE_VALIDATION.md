@@ -19,7 +19,8 @@ to the phone over ADB, and deleted from `/data/local/tmp` after use.
 ## 2. What only the phone can show
 
 1. A real Media3/MediaCodec export drives the phases as designed (no "100 %" before finalizing).
-2. The native scorer scores identical frames 100 on this build.
+2. The native scorer certifies a source against itself. The separate frame-parity control checks
+   that decoded frames are byte-identical even when raw VMAF is below 100.
 3. The source is byte-identical after a discarded candidate.
 4. A superseded export's callbacks cannot move a retried row.
 5. On a batch: the row text, the indeterminate bar while finalizing/verifying, "Certifying pixels

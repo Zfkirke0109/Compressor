@@ -29,7 +29,8 @@ class ScoringParityDeviceTest {
         fun copy(name: String): File {
             require(name.matches(Regex("[A-Za-z0-9_.-]+")))
             val file = File(work, name)
-            val pfd = instrumentation.uiAutomation.executeShellCommand("cat '$input/$name'")
+            // UiAutomation passes the command directly to Runtime.exec. Both path parts are validated.
+            val pfd = instrumentation.uiAutomation.executeShellCommand("cat $input/$name")
             ParcelFileDescriptor.AutoCloseInputStream(pfd).use { stream -> file.outputStream().use { stream.copyTo(it) } }
             return file
         }
