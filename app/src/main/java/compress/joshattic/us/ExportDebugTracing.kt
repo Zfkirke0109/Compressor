@@ -36,10 +36,23 @@ object ExportDebugTracing {
 
     private val _state = MutableStateFlow(State.IDLE)
     val state = _state.asStateFlow()
+    private val _isOperationRunning = MutableStateFlow(false)
+    val isOperationRunning = _isOperationRunning.asStateFlow()
     private val operationLock = Mutex()
 
     fun armNextBatch() {
         _state.compareAndSet(State.IDLE, State.ARMED)
+    }
+
+    /** Keep a live batch's encoder requests and evidence settings consistent across windows. */
+    internal fun tryChangeSettings(change: () -> Unit): Boolean {
+        if (!operationLock.tryLock()) return false
+        try {
+            change()
+            return true
+        } finally {
+            operationLock.unlock()
+        }
     }
 
     /** Serialize batches, scorer self-checks and profile resets across app windows. */
@@ -47,6 +60,7 @@ object ExportDebugTracing {
     suspend fun tryRunExclusive(consumeTraceArm: Boolean = false, operation: suspend () -> Unit): Boolean {
         if (!operationLock.tryLock()) return false
         try {
+            _isOperationRunning.value = true
             val traceThisBatch = consumeTraceArm && _state.compareAndSet(State.ARMED, State.ACTIVE)
             try {
                 if (traceThisBatch) DebugTraceUtil.enableTracing = true
@@ -60,6 +74,7 @@ object ExportDebugTracing {
             }
             return true
         } finally {
+            _isOperationRunning.value = false
             operationLock.unlock()
         }
     }

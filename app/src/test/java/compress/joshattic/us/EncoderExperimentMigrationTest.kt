@@ -2,7 +2,14 @@ package compress.joshattic.us
 
 import android.content.SharedPreferences
 import java.lang.reflect.Proxy
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class EncoderExperimentMigrationTest {
@@ -31,6 +38,27 @@ class EncoderExperimentMigrationTest {
         assertEquals(";bf0", EncoderExperiments.learningKeySuffixForPreferences(prefs))
         EncoderExperiments.setBFramesEnabled(prefs, true)
         assertEquals("", EncoderExperiments.learningKeySuffixForPreferences(prefs))
+    }
+
+    @Test
+    fun anotherWindowCannotChangeBFramesUntilTheBatchExits() = runBlocking {
+        val prefs = preferences(mutableMapOf("max_b_frames" to 2))
+        val batch = launch(start = CoroutineStart.UNDISPATCHED) {
+            ExportDebugTracing.tryRunExclusive(consumeTraceArm = true) {
+                awaitCancellation()
+            }
+        }
+        try {
+            assertTrue(ExportDebugTracing.isOperationRunning.value)
+            assertFalse(EncoderExperiments.setBFramesEnabled(prefs, false))
+            assertEquals(2, prefs.getInt("max_b_frames", 0))
+            assertEquals("", EncoderExperiments.learningKeySuffixForPreferences(prefs))
+        } finally {
+            batch.cancelAndJoin()
+        }
+        assertFalse(ExportDebugTracing.isOperationRunning.value)
+        assertTrue(EncoderExperiments.setBFramesEnabled(prefs, false))
+        assertEquals(";bf0", EncoderExperiments.learningKeySuffixForPreferences(prefs))
     }
 
     // Only the Android preference storage boundary is replaced; the real migration and key

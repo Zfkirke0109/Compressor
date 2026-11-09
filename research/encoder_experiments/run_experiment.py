@@ -150,8 +150,10 @@ def _row(j: dict[str, Any]) -> dict[str, Any]:
         "keptOutputBytes": j.get("outputSize") or 0 if _saved(j) else 0,
         "acceptedSavedBytes": _saved(j),
         "terminal": j.get("terminal"),
-        "measuredFailure": decision in ("measured_below_bar", "misaligned") or j.get("terminal") == "SKIPPED_WOULD_DEGRADE",
-        "unavailableEvidence": decision in ("unavailable", "insufficient_frames", "partial_unavailable"),
+        "measuredFailure": decision == "measured_below_bar" or (
+            decision is None and j.get("terminal") == "SKIPPED_WOULD_DEGRADE"
+        ),
+        "unavailableEvidence": decision in ("unavailable", "insufficient_frames", "partial_unavailable", "misaligned"),
         "attemptsStarted": _attempts_started(j),
         "retried": _attempts_started(j) > 1,
         "audio": j.get("audioPreservation"),

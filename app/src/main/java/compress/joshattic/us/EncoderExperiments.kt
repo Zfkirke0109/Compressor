@@ -29,21 +29,25 @@ object EncoderExperiments {
 
     fun isBFramesEnabled(context: Context): Boolean = maxBFrames(context) > 0
 
-    fun setBFramesEnabled(context: Context, enabled: Boolean) {
+    fun setBFramesEnabled(context: Context, enabled: Boolean): Boolean =
         setBFramesEnabled(context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE), enabled)
-    }
 
-    internal fun setBFramesEnabled(prefs: SharedPreferences, enabled: Boolean) {
-        // Existing unsuffixed profiles belong to the setting before this build's first change.
-        // Pin it in the same preference update, even if no batch has run since the upgrade.
-        val editor = prefs.edit()
-        if (!prefs.contains(KEY_BASELINE_B_FRAMES)) {
-            editor.putInt(KEY_BASELINE_B_FRAMES, prefs.getInt(KEY_MAX_B_FRAMES, 0))
+    internal fun setBFramesEnabled(prefs: SharedPreferences, enabled: Boolean): Boolean =
+        ExportDebugTracing.tryChangeSettings {
+            // Existing unsuffixed profiles belong to the setting before this build's first change.
+            // Pin it in the same preference update, even if no batch has run since the upgrade.
+            val editor = prefs.edit()
+            if (!prefs.contains(KEY_BASELINE_B_FRAMES)) {
+                editor.putInt(KEY_BASELINE_B_FRAMES, prefs.getInt(KEY_MAX_B_FRAMES, 0))
+            }
+            editor.putInt(KEY_MAX_B_FRAMES, if (enabled) B_FRAMES_WHEN_ENABLED else 0).apply()
         }
-        editor
-            .putInt(KEY_MAX_B_FRAMES, if (enabled) B_FRAMES_WHEN_ENABLED else 0)
-            .apply()
-    }
+
+    private fun setFlag(context: Context, key: String, enabled: Boolean): Boolean =
+        ExportDebugTracing.tryChangeSettings {
+            context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putBoolean(key, enabled).apply()
+        }
 
     private const val KEY_SAFER_RUNG_RETRY = "safer_rung_retry"
 
@@ -56,11 +60,8 @@ object EncoderExperiments {
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean(KEY_SAFER_RUNG_RETRY, false)
 
-    fun setSaferRungRetryEnabled(context: Context, enabled: Boolean) {
-        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putBoolean(KEY_SAFER_RUNG_RETRY, enabled)
-            .apply()
-    }
+    fun setSaferRungRetryEnabled(context: Context, enabled: Boolean): Boolean =
+        setFlag(context, KEY_SAFER_RUNG_RETRY, enabled)
 
     private const val KEY_SHADOW_CALIBRATION = "shadow_v1_calibration"
 
@@ -73,11 +74,8 @@ object EncoderExperiments {
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean(KEY_SHADOW_CALIBRATION, false)
 
-    fun setShadowCalibrationEnabled(context: Context, enabled: Boolean) {
-        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putBoolean(KEY_SHADOW_CALIBRATION, enabled)
-            .apply()
-    }
+    fun setShadowCalibrationEnabled(context: Context, enabled: Boolean): Boolean =
+        setFlag(context, KEY_SHADOW_CALIBRATION, enabled)
 
     private const val KEY_FULL_SOURCE_HASH = "full_source_hash"
 
@@ -86,20 +84,16 @@ object EncoderExperiments {
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean("full_frame_trace", false)
 
-    fun setFrameTraceEnabled(context: Context, enabled: Boolean) {
-        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putBoolean("full_frame_trace", enabled).apply()
-    }
+    fun setFrameTraceEnabled(context: Context, enabled: Boolean): Boolean =
+        setFlag(context, "full_frame_trace", enabled)
 
     /** Encoded probe clips, not decoded images. Explicit opt-in for exact offline comparisons. */
     fun isRetainCandidatesEnabled(context: Context): Boolean =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean("retain_encoded_candidates", false)
 
-    fun setRetainCandidatesEnabled(context: Context, enabled: Boolean) {
-        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putBoolean("retain_encoded_candidates", enabled).apply()
-    }
+    fun setRetainCandidatesEnabled(context: Context, enabled: Boolean): Boolean =
+        setFlag(context, "retain_encoded_candidates", enabled)
 
     /**
      * Opt-in, for the encoder pilot: hash every source in full (SHA-256 of all its bytes) before
@@ -112,11 +106,8 @@ object EncoderExperiments {
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean(KEY_FULL_SOURCE_HASH, false)
 
-    fun setFullSourceHashEnabled(context: Context, enabled: Boolean) {
-        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putBoolean(KEY_FULL_SOURCE_HASH, enabled)
-            .apply()
-    }
+    fun setFullSourceHashEnabled(context: Context, enabled: Boolean): Boolean =
+        setFlag(context, KEY_FULL_SOURCE_HASH, enabled)
 
     private const val KEY_LONG_GOP = "long_gop_x2"
 
@@ -134,11 +125,8 @@ object EncoderExperiments {
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .getBoolean(KEY_LONG_GOP, false)
 
-    fun setLongGopEnabled(context: Context, enabled: Boolean) {
-        context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
-            .putBoolean(KEY_LONG_GOP, enabled)
-            .apply()
-    }
+    fun setLongGopEnabled(context: Context, enabled: Boolean): Boolean =
+        setFlag(context, KEY_LONG_GOP, enabled)
 
     /** The keyframe interval to request for a source whose own interval policy gave [baseSeconds]. */
     fun keyframeIntervalSeconds(baseSeconds: Float, longGop: Boolean): Float =

@@ -513,6 +513,8 @@ private fun DiagnosticsExportCard(
 
             HorizontalDivider()
 
+            val operationRunning by ExportDebugTracing.isOperationRunning.collectAsState()
+            val canChangeExperiments = !isCompressing && !operationRunning
             var bFrames by remember { mutableStateOf(EncoderExperiments.isBFramesEnabled(context)) }
             Text("Encoder experiment: B-frames", style = MaterialTheme.typography.labelLarge)
             Text(
@@ -526,8 +528,10 @@ private fun DiagnosticsExportCard(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(
                     checked = bFrames,
-                    onCheckedChange = { on -> EncoderExperiments.setBFramesEnabled(context, on); bFrames = on },
-                    enabled = !isCompressing
+                    onCheckedChange = { on ->
+                        if (EncoderExperiments.setBFramesEnabled(context, on)) bFrames = on
+                    },
+                    enabled = canChangeExperiments
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
@@ -552,8 +556,10 @@ private fun DiagnosticsExportCard(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(
                     checked = saferRetry,
-                    onCheckedChange = { on -> EncoderExperiments.setSaferRungRetryEnabled(context, on); saferRetry = on },
-                    enabled = !isCompressing
+                    onCheckedChange = { on ->
+                        if (EncoderExperiments.setSaferRungRetryEnabled(context, on)) saferRetry = on
+                    },
+                    enabled = canChangeExperiments
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
@@ -576,8 +582,10 @@ private fun DiagnosticsExportCard(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(
                     checked = longGop,
-                    onCheckedChange = { on -> EncoderExperiments.setLongGopEnabled(context, on); longGop = on },
-                    enabled = !isCompressing
+                    onCheckedChange = { on ->
+                        if (EncoderExperiments.setLongGopEnabled(context, on)) longGop = on
+                    },
+                    enabled = canChangeExperiments
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
@@ -601,8 +609,10 @@ private fun DiagnosticsExportCard(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(
                     checked = shadowCalibration,
-                    onCheckedChange = { on -> EncoderExperiments.setShadowCalibrationEnabled(context, on); shadowCalibration = on },
-                    enabled = !isCompressing
+                    onCheckedChange = { on ->
+                        if (EncoderExperiments.setShadowCalibrationEnabled(context, on)) shadowCalibration = on
+                    },
+                    enabled = canChangeExperiments
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(
@@ -619,8 +629,9 @@ private fun DiagnosticsExportCard(
                 "Adds CPU and storage work. No decoded images are saved. Export the diagnostics ZIP after a focused test.",
                 style = MaterialTheme.typography.bodySmall)
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(checked = frameTrace, enabled = !isCompressing,
-                    onCheckedChange = { on -> EncoderExperiments.setFrameTraceEnabled(context, on); frameTrace = on })
+                Switch(checked = frameTrace, enabled = canChangeExperiments, onCheckedChange = { on ->
+                    if (EncoderExperiments.setFrameTraceEnabled(context, on)) frameTrace = on
+                })
                 Spacer(Modifier.width(8.dp))
                 Text(if (frameTrace) "Per-frame evidence on" else "Per-frame evidence off", style = MaterialTheme.typography.bodySmall)
             }
@@ -629,8 +640,9 @@ private fun DiagnosticsExportCard(
             Text("Includes the actual short videos in the exported ZIP for offline scoring. The archive will contain video content " +
                 "and can be large (512 MiB of clips per run). Use with per-frame evidence on a small selected test.", style = MaterialTheme.typography.bodySmall)
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Switch(checked = retainCandidates, enabled = !isCompressing,
-                    onCheckedChange = { on -> EncoderExperiments.setRetainCandidatesEnabled(context, on); retainCandidates = on })
+                Switch(checked = retainCandidates, enabled = canChangeExperiments, onCheckedChange = { on ->
+                    if (EncoderExperiments.setRetainCandidatesEnabled(context, on)) retainCandidates = on
+                })
                 Spacer(Modifier.width(8.dp))
                 Text(if (retainCandidates) "Include encoded clips" else "Exclude encoded clips", style = MaterialTheme.typography.bodySmall)
             }
@@ -649,8 +661,10 @@ private fun DiagnosticsExportCard(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Switch(
                     checked = fullSourceHash,
-                    onCheckedChange = { on -> EncoderExperiments.setFullSourceHashEnabled(context, on); fullSourceHash = on },
-                    enabled = !isCompressing
+                    onCheckedChange = { on ->
+                        if (EncoderExperiments.setFullSourceHashEnabled(context, on)) fullSourceHash = on
+                    },
+                    enabled = canChangeExperiments
                 )
                 Spacer(Modifier.width(8.dp))
                 Text(

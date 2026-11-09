@@ -294,6 +294,17 @@ def test_ingest_rejects_contradictory_accepted_savings():
                 raise AssertionError(f"contradictory savings admitted: {fields}")
 
 
+def test_report_separates_misalignment_from_measured_rejections():
+    # Older exports used the quality-skip terminal even when certification could not align frames.
+    for terminal in ("UNEXPECTED_REMUX", "SKIPPED_WOULD_DEGRADE"):
+        row = r._row({"terminal": terminal, "certificationDecision": "misaligned"})
+        assert not row["measuredFailure"] and row["unavailableEvidence"]
+
+    for job in ({"terminal": "SKIPPED_WOULD_DEGRADE"}, {"certificationDecision": "measured_below_bar"}):
+        row = r._row(job)
+        assert row["measuredFailure"] and not row["unavailableEvidence"]
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
