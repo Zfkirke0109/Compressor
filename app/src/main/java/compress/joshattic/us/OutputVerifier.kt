@@ -441,7 +441,12 @@ object OutputVerifier {
         val replacementSafe = when (input.mode) {
             BatchQualityMode.REMUX_ONLY -> remuxVerified
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance && strictlySmaller
-            else -> lossyVerified
+            // A lossy mode promises nothing about sameness, but the output must still be the WHOLE
+            // video before it may overwrite its source. One that plays and stops early is also
+            // much smaller, so it read as a real compression and as replaceable; the block reason
+            // below already named the duration while this flag stayed true. The lossy verdict
+            // itself is unchanged: this decides only what may replace an original.
+            else -> lossyVerified && durationMatches
         }
 
         val blockReason = when {

@@ -195,6 +195,28 @@ class OutputDispositionTest {
     }
 
     @Test
+    fun aLossyOutputThatStopsEarlyMayNeverReplaceItsSource() {
+        // Five seconds of a 64.8 s source: playable, and far smaller for the wrong reason. The
+        // lossy verdict is unchanged, but it is not the whole video and must not overwrite it.
+        val truncated = highQualityPortrait(outputDurationMs = 5_000L)
+        assertTrue(truncated.verified)
+        assertFalse(truncated.replacementSafe)
+        assertEquals("output duration differs from the source (possible truncation)", truncated.replacementBlockReason)
+        assertEquals(emptyList<String>(), truncated.failingChecks())
+        assertTrue(truncated.unjudgedDifferences!!.contains("durationMatches"))
+        val acceptance = FinalAcceptance.of(BatchTerminalResult.LOSSY_SMALLER, truncated, 9_000_000L, 9_000_000L)
+        assertFalse(acceptance.replacementSafe)
+        assertFalse(OutputDisposition.of(BatchTerminalResult.LOSSY_SMALLER, acceptance, originalRetained = false, pixelCertified = false).replacementEligible)
+        // Inside the tolerance (the larger of 500 ms and 2 %) it is the whole video.
+        for (ms in listOf(64_834L, 64_400L, 65_900L)) {
+            val whole = highQualityPortrait(outputDurationMs = ms)
+            assertTrue("$ms", whole.replacementSafe)
+            assertEquals("$ms", null, whole.replacementBlockReason)
+        }
+        assertFalse(highQualityPortrait(outputDurationMs = 63_000L).replacementSafe)
+    }
+
+    @Test
     fun anUnplayableLossyOutputStillFailsOnAPredicateItIsJudgedOn() {
         val report = highQualityPortrait(outputDurationMs = 0L)
         assertFalse(report.verified)
