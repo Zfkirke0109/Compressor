@@ -32,6 +32,8 @@ data class StageEvent(
         const val CERTIFY = "certify"
         const val RETRY = "retry"
         const val ACCEPT = "accept"
+        /** After the job record: what was asked of a replaceable output and what came of it (ReplacementOutcome). */
+        const val REPLACE = "replace"
     }
 
     /** Stable reason codes. Never renamed: captures are compared across builds by these strings. */

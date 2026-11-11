@@ -4,16 +4,13 @@
    for details.
 -->
 <data-extraction-rules>
+    <!-- Rollback copies of a user's original video and the journal naming the file each belongs
+         to (ReplacementJournal). They mean something only on this device, while a replacement is
+         in flight or being recovered, and must not travel to a backup or another device. -->
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="file" path="replace_recovery" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="file" path="replace_recovery" />
     </device-transfer>
-    -->
 </data-extraction-rules>

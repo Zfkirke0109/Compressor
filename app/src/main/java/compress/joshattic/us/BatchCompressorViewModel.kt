@@ -251,6 +251,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     // SourceFingerprint per source of the running batch, read on the IO dispatcher at item start.
     private val sourceFingerprints = java.util.concurrent.ConcurrentHashMap<Uri, String>()
     private val fullSourceHashes = java.util.concurrent.ConcurrentHashMap<Uri, String>()
+    // SHA-256 of each source as it stood when its item began, taken only when the batch may replace
+    // originals. A replacement is bound to it (ReplacementRequest): the staged original must still
+    // equal it. Never written to a capture; the pilot's opt-in `source_hash` record is separate.
+    private val replacementSourceDigests = java.util.concurrent.ConcurrentHashMap<Uri, String>()
 
     private var compressionJob: Job? = null
     private var selfCheckJob: Job? = null
@@ -324,6 +328,56 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
     }
 
     private val qualityProber by lazy { PerceptualQualityProber(getApplication()) }
+
+    init {
+        recoverInterruptedReplacements()
+    }
+
+    /**
+     * Rollback copies a previous process left behind (ReplacementJournal). A replacement stages
+     * the original's bytes inside the app before it truncates the file; if the process died after
+     * that, the file may be incomplete and nothing ever looked for the copy again.
+     *
+     * Each copy is settled by digest: when the file still holds the staged original, or holds the
+     * verified output, it is whole and the copy is deleted. Otherwise the copy may be the last
+     * intact original, so it is saved to the gallery and the user is told; if that fails it stays
+     * where it is and they are told that. Nothing here writes to the file being replaced.
+     */
+    private fun recoverInterruptedReplacements() = viewModelScope.launch(Dispatchers.IO) {
+        val context = getApplication<Application>()
+        val leftovers = runCatching {
+            ReplacementJournal.leftovers(File(context.filesDir, BatchCacheRetention.RECOVERY_DIRECTORY))
+        }.getOrDefault(emptyList())
+        var preserved = 0
+        var held = 0
+        for (leftover in leftovers) {
+            val journal = leftover.journal
+            val targetDigest = journal?.takeIf { it.state == ReplacementJournalEntry.STAGED }?.let { entry ->
+                runCatching {
+                    context.contentResolver.openInputStream(Uri.parse(entry.targetUri))?.use { ReplacementContentProof.sha256(it) }
+                }.getOrNull()
+            }
+            val verdict = ReplacementRecovery.classify(journal, targetDigest)
+            DiagLog.w(
+                "CompressorBatch",
+                "replacement recovery; job=${journal?.jobId ?: "unknown"}; verdict=${verdict.name}; copyBytes=${leftover.recoveryCopy.length()}"
+            )
+            if (!verdict.preserveCopy) {
+                ReplacementJournal.discard(leftover.recoveryCopy)
+                continue
+            }
+            val saved = saveFileToGallery(
+                context, leftover.recoveryCopy, ReplacementRecovery.recoveredName(journal, leftover.recoveryCopy.lastModified())
+            ) != null
+            if (saved) {
+                ReplacementJournal.discard(leftover.recoveryCopy)
+                preserved++
+            } else {
+                held++
+            }
+        }
+        ReplacementRecovery.notice(preserved, held)?.let { notice -> _uiState.update { it.copy(statusMessage = notice) } }
+    }
 
     private data class PerceptualLosslessPlan(
         val profileKey: SmartPerceptualProfileEngine.EncodeProfileKey,
@@ -1072,6 +1126,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // Off the main thread: it hashes the native libraries and enumerates the codecs.
         sourceFingerprints.clear()
         fullSourceHashes.clear()
+        replacementSourceDigests.clear()
         activeDiagnostics = diagnostics
         val run = BatchRun(
             context = context,
@@ -1334,6 +1389,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val thermalWindow = waitForThermalWindow(run.context, item.originalName)
         // Before itemStartedAt, so the job's elapsed time does not include it; the record keeps its own time.
         if (run.fullSourceHash) hashSourceForPilot(run, item, "before")
+        // Before anything reads the source for the encode: the bytes a replacement of this
+        // original would have to still find there (ReplacementRequest.boundSourceDigest).
+        if (_uiState.value.replaceOriginals) bindSourceForReplacement(run, item) else replacementSourceDigests.remove(item.sourceUri)
         val s = ItemRun(
             run = run,
             index = index,
@@ -1394,6 +1452,22 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // After the job has ended and its record is written; a cancelled item never gets here.
         if (run.fullSourceHash) hashSourceForPilot(run, item, "after")
         return s.cooldownForNextItemMs
+    }
+
+    /**
+     * Binds this item's possible replacement to the source as it is now: one full read, about a
+     * second per gigabyte on the S26's storage (b287 `source_hash` records: 39 GB in 42 s). The
+     * pilot's hash is reused when it was just taken. A source that cannot be read, or whose length
+     * is not the one the item was indexed with, is left unbound, and an unbound original is never
+     * overwritten.
+     */
+    private suspend fun bindSourceForReplacement(run: BatchRun, item: BatchVideoItem) {
+        val digest = fullSourceHashes[item.sourceUri] ?: withContext(Dispatchers.IO) {
+            val hashContext = currentCoroutineContext()
+            FullSourceHash.of(run.context, item.sourceUri) { hashContext.ensureActive() }
+                .takeIf { it.bytes == item.originalSize }?.sha256
+        }
+        if (digest != null) replacementSourceDigests[item.sourceUri] = digest else replacementSourceDigests.remove(item.sourceUri)
     }
 
     /**
@@ -3174,6 +3248,16 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             s.itemOutputAccepted = true
         }
 
+        // What was asked of THIS output and what came of it, as its own event after the job
+        // record: eligibility is a property of the output, a replacement is a write.
+        fun recordReplacement(outcome: String, fields: Map<String, Any?> = emptyMap()) = runCatching {
+            run.diagnostics.stage(
+                StageEvent(
+                    sourceKey = item.sourceUri.toString(), attempt = s.phases.token.attempt, attemptIndex = s.ledger.currentIndex,
+                    stage = StageEvent.Stage.REPLACE, reasonCode = outcome, elapsedMs = s.elapsedMs, fields = fields
+                )
+            )
+        }
         if (terminal.allowsOriginalReplacement && _uiState.value.replaceOriginals) {
             // Once destructive replacement starts, finish it and publish its disposition
             // atomically before honoring cancellation. This prevents an original from changing
@@ -3187,8 +3271,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     quality = s.effectiveQuality,
                     verification = verification,
                     backupBeforeReplace = _uiState.value.backupBeforeReplace,
-                    privacyMode = run.privacyMode
+                    privacyMode = run.privacyMode,
+                    boundSourceDigest = replacementSourceDigests[item.sourceUri]
                 )
+                recordReplacement(replacement.outcome, replacement.fields)
                 updateItem(s.index) {
                     it.copy(
                         status = if (replacement.success) BatchItemStatus.Replaced else BatchItemStatus.SavedCopy,
@@ -3196,7 +3282,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     )
                 }
             }
+        } else if (terminal.allowsOriginalReplacement && !terminal.isFailure && verification.replacementSafe) {
+            recordReplacement(ReplacementOutcome.NOT_REQUESTED)
         }
+        replacementSourceDigests.remove(item.sourceUri)
 
         if (s.index < _uiState.value.items.lastIndex) {
             // Apply the thermal cooldown ONLY after an item that actually ran a full hardware
@@ -5011,7 +5100,14 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         }
     }
 
-    private data class ReplacementResult(val success: Boolean, val message: String)
+    private data class ReplacementResult(
+        val success: Boolean,
+        val message: String,
+        /** The transaction's stable machine state (ReplacementTransaction.outcome / ReplacementOutcome). */
+        val outcome: String,
+        /** Privacy-safe evidence for the `replace` stage: states, counts and redacted digests. */
+        val fields: Map<String, Any?> = emptyMap()
+    )
 
     private suspend fun replaceOriginalSafely(
         context: Context,
@@ -5021,48 +5117,94 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         quality: BatchQualityPreset,
         verification: OutputVerificationReport,
         backupBeforeReplace: Boolean,
-        privacyMode: MetadataPrivacyMode
+        privacyMode: MetadataPrivacyMode,
+        boundSourceDigest: String?
     ): ReplacementResult = withContext(Dispatchers.IO) {
+        // The evidence every exit carries: what was asked, on which bytes (by role, redacted), and
+        // how far the transaction got. No path, name or URI.
+        var outputDigest: String? = null
+        var postWriteDigest: String? = null
+        fun evidence(tx: ReplacementTransaction? = null, copySaved: Boolean? = null, extra: Map<String, Any?> = emptyMap()): Map<String, Any?> =
+            linkedMapOf<String, Any?>(
+                "backupRequested" to backupBeforeReplace,
+                "sourceBytes" to item.originalSize,
+                "outputBytes" to outputFile.length(),
+                "sourceBound" to (boundSourceDigest != null),
+                "sourceBeforeDigest" to ReplacementOutcome.redact(boundSourceDigest),
+                "stagedDigest" to ReplacementOutcome.redact(tx?.stagedDigest),
+                "outputDigest" to ReplacementOutcome.redact(outputDigest),
+                "postWriteDigest" to ReplacementOutcome.redact(postWriteDigest),
+                "stagedBytes" to tx?.stagedBytes,
+                "stagedMatchesSourceBefore" to tx?.stagedMatchesBoundSource,
+                "originalOpenedForWriting" to (tx?.originalWasOpenedForWriting ?: false),
+                "writeReadBack" to tx?.writeReadBack?.wire,
+                "restoreReadBack" to tx?.restoreReadBack?.wire,
+                "copySaved" to copySaved
+            ) + extra
+        fun saveCopy(): Boolean =
+            saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode) != null
+
         if (!outputFile.exists() || outputFile.length() <= 0) {
-            return@withContext ReplacementResult(false, "Replacement skipped: output file was missing or empty.")
+            return@withContext ReplacementResult(false, "Replacement skipped: output file was missing or empty.",
+                ReplacementOutcome.REFUSED_OUTPUT_MISSING, evidence())
         }
 
         if (!verification.replacementSafe) {
-            val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
+            val saved = saveCopy()
             return@withContext ReplacementResult(
                 false,
-                if (savedUri != null) {
+                if (saved) {
                     "Replace only after verification blocked replacement: ${verification.replacementBlockReason ?: "output verification failed"}. A safe copy was saved instead."
                 } else {
                     "Replace only after verification blocked replacement: ${verification.replacementBlockReason ?: "output verification failed"}, and saving a safe copy failed."
-                }
+                },
+                ReplacementOutcome.REFUSED_NOT_REPLACEMENT_SAFE, evidence(copySaved = saved)
             )
         }
 
         if (shouldBlockOriginalOverwrite(item, outputFile, quality)) {
-            val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
+            val saved = saveCopy()
             val ratioPercent = ((outputFile.length().toDouble() / item.originalSize.toDouble()) * 100.0).toInt()
             return@withContext ReplacementResult(
                 false,
-                if (savedUri != null) {
+                if (saved) {
                     "Perceptually-lossless overwrite blocked to protect quality: output was only $ratioPercent% of the source. A safe copy was saved instead."
                 } else {
                     "Perceptually-lossless overwrite blocked to protect quality: output was only $ratioPercent% of the source, and saving a safe copy failed."
-                }
+                },
+                ReplacementOutcome.REFUSED_OVERWRITE_GUARD, evidence(copySaved = saved)
+            )
+        }
+
+        // The output was made from, and verified against, the bytes the source held when the item
+        // began. With no digest of those bytes there is nothing to hold the original to, so it is
+        // not opened: the output is saved beside it instead.
+        if (boundSourceDigest == null) {
+            val saved = saveCopy()
+            DiagLog.w("CompressorBatch", "replace refused; job=${diagnosticJobId(item)}; no source digest was bound when the item began")
+            return@withContext ReplacementResult(
+                false,
+                if (saved) {
+                    "The original could not be confirmed unchanged since it was read for compression, so it was left untouched. A safe compressed copy was saved instead."
+                } else {
+                    "The original could not be confirmed unchanged since it was read for compression; it was left untouched, and saving a safe copy failed."
+                },
+                ReplacementTransaction.REFUSED_SOURCE_NOT_BOUND, evidence(copySaved = saved)
             )
         }
 
         val backupMessage = if (backupBeforeReplace) {
             val backedUp = saveSourceBackupToGallery(context, item)
             if (!backedUp) {
-                val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
+                val saved = saveCopy()
                 return@withContext ReplacementResult(
                     false,
-                    if (savedUri != null) {
+                    if (saved) {
                         "Backup before replace failed, so the original was not touched. A safe output copy was saved instead."
                     } else {
                         "Backup before replace failed, so the original was not touched, and saving the output copy also failed."
-                    }
+                    },
+                    ReplacementOutcome.REFUSED_BACKUP_FAILED, evidence(copySaved = saved)
                 )
             }
             "Backup copy saved. "
@@ -5091,14 +5233,15 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         if (StorageSpacePolicy.blocks(item.originalSize, cacheAvailable)) {
             val shortfall = StorageSpacePolicy.shortfallMessage(item.originalSize, cacheAvailable)
             DiagLog.w("CompressorBatch", "replace precheck; job=${diagnosticJobId(item)}; blocked: $shortfall")
-            val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
+            val saved = saveCopy()
             return@withContext ReplacementResult(
                 false,
-                if (savedUri != null) {
+                if (saved) {
                     "Not enough free space to protect the original ($shortfall), so it was left untouched. A safe compressed copy was saved instead."
                 } else {
                     "Not enough free space to protect the original ($shortfall); it was left untouched, and saving a safe copy also failed."
-                }
+                },
+                ReplacementOutcome.REFUSED_LOW_SPACE, evidence(copySaved = saved)
             )
         }
         // The stage -> write -> verify -> rollback decision lives in OriginalReplacementCoordinator so
@@ -5108,17 +5251,31 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val recoveryCopy = runCatching {
             ReplacementContentProof.newRecoveryFile(recoveryDir, diagnosticJobId(item))
         }.getOrNull() ?: return@withContext ReplacementResult(false,
-            "Replacement skipped: a recovery file could not be allocated. Original left untouched.")
+            "Replacement skipped: a recovery file could not be allocated. Original left untouched.",
+            ReplacementOutcome.REFUSED_RECOVERY_UNAVAILABLE, evidence())
+        // This replacement owns the copy until it returns: a scan for leftovers skips it.
+        ReplacementJournal.markActive(recoveryCopy)
+        try {
+        // What the write is confirmed against, and what a later start compares the file with.
+        outputDigest = runCatching { outputFile.inputStream().use { ReplacementContentProof.sha256(it) } }.getOrNull()
+        var stagedDigest: String? = null
         val replacementIo = object : OriginalReplacementIo {
+            // One pass: the bytes are digested as they are copied, so the digest is of exactly
+            // what the recovery file holds and costs no second read of the original.
             override fun stageRecoveryCopy(): Long {
+                val md = java.security.MessageDigest.getInstance("SHA-256")
                 val opened = context.contentResolver.openInputStream(item.sourceUri)?.use { input ->
                     recoveryCopy.outputStream().use { output ->
-                        input.copyTo(output)
+                        java.security.DigestInputStream(input, md).copyTo(output)
                         output.fd.sync() // Recovery must be durable before the destructive open.
                     }
                 }
-                return if (opened == null) -1L else recoveryCopy.length()
+                if (opened == null) return -1L
+                stagedDigest = md.digest().joinToString("") { "%02x".format(it) }
+                return recoveryCopy.length()
             }
+
+            override fun stagedSourceDigest(): String? = stagedDigest
 
             override fun writeOutputOverOriginal() {
                 context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
@@ -5140,7 +5297,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
             override fun recoveryCopyLength(): Long = recoveryCopy.length()
 
-            override fun discardRecoveryCopy() { runCatching { recoveryCopy.delete() } }
+            override fun discardRecoveryCopy() = ReplacementJournal.discard(recoveryCopy)
 
             // Content proof: the original read back through the provider, digested and compared
             // with the file it should now hold. A size match cannot catch equal-length corruption.
@@ -5148,33 +5305,76 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 context.contentResolver.openInputStream(item.sourceUri)?.use { ReplacementContentProof.sha256(it) }
             }.getOrNull()
 
-            override fun writtenOutputMatches(): Boolean {
-                val expected = runCatching { outputFile.inputStream().use { ReplacementContentProof.sha256(it) } }.getOrNull()
-                return expected != null && expected == sourceDigest()
+            private fun proof(expected: String?, actual: String?) = when {
+                expected == null || actual == null -> ContentProof.UNAVAILABLE
+                expected == actual -> ContentProof.MATCH
+                else -> ContentProof.MISMATCH
             }
 
-            override fun restoredOriginalMatches(): Boolean {
-                val expected = runCatching { recoveryCopy.inputStream().use { ReplacementContentProof.sha256(it) } }.getOrNull()
-                return expected != null && expected == sourceDigest()
+            override fun writtenOutputProof(): ContentProof {
+                val readBack = sourceDigest()
+                postWriteDigest = readBack
+                return proof(outputDigest, readBack)
             }
+
+            override fun restoredOriginalProof(): ContentProof =
+                proof(runCatching { recoveryCopy.inputStream().use { ReplacementContentProof.sha256(it) } }.getOrNull(), sourceDigest())
+
+            override fun writtenOutputMatches(): Boolean = writtenOutputProof() == ContentProof.MATCH
+
+            override fun restoredOriginalMatches(): Boolean = restoredOriginalProof() == ContentProof.MATCH
         }
 
         val expectedLength = outputFile.length()
-        // The recovery copy must hold the whole original (item.originalSize, as indexed) before the
-        // truncating write may begin.
-        val attempt = OriginalReplacementCoordinator.attempt(replacementIo, expectedLength, item.originalSize.takeIf { it > 0L })
+        // Beside the recovery copy, durably, before the original is opened: which file the copy
+        // belongs to and the digests that settle its state, for a start after a process death.
+        val journalEntry = ReplacementJournalEntry(
+            jobId = diagnosticJobId(item), state = ReplacementJournalEntry.STAGING,
+            targetUri = item.sourceUri.toString(), displayName = item.originalName,
+            sourceBytes = item.originalSize, boundSourceSha256 = boundSourceDigest, stagedSha256 = null,
+            outputBytes = expectedLength, outputSha256 = outputDigest, createdAtMs = System.currentTimeMillis()
+        )
+        val journal = object : ReplacementJournalSink {
+            override fun staging(): Boolean = ReplacementJournal.write(recoveryCopy, journalEntry)
+            override fun staged(stagedDigest: String?, stagedBytes: Long): Boolean =
+                ReplacementJournal.write(recoveryCopy, journalEntry.copy(state = ReplacementJournalEntry.STAGED, stagedSha256 = stagedDigest))
+        }
+        // The recovery copy must hold the whole original (item.originalSize, as indexed) and equal
+        // the digest bound when the item began, before the truncating write may begin.
+        val transaction = OriginalReplacementCoordinator.replace(
+            replacementIo,
+            ReplacementRequest(expectedLength, item.originalSize.takeIf { it > 0L }, boundSourceDigest),
+            journal
+        )
+        val attempt = transaction.attempt
 
+        if (attempt is ReplacementAttempt.OriginalIntact && attempt.reason == ReplacementAttempt.Reason.SOURCE_CHANGED) {
+            // The file is no longer the one this output was made from. It was not opened, and the
+            // Shizuku path below must not write over it either.
+            DiagLog.w("CompressorBatch", "replace refused; job=${diagnosticJobId(item)}; the original changed after it was read for compression")
+            val saved = saveCopy()
+            return@withContext ReplacementResult(
+                false,
+                if (saved) {
+                    "The original changed after it was read for compression, so it was left untouched. A safe compressed copy was saved instead."
+                } else {
+                    "The original changed after it was read for compression; it was left untouched, and saving a safe copy failed."
+                },
+                transaction.outcome, evidence(transaction, saved)
+            )
+        }
         if (attempt is ReplacementAttempt.OriginalIntact &&
             attempt.reason == ReplacementAttempt.Reason.RECOVERY_STAGING_FAILED
         ) {
-            val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
+            val saved = saveCopy()
             return@withContext ReplacementResult(
                 false,
-                if (savedUri != null) {
+                if (saved) {
                     "Could not stage a rollback copy of the original, so it was left untouched. A safe compressed copy was saved instead."
                 } else {
                     "Could not stage a rollback copy of the original; it was left untouched, and saving a safe copy also failed."
-                }
+                },
+                transaction.outcome, evidence(transaction, saved)
             )
         }
         if (attempt is ReplacementAttempt.Replaced) {
@@ -5187,7 +5387,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             )
             return@withContext ReplacementResult(
                 true,
-                "${backupMessage}Original replaced through Android writable document access. Replace only after verification passed. Name/folder preserved. ${metadataReport.summary()}"
+                "${backupMessage}Original replaced through Android writable document access. Replace only after verification passed. Name/folder preserved. ${metadataReport.summary()}",
+                transaction.outcome, evidence(transaction)
             )
         }
 
@@ -5208,7 +5409,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 val copied = ShizukuSupport.copyFileWithShizuku(outputFile.absolutePath, targetPath)
                 shizukuWriteFailed = true
                 if (copied && runCatching { replacementIo.writtenOutputMatches() }.getOrDefault(false)) {
-                    runCatching { recoveryCopy.delete() }
+                    ReplacementJournal.discard(recoveryCopy)
                     val metadataReport = VideoMetadataPreserver.restoreAfterReplacement(
                         context = context,
                         sourceUri = item.sourceUri,
@@ -5217,7 +5418,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     )
                     return@withContext ReplacementResult(
                         true,
-                        "${backupMessage}Original replaced with Shizuku path fallback. Replace only after verification passed. Original folder/path preserved. ${metadataReport.summary()}"
+                        "${backupMessage}Original replaced with Shizuku path fallback. Replace only after verification passed. Original folder/path preserved. ${metadataReport.summary()}",
+                        ReplacementOutcome.COMMITTED_SHIZUKU, evidence(transaction, extra = mapOf("directOutcome" to transaction.outcome))
                     )
                 }
             }
@@ -5236,16 +5438,18 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
 
         // Every replacement attempt failed. Report the TRUTH about the original's state and never
         // claim it was "protected" when the destructive open may have truncated it.
-        val savedUri = saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode)
+        val saved = saveCopy()
+        val shizuku = mapOf("shizukuAttemptedAndFailed" to shizukuWriteFailed)
         val result = if (originalStillWhole) {
-            runCatching { recoveryCopy.delete() }
+            ReplacementJournal.discard(recoveryCopy)
             ReplacementResult(
                 false,
-                if (savedUri != null) {
+                if (saved) {
                     "In-place replacement failed, so the original was restored intact and left in place. A safe compressed copy was saved instead."
                 } else {
                     "In-place replacement failed; the original was restored intact, but saving a safe copy also failed."
-                }
+                },
+                transaction.outcome, evidence(transaction, saved, shizuku)
             )
         } else {
             // Worst case: the source may be incomplete AND we could not restore it in place.
@@ -5256,8 +5460,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             ) != null
             // Only discard once the bytes exist somewhere else. If preserving them failed, this file
             // IS the user's last intact original — deleting it here would destroy it and make the
-            // "don't clear the cache" advice below a lie. Keep it and say where it is.
-            if (!originalPreserved) {
+            // "don't clear the cache" advice below a lie. Keep it and say where it is. Its journal
+            // entry stays with it, so the next start finds it and tries to preserve it again.
+            if (originalPreserved) {
+                ReplacementJournal.discard(recoveryCopy)
+            } else {
                 DiagLog.e(
                     "CompressorBatch",
                     "job=${diagnosticJobId(item)}; original may be incomplete and could not be preserved; " +
@@ -5267,16 +5474,21 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             ReplacementResult(
                 false,
                 when {
-                    originalPreserved && savedUri != null ->
+                    originalPreserved && saved ->
                         "In-place replacement failed and the original on disk may be incomplete. A copy of your original AND the compressed version were both saved to your gallery — please verify the file in its original folder."
                     originalPreserved ->
                         "In-place replacement failed and the original on disk may be incomplete. A copy of your untouched original was saved to your gallery — please recover it from there."
                     else ->
                         "In-place replacement failed and the original on disk may be incomplete, and saving a recovered copy to your gallery failed. An intact copy of the original is still held inside the app — do not clear the app's storage, and free up space then try again."
-                }
+                },
+                if (originalPreserved) ReplacementOutcome.AT_RISK_ORIGINAL_PRESERVED else ReplacementOutcome.AT_RISK_RECOVERY_RETAINED,
+                evidence(transaction, saved, shizuku + mapOf("directOutcome" to transaction.outcome, "originalPreserved" to originalPreserved))
             )
         }
         result
+        } finally {
+            ReplacementJournal.release(recoveryCopy)
+        }
     }
 
     private fun shouldBlockOriginalOverwrite(

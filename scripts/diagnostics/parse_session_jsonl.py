@@ -217,6 +217,7 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "differencesOnVerifiedOutputs": dict(difference_counts.most_common()),
         "sizeGates": size_gates(session),
         "dispositions": dispositions(jobs),
+        "replacements": replacements(session),
         "silentRejections": len(silent_rejections),
         "learnedStateIdentity": (start or {}).get("learnedStateIdentity"),
         "terminals": dict(terminals.most_common()),
@@ -756,6 +757,37 @@ def dispositions(jobs: list[dict[str, Any]]) -> dict[str, Any]:
 _FAILURE_TERMINALS = {"OUTPUT_VALIDATION_FAILED", "ENCODER_FAILURE", "UNSUPPORTED_CONTAINER", "FAILED"}
 
 
+def replacements(session: dict[str, Any]) -> dict[str, Any]:
+    """Replacement requests and how each ended, from the `replace` stage and the batch settings.
+
+    A build that writes neither cannot say whether an original was left alone because replacement
+    was off, was refused, or was never recorded: `recorded` is False and nothing is counted, so an
+    old capture is never read as "no replacement happened". Outcomes are the stage's reason codes
+    (ReplacementTransaction.outcome / ReplacementOutcome); `originalOpenedForWriting` counts the
+    transactions that reached the destructive open, whatever followed.
+    """
+    stages = [r for r in session.get("stages", []) if r.get("stage") == "replace"]
+    settings = (session.get("identity") or {}).get("batchSettings")
+    if not stages and not isinstance(settings, dict):
+        return {"recorded": False}
+    outcomes = Counter(str(r.get("reasonCode")) for r in stages)
+    requested = [r for r in stages if r.get("reasonCode") != "replace_not_requested"]
+    return {
+        "recorded": True,
+        "replaceOriginalsAtStart": (settings or {}).get("replaceOriginals"),
+        "backupBeforeReplaceAtStart": (settings or {}).get("backupBeforeReplace"),
+        "outcomes": dict(outcomes.most_common()),
+        "requested": len(requested),
+        "committed": sum(1 for r in requested if str(r.get("reasonCode")).startswith("replace_committed")),
+        "refused": sum(1 for r in requested if str(r.get("reasonCode")).startswith("replace_refused")),
+        "restored": sum(1 for r in requested if str(r.get("reasonCode")).startswith("replace_restored")),
+        "atRisk": [r.get("jobId") for r in requested if str(r.get("reasonCode")).startswith("replace_at_risk")],
+        "originalOpenedForWriting": sum(1 for r in requested if r.get("originalOpenedForWriting") is True),
+        "sourceChanged": [r.get("jobId") for r in requested if r.get("reasonCode") == "replace_refused_source_changed"],
+        "readBackUnavailable": [r.get("jobId") for r in requested if r.get("reasonCode") == "replace_restored_readback_unavailable"],
+    }
+
+
 def basis_kind(text: Any) -> str:
     t = str(text or "")
     if "the size prediction decided" in t:
@@ -915,6 +947,19 @@ def render(s: dict[str, Any]) -> str:
         out.append(f"  VMAF v1 shadow : {len(pairs)} certification window(s) scored by both models (min score)")
         for v0, v1 in pairs[:12]:
             out.append(f"      v0.6.1 {v0:6.2f}   v1 {v1:6.2f}   delta {v1 - v0:+6.2f}")
+    repl = s.get("replacements") or {}
+    if repl.get("recorded"):
+        out.append(f"  replacements   : replace originals at start={repl.get('replaceOriginalsAtStart')};"
+                   f" requested {repl['requested']}, committed {repl['committed']}, refused {repl['refused']},"
+                   f" restored {repl['restored']}, opened for writing {repl['originalOpenedForWriting']}; {repl['outcomes']}")
+        if repl["atRisk"]:
+            out.append(f"  !! {len(repl['atRisk'])} replacement(s) left an original possibly incomplete: "
+                       + ", ".join(map(str, repl["atRisk"][:8])))
+        if repl["sourceChanged"]:
+            out.append(f"  !! {len(repl['sourceChanged'])} original(s) changed after being read for compression and were"
+                       f" not overwritten: {', '.join(map(str, repl['sourceChanged'][:8]))}")
+    else:
+        out.append("  replacements   : not recorded by this build (whether originals were replaced cannot be read from this capture)")
     if s["jobsWithVerification"]:
         out.append(f"  failing checks : ({s['jobsWithVerification']} job(s) carry verification)")
         for name, n in s["failedCheckCounts"].items():

@@ -725,5 +725,56 @@ def test_an_older_record_that_cannot_settle_a_state_leaves_it_unknown():
     assert d["output"] == {"original_retained": 2, "none": 1}, d
     assert d["generatedThenRejected"] == ["discarded"], d
 
+
+def _replace(job_id, reason, **kw):
+    d = {"type": "stage", "batchId": "b1", "jobId": job_id, "stage": "replace", "reasonCode": reason, "attempt": 1}
+    d.update(kw)
+    return d
+
+
+def test_a_capture_without_replacement_records_says_so_instead_of_reading_as_none():
+    # v1.6.287 and earlier: no `replace` stage and no batch settings. An untouched original may
+    # mean replacement was off, refused or simply unrecorded; the summary must not pick one.
+    path = write([start(), job("a", batchId="b1", jobId="a", terminal="TRANSCODED_SMALLER", verified=True),
+                  {"type": "run_identity", "batchId": "b1", "scoring": {}},
+                  {"type": "session_summary", "batchId": "b1"}])
+    s = summarize(path)
+    assert s["replacements"] == {"recorded": False}, s["replacements"]
+    from parse_session_jsonl import render
+    assert "replacements   : not recorded by this build" in render(s)
+
+
+def test_replacement_requests_are_counted_by_how_each_one_ended():
+    path = write([
+        start(),
+        {"type": "run_identity", "batchId": "b1", "scoring": {},
+         "batchSettings": {"replaceOriginals": True, "backupBeforeReplace": False, "useShizukuFallback": False}},
+        _replace("ok", "replace_committed", originalOpenedForWriting=True, stagedMatchesSourceBefore=True,
+                 writeReadBack="confirmed", sourceBeforeDigest="aaaaaaaaaaaa", stagedDigest="aaaaaaaaaaaa",
+                 outputDigest="bbbbbbbbbbbb", postWriteDigest="bbbbbbbbbbbb"),
+        _replace("changed", "replace_refused_source_changed", originalOpenedForWriting=False,
+                 stagedMatchesSourceBefore=False, sourceBeforeDigest="aaaaaaaaaaaa", stagedDigest="cccccccccccc"),
+        _replace("blind", "replace_restored_readback_unavailable", originalOpenedForWriting=True, writeReadBack="size_unavailable",
+                 restoreReadBack="confirmed"),
+        _replace("bad", "replace_restored_readback_mismatch", originalOpenedForWriting=True, writeReadBack="content_mismatch"),
+        _replace("risk", "replace_at_risk_recovery_retained", originalOpenedForWriting=True),
+        _replace("off", "replace_not_requested"),
+        *[job(j, batchId="b1", jobId=j, terminal="TRANSCODED_SMALLER", verified=True) for j in ("ok", "changed", "blind", "bad", "risk", "off")],
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    r = s["replacements"]
+    assert r["recorded"] and r["replaceOriginalsAtStart"] is True and r["backupBeforeReplaceAtStart"] is False, r
+    assert (r["requested"], r["committed"], r["refused"], r["restored"]) == (5, 1, 1, 2), r
+    assert r["originalOpenedForWriting"] == 4, r
+    assert r["atRisk"] == ["risk"] and r["sourceChanged"] == ["changed"] and r["readBackUnavailable"] == ["blind"], r
+    assert r["outcomes"]["replace_not_requested"] == 1
+    from parse_session_jsonl import render, replay_coverage, load_sessions
+    text = render(s)
+    assert "left an original possibly incomplete: risk" in text
+    assert "changed after being read for compression and were not overwritten: changed" in text
+    # A replace event belongs to its job: it is not an orphan and asks nothing more of the record.
+    assert replay_coverage(load_sessions(path)["b1"])["orphanStages"] == 0
+
 if __name__ == "__main__":
     raise SystemExit(_main())
