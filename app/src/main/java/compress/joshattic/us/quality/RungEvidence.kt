@@ -26,6 +26,20 @@ object EncodeConfigIdentity {
     fun of(outputMime: String, shape: ProbeEncodeShape, videoBitrate: Int): String =
         of(outputMime, if (shape.isCbr) "CBR" else "VBR", shape.iFrameIntervalSeconds, shape.maxBFrames, videoBitrate)
 
+    /**
+     * The request with the bitrate left out: what every rung of one probe ladder shares, and what
+     * tells two ladders apart. Rungs are steps of one ladder only when this matches, along with
+     * their attempt and the encoder that actually ran. The bitrate is what a ladder varies, so
+     * [of] differs on every rung and cannot group them.
+     */
+    fun shapeOf(outputMime: String, shape: ProbeEncodeShape): String =
+        hash(
+            String.format(
+                Locale.US, "mime=%s;mode=%s;gop=%.3f;bframes=%d",
+                outputMime, if (shape.isCbr) "CBR" else "VBR", shape.iFrameIntervalSeconds, shape.maxBFrames
+            )
+        )
+
     /** First 12 hex digits of SHA-256: enough to tell configurations apart within a capture. */
     fun hash(text: String): String =
         MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))
@@ -61,7 +75,9 @@ data class RungEvidence(
     /** Wall time the rung took, monotonic clock. */
     val elapsedMs: Long,
     val reason: String? = null,
-    val encoderNames: List<String> = emptyList()
+    val encoderNames: List<String> = emptyList(),
+    /** EncodeConfigIdentity.shapeOf for the ladder this rung belongs to; null on evidence built without one. */
+    val encodeShapeId: String? = null
 ) {
     val id: String get() = String.format(Locale.US, "%.2f@%s", ratio, configId)
 
@@ -83,6 +99,10 @@ data class RungEvidence(
         const val MEASURED = "measured"
         const val MISALIGNED = "misaligned"
         const val UNAVAILABLE = "unavailable"
+
+        /** Which search of the attempt a rung belongs to: the requested codec's, or the alternate codec's. */
+        const val LADDER_PRIMARY = "primary"
+        const val LADDER_ALTERNATE = "alternate"
 
         /** The last measured rung at exactly [ratio], or null when none was measured there. */
         fun measuredAt(rungs: List<RungEvidence>, ratio: Double): RungEvidence? =

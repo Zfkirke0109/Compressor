@@ -1454,7 +1454,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         } else {
             null
         }
-        perceptualPlan?.let { emitProbeEvidence(s, it) }
+        perceptualPlan?.let { emitProbeEvidence(s, it, RungEvidence.LADDER_PRIMARY) }
         if (resolvedMime != null && perceptualPlan != null) {
             val alternate = probeAlternateCodec(s, resolvedMime, perceptualPlan)
             if (alternate != null) {
@@ -1536,7 +1536,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         val alternate = refinePlanWithPixelProbes(
             s, MimeTypes.VIDEO_H264, base, alternateCodecSearch = true
         )
-        emitProbeEvidence(s, alternate)
+        emitProbeEvidence(s, alternate, RungEvidence.LADDER_ALTERNATE)
         val selected = policy.canSelect(alternate.pixelProvenRatio, alternate.preferRemux,
             alternate.skipReason, alternate.sizeGateVerdict)
         s.run.diagnostics.stage(StageEvent(
@@ -1557,8 +1557,13 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
      * One `probe_rung` event per rung the ladder tried, then the `size_gate` event when the gate
      * ran (b177 F4): production emissions, full precision, with window ids and the config id the
      * rung was encoded with. Telemetry only.
+     *
+     * An attempt can hold two ladders over the same planned windows (the requested codec's, then
+     * the alternate codec's), so every rung names its own: [ladderRole], the codec it encoded
+     * with, the request shape the ladder shares and the encoder that ran. A reader that orders an
+     * attempt's rungs by ratio alone mixes the two.
      */
-    private fun emitProbeEvidence(s: ItemRun, plan: PerceptualLosslessPlan) {
+    private fun emitProbeEvidence(s: ItemRun, plan: PerceptualLosslessPlan, ladderRole: String) {
         plan.rungEvidence.forEachIndexed { i, rung ->
             s.run.diagnostics.stage(
                 StageEvent(
@@ -1572,7 +1577,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     elapsedMs = s.elapsedMs,
                     fields = linkedMapOf<String, Any?>(
                         "rungIndex" to i,
+                        "ladderRole" to ladderRole,
                         "outputMime" to plan.profileKey.encoderMime.substringBefore(';'),
+                        "encodeShapeId" to rung.encodeShapeId,
                         "rungId" to rung.id,
                         "ratio" to rung.ratio,
                         "verdict" to rung.verdict,

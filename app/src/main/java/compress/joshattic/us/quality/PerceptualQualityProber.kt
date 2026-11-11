@@ -235,7 +235,8 @@ class PerceptualQualityProber(private val context: Context) {
                     is RungResult.Misaligned -> r.reason
                     is RungResult.Unavailable -> r.reason
                     else -> null
-                }
+                },
+                encodeShapeId = EncodeConfigIdentity.shapeOf(outputMime, shape)
             )
             when (r) {
                 is RungResult.Measured -> {

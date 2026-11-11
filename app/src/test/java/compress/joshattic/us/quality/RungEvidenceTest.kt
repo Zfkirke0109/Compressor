@@ -1,5 +1,6 @@
 package compress.joshattic.us.quality
 
+import android.media.MediaCodecInfo
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -81,6 +82,24 @@ class RungEvidenceTest {
         assertNotEquals(probe, EncodeConfigIdentity.of("video/hevc", "CBR", 3f, 2, 826_407))
         assertNotEquals(probe, EncodeConfigIdentity.of("video/avc", "VBR", 3f, 2, 826_407))
         assertEquals(12, probe.length)
+    }
+
+    @Test
+    fun everyRungOfOneLadderSharesAShapeIdAndTwoLaddersNeverDo() {
+        val shape = ProbeEncodeShape(iFrameIntervalSeconds = 3f, maxBFrames = 2)
+        val hevc = EncodeConfigIdentity.shapeOf("video/hevc", shape)
+        // The bitrate is what a ladder varies: the config id moves with it, the shape id does not.
+        assertNotEquals(EncodeConfigIdentity.of("video/hevc", shape, 9_500_000), EncodeConfigIdentity.of("video/hevc", shape, 9_700_000))
+        assertEquals(hevc, EncodeConfigIdentity.shapeOf("video/hevc", shape.copy()))
+        // b287 Secure Folder job_c9ba3d6425be: an AVC .95 rung and an HEVC .97 rung shared one
+        // attempt and one window, and an offline join read them as two steps of one ladder.
+        assertNotEquals(hevc, EncodeConfigIdentity.shapeOf("video/avc", shape))
+        assertNotEquals(hevc, EncodeConfigIdentity.shapeOf("video/hevc", shape.copy(maxBFrames = 0)))
+        assertNotEquals(hevc, EncodeConfigIdentity.shapeOf("video/hevc", shape.copy(iFrameIntervalSeconds = 1f)))
+        assertNotEquals(hevc, EncodeConfigIdentity.shapeOf("video/hevc", shape.copy(bitrateMode = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)))
+        // SHA-256("mime=video/hevc;mode=VBR;gop=3.000;bframes=2"), first 12 hex: a capture reader can recompute it.
+        assertEquals("f2c9aaab5b2d", hevc)
+        assertEquals("62d81c59108f", EncodeConfigIdentity.shapeOf("video/avc", shape))
     }
 
     @Test
