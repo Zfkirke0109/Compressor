@@ -67,7 +67,11 @@ def main() -> int:
     base = os.path.join(out, "_base.mp4")
     src = ["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=12"]
     enc = ["-c:v", "libx264", "-preset", "veryfast", "-g", "20", "-pix_fmt", "yuv420p"]
-    subprocess.run(["ffmpeg", "-v", "error", "-y", *src, *enc, base], check=True)
+    # -nostdin and a closed stdin: ffmpeg otherwise reads its parent's stdin for interactive keys.
+    # Run from a loop that feeds file names on stdin (the CI suite runner), it swallowed part of
+    # the next name and that suite was never run.
+    ffmpeg = ["ffmpeg", "-nostdin", "-v", "error", "-y"]
+    subprocess.run([*ffmpeg, *src, *enc, base], check=True, stdin=subprocess.DEVNULL)
     data = bytearray(open(base, "rb").read())
     patched = patch_durations(data)
     if sorted(set(patched)) != ["mdhd", "mvhd", "tkhd"]:
@@ -75,8 +79,8 @@ def main() -> int:
     with open(os.path.join(out, "zero_track_duration.mp4"), "wb") as fh:
         fh.write(data)
     os.remove(base)
-    subprocess.run(["ffmpeg", "-v", "error", "-y", *src, *enc, "-movflags", "frag_keyframe+empty_moov",
-                    os.path.join(out, "fragmented_no_duration.mp4")], check=True)
+    subprocess.run([*ffmpeg, *src, *enc, "-movflags", "frag_keyframe+empty_moov",
+                    os.path.join(out, "fragmented_no_duration.mp4")], check=True, stdin=subprocess.DEVNULL)
     print(f"patched {patched}; wrote fixtures to {out}")
     return 0
 

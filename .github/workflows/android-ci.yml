@@ -168,7 +168,9 @@ jobs:
           failed=0
           while IFS= read -r test; do
             echo "::group::$test"
-            ( cd "$(dirname "$test")" && python3 "$(basename "$test")" ) || failed=1
+            # stdin is the list of suites: a suite (or a tool it runs) that reads it would
+            # swallow the names that follow, and those suites would silently not run.
+            ( cd "$(dirname "$test")" && python3 "$(basename "$test")" < /dev/null ) || failed=1
             echo "::endgroup::"
           done < <(git ls-files '*/test_*.py' | sort)
           test "$failed" -eq 0 || { echo "::error::One or more Python test suites failed."; exit 1; }
