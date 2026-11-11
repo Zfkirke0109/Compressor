@@ -418,15 +418,16 @@ object OutputVerifier {
         val remuxVerified = checks.passes(VerificationChecks.Scope.REMUX)
 
         // The failing predicates for the mode actually being judged, straight from the same
-        // structure that produced the verdict above. Null for modes with no verification scope:
-        // those verdicts are not derived from VerificationChecks, so claiming "nothing failed"
-        // would assert something this function never evaluated.
-        val failedChecks: List<String>? = when (input.mode) {
-            BatchQualityMode.REMUX_ONLY -> checks.failures(VerificationChecks.Scope.REMUX)
-            BatchQualityMode.PERCEPTUAL_LOSSLESS ->
-                checks.failures(VerificationChecks.Scope.PERCEPTUAL_LOSSLESS)
-            else -> null
+        // structure that produced the verdict above. A lossy mode is judged on LOSSY: what it
+        // changes by design (codec, a portrait source's coded orientation) is a difference
+        // outside its scope, reported apart, and never a failed check.
+        val scope = when (input.mode) {
+            BatchQualityMode.REMUX_ONLY -> VerificationChecks.Scope.REMUX
+            BatchQualityMode.PERCEPTUAL_LOSSLESS -> VerificationChecks.Scope.PERCEPTUAL_LOSSLESS
+            else -> VerificationChecks.Scope.LOSSY
         }
+        val failedChecks: List<String> = checks.failures(scope)
+        val lossyVerified = checks.passes(VerificationChecks.Scope.LOSSY)
 
         val outputWithinTolerance = input.sourceSize <= 0L ||
             input.outputSize <= (input.sourceSize * (1.0 + BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_SIZE_TOLERANCE)).toLong()
@@ -440,7 +441,7 @@ object OutputVerifier {
         val replacementSafe = when (input.mode) {
             BatchQualityMode.REMUX_ONLY -> remuxVerified
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance && strictlySmaller
-            else -> playable
+            else -> lossyVerified
         }
 
         val blockReason = when {
@@ -537,6 +538,7 @@ object OutputVerifier {
             replacementBlockReason = blockReason,
             criticalFieldsComplete = criticalFieldsComplete,
             failedChecks = failedChecks,
+            unjudgedDifferences = checks.differencesOutside(scope),
             structuralEvidence = mapOf("videoTimeline" to input.videoTimeline?.let { t -> mapOf(
                 "matches" to t.matches, "sourceFrames" to t.sourceFrames, "outputFrames" to t.outputFrames,
                 "sourceOriginUs" to t.sourceOriginUs, "outputOriginUs" to t.outputOriginUs,
@@ -550,7 +552,7 @@ object OutputVerifier {
             verified = when (input.mode) {
                 BatchQualityMode.REMUX_ONLY -> remuxVerified
                 BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance
-                else -> playable
+                else -> lossyVerified
             },
             failedOnlyOnVideoBitrateFloor = input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS &&
                 !bitratePass &&

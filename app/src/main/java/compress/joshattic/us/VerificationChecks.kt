@@ -70,7 +70,17 @@ data class VerificationChecks(
          */
         REMUX(
             PERCEPTUAL_LOSSLESS_EXCEPT_VIDEO_BITRATE.names + "videoCodecMatches"
-        );
+        ),
+
+        /**
+         * A lossy mode (High Quality, Storage Saver) promises a playable re-encode and makes no
+         * claim that anything matches the source: the codec changes by design, and Media3 codes a
+         * portrait source as landscape with a rotation hint. Those are differences, not failures.
+         * Naming the scope lets a lossy verdict report the predicates it was actually judged on
+         * instead of none at all, which sent its record down a text scan that listed
+         * `videoCodec` and `rotation` as failed checks on a verified output (b287 HQ job_31e5faeaf665).
+         */
+        LOSSY(listOf("playable"));
     }
 
     private fun valueOf(name: String): Boolean = when (name) {
@@ -102,4 +112,15 @@ data class VerificationChecks(
 
     /** The predicates in [scope] that did NOT pass, in declaration order. Empty iff [passes]. */
     fun failures(scope: Scope): List<String> = scope.names.filterNot(::valueOf)
+
+    /**
+     * The predicates that do not hold and that [scope] does not judge: how the output differs from
+     * the source in ways this verdict never promised to preserve. Information, never a failure.
+     */
+    fun differencesOutside(scope: Scope): List<String> = ALL.filterNot { it in scope.names }.filterNot(::valueOf)
+
+    private companion object {
+        /** Every predicate, in declaration order. */
+        val ALL = Scope.REMUX.names + "videoBitratePass"
+    }
 }

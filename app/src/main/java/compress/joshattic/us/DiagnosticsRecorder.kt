@@ -257,7 +257,13 @@ class DiagnosticsRecorder private constructor(
         // observed result is audioPreservation.
         audioRequested: String? = null,
         // SourceFingerprint of the source (sampled content hash), for matching runs by content.
-        sourceFingerprint: String? = null
+        sourceFingerprint: String? = null,
+        // VerificationChecks.differencesOutside: how the output differs from the source in ways
+        // its mode does not judge. Never failed checks.
+        unjudgedDifferences: List<String>? = null,
+        // OutputDisposition.fields(): generated, verified, kept, counted and replaceable, each
+        // stated on its own. Null only on records written by code that predates it.
+        disposition: Map<String, Any?>? = null
     ) {
         val accountingEntry = BatchTerminalAccountingEntry(terminal, sourceSize, outputSize)
         outcomes += accountingEntry
@@ -294,6 +300,8 @@ class DiagnosticsRecorder private constructor(
                 "verdict" to verdict,
                 "verified" to verified,
                 "failedChecks" to failedChecks?.let { JSONArray(it) },
+                "unjudgedDifferences" to unjudgedDifferences?.let { JSONArray(it) },
+                "disposition" to disposition?.let { JSONObject(it as Map<*, *>) },
                 "pixelCertified" to pixelCertified,
                 "replacementSafe" to replacementSafe,
                 "blockReason" to blockReason,
@@ -418,15 +426,26 @@ class DiagnosticsRecorder private constructor(
         )
     }
 
-    /** Session-level identities: scoring libraries/models and the device's encoder inventory. */
-    fun runIdentity(scoring: Map<String, Any?>, encoders: List<EncoderInventory.Entry>) {
+    /**
+     * Session-level identities: scoring libraries/models, the device's encoder inventory, and the
+     * batch's output settings as they stood when it started ([batchSettings]: replace originals,
+     * backup before replace, the Shizuku fallback, metadata privacy, codec and frame-rate options).
+     * Without them a capture could not say whether an untouched original meant "replacement was
+     * off" or "replacement was refused". Option labels and switches only: no path, name or URI.
+     */
+    fun runIdentity(
+        scoring: Map<String, Any?>,
+        encoders: List<EncoderInventory.Entry>,
+        batchSettings: Map<String, Any?> = emptyMap()
+    ) {
         record(
             "run_identity",
             fields = linkedMapOf<String, Any?>(
                 "scoring" to JSONObject(scoring as Map<*, *>),
                 "encoderInventory" to JSONArray(encoders.map { it.compact() }),
                 "encoderCount" to encoders.size,
-                "sourceFingerprintBasis" to SourceFingerprint.BASIS
+                "sourceFingerprintBasis" to SourceFingerprint.BASIS,
+                "batchSettings" to JSONObject(batchSettings as Map<*, *>)
             )
         )
     }

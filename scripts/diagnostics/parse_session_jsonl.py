@@ -167,9 +167,17 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         j for j in ladders_unmeasured
         if str(j.get("probeDetail")) == "no candidate ratio passed"
     ]
+    # A name listed on an output whose own verdict PASSED is not a failed check. Builds before the
+    # lossy scope existed listed what a High Quality encode changes by design (b287 HQ
+    # job_31e5faeaf665: verified=true beside failedChecks=[videoCodec, rotation]), and an earlier
+    # one did the same to passing Perceptually Lossless outputs. Those are counted as differences,
+    # with the `unjudgedDifferences` newer builds record under that name.
     check_counts = Counter(
-        c for j in verified_jobs for c in j["failedChecks"] if isinstance(c, str)
+        c for j in verified_jobs if j.get("verified") is not True for c in j["failedChecks"] if isinstance(c, str)
     )
+    difference_counts = Counter(
+        c for j in verified_jobs if j.get("verified") is True for c in j["failedChecks"] if isinstance(c, str)
+    ) + Counter(c for j in jobs for c in (j.get("unjudgedDifferences") or []) if isinstance(c, str))
     # A rejection that names nothing. From schema v3, a candidate discarded by pixel certification
     # carries verified=false with an empty structural failure list but a fallbackReason (and its
     # structuralVerified=true): that is explained, not silent.
@@ -206,6 +214,9 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "laddersMislabelledAsMeasured": len(mislabelled),
         "jobsWithVerification": len(verified_jobs),
         "failedCheckCounts": dict(check_counts.most_common()),
+        "differencesOnVerifiedOutputs": dict(difference_counts.most_common()),
+        "sizeGates": size_gates(session),
+        "dispositions": dispositions(jobs),
         "silentRejections": len(silent_rejections),
         "learnedStateIdentity": (start or {}).get("learnedStateIdentity"),
         "terminals": dict(terminals.most_common()),
@@ -639,9 +650,121 @@ def budget_exhausted(jobs: list[dict[str, Any]]) -> dict[str, int]:
     }
 
 
+def size_gates(session: dict[str, Any]) -> dict[str, Any] | None:
+    """Size-gate decisions by how the assessed rung stood: "passed", "marginal" or "unknown".
+
+    The gate assesses one probe rung and predicts the size of an encode at its ratio. A rung that
+    cleared the bar and the selection margin "passed"; one that cleared only the bar is "marginal".
+    b287 regular job_8227cd6d6a43 was kept on predicted size after a MARGINAL 0.97 measured on one
+    window, and its basis read "pixel probes passed at 0.97".
+
+    A build that records SizeGateEvidence states the rung's verdict and window counts on the
+    stage. An older capture carries only the assessed rung's id, so the verdict is read from that
+    job's own `probe_rung` record with the same attempt, codec and rung id. Where neither exists
+    the verdict is "unknown", never assumed to be a pass.
+    """
+    stages = session.get("stages", [])
+    gates = [r for r in stages if r.get("stage") == "size_gate"]
+    if not gates:
+        return None
+    rungs = {(r.get("jobId"), r.get("attempt"), r.get("outputMime"), r.get("rungId")): r
+             for r in stages if r.get("stage") == "probe_rung" and r.get("rungId")}
+    basis = {(j.get("jobId") or j.get("id")): str(j.get("decisionBasis") or "") for j in session.get("jobs", [])}
+    counts: dict[str, Counter] = {"keep_original": Counter(), "encode": Counter()}
+    rows = []
+    for g in gates:
+        verdict = "keep_original" if g.get("reasonCode") == "gate_keep_original" else "encode"
+        rung_id = g.get("assessedRungId") or g.get("probeRungId")
+        rung = rungs.get((g.get("jobId"), g.get("attempt"), g.get("outputMime"), rung_id))
+        if g.get("rungVerdict"):
+            source, rung_verdict = "recorded on the size gate", g["rungVerdict"]
+            measured, planned, ratio = g.get("measuredWindows"), g.get("plannedWindows"), g.get("assessedRatio")
+        elif rung is not None:
+            source, rung_verdict = "joined to the probe rung by id", rung.get("verdict") or "unknown"
+            measured = rung.get("probeWindows")
+            planned = len([w for w in str(rung.get("plannedWindowIds") or "").split(";") if w]) or None
+            ratio = rung.get("ratio")
+        else:
+            source, rung_verdict, measured, planned, ratio = "not recorded", "unknown", None, None, g.get("provenRatio")
+        counts[verdict][rung_verdict] += 1
+        rows.append({
+            "jobId": g.get("jobId"), "verdict": verdict, "assessedRatio": ratio, "rungVerdict": rung_verdict,
+            "measuredWindows": measured, "plannedWindows": planned, "predictedBytes": g.get("predictedBytes"),
+            "sourceBytes": g.get("sourceBytes"), "rungVerdictSource": source,
+            # The row text a build before SizeGateEvidence wrote for a marginal rung.
+            "wordedAsPassed": rung_verdict != "passed" and "pixel probes passed" in basis.get(g.get("jobId"), ""),
+        })
+    return {
+        "keepOriginal": dict(counts["keep_original"]), "encode": dict(counts["encode"]),
+        "wordedAsPassedButNot": [r["jobId"] for r in rows if r["wordedAsPassed"]],
+        "gates": rows,
+    }
+
+
+def dispositions(jobs: list[dict[str, Any]]) -> dict[str, Any]:
+    """What each job left behind, as separate states: generated, kept, counted, replaceable.
+
+    A build that writes `disposition` (OutputDisposition) states them. For an older record the
+    same states are DERIVED from the fields it does carry, by the same rules, and counted under
+    "derived"; a state those fields cannot settle is None, never a guess. The case this separates:
+    an output that verified and is kept for copy but is no size win (b287 HQ job_31e5faeaf665,
+    whose record read finalAccepted=true beside a ledger outcome of not_accepted).
+    """
+    out: Counter = Counter()
+    basis: Counter = Counter()
+    kept_not_counted, generated_rejected = [], []
+    for j in jobs:
+        job_id = j.get("jobId") or j.get("id")
+        d = j.get("disposition")
+        if isinstance(d, dict):
+            basis["recorded"] += 1
+        else:
+            basis["derived"] += 1
+            mode = j.get("materializationMode")
+            failed = str(j.get("terminal")) in _FAILURE_TERMINALS
+            kept_bytes = j.get("outputSize") if isinstance(j.get("outputSize"), (int, float)) else 0
+            if mode == "REUSED_SOURCE":
+                output = "original_retained" if j.get("verified") is True and not failed else "none"
+            elif mode == "GENERATED_FILE":
+                output = "kept_for_copy" if kept_bytes > 0 and not failed else "none"
+            else:
+                output = None if mode is None and kept_bytes > 0 else "none"
+            candidate = j.get("candidateBytes")
+            generated = (candidate > 0) if isinstance(candidate, (int, float)) else (True if output == "kept_for_copy" else None)
+            kept = output == "kept_for_copy"
+            d = {
+                "candidateGenerated": generated, "output": output,
+                "candidateRejected": None if generated is None else bool(generated and not kept),
+                "qualifyingSavings": kept and j.get("countsAsRealCompression") is True,
+                "replacementEligible": kept and j.get("replacementSafe") is True,
+            }
+        out[str(d.get("output"))] += 1
+        if d.get("output") == "kept_for_copy" and not d.get("qualifyingSavings"):
+            kept_not_counted.append(job_id)
+        if d.get("candidateRejected"):
+            generated_rejected.append(job_id)
+    return {
+        "output": dict(out), "basis": dict(basis),
+        "keptForCopyNotCounted": kept_not_counted, "generatedThenRejected": generated_rejected,
+        "qualifyingSavings": sum(
+            1 for j in jobs
+            if (j["disposition"].get("qualifyingSavings") if isinstance(j.get("disposition"), dict)
+                else j.get("countsAsRealCompression") is True and (j.get("outputSize") or 0) > 0)),
+    }
+
+
+_FAILURE_TERMINALS = {"OUTPUT_VALIDATION_FAILED", "ENCODER_FAILURE", "UNSUPPORTED_CONTAINER", "FAILED"}
+
+
 def basis_kind(text: Any) -> str:
     t = str(text or "")
     if "the size prediction decided" in t:
+        # From SizeGateEvidence on, the sentence says how the assessed rung stood. An older build
+        # wrote "pixel probes passed" for a marginal rung too: `sizeGates` reads the rung itself.
+        if "but not the selection margin" in t:
+            return "probe marginal, size predicted"
+        if "its verdict was not recorded" in t:
+            return "probe verdict unknown, size predicted"
         return "probe passed, size predicted"
     if "(learned)" in t:
         return "learned"
@@ -731,6 +854,19 @@ def render(s: dict[str, Any]) -> str:
         out.append(f"  budget exhausted: {budget['ladders']} ladder(s), {budget['encodedThenFailed']} then encoded and failed certification")
     if s.get("decisionBasis"):
         out.append(f"  keep-original basis: {s['decisionBasis']}")
+    gates = s.get("sizeGates")
+    if gates:
+        out.append(f"  size gates     : kept original {gates['keepOriginal'] or {}}; sent to encode {gates['encode'] or {}}"
+                   " (by the assessed rung's own verdict; the size is a prediction either way)")
+        if gates["wordedAsPassedButNot"]:
+            out.append(f"  !! {len(gates['wordedAsPassedButNot'])} size-gate keep(s) read \"pixel probes passed\" for a rung that"
+                       f" did not clear the selection margin: {', '.join(map(str, gates['wordedAsPassedButNot'][:8]))}")
+    disp = s.get("dispositions")
+    if disp and disp["output"]:
+        out.append(f"  dispositions   : {disp['output']} ({disp['basis']});"
+                   f" qualifying savings {disp['qualifyingSavings']};"
+                   f" kept for copy but not counted {len(disp['keptForCopyNotCounted'])};"
+                   f" generated then rejected {len(disp['generatedThenRejected'])}")
     if s.get("media3Input"):
         out.append("  media3 input   : files Media3 could not parse, by what the platform copy did")
         for kind, entry in s["media3Input"].items():
@@ -786,6 +922,8 @@ def render(s: dict[str, Any]) -> str:
             out.append(f"      {n:5}  {share:6.1%}  {name}")
         if not s["failedCheckCounts"]:
             out.append("      (none — every verified job passed every predicate in scope)")
+        if s.get("differencesOnVerifiedOutputs"):
+            out.append(f"  differences    : on outputs whose verdict passed (not failures): {s['differencesOnVerifiedOutputs']}")
     else:
         out.append("  failing checks : not recorded by this build; a rejection cannot be diagnosed")
     if s["laddersMislabelledAsMeasured"]:

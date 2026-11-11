@@ -269,6 +269,44 @@ def codec_key(codec):
     return codec or 'unrecorded'
 
 
+def size_gate_rows(stages):
+    """Each size-gate decision with the rung it assessed: ratio, verdict, windows scored of planned.
+
+    The gate predicts the size of an encode at one probe rung's ratio. That rung "passed" (bar and
+    selection margin) or was only "marginal" (bar alone), and the difference is not in the gate's
+    reason code. A build that records SizeGateEvidence states it on the stage; an older export
+    carries the assessed rung's id, so it is read from that job's probe rung with the same
+    attempt, codec and id. Neither: "unknown", never taken for a pass.
+    """
+    rungs = {(r.get('attempt'), r.get('attemptIndex'), r.get('outputMime'), r.get('rungId')): r
+             for r in stages if r.get('stage') == 'probe_rung' and r.get('rungId')}
+    rows = []
+    for g in stages:
+        if g.get('stage') != 'size_gate': continue
+        rung_id = g.get('assessedRungId') or g.get('probeRungId')
+        rung = rungs.get((g.get('attempt'), g.get('attemptIndex'), g.get('outputMime'), rung_id))
+        if g.get('rungVerdict'):
+            source, verdict = 'recorded on the size gate', g['rungVerdict']
+            measured, planned, ratio = g.get('measuredWindows'), g.get('plannedWindows'), g.get('assessedRatio')
+        elif rung is not None:
+            source, verdict = 'joined to the probe rung by id', rung.get('verdict') or 'unknown'
+            measured = rung.get('probeWindows')
+            planned = len([w for w in str(rung.get('plannedWindowIds') or '').split(';') if w]) or None
+            ratio = rung.get('ratio')
+        else:
+            source, verdict, measured, planned, ratio = 'not recorded', 'unknown', None, None, None
+        scope = 'unknown' if not planned or measured is None else 'complete' if measured >= planned else 'partial'
+        rows.append(dict(jobId=g.get('jobId'), attempt=g.get('attempt'), attemptIndex=g.get('attemptIndex'),
+                         sequence=g.get('sequence'), rungCodec=g.get('outputMime'), ladderRole=g.get('ladderRole'),
+                         decision='keep_original' if g.get('reasonCode') == 'gate_keep_original' else 'encode',
+                         assessedRatio=ratio, assessedRungId=rung_id, rungVerdict=verdict, rungVerdictSource=source,
+                         clearedSelectionMargin=verdict == 'passed', measuredWindows=measured, plannedWindows=planned,
+                         scope=scope, predictedBytes=g.get('predictedBytes'), sourceBytes=g.get('sourceBytes'),
+                         overshootPreClamp=g.get('overshootPreClamp'), adoptedRatio=g.get('provenRatio'),
+                         qualityBasis='sampled probe windows', sizeBasis='predicted'))
+    return rows
+
+
 def analyze_tables(records):
     """Every table of the audit, by name. [analyze] returns the four the earlier callers unpack."""
     jobs = [r for r in records if r.get('type') == 'job']
@@ -361,7 +399,8 @@ def analyze_tables(records):
                    marginLadderCodec=chosen['rungCodec'] if chosen else None,
                    marginLadderRole=chosen['ladderRole'] if chosen else None,
                    measuredLadderCodecs=list(dict.fromkeys(l['rungCodec'] for l in job_ladders)),
-                   ladders=job_ladders, humanLabel=None, proposedSourceSplit=source_split(identity),
+                   ladders=job_ladders, sizeGates=size_gate_rows(stages), humanLabel=None,
+                   proposedSourceSplit=source_split(identity),
                    splitRequiresFamilyReview=True,
                    learningEvents=[r for r in events if r.get('type') == 'learned_state_update'],
                    encoderName=(j.get('encoderConfig') or '').partition('encoder=')[2].split(';')[0] or None,
@@ -420,12 +459,16 @@ def analyze_tables(records):
                                                   m['encodeShapeId'], m['windowId'], m['lowerRatio'], m['higherRatio'])
                                                  for m in monotonic}),
                'repeatObservations': len(repeats),
+               'sizeGates': {decision: dict(Counter(g['rungVerdict'] for s in sources for g in s['sizeGates']
+                                                    if g['decision'] == decision))
+                             for decision in ['keep_original', 'encode']},
+               'sizeGateBasis': 'quality is the assessed probe rung (sampled windows); size is a prediction, on either decision',
                'excludedComparisons': dict(Counter(e['reason'] for e in excluded)),
                'legacyPooledJoin': pooled,
                'calibrationStatus': 'observational policy outcomes, no independent human labels',
                'runIdentity': next((r for r in records if r.get('type') == 'run_identity'), None)}
     return dict(sources=sources, windows=windows, nonmonotonic=monotonic, ladders=ladders, excluded=excluded,
-                repeats=repeats, summary=summary)
+                repeats=repeats, size_gates=[g for s in sources for g in s['sizeGates']], summary=summary)
 
 
 def analyze(records):
@@ -446,6 +489,7 @@ def main():
     a.out.mkdir(parents=True, exist_ok=True)
     for name, rows in [('sources', tables['sources']), ('windows', tables['windows']), ('nonmonotonic', tables['nonmonotonic']),
                        ('ladders', tables['ladders']), ('excluded_comparisons', tables['excluded']), ('repeats', tables['repeats']),
+                       ('size_gates', tables['size_gates']),
                        ('events', records), ('attempts', [r for r in records if r.get('type') == 'stage'])]:
         write_rows(a.out / (name + '.jsonl'), rows)
         if name in ['sources', 'windows', 'ladders']: write_rows(a.out / (name + '.csv'), rows)

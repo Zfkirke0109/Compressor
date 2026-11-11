@@ -57,6 +57,7 @@ import compress.joshattic.us.quality.CertificationGate
 import compress.joshattic.us.quality.EncodeConfigIdentity
 import compress.joshattic.us.quality.RungEvidence
 import compress.joshattic.us.quality.ShadowCalibration
+import compress.joshattic.us.quality.SizeGateEvidence
 import compress.joshattic.us.quality.scoredWindows
 import compress.joshattic.us.quality.PairScoreOutcome
 import compress.joshattic.us.quality.SaferRungRetry
@@ -367,9 +368,6 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // Ratio proven by on-device VMAF probe windows for THIS clip. May sit ABOVE the
         // learned/default target when only a safer retreat rung passed its windows.
         val pixelProvenRatio: Double? = null,
-        // The overshoot the size gate multiplied the proven ratio's request by, BEFORE the
-        // prediction's clamp to 1.0-2.0 (MeasuredOvershoot.forPrediction). Null when no gate ran.
-        val sizeGateOvershoot: Double? = null,
         // A HIGHER ratio the probes also measured as passing (the ladder refined below it), kept as
         // the only candidate for the opt-in safer-rung retry (SaferRungRetry). Null when none.
         val saferPassingRatio: Double? = null,
@@ -390,10 +388,6 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // Per-window frame-pairing diagnostics of the same rung (counts + decode-order pts skew):
         // distinguishes "windows measured real quality" from "windows scored misaligned frames".
         val probePairDiag: String? = null,
-        // Set when a rung PASSED its windows but the output at that rung is predicted to be no
-        // smaller than the source, so the size prediction, not a quality measurement, kept the
-        // original. The basis sentence (KeepOriginalMessages) must say exactly that.
-        val sizeGateBasis: String? = null,
         // Set when the probe exports stopped because Media3 cannot parse the input they read
         // (SourceParseFailure): the full encode would stop the same way, so it is not started on
         // that input.
@@ -403,10 +397,24 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // switches both to that ratio's own rung; it never keeps this rung's windows.
         val rungEvidence: List<compress.joshattic.us.quality.RungEvidence> = emptyList(),
         val probeRungId: String? = null,
-        // The size gate's prediction and verdict when it ran ("encode" / "keep_original").
-        val sizeGatePredictedBytes: Long? = null,
-        val sizeGateVerdict: String? = null
-    )
+        // What the size gate assessed and decided, when it ran: the rung (ratio, verdict, windows
+        // scored of windows planned), the predicted bytes and the overshoot behind them. One value,
+        // so the record, the basis sentence and the next step cannot disagree about it.
+        val sizeGate: SizeGateEvidence? = null
+    ) {
+        /** "encode" or "keep_original"; null when no gate ran. */
+        val sizeGateVerdict: String? get() = sizeGate?.verdict
+        val sizeGatePredictedBytes: Long? get() = sizeGate?.predictedBytes
+
+        // The overshoot the size gate multiplied the assessed ratio's request by, BEFORE the
+        // prediction's clamp to 1.0-2.0 (MeasuredOvershoot.forPrediction). Null when no gate ran.
+        val sizeGateOvershoot: Double? get() = sizeGate?.overshoot
+
+        // Set when the output at the assessed rung is predicted to be no smaller than the source,
+        // so the size prediction, not a quality measurement, kept the original. The sentence says
+        // how that rung stood (passed or only marginal) and on how many windows.
+        val sizeGateBasis: String? get() = sizeGate?.takeIf { it.keepsOriginal }?.let(KeepOriginalMessages::sizeGateBasis)
+    }
 
     private data class EncodeAttemptResult(
         val file: File,
@@ -1076,6 +1084,21 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             exhaustivePerceptualLossless = exhaustivePerceptualLossless,
             fullSourceHash = EncoderExperiments.isFullSourceHashEnabled(context)
         )
+        // The output settings this batch STARTS with. The switches are read again when an item
+        // finishes, so the record of each replacement (the `replace` stage) says what was asked
+        // of that item; this is the starting point those are compared with.
+        val batchSettings = _uiState.value.let { state ->
+            linkedMapOf<String, Any?>(
+                "replaceOriginals" to state.replaceOriginals,
+                "backupBeforeReplace" to state.backupBeforeReplace,
+                "useShizukuFallback" to state.useShizukuFallback,
+                "metadataPrivacy" to privacyMode.name,
+                "quality" to quality.label,
+                "codecOption" to codec.name,
+                "frameRateOption" to frameRate.name,
+                "exhaustivePerceptualLossless" to exhaustivePerceptualLossless
+            )
+        }
         _uiState.value.items.filter { it.isAlreadyCompressed }.forEach { skippedItem ->
             recordDiagnosticJob(
                 diagnostics = diagnostics,
@@ -1120,7 +1143,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                             "fullFrameTrace" to EncoderExperiments.isFrameTraceEnabled(context),
                             "measurementPolicyEpoch" to compress.joshattic.us.quality.ScientificPolicy.EPOCH
                         ),
-                    EncoderInventory.snapshot()
+                    EncoderInventory.snapshot(),
+                    batchSettings
                 )
             } }
             // Post-item thermal cooldown that was applied BEFORE the current item started (i.e. the
@@ -1594,21 +1618,25 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 )
             )
         }
-        val verdict = plan.sizeGateVerdict ?: return
+        val gate = plan.sizeGate ?: return
         s.run.diagnostics.stage(
             StageEvent(
                 sourceKey = s.item.sourceUri.toString(), attempt = s.phases.token.attempt, attemptIndex = s.ledger.currentIndex,
                 stage = StageEvent.Stage.SIZE_GATE,
-                reasonCode = if (verdict == "encode") StageEvent.Reason.GATE_ENCODE else StageEvent.Reason.GATE_KEEP_ORIGINAL,
+                reasonCode = if (gate.keepsOriginal) StageEvent.Reason.GATE_KEEP_ORIGINAL else StageEvent.Reason.GATE_ENCODE,
                 elapsedMs = s.elapsedMs,
-                fields = mapOf(
+                // provenRatio is the ratio the plan ADOPTED, so it is null whenever the gate kept
+                // the original. What the gate assessed, and how that rung stood, is in the
+                // SizeGateEvidence fields, on either verdict.
+                fields = linkedMapOf<String, Any?>(
+                    "ladderRole" to ladderRole,
                     "outputMime" to plan.profileKey.encoderMime.substringBefore(';'),
                     "provenRatio" to plan.pixelProvenRatio,
                     "probeRungId" to plan.probeRungId,
-                    "predictedBytes" to plan.sizeGatePredictedBytes,
-                    "sourceBytes" to s.item.originalSize,
-                    "overshootPreClamp" to plan.sizeGateOvershoot
-                )
+                    "predictedBytes" to gate.predictedBytes,
+                    "sourceBytes" to gate.sourceBytes,
+                    "overshootPreClamp" to gate.overshoot
+                ) + gate.fields()
             )
         )
     }
@@ -2374,6 +2402,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 fields = mapOf(
                     "verdict" to verification.verdict,
                     "failedChecks" to verification.failingChecks().joinToString(","),
+                    "unjudgedDifferences" to verification.unjudgedDifferences?.joinToString(","),
                     "candidateBytes" to s.outputSize,
                     "floorRecovery" to s.floorRecoveryDecision?.wire,
                     "audioBasis" to verification.audioBasis,
@@ -3046,21 +3075,6 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 outputSize, s.lastEncodeMs
             )
         }
-        run.diagnostics.stage(
-            StageEvent(
-                sourceKey = item.sourceUri.toString(), attempt = s.phases.token.attempt, attemptIndex = s.ledger.currentIndex,
-                stage = StageEvent.Stage.ACCEPT,
-                reasonCode = if (!terminal.isFailure && outputSize > 0L) StageEvent.Reason.ACCEPTED else StageEvent.Reason.REJECTED,
-                elapsedMs = s.elapsedMs,
-                fields = mapOf(
-                    "terminal" to terminal.name,
-                    "candidateBytes" to outputSize,
-                    "predictedBytes" to s.resolvedPlan?.estimatedBytes,
-                    "pixelCertified" to s.pixelCertifiedThisRun,
-                    "retries" to s.retriesThisItem
-                )
-            )
-        )
         recordDiagnosticJob(
             diagnostics = run.diagnostics,
             item = item,
@@ -3100,7 +3114,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             encodePlan = s.resolvedPlan,
             attempts = s.ledger,
             probeRungId = perceptualPlan?.probeRungId,
-            acceptStageEmitted = true
+            stageAttempt = s.phases.token.attempt,
+            acceptStageFields = mapOf(
+                "predictedBytes" to s.resolvedPlan?.estimatedBytes,
+                "pixelCertified" to s.pixelCertifiedThisRun,
+                "retries" to s.retriesThisItem
+            )
         )
 
         if (terminal.isFailure) {
@@ -3902,6 +3921,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         return LearningObservation(sourceId, SourceFingerprint.BASIS, rung.configId, rung.scoredWindowIds,
             "probe", kind, BuildConfig.GIT_COMMIT, rung.encoderNames.joinToString("|"), details =
                 StageEvent.windowFields("probe", rung.scores, rung.scoredWindowIds) + mapOf(
+                    // A marginal rung cleared the bar, not the selection margin, and is recorded
+                    // as that: VISUAL_PASS at stage "probe" is never a full-file certificate.
+                    "rungVerdict" to rung.verdict,
                     "ratio" to rung.ratio, "requestedVideoBitrate" to rung.requestedVideoBitrate,
                     "fullSourceSha256" to fullSourceHashes[item.sourceUri], "androidBuild" to android.os.Build.FINGERPRINT))
     }
@@ -4087,7 +4109,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 probeTrace
             }
         }
-        // A pixel-proven rung clears the probe-skip latch: fresh evidence supersedes history.
+        // A rung that cleared the bar on every planned window (passed, or only marginal) clears the
+        // probe-skip latch: fresh evidence supersedes history. The ledger row keeps the rung's verdict.
         learningEngine.recordProbePass(plan.profileKey, probeObservation(item, scoredRung, LearningObservation.Kind.VISUAL_PASS))
         // A proven ratio must still clear file-size measurement noise before overturning a
         // remux decision — a NOISE threshold, not a worthiness bar: verified 1-2% savings count.
@@ -4104,9 +4127,22 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             exhaustive = exhaustive,
             meetsNoiseThreshold = BatchQualityBitratePolicy.meetsMinimumUsefulSavings(item.originalSize, predicted)
         )
+        // The gate's evidence is the rung AT the assessed ratio, as the ladder recorded it: its
+        // verdict (a rung that only cleared the bar is "marginal", not "passed") and how many
+        // planned windows it scored. Never another rung's: an unknown verdict is recorded as unknown.
+        val gate = SizeGateEvidence.of(
+            keepOriginal = !worth,
+            assessedRatio = proven,
+            rung = RungEvidence.measuredAt(decision.rungs, proven),
+            predictedBytes = predicted,
+            sourceBytes = item.originalSize,
+            overshoot = overshoot,
+            overshootMeasured = MeasuredOvershoot.fromThisFile(decision.provenRateFactors)
+        )
         DiagLog.i(
             "CompressorProbe",
-            "size gate; job=${diagnosticJobId(item)}; proven=${"%.2f".format(java.util.Locale.US, proven)}; " +
+            "size gate; job=${diagnosticJobId(item)}; assessed=${"%.2f".format(java.util.Locale.US, proven)}; " +
+                "rungVerdict=${gate.rungVerdict ?: "unknown"}; windows=${gate.measuredWindows}/${gate.plannedWindows}; " +
                 "predictedBytes=$predicted; sourceBytes=${item.originalSize}; " +
                 "${MeasuredOvershoot.describe(plan.expectedOvershootFactor, decision.provenRateFactors)}; " +
                 "verdict=${if (worth) "encode" else "keep original"}"
@@ -4116,22 +4152,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // no usable ratio is both proven and smaller: keep the original. Falling back to the
             // inference plan instead would encode at its target ratio, which may be a rung the
             // probes just measured as failing.
-            val basis = KeepOriginalMessages.sizeGateBasis(
-                provenRatio = proven,
-                predictedBytes = predicted,
-                sourceBytes = item.originalSize,
-                overshoot = overshoot,
-                overshootMeasured = MeasuredOvershoot.fromThisFile(decision.provenRateFactors)
-            )
             return probeTrace.copy(
                 preferRemux = true,
                 remuxReason = KeepOriginalMessages.SIZE_GATE_REASON,
                 remuxWasSourceEfficient = true,
                 remuxWasEvidencePreferred = false,
-                sizeGateBasis = basis,
-                sizeGateOvershoot = overshoot,
-                sizeGatePredictedBytes = predicted,
-                sizeGateVerdict = "keep_original"
+                sizeGate = gate
             )
         }
         // Adopt the proven ratio in BOTH directions: below the learned target it buys more
@@ -4145,9 +4171,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             remuxWasEvidencePreferred = false,
             pixelProvenRatio = proven,
             requiresMeasuredCertification = decision.marginal || (exhaustive && plan.preferRemux),
-            sizeGateOvershoot = overshoot,
-            sizeGatePredictedBytes = predicted,
-            sizeGateVerdict = "encode",
+            sizeGate = gate,
             saferPassingRatio = decision.saferPassingRatio,
             saferPassingRateFactors = decision.saferPassingRateFactors,
             marginalRefinementTrial = decision.marginal && decision.saferPassingRatio != null
@@ -4741,8 +4765,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // The callback token of the attempt that ended the job, for its terminal stage event. The
         // ledger's current entry carries it once an encode began; a skip passes its own token.
         stageAttempt: Int = attempts?.current?.token ?: 0,
-        // The finalize path emits a richer `accept` event itself; every other path gets one here.
-        acceptStageEmitted: Boolean = false
+        // What the ending path knows beyond the terminal (the finalize path: predicted bytes,
+        // certification, retries), added to the job's one `accept` event.
+        acceptStageFields: Map<String, Any?> = emptyMap()
     ) {
         require(verification == null || retainedValidation == null) {
             "A job cannot carry both output verification and retained-source validation"
@@ -4758,16 +4783,22 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             retainedVerdict = retainedValidation?.verdict,
             retainedReadable = retainedValidation?.readableAtDecisionTime
         )
-        if (!acceptStageEmitted) {
-            diagnostics.stage(
-                StageEvent.terminal(
-                    sourceKey = item.sourceUri.toString(), attempt = stageAttempt,
-                    attemptIndex = attempts?.currentIndex ?: 0, terminal = terminal,
-                    keptOutputBytes = acceptance.acceptedOutputBytes, candidateBytes = acceptance.candidateBytes,
-                    elapsedMs = elapsedMs
-                )
+        // Generated, verified, kept, counted and replaceable are different questions; the record
+        // answers each (OutputDisposition) beside the verdict strings older readers compare.
+        val disposition = OutputDisposition.of(
+            terminal = terminal,
+            acceptance = acceptance,
+            originalRetained = retainedValidation != null,
+            pixelCertified = verification?.pixelCertified == true
+        )
+        diagnostics.stage(
+            StageEvent.terminal(
+                sourceKey = item.sourceUri.toString(), attempt = stageAttempt,
+                attemptIndex = attempts?.currentIndex ?: 0, terminal = terminal,
+                keptOutputBytes = acceptance.acceptedOutputBytes, candidateBytes = acceptance.candidateBytes,
+                elapsedMs = elapsedMs, extra = acceptStageFields + mapOf("disposition" to disposition.fields())
             )
-        }
+        )
         diagnostics.job(
             // The recorder hashes both values before emission; raw URI/name never leave this call.
             sourceKey = item.sourceUri.toString(),
@@ -4799,6 +4830,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             // never verified as an output, so it records null here rather than an empty list that
             // would read as "verified and nothing failed".
             failedChecks = verification?.failingChecks(),
+            unjudgedDifferences = verification?.unjudgedDifferences,
+            disposition = disposition.fields(),
             // Retained sources never encode, so they can never be pixel-certified.
             pixelCertified = verification?.pixelCertified == true,
             replacementSafe = acceptance.replacementSafe,

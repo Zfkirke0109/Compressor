@@ -305,7 +305,7 @@ class ReportingTest(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr)
             for name in ['sources.jsonl', 'sources.csv', 'windows.jsonl', 'windows.csv', 'nonmonotonic.jsonl', 'events.jsonl',
                          'attempts.jsonl', 'summary.json', 'ladders.jsonl', 'ladders.csv', 'excluded_comparisons.jsonl',
-                         'repeats.jsonl']:
+                         'repeats.jsonl', 'size_gates.jsonl']:
                 self.assertTrue((out / name).exists(), name)
             summary = json.loads((out / 'summary.json').read_text())
             for key in ['jobs', 'classifications', 'terminals', 'savedBytes', 'originalsHashVerifiedUnchanged',
@@ -323,6 +323,94 @@ class ReportingTest(unittest.TestCase):
     def test_analyze_still_returns_the_four_tables_callers_unpack(self):
         sources, windows, monotonic, summary = audit_pl_capture.analyze(cross_codec_job())
         self.assertEqual((len(sources), len(windows), monotonic, summary['jobs']), (1, 4, [], 1))
+
+
+def size_gate(seq, job_id, reason, rung_id, attempt, mime=HEVC, **extra):
+    stage = dict(type='stage', stage='size_gate', reasonCode=reason, jobId=job_id, sequence=seq, attempt=attempt,
+                 attemptIndex=0, outputMime=mime, provenRatio=None, probeRungId=rung_id)
+    stage.update(extra)
+    return stage
+
+
+# Regular profile b287, batch_1794291512031: the one planned window of each rung, full precision.
+J82_75 = (95.06946158548124, 93.57089107441205, 92.90193200677668)
+J82_95 = (95.55968238949218, 94.00163211764911, 93.93942047542116)
+J82_97 = (95.7019398749062, 94.0104548435293, 93.95730819999392)
+ONE_WINDOW = '2706000-3906000'
+
+
+def marginal_size_keep():
+    kw = dict(job='job_8227cd6d6a43', attempt=7, window=ONE_WINDOW, planned=ONE_WINDOW, frames=71)
+    return [rung(98, 0.75, HEVC, QTI_HEVC, J82_75, config='9aade12672e7', verdict='failed', **kw),
+            rung(99, 0.95, HEVC, QTI_HEVC, J82_95, config='1eec1b05b828', verdict='marginal', rungIndex=1, **kw),
+            rung(100, 0.97, HEVC, QTI_HEVC, J82_97, config='ed624713bee1', verdict='marginal', rungIndex=2, **kw),
+            size_gate(101, 'job_8227cd6d6a43', 'gate_keep_original', '0.97@ed624713bee1', 7,
+                      predictedBytes=114912600, sourceBytes=102508481, overshootPreClamp=1.1444063863537028),
+            job('job_8227cd6d6a43', terminal='ALREADY_HIGHLY_OPTIMIZED', mime=None, sourceSize=102508481,
+                materializationMode='REUSED_SOURCE', copyAvoidedBytes=102508481, pixelCertified=False,
+                countsAsRealCompression=False, attemptsStarted=None)]
+
+
+class SizeGateTest(unittest.TestCase):
+    def test_a_marginal_rung_kept_on_predicted_size_keeps_its_verdict_scope_and_bytes(self):
+        tables = audit_pl_capture.analyze_tables(marginal_size_keep())
+        (gate,) = tables['size_gates']
+        self.assertEqual(gate['decision'], 'keep_original')
+        self.assertEqual((gate['assessedRatio'], gate['assessedRungId']), (0.97, '0.97@ed624713bee1'))
+        self.assertEqual(gate['rungVerdict'], 'marginal')
+        self.assertFalse(gate['clearedSelectionMargin'])
+        self.assertEqual((gate['measuredWindows'], gate['plannedWindows'], gate['scope']), (1, 1, 'complete'))
+        self.assertEqual((gate['predictedBytes'], gate['sourceBytes']), (114912600, 102508481))
+        self.assertEqual(gate['rungVerdictSource'], 'joined to the probe rung by id')
+        self.assertEqual((gate['sizeBasis'], gate['rungCodec']), ('predicted', HEVC))
+        # The plan adopted no ratio: null there never meant "no rung was assessed".
+        self.assertIsNone(gate['adoptedRatio'])
+        self.assertEqual(tables['summary']['sizeGates'], {'keep_original': {'marginal': 1}, 'encode': {}})
+
+    def test_a_size_keep_is_a_prediction_with_no_attempt_certificate_or_saving(self):
+        tables = audit_pl_capture.analyze_tables(marginal_size_keep())
+        (source,) = tables['sources']
+        self.assertEqual(source['classification'], 'predicted_not_smaller')
+        self.assertEqual((source['outputSize'], source['savedBytes'], source['pixelCertified']), (0, 0, False))
+        self.assertIsNone(source['attemptsStarted'])
+        self.assertEqual(tables['summary']['savedBytes'], 0)
+        self.assertEqual([w['stage'] for w in tables['windows']], ['probe_rung'] * 3)
+        # The rung that cleared the bar is still below the selection margin on its limiting gate.
+        self.assertAlmostEqual(source['worstMargin'], 95.7019398749062 - 95.5)
+        self.assertEqual(source['limitingGate'], 'mean')
+
+    def test_a_clean_pass_kept_on_predicted_size_is_told_apart(self):
+        # Secure Folder b287 job_31e5faeaf665: 0.90 passed on three of three windows.
+        scores = ('99.5743957723856;98.54452288978827;96.99546166108556', '96.80814659903729;96.08925662988143;95.6022449387839',
+                  '96.71406798517874;96.0073762166292;95.56249457322518')
+        passed = dict(type='stage', stage='probe_rung', jobId='job_31e5faeaf665', sequence=39, attempt=3, attemptIndex=0, ratio=0.9,
+                      outputMime=HEVC, actualEncoderNames=[QTI_HEVC], rungId='0.90@e929b108d9e5', configId='e929b108d9e5',
+                      verdict='passed', plannedWindowIds=PLANNED, probeWindowIds=PLANNED, probeWindows=3,
+                      probeMean=scores[0], probeP5=scores[1], probeMin=scores[2], probeFrames='36;36;36')
+        records = [passed, size_gate(40, 'job_31e5faeaf665', 'gate_keep_original', '0.90@e929b108d9e5', 3,
+                                     predictedBytes=126265012, sourceBytes=123783185),
+                   job('job_31e5faeaf665', terminal='ALREADY_HIGHLY_OPTIMIZED', mime=None, sourceSize=123783185)]
+        tables = audit_pl_capture.analyze_tables(records)
+        (gate,) = tables['size_gates']
+        self.assertEqual((gate['rungVerdict'], gate['clearedSelectionMargin']), ('passed', True))
+        self.assertEqual((gate['measuredWindows'], gate['plannedWindows'], gate['scope']), (3, 3, 'complete'))
+        self.assertEqual(tables['summary']['sizeGates']['keep_original'], {'passed': 1})
+
+    def test_evidence_recorded_on_the_gate_wins_and_a_gate_with_neither_is_unknown(self):
+        recorded = size_gate(5, 'job_new', 'gate_encode', '0.75@abc', 2, assessedRatio=0.75, assessedRungId='0.75@abc',
+                             rungVerdict='marginal', measuredWindows=3, plannedWindows=3, ladderRole='primary',
+                             predictedBytes=33366670, sourceBytes=44000000, provenRatio=0.75)
+        bare = size_gate(6, 'job_old', 'gate_keep_original', '0.95@zzz', 4)
+        # Same id and attempt but the other codec's rung: never the gate's own.
+        other = rung(4, 0.95, AVC, QTI_AVC, J82_95, job='job_old', attempt=4, config='zzz', verdict='passed')
+        tables = audit_pl_capture.analyze_tables(
+            [recorded, job('job_new', terminal='TRANSCODED_SMALLER'), other, bare, job('job_old', terminal='ALREADY_HIGHLY_OPTIMIZED')])
+        new, old = tables['size_gates']
+        self.assertEqual((new['rungVerdictSource'], new['rungVerdict'], new['ladderRole'], new['adoptedRatio']),
+                         ('recorded on the size gate', 'marginal', 'primary', 0.75))
+        self.assertEqual((old['rungVerdictSource'], old['rungVerdict'], old['scope'], old['clearedSelectionMargin']),
+                         ('not recorded', 'unknown', 'unknown', False))
+        self.assertEqual(tables['summary']['sizeGates'], {'keep_original': {'unknown': 1}, 'encode': {'marginal': 1}})
 
 
 if __name__ == '__main__': unittest.main()

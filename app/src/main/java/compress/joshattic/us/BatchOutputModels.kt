@@ -146,6 +146,11 @@ data class OutputVerificationReport(
     //   []   - derived: every predicate in scope passed
     //   [..] - derived: these predicates failed
     val failedChecks: List<String>? = null,
+    // Predicates that do not hold and that this mode's verdict does not judge
+    // (VerificationChecks.differencesOutside): a Perceptually Lossless transcode changes the video
+    // codec, a lossy mode may also change a portrait source's coded orientation. They describe the
+    // output; they are never failed checks. Null on a report built without a derivation.
+    val unjudgedDifferences: List<String>? = null,
     val structuralEvidence: Map<String, Any?> = emptyMap()
 ) {
     /**

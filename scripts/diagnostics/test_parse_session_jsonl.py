@@ -598,5 +598,132 @@ def test_replay_coverage_judges_each_job_not_stages_no_job_reached():
     kstages.append({"jobId": "k", "stage": "size_gate"})
     assert replay_coverage(session([kept], kstages))["label"] == "REPLAYABLE_RECORD"
 
+
+def _gate(job_id, reason, rung_id, attempt, **kw):
+    d = {"type": "stage", "batchId": "b1", "jobId": job_id, "stage": "size_gate", "reasonCode": reason,
+         "attempt": attempt, "outputMime": "video/hevc", "provenRatio": None, "probeRungId": rung_id}
+    d.update(kw)
+    return d
+
+
+def _rung(job_id, rung_id, attempt, ratio, verdict, planned, scored, mime="video/hevc"):
+    return {"type": "stage", "batchId": "b1", "jobId": job_id, "stage": "probe_rung", "reasonCode": "rung_measured",
+            "attempt": attempt, "outputMime": mime, "rungId": rung_id, "ratio": ratio, "verdict": verdict,
+            "plannedWindowIds": ";".join(f"{i}-{i + 1}" for i in range(planned)), "probeWindows": scored}
+
+
+def test_a_size_gate_is_counted_by_how_its_assessed_rung_stood():
+    # b287 regular job_8227cd6d6a43: 0.75 failed, 0.95 and 0.97 marginal on the one planned window,
+    # kept on predicted size, and worded "pixel probes passed at 0.97". b287 Secure Folder
+    # job_31e5faeaf665: a clean 0.90 pass on three of three windows, also kept on predicted size.
+    # Neither build recorded the rung's verdict on the gate: it is joined by attempt, codec and id.
+    worded = ("Basis: pixel probes passed at {}; the size prediction decided. At that rate the re-encode is "
+              "predicted ... The quality was measured; the size was predicted.")
+    path = write([
+        start(),
+        _rung("m", "0.75@9aade12672e7", 7, 0.75, "failed", 1, 1),
+        _rung("m", "0.95@1eec1b05b828", 7, 0.95, "marginal", 1, 1),
+        _rung("m", "0.97@ed624713bee1", 7, 0.97, "marginal", 1, 1),
+        _gate("m", "gate_keep_original", "0.97@ed624713bee1", 7, predictedBytes=114912600, sourceBytes=102508481),
+        job("m", batchId="b1", jobId="m", terminal="ALREADY_HIGHLY_OPTIMIZED", verified=True, outputSize=0,
+            materializationMode="REUSED_SOURCE", decisionBasis=worded.format("0.97")),
+        _rung("c", "0.90@e929b108d9e5", 3, 0.90, "passed", 3, 3),
+        _gate("c", "gate_keep_original", "0.90@e929b108d9e5", 3, predictedBytes=126265012, sourceBytes=123783185),
+        job("c", batchId="b1", jobId="c", terminal="ALREADY_HIGHLY_OPTIMIZED", verified=True, outputSize=0,
+            materializationMode="REUSED_SOURCE", decisionBasis=worded.format("0.90")),
+        # An AVC rung with the same id in the same attempt must not answer for the HEVC gate.
+        _rung("x", "0.97@samehash", 9, 0.97, "passed", 3, 3, mime="video/avc"),
+        _gate("x", "gate_encode", "0.97@samehash", 9),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    gates = summarize(path)["sizeGates"]
+    assert gates["keepOriginal"] == {"marginal": 1, "passed": 1}, gates
+    assert gates["encode"] == {"unknown": 1}, gates
+    assert gates["wordedAsPassedButNot"] == ["m"], gates
+    marginal = next(g for g in gates["gates"] if g["jobId"] == "m")
+    assert (marginal["assessedRatio"], marginal["measuredWindows"], marginal["plannedWindows"]) == (0.97, 1, 1), marginal
+    assert marginal["rungVerdictSource"] == "joined to the probe rung by id"
+    assert (marginal["predictedBytes"], marginal["sourceBytes"]) == (114912600, 102508481)
+    clean = next(g for g in gates["gates"] if g["jobId"] == "c")
+    assert (clean["rungVerdict"], clean["measuredWindows"], clean["plannedWindows"], clean["wordedAsPassed"]) == ("passed", 3, 3, False)
+    unknown = next(g for g in gates["gates"] if g["jobId"] == "x")
+    assert unknown["rungVerdictSource"] == "not recorded" and unknown["rungVerdict"] == "unknown", unknown
+
+
+def test_a_size_gate_that_records_its_evidence_is_read_from_the_gate_itself():
+    path = write([
+        start(),
+        _gate("n", "gate_keep_original", "0.97@ed624713bee1", 7, assessedRatio=0.97, assessedRungId="0.97@ed624713bee1",
+              rungVerdict="marginal", clearedSelectionMargin=False, measuredWindows=1, plannedWindows=1, scope="complete",
+              sizeBasis="predicted", disposition="predicted_not_smaller", predictedBytes=114912600, sourceBytes=102508481),
+        job("n", batchId="b1", jobId="n", terminal="ALREADY_HIGHLY_OPTIMIZED", verified=True, outputSize=0,
+            materializationMode="REUSED_SOURCE",
+            decisionBasis="Basis: the 0.97 probe cleared the Perceptually Lossless bar on 1 of 1 planned window but not the "
+                          "selection margin (marginal), so no ratio was selected on quality; the size prediction decided. ..."),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    gate = s["sizeGates"]["gates"][0]
+    assert gate["rungVerdictSource"] == "recorded on the size gate" and gate["rungVerdict"] == "marginal", gate
+    assert s["sizeGates"]["wordedAsPassedButNot"] == []
+    assert s["decisionBasis"] == {"probe marginal, size predicted": 1}, s["decisionBasis"]
+    from parse_session_jsonl import basis_kind
+    assert basis_kind("Basis: the 0.90 probe was the rung assessed, and its verdict was not recorded; "
+                      "the size prediction decided. ...") == "probe verdict unknown, size predicted"
+    # No encode ran for either size keep: no attempt, no certificate, no saving, and no output bytes.
+    assert s["realCompressions"] == 0 and s["savedBytes"] == 0 and s["pixelCertified"] == 0
+    assert s["generatedOutputBytes"] == 0
+    assert s["dispositions"]["output"] == {"original_retained": 1}
+
+
+def test_a_difference_on_a_verified_output_is_not_a_failed_check():
+    # b287 HQ job_31e5faeaf665: verified=true beside failedChecks=[videoCodec, rotation] (a text
+    # scan of what High Quality changes by design). A later build records [] and names the two
+    # under unjudgedDifferences. Neither is a failure; a rejected output's named check still is.
+    path = write([
+        start(mode="High Quality"),
+        job("old", batchId="b1", jobId="old", terminal="TRANSCODED_NOT_MEANINGFULLY_SMALLER", verified=True,
+            failedChecks=["videoCodec", "rotation"], sourceSize=123783185, outputSize=122130776,
+            materializationMode="GENERATED_FILE", finalAccepted=True, candidateBytes=122130776, replacementSafe=False),
+        job("new", batchId="b1", jobId="new", terminal="TRANSCODED_NOT_MEANINGFULLY_SMALLER", verified=True,
+            failedChecks=[], unjudgedDifferences=["rotationMatches", "videoCodecMatches"],
+            sourceSize=123783185, outputSize=122130776, materializationMode="GENERATED_FILE",
+            disposition={"candidateGenerated": True, "structurallyVerified": True, "pixelCertified": False,
+                         "output": "kept_for_copy", "candidateRejected": False, "qualifyingSavings": False,
+                         "replacementEligible": False}),
+        job("bad", batchId="b1", jobId="bad", failedChecks=["playable"], materializationMode="GENERATED_FILE", outputSize=0,
+            candidateBytes=5),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["failedCheckCounts"] == {"playable": 1}, s["failedCheckCounts"]
+    assert s["differencesOnVerifiedOutputs"] == {"videoCodec": 1, "rotation": 1, "rotationMatches": 1, "videoCodecMatches": 1}
+    d = s["dispositions"]
+    assert d["basis"] == {"derived": 2, "recorded": 1}, d
+    assert d["output"] == {"kept_for_copy": 2, "none": 1}, d
+    assert d["keptForCopyNotCounted"] == ["old", "new"], d
+    assert d["generatedThenRejected"] == ["bad"], d
+    assert d["qualifyingSavings"] == 0
+    assert s["realCompressions"] == 0
+
+
+def test_an_older_record_that_cannot_settle_a_state_leaves_it_unknown():
+    from parse_session_jsonl import dispositions
+    # Before materializationMode and candidateBytes existed: a kept size says nothing about where
+    # the bytes came from.
+    d = dispositions([{"id": "legacy", "terminal": "TRANSCODED_SMALLER", "outputSize": 900, "sourceSize": 1000,
+                       "countsAsRealCompression": True, "verified": True}])
+    assert d["output"] == {"None": 1}, d
+    assert d["generatedThenRejected"] == [] and d["keptForCopyNotCounted"] == []
+    # A retained original is never a generated output, and a failure leaves nothing.
+    d = dispositions([
+        {"id": "kept", "terminal": "ALREADY_HIGHLY_OPTIMIZED", "materializationMode": "REUSED_SOURCE", "verified": True, "outputSize": 0},
+        {"id": "gone", "terminal": "OUTPUT_VALIDATION_FAILED", "materializationMode": "REUSED_SOURCE", "verified": False, "outputSize": 0},
+        {"id": "discarded", "terminal": "ALREADY_HIGHLY_OPTIMIZED", "materializationMode": "REUSED_SOURCE", "verified": True,
+         "outputSize": 0, "candidateBytes": 79552584},
+    ])
+    assert d["output"] == {"original_retained": 2, "none": 1}, d
+    assert d["generatedThenRejected"] == ["discarded"], d
+
 if __name__ == "__main__":
     raise SystemExit(_main())

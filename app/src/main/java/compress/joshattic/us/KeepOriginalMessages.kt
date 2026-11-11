@@ -1,5 +1,6 @@
 package compress.joshattic.us
 
+import compress.joshattic.us.quality.SizeGateEvidence
 import java.util.Locale
 
 /**
@@ -42,22 +43,29 @@ object KeepOriginalMessages {
     const val SIZE_GATE_REASON = "Re-encoding would not make this file smaller."
 
     /**
-     * The basis when a rung PASSED its probe windows and the size prediction kept the original.
-     * Says which part was measured (quality) and which was predicted (size), and where the
-     * overshoot in that prediction came from.
+     * The basis when the size prediction kept the original. Says what the probe rung measured, how
+     * it stood against the bar and the selection margin, on how many of its planned windows, and
+     * that the size was predicted and where its overshoot came from.
+     *
+     * Only a rung that cleared the selection margin "passed". A marginal rung cleared the bar and
+     * nothing more: b287 job_8227cd6d6a43 was kept on predicted size after a marginal 0.97 on one
+     * window, and read "pixel probes passed at 0.97" (SizeGateEvidence).
      */
-    fun sizeGateBasis(
-        provenRatio: Double,
-        predictedBytes: Long,
-        sourceBytes: Long,
-        overshoot: Double,
-        overshootMeasured: Boolean
-    ): String {
-        val origin = if (overshootMeasured) "measured on this file's probe clips, less a margin" else "learned for this device and content class; this file's probes gave too few windows"
-        return "Basis: pixel probes passed at ${"%.2f".format(Locale.US, provenRatio)}; the size prediction decided. " +
-            "At that rate the re-encode is predicted at ${mb(predictedBytes)} against the ${mb(sourceBytes)} original " +
-            "(encoder overshoot ×${"%.2f".format(Locale.US, overshoot)}, $origin), so it would not be smaller. " +
-            "The quality was measured; the size was predicted."
+    fun sizeGateBasis(gate: SizeGateEvidence): String {
+        val ratio = "%.2f".format(Locale.US, gate.assessedRatio)
+        val windows = "${gate.measuredWindows} of ${gate.plannedWindows} planned window${if (gate.plannedWindows == 1) "" else "s"}"
+        val quality = when (gate.rungVerdict) {
+            SizeGateEvidence.PASSED -> "pixel probes passed at $ratio on $windows"
+            SizeGateEvidence.MARGINAL ->
+                "the $ratio probe cleared the Perceptually Lossless bar on $windows but not the selection margin " +
+                    "(marginal), so no ratio was selected on quality"
+            else -> "the $ratio probe was the rung assessed, and its verdict was not recorded"
+        }
+        val origin = if (gate.overshootMeasured) "measured on this file's probe clips, less a margin" else "learned for this device and content class; this file's probes gave too few windows"
+        return "Basis: $quality; the size prediction decided. " +
+            "At that rate the re-encode is predicted at ${mb(gate.predictedBytes)} against the ${mb(gate.sourceBytes)} original " +
+            "(encoder overshoot ×${"%.2f".format(Locale.US, gate.overshoot)}, $origin), so it would not be smaller. " +
+            "The quality was measured on sampled windows; the size was predicted."
     }
 
     /** The basis sentence alone, for records and tests. */
@@ -68,8 +76,8 @@ object KeepOriginalMessages {
         pixelCertifiableBlockReason: String?,
         sizeGateBasis: String? = null
     ): String = when {
-        // A measured pass that the size prediction overruled. Checked first: whatever inference
-        // or class history proposed, this is what decided.
+        // A measured rung (passed, or only marginal) that the size prediction overruled. Checked
+        // first: whatever inference or class history proposed, this is what decided.
         sizeGateBasis != null -> sizeGateBasis
         evidencePreferred ->
             "Basis: earlier measured failures for this device and content class (learned), not a measurement of this file."

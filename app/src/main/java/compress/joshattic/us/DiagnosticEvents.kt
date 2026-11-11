@@ -102,6 +102,11 @@ data class StageEvent(
          * failure or an item failure ended with a job record and no terminal event (199 of 226
          * jobs in each b177 PL batch). [keptOutputBytes] is what the job keeps: 0 when the
          * candidate was discarded or nothing was produced, so a discarded candidate is "rejected".
+         *
+         * The reason code answers one question, "did the job keep a generated output", and has
+         * to stay as it is. It also reads "rejected" for a kept original that never generated
+         * anything, and "accepted" for a kept copy that is no size win; [extra] carries the
+         * OutputDisposition fields, which state each of those separately.
          */
         fun terminal(
             sourceKey: String,
@@ -110,7 +115,8 @@ data class StageEvent(
             terminal: BatchTerminalResult,
             keptOutputBytes: Long,
             candidateBytes: Long?,
-            elapsedMs: Long?
+            elapsedMs: Long?,
+            extra: Map<String, Any?> = emptyMap()
         ): StageEvent = StageEvent(
             sourceKey = sourceKey,
             attempt = attempt,
@@ -118,11 +124,11 @@ data class StageEvent(
             stage = Stage.ACCEPT,
             reasonCode = if (!terminal.isFailure && keptOutputBytes > 0L) Reason.ACCEPTED else Reason.REJECTED,
             elapsedMs = elapsedMs,
-            fields = linkedMapOf(
+            fields = linkedMapOf<String, Any?>(
                 "terminal" to terminal.name,
                 "keptBytes" to keptOutputBytes,
                 "candidateBytes" to (candidateBytes ?: 0L)
-            )
+            ) + extra
         )
     }
 }
