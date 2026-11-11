@@ -483,7 +483,10 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // would trip videoMatches inside the PL verification scope - so a rejection could be
         // caused by the encoder quietly producing something else. Recorded, never acted on:
         // OutputVerifier measuring the finished file remains the only verdict.
-        val configDelta: EncoderConfigDelta? = null
+        val configDelta: EncoderConfigDelta? = null,
+        // ExportResult.videoFrameCount: how many video frames Media3 says it wrote. Recorded so a
+        // timeline failure can tell a frame Media3 never produced from one lost after it (TimelineLocalization).
+        val media3VideoFrameCount: Int? = null
     )
 
     fun refreshShizukuStatus(context: Context) {
@@ -2071,11 +2074,56 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     "requestedVideoBitrate" to plan?.requestedVideoBitrate,
                     "reportedVideoBitrate" to s.encodeAttempt?.reportedAverageVideoBitrate,
                     "encoderName" to s.encodeAttempt?.videoEncoderName,
-                    "metadataRemuxed" to remuxResult.didRemux
+                    "metadataRemuxed" to remuxResult.didRemux,
+                    // The closed Media3 file as the remux read it, and what the remux wrote: the
+                    // stage evidence a later timeline failure is localized with.
+                    "remuxVideoSamplesRead" to remuxResult.videoSamplesRead,
+                    "remuxVideoSamplesWritten" to remuxResult.videoSamplesWritten,
+                    "remuxFirstVideoPtsUs" to remuxResult.firstVideoPtsUs,
+                    "remuxLastVideoPtsUs" to remuxResult.lastVideoPtsUs
                 )
             )
         )
         return true
+    }
+
+    /**
+     * When the candidate's video sample count differs from the source's: the stage at which the
+     * count first changed, from what each stage reported (TimelineLocalization), with the source's
+     * edit list read from its moov box for this one file (Mp4EditTimeline). Null when the counts
+     * agree or the verifier compared no timeline.
+     *
+     * b287 job_782a717d3217 recorded 168 -> 166 from a single measurement taken after the
+     * metadata remux, and nothing could say where the two samples went. Evidence only: the
+     * verdict was already reached and does not read this.
+     */
+    private suspend fun localizeFrameCountChange(s: ItemRun, verification: OutputVerificationReport): Map<String, Any?>? {
+        val timeline = verification.structuralEvidence["videoTimeline"] as? Map<*, *> ?: return null
+        val sourceFrames = timeline["sourceFrames"] as? Int ?: return null
+        val outputFrames = timeline["outputFrames"] as? Int ?: return null
+        if (sourceFrames <= 0 || outputFrames <= 0 || sourceFrames == outputFrames) return null
+        val sourceEdit = withContext(Dispatchers.IO) {
+            runCatching {
+                s.run.context.contentResolver.openFileDescriptor(s.item.sourceUri, "r")?.use { descriptor ->
+                    java.io.FileInputStream(descriptor.fileDescriptor).channel.use { Mp4EditTimeline.read(it) }
+                }
+            }.getOrNull()
+        }
+        val remux = s.remuxResult
+        val media3Frames = s.encodeAttempt?.media3VideoFrameCount
+        return TimelineLocalization.localize(
+            sourceTableSamples = sourceFrames,
+            sourcePresentedSamples = sourceEdit?.presentedSamples,
+            media3FrameCount = media3Frames,
+            remuxReadSamples = remux?.videoSamplesRead,
+            remuxWrittenSamples = remux?.videoSamplesWritten,
+            finalSamples = outputFrames
+        ).fields() + mapOf(
+            "sourceEdit" to sourceEdit?.fields(),
+            "media3VideoFrameCount" to media3Frames,
+            "remuxVideoSamplesRead" to remux?.videoSamplesRead,
+            "remuxVideoSamplesWritten" to remux?.videoSamplesWritten
+        )
     }
 
     /**
@@ -2157,7 +2205,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         "audioConversion" to result.audioConversion,
                         "audioEncoderName" to result.audioEncoderName,
                         "encoderConfig" to result.configDelta?.compact(),
-                        "input" to if (s.media3Input != null) "platform-normalised" else "source"
+                        "input" to if (s.media3Input != null) "platform-normalised" else "source",
+                        "media3VideoFrameCount" to result.media3VideoFrameCount
                     )
                 )
             )
@@ -2480,7 +2529,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     "candidateBytes" to s.outputSize,
                     "floorRecovery" to s.floorRecoveryDecision?.wire,
                     "audioBasis" to verification.audioBasis,
-                    "structuralEvidence" to verification.structuralEvidence
+                    "structuralEvidence" to verification.structuralEvidence,
+                    "timelineLocalization" to localizeFrameCountChange(s, verification)
                 )
             )
         )
@@ -4504,7 +4554,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                                         else -> "unknown"
                                     },
                                     audioEncoderName = exportResult.audioEncoderName,
-                                    configDelta = configDelta
+                                    configDelta = configDelta,
+                                    media3VideoFrameCount = exportResult.videoFrameCount
                                 )
                             )
                         }

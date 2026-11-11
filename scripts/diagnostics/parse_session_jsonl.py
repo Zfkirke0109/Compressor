@@ -218,6 +218,7 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "sizeGates": size_gates(session),
         "dispositions": dispositions(jobs),
         "replacements": replacements(session),
+        "frameCountChanges": frame_count_changes(session),
         "silentRejections": len(silent_rejections),
         "learnedStateIdentity": (start or {}).get("learnedStateIdentity"),
         "terminals": dict(terminals.most_common()),
@@ -757,6 +758,39 @@ def dispositions(jobs: list[dict[str, Any]]) -> dict[str, Any]:
 _FAILURE_TERMINALS = {"OUTPUT_VALIDATION_FAILED", "ENCODER_FAILURE", "UNSUPPORTED_CONTAINER", "FAILED"}
 
 
+def frame_count_changes(session: dict[str, Any]) -> list[dict[str, Any]]:
+    """Verify stages whose candidate holds a different number of video samples than its source.
+
+    One row per stage: the two counts, the source's first timestamp, and the stage at which the
+    count first changed when the build recorded what each stage reported (`timelineLocalization`:
+    the source's edit list, Media3's own frame count, what the metadata remux read and wrote).
+    b287 regular job_782a717d3217 has 168 -> 166 from one measurement taken after the remux, so
+    its row says `not localized`: the capture cannot tell a frame the pipeline lost from two
+    samples the source's own edit list never presents.
+    """
+    rows = []
+    for r in session.get("stages", []):
+        if r.get("stage") != "verify":
+            continue
+        timeline = (r.get("structuralEvidence") or {}).get("videoTimeline") or {}
+        source, output = timeline.get("sourceFrames"), timeline.get("outputFrames")
+        if not isinstance(source, int) or not isinstance(output, int) or source <= 0 or output <= 0 or source == output:
+            continue
+        local = r.get("timelineLocalization") or {}
+        edit = local.get("sourceEdit") or {}
+        rows.append({
+            "jobId": r.get("jobId"), "attemptIndex": r.get("attemptIndex"), "sourceFrames": source, "outputFrames": output,
+            "sourceOriginUs": timeline.get("sourceOriginUs"), "outputOriginUs": timeline.get("outputOriginUs"),
+            "firstChangedStage": local.get("firstChangedStage") or "not localized",
+            "reason": local.get("reason"),
+            "sourcePresentedSamples": edit.get("presentedSamples"),
+            "sourceSamplesAfterEditEnd": edit.get("samplesAfterEditEnd"),
+            "media3VideoFrameCount": local.get("media3VideoFrameCount"),
+            "remuxVideoSamplesRead": local.get("remuxVideoSamplesRead"),
+        })
+    return rows
+
+
 def replacements(session: dict[str, Any]) -> dict[str, Any]:
     """Replacement requests and how each ended, from the `replace` stage and the batch settings.
 
@@ -947,6 +981,11 @@ def render(s: dict[str, Any]) -> str:
         out.append(f"  VMAF v1 shadow : {len(pairs)} certification window(s) scored by both models (min score)")
         for v0, v1 in pairs[:12]:
             out.append(f"      v0.6.1 {v0:6.2f}   v1 {v1:6.2f}   delta {v1 - v0:+6.2f}")
+    for change in s.get("frameCountChanges") or []:
+        out.append(f"  !! frame count  : {change['jobId']} {change['sourceFrames']} -> {change['outputFrames']} video samples"
+                   f" (source first timestamp {change['sourceOriginUs']} us); first changed at: {change['firstChangedStage']}"
+                   + (f" ({change['reason']})" if change.get("reason") else
+                      " (one measurement after the remux; this build recorded no per-stage counts)"))
     repl = s.get("replacements") or {}
     if repl.get("recorded"):
         out.append(f"  replacements   : replace originals at start={repl.get('replaceOriginalsAtStart')};"

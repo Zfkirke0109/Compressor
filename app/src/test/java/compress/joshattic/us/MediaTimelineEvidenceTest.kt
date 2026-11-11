@@ -37,6 +37,61 @@ class MediaTimelineEvidenceTest {
         assertNull(uniformShift.firstVideoPtsToRestoreUs)
     }
 
+    /** 168 frames from 97,488 us at an uneven 24 fps on a 60 fps grid: b287 job_782a717d3217's shape. */
+    private fun capturedShape(): LongArray {
+        var time = 97_488L
+        return LongArray(168) { i -> time.also { time += if (i % 2 == 0) 33_333L else 50_000L } }
+    }
+
+    @Test fun twoFramesMissingFromTheEndAreNeverAnOriginShiftOrARestorableTimestamp() {
+        val source = capturedShape()
+        // What the capture recorded: 166 samples, the first at zero, the rest where they were.
+        val candidate = source.copyOfRange(0, 166).also { it[0] = 0 }
+        val result = MediaTimelineEvidence.compare(source, candidate)
+        assertFalse(result.matches)
+        assertEquals("frame count 168 -> 166", result.reason)
+        assertEquals(168, result.sourceFrames)
+        assertEquals(166, result.outputFrames)
+        assertEquals(97_488L, result.sourceOriginUs)
+        assertEquals(0L, result.outputOriginUs)
+        assertEquals(97_488L, result.maxSkewUs)
+        assertEquals(1, result.firstMismatch)
+        // Putting the first timestamp back does not make 166 frames into 168.
+        assertNull(result.firstVideoPtsToRestoreUs)
+        val restored = candidate.copyOf().also { it[0] = 97_488 }
+        val again = MediaTimelineEvidence.compare(source, restored)
+        assertFalse(again.matches)
+        assertEquals("frame count 168 -> 166", again.reason)
+        assertNull(again.firstVideoPtsToRestoreUs)
+    }
+
+    @Test fun twoFramesMissingAnywhereAreRejectedWhateverElseAgrees() {
+        val source = capturedShape()
+        for (dropped in listOf(listOf(0, 1), listOf(80, 81), listOf(40, 120), listOf(166, 167))) {
+            val candidate = source.filterIndexed { i, _ -> i !in dropped }.toLongArray()
+            val result = MediaTimelineEvidence.compare(source, candidate)
+            assertFalse("$dropped", result.matches)
+            assertNull("$dropped", result.firstVideoPtsToRestoreUs)
+            // The same frames presented from another origin are still two short.
+            assertFalse("$dropped", MediaTimelineEvidence.compare(source, candidate.map { it - candidate[0] }.toLongArray()).matches)
+        }
+    }
+
+    @Test fun everyFrameWithOnlyTheFirstTimestampMovedIsStillRecognisedAtThatLength() {
+        // The repair b287 made twice (job_4e26f86286b1 at 14,277 us, job_42f517cc2b8a at 3,633 us),
+        // at this source's offset and frame count: all 168 frames, the first moved to zero.
+        val source = capturedShape()
+        val candidate = source.copyOf().also { it[0] = 0 }
+        val before = MediaTimelineEvidence.compare(source, candidate)
+        assertFalse(before.matches)
+        assertEquals(97_488L, before.firstVideoPtsToRestoreUs)
+        assertTrue(MediaTimelineEvidence.compare(source, candidate.also { it[0] = 97_488 }).matches)
+        // The whole timeline moved together is a new origin, not a defect to repair.
+        val shifted = MediaTimelineEvidence.compare(source, source.map { it - 97_488 }.toLongArray())
+        assertTrue(shifted.matches)
+        assertNull(shifted.firstVideoPtsToRestoreUs)
+    }
+
     private fun packets(shift: Long=0, flags: Int=1) = listOf(0L,23000L,46000L).map {
         AudioPacketEvidence.Packet(byteArrayOf(1,2,3),it+shift,flags)
     }.iterator()

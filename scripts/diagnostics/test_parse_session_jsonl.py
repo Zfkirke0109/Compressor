@@ -776,5 +776,47 @@ def test_replacement_requests_are_counted_by_how_each_one_ended():
     # A replace event belongs to its job: it is not an orphan and asks nothing more of the record.
     assert replay_coverage(load_sessions(path)["b1"])["orphanStages"] == 0
 
+
+def _verify(job_id, source, output, **kw):
+    d = {"type": "stage", "batchId": "b1", "jobId": job_id, "stage": "verify", "reasonCode": "structural_failed", "attemptIndex": 1,
+         "structuralEvidence": {"videoTimeline": {"matches": source == output, "sourceFrames": source, "outputFrames": output,
+                                                  "sourceOriginUs": 97488, "outputOriginUs": 0}}}
+    d.update(kw)
+    return d
+
+
+def test_a_frame_count_change_is_reported_with_the_stage_it_was_localized_to():
+    path = write([
+        start(),
+        # b287 regular job_782a717d3217: one measurement after the remux and nothing else.
+        _verify("old", 168, 166),
+        # A build that records per-stage counts, on a source whose edit list presents 166 of 168.
+        _verify("new", 168, 166, timelineLocalization={
+            "firstChangedStage": "source_edit_list",
+            "reason": "the source's edit list presents 166 of the 168 samples in its table, and the first stage that "
+                      "reported a count had 166: Media3 read what the edit list presents",
+            "sourceEdit": {"tableSamples": 168, "presentedSamples": 166, "samplesAfterEditEnd": 2, "initialEmptyEditUs": 97488},
+            "media3VideoFrameCount": 166, "remuxVideoSamplesRead": 166, "remuxVideoSamplesWritten": 166}),
+        # The app's own remux lost them: the same counts, a different stage.
+        _verify("remux", 168, 166, timelineLocalization={"firstChangedStage": "metadata_remux",
+                                                         "reason": "the metadata remux read 168 video samples and wrote 166",
+                                                         "media3VideoFrameCount": 168, "remuxVideoSamplesRead": 168}),
+        _verify("same", 842, 842),
+        *[job(j, batchId="b1", jobId=j, terminal="UNEXPECTED_REMUX", verified=True, outputSize=0, materializationMode="REUSED_SOURCE")
+          for j in ("old", "new", "remux", "same")],
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    changes = {c["jobId"]: c for c in s["frameCountChanges"]}
+    assert set(changes) == {"old", "new", "remux"}, changes
+    assert changes["old"]["firstChangedStage"] == "not localized" and changes["old"]["sourcePresentedSamples"] is None
+    assert (changes["new"]["firstChangedStage"], changes["new"]["sourcePresentedSamples"], changes["new"]["sourceSamplesAfterEditEnd"],
+            changes["new"]["media3VideoFrameCount"]) == ("source_edit_list", 166, 2, 166)
+    assert changes["remux"]["firstChangedStage"] == "metadata_remux"
+    from parse_session_jsonl import render
+    text = render(s)
+    assert "old 168 -> 166 video samples (source first timestamp 97488 us); first changed at: not localized" in text
+    assert "first changed at: source_edit_list" in text and "first changed at: metadata_remux" in text
+
 if __name__ == "__main__":
     raise SystemExit(_main())
