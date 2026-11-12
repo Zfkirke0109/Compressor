@@ -47,9 +47,9 @@ artifact, then run the checks against that installed pair:
 scripts/device/run-device-checks.sh --installed /path/to/short_sdr_clip.mp4 0
 ```
 
-The command runs the pipeline, production-evidence and native frame-packing controls. It writes
-`short_sdr_clip.device-checks.txt` and reads the relevant log entries from the start of the run.
-A short clip is required. Any skipped test makes the run incomplete.
+The command runs the pipeline, production-evidence, native frame-packing and edit-list timeline
+controls. It writes `short_sdr_clip.device-checks.txt` and reads the relevant log entries from the
+start of the run. A short clip is required. Any skipped test makes the run incomplete.
 
 **Find the 44 target files locally (names never leave the machine):**
 
@@ -168,6 +168,28 @@ implementation (`scripts/ci/verify_no_test_veto.py`).
 Not covered by this check: the retry after a candidate fails structural verification (the other
 trigger of the same fallback), and the learning write a real measured failure makes. Both remain
 covered by JVM tests only.
+
+### Where 168 samples became 166
+
+The regular-profile run of v1.6.287 rejected one 4K candidate (`job_782a717d3217`) because its
+source held 168 video samples and the output 166, with the source's first video timestamp at
+97,488 µs. The capture has one count, taken after the metadata remux, and the original is no
+longer available. Media3 1.11.0's MP4 parser applies the edit list and leaves out samples that
+start after an edit ends, while `MediaExtractor` returns the whole sample table, so a source whose
+media runs two frames past its presentation edit would give those numbers with no stage losing a
+frame. That is a reading of the code and of a synthetic file with FFmpeg, not an observation on a
+phone, so no acceptance rule and no pipeline stage was changed on it.
+
+`EditListTimelineDeviceTest` is the observation. It runs with the default device checks, needs no
+clip, and takes two synthetic sources from the test APK (`scripts/device/make_edit_list_timeline_fixture.py`:
+168 samples with 166 inside the edit, and the same streams with all 168 inside it) through the
+platform extractor, a real Media3 export and the app's metadata remux. The run log prints what
+each stage counted (`b287-timeline …`) and the stage `TimelineLocalization` names from them. If
+it fails, the device does not behave as the reading says and the message carries the counts; that
+is the evidence to act on. From this build a batch also records these counts itself whenever a
+candidate's sample count differs from its source's (`timelineLocalization` on the `verify` stage).
+
+Still pending either way: a retest with the exact source, if a copy can be found.
 
 ## 7. What the alternate search and the 4K pipeline cost (v1.6.287 captures)
 

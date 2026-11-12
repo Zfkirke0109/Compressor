@@ -79,6 +79,8 @@ class DeviceChecksTest(unittest.TestCase):
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
         instrument = next(call for call in calls if call.startswith("shell am instrument "))
         self.assertIn("compress.joshattic.us.FramePackingDeviceTest", instrument)
+        # The clip-free timeline localization runs with the default checks.
+        self.assertIn("compress.joshattic.us.EditListTimelineDeviceTest", instrument)
         self.assertNotIn("logcat -c", calls)
         self.assertTrue(any("logcat -t 1794198030.123456789 " in call for call in calls))
 
@@ -89,6 +91,7 @@ class DeviceChecksTest(unittest.TestCase):
         instrument = next(call for call in calls if call.startswith("shell am instrument "))
         self.assertIn("-e class compress.joshattic.us.SaferRungFallbackDeviceTest -e sourceVideo ", instrument)
         self.assertNotIn("PipelineDeviceTest", instrument)
+        self.assertNotIn("EditListTimelineDeviceTest", instrument)
         self.assertIn("--user 150", instrument)
         self.assertIn(f"sha256={digest}", report)
         self.assertFalse(any(call.startswith("install ") for call in calls))

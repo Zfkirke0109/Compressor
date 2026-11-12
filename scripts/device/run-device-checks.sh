@@ -4,6 +4,9 @@
 # (ProductionEvidenceDeviceTest, b177) certification windows on files with no track duration and a
 # real Perceptually Lossless batch through BatchCompressorViewModel writing the b177 evidence fields.
 # The batch test leaves replace-original off and checks the source hash afterwards.
+# EditListTimelineDeviceTest needs no clip: it runs two synthetic sources from the test APK through
+# the platform extractor, a real Media3 export and the metadata remux, and says at which of them a
+# video sample count first changes (the 168 -> 166 case of the v1.6.287 regular-profile run).
 #
 # Usage:
 #   scripts/device/run-device-checks.sh [--installed] [--fallback] CLIP.mp4 [ANDROID_USER]
@@ -45,7 +48,7 @@ CLIP="$CLIP_DIR/$(basename -- "$CLIP")"
 USER_ID="${2:-}"
 PKG=io.github.zfkirke0109.galaxycompressor
 TEST_PACKAGE=compress.joshattic.us
-TEST_CLASSES="$TEST_PACKAGE.PipelineDeviceTest,$TEST_PACKAGE.ProductionEvidenceDeviceTest,$TEST_PACKAGE.FramePackingDeviceTest"
+TEST_CLASSES="$TEST_PACKAGE.PipelineDeviceTest,$TEST_PACKAGE.ProductionEvidenceDeviceTest,$TEST_PACKAGE.FramePackingDeviceTest,$TEST_PACKAGE.EditListTimelineDeviceTest"
 REMOTE="/data/local/tmp/compressor_smoke_$$.mp4"
 OUT="${CLIP%.*}.device-checks.txt"
 if "$FALLBACK"; then
@@ -88,6 +91,7 @@ if grep -Eq '^INSTRUMENTATION_STATUS_CODE: -[34][[:space:]]*$|AssumptionViolated
 fi
 # The b177 tests print what the platform reported (durations, window starts, record fields) to
 # System.out, which lands in logcat rather than the instrumentation output; the fallback test
-# prints each batch's rungs, attempts, retry and certification the same way.
-adb logcat -t "$LOG_START" -s System.out:I | grep -E "b177-(fixture|evidence)|b287-fallback" | tee -a "$OUT" || true
+# prints each batch's rungs, attempts, retry and certification the same way, and the timeline test
+# what each stage counted.
+adb logcat -t "$LOG_START" -s System.out:I | grep -E "b177-(fixture|evidence)|b287-(fallback|timeline)" | tee -a "$OUT" || true
 echo "device checks passed; see $OUT"
