@@ -843,14 +843,29 @@ def test_an_audio_packet_difference_says_what_differed_or_that_it_was_not_record
                sourcePackets=342, outputPackets=342, sourceFirstPtsUs=0, outputFirstPtsUs=0,
                outputLacksFirstSourcePacket=False, outputHasExtraFirstPacket=False,
                sourceConfig=aac, outputConfig=dict(aac, csd0Hex="1210", sampleRate=44100)),
+        # What the S26 read for Media3's copy: the same packets, 2 samples of end padding where the
+        # source has 0. A build before the classification was recorded, and one that records it.
+        _audio("padding", sourcePayloadSha256="cc", outputPayloadSha256="cc", maxSkewUs=0, firstMismatch=None, packets=329,
+               sourcePackets=329, outputPackets=329, sourceFirstPtsUs=-21333, outputFirstPtsUs=-21333,
+               outputLacksFirstSourcePacket=False, outputHasExtraFirstPacket=False,
+               sourceConfig=dict(aac, encoderDelay=1024, encoderPadding=0), outputConfig=dict(aac, encoderDelay=1024, encoderPadding=2)),
+        _audio("padding_flag", sourcePayloadSha256="cc", outputPayloadSha256="cc", maxSkewUs=0, firstMismatch=None, packets=329,
+               sourcePackets=329, outputPackets=329, sourceFirstPtsUs=-21333, outputFirstPtsUs=-21333,
+               differsOnlyInEndPadding=True,
+               sourceConfig=dict(aac, encoderPadding=None), outputConfig=dict(aac, encoderPadding=3)),
+        # The padding differs and the audio also sits elsewhere against the video: not only the padding.
+        _audio("padding_and_time", sourcePayloadSha256="cc", outputPayloadSha256="cc", maxSkewUs=97488, firstMismatch=0, packets=329,
+               sourcePackets=329, outputPackets=329, sourceFirstPtsUs=-21333, outputFirstPtsUs=-21333,
+               differsOnlyInEndPadding=False,
+               sourceConfig=dict(aac, encoderPadding=0), outputConfig=dict(aac, encoderPadding=2)),
         # A matching copy is not a difference.
         _audio("same", result="IDENTICAL", outputConfigSha256="aa", outputPayloadSha256="cc", reason=None),
-        *[job(j, batchId="b1", jobId=j) for j in ("old", "late", "config", "same")],
+        *[job(j, batchId="b1", jobId=j) for j in ("old", "late", "config", "padding", "padding_flag", "padding_and_time", "same")],
         {"type": "session_summary", "batchId": "b1"},
     ])
     s = summarize(path)
     rows = {d["jobId"]: d for d in s["audioPacketDifferences"]}
-    assert set(rows) == {"old", "late", "config"}, rows
+    assert set(rows) == {"old", "late", "config", "padding", "padding_flag", "padding_and_time"}, rows
     assert rows["old"]["countsRecorded"] is False and rows["old"]["explanation"] == "not recorded"
     assert rows["old"]["configFieldsThatDiffer"] is None and rows["old"]["configDiffers"] and rows["old"]["payloadDiffers"]
     assert rows["late"]["explanation"] == "the output is the source without its first packet"
@@ -858,12 +873,20 @@ def test_an_audio_packet_difference_says_what_differed_or_that_it_was_not_record
     assert (rows["late"]["sourcePackets"], rows["late"]["outputPackets"], rows["late"]["outputFirstPtsUs"]) == (342, 341, 21333)
     assert rows["config"]["explanation"] == "the same packets under a different decoder configuration"
     assert rows["config"]["configFieldsThatDiffer"] == ["sampleRate", "csd0Hex"] and not rows["config"]["payloadDiffers"]
+    assert rows["config"]["endPaddingOnly"] is False and rows["late"]["endPaddingOnly"] is False and rows["old"]["endPaddingOnly"] is False
+    assert rows["padding"]["endPaddingOnly"] is True and rows["padding"]["configFieldsThatDiffer"] == ["encoderPadding"]
+    assert rows["padding"]["explanation"] == "the same packets; only the end padding differs (source 0, output 2 samples)"
+    assert rows["padding_flag"]["endPaddingOnly"] is True
+    assert rows["padding_flag"]["explanation"] == "the same packets; only the end padding differs (source 0, output 3 samples)"
+    assert rows["padding_and_time"]["endPaddingOnly"] is False
+    assert rows["padding_and_time"]["explanation"] == "the same packets under a different decoder configuration"
     from parse_session_jsonl import render
     text = render(s)
     assert "old decoder configuration differs over 342 compared packet(s), max skew 21334 us; this build recorded neither" in text
     assert "source 342 / output 341 packets, first at 0 / 21333 us; the output is the source without its first packet; " \
            "configuration differs in encoderDelay" in text
     assert "configuration differs in sampleRate, csd0Hex" in text and "audio packets: same" not in text
+    assert "the same packets; only the end padding differs (source 0, output 2 samples); configuration differs in encoderPadding" in text
 
 
 def test_a_capture_from_the_candidate_veto_test_is_marked_and_its_retry_is_not_a_recovered_failure():

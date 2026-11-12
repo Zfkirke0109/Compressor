@@ -63,7 +63,7 @@ import kotlin.coroutines.resumeWithException
  * A failure here is a result, not a broken test: it means this device does not behave as the
  * reading above says, and its message carries the counts that say how.
  *
- * The run also prints, and asserts nothing about, three things only a phone can show:
+ * The run also prints, and asserts nothing about, four things only a phone can show:
  *
  *  - the app's audio comparison of the copied AAC track, for Media3's file and for the remuxed
  *    one (`... audio ...`). Both assets carry an AAC track with an encoder-delay edit, the kind an
@@ -76,6 +76,12 @@ import kotlin.coroutines.resumeWithException
  *    repair's own remux then gives back the source's timeline (`... firstTimestampRepair ...`).
  *    Media3's muxer moves the first video timestamp to zero when the file has audio and logs
  *    "Shifting first video timestamp from N to zero." under the tag MuxerWrapper.
+ *  - what the audio end padding repair would do (`... endPaddingRepair ...`). The S26 read 2
+ *    samples of end padding for Media3's copy of the tail file's track where the source has 0,
+ *    and 0 again after the metadata remux. A candidate that differs from its source in nothing
+ *    else is rewritten once by the platform's muxer and judged again by the unchanged check
+ *    (CandidateContainerRepair). This line is that rewrite, made as the batch makes it, with the
+ *    track compared before and after.
  */
 @UnstableApi
 @RunWith(AndroidJUnit4::class)
@@ -164,6 +170,35 @@ class EditListTimelineDeviceTest {
         }
     }
 
+    /**
+     * What the audio end padding repair would do with Media3's file, printed and never asserted.
+     * The copied track is compared with both video origins taken as the source's, so the video's
+     * own start, which the first timestamp repair is for, stays out of it. When the copy then
+     * differs from the source only in its end padding, the file is rewritten as the repair
+     * rewrites it (the platform's muxer, no timestamp restored) and compared again the same way.
+     */
+    private fun printEndPaddingRepair(name: String, source: File, raw: File, rawTimeline: MediaTimelineEvidence.Result) {
+        val origin = rawTimeline.sourceOriginUs
+        val before = runCatching {
+            AudioTrackIdentity.compare(context, Uri.fromFile(source), raw, origin, origin, requirePresentationProof = true)
+        }.getOrNull()
+        if (before == null || !before.differsOnlyInEndPadding) {
+            println("b287-timeline $name endPaddingRepair proposed=false audioAlone=${before?.result} reason=${before?.failureReason}")
+            return
+        }
+        runCatching {
+            val repaired = File(context.cacheDir, "timeline_padding_$name").also { scratch += it; it.delete() }
+            Mp4MetadataRemuxer.remuxSourceWithoutReencode(context, Uri.fromFile(raw), repaired, VideoMetadataSnapshot())
+            println(
+                "b287-timeline $name endPaddingRepair proposed=true sourcePadding=${before.sourceConfig?.get("encoderPadding")} " +
+                    "rawPadding=${before.outputConfig?.get("encoderPadding")} audio alone after the rewrite: " +
+                    audioLine(source, repaired, origin, origin)
+            )
+        }.onFailure {
+            println("b287-timeline $name endPaddingRepair proposed=true remux failed: ${it.javaClass.simpleName}: ${it.message}")
+        }
+    }
+
     private class Counts(
         val edit: Mp4EditTimeline.Evidence,
         /** What the platform extractor lists for the source: the verifier's reference. */
@@ -189,6 +224,7 @@ class EditListTimelineDeviceTest {
         // Observations on Media3's file, before the metadata remux replaces it. Printed only.
         println("b287-timeline $name audio raw: " + audioLine(source, raw, rawTimeline.sourceOriginUs, rawTimeline.outputOriginUs))
         printFirstTimestampRepair(name, source, raw, rawTimeline)
+        printEndPaddingRepair(name, source, raw, rawTimeline)
         // The remux runs only for a source with a location to write. These coordinates are made up.
         val remux = Mp4MetadataRemuxer.remuxWithSourceMetadata(
             context, raw, VideoMetadataSnapshot(latitude = 12.5, longitude = -45.25)

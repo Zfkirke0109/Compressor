@@ -2423,7 +2423,7 @@ class BatchCompressorViewModel internal constructor(
                 cancellationCheck = { ioContext.ensureActive() }
             )
         }
-        val corrected = restoreFirstVideoTimestamp(s, firstCandidate, verificationInput)
+        val corrected = repairContainer(s, firstCandidate, verificationInput)
         if (corrected != null) verificationInput = corrected
         val outputFile = checkNotNull(s.outputFile)
         var verification = OutputVerifier.verify(verificationInput)
@@ -2571,13 +2571,24 @@ class BatchCompressorViewModel internal constructor(
         }
     }
 
-    /** Recover Media3's zeroed first video PTS only after the whole timeline and audio prove the repair. */
-    private suspend fun restoreFirstVideoTimestamp(
+    /**
+     * Rewrite the candidate's container once, before it is judged, when its evidence shows one of
+     * the two things a rewrite puts right (CandidateContainerRepair): Media3's zeroed first video
+     * timestamp, and end padding on its copy of the audio that the source does not have. Only
+     * after the whole timeline and the audio prove the candidate is otherwise the source's. The
+     * rewritten file is verified by the unchanged rules and takes the candidate's place only if it
+     * passes them; otherwise the candidate is judged as it was.
+     */
+    private suspend fun repairContainer(
         s: ItemRun,
         candidate: File,
         input: OutputVerifier.VerificationInput
     ): OutputVerifier.VerificationInput? {
-        val pts = input.videoTimeline?.firstVideoPtsToRestoreUs ?: return null
+        val timeline = input.videoTimeline ?: return null
+        val pts = timeline.firstVideoPtsToRestoreUs
+        // When the metadata remux ran, the platform's muxer has already written this candidate.
+        val platformMuxed = s.remuxResult?.didRemux == true
+        if (pts == null && !CandidateContainerRepair.endPaddingAlone(timeline, input.audioEvidence, platformMuxed)) return null
         if (s.outputSize !in 1 until s.item.originalSize || input.sourceTrackProbe.audioCodec == null) return null
         val run = s.run
         val context = run.context
@@ -2590,12 +2601,15 @@ class BatchCompressorViewModel internal constructor(
             if (directory.usableSpace - SaferRungRetry.FREE_SPACE_MARGIN_BYTES < input.outputSize) {
                 return@withContext null
             }
-            val audio = AudioTrackIdentity.compare(
-                context, item.sourceUri, candidate, input.videoTimeline.sourceOriginUs, pts,
+            // With a first timestamp to restore, the audio is compared against the video origin as
+            // it will be. Without one the captured comparison already stands.
+            val audio = if (pts == null) input.audioEvidence else AudioTrackIdentity.compare(
+                context, item.sourceUri, candidate, timeline.sourceOriginUs, pts,
                 requirePresentationProof = true,
                 cancellationCheck = { ioContext.ensureActive() }
             )
-            if (audio.result != AudioTrackIdentity.Result.IDENTICAL) return@withContext null
+            val basis = CandidateContainerRepair.audioBasis(audio, platformMuxed) ?: return@withContext null
+            val what = if (pts != null) "first video timestamp repair" else "audio end padding repair"
 
             try {
                 val remux = Mp4MetadataRemuxer.remuxSourceWithoutReencode(
@@ -2615,23 +2629,25 @@ class BatchCompressorViewModel internal constructor(
                 if (repairedInput.outputSize in 1 until item.originalSize &&
                     (report.verified || report.failedOnlyOnVideoBitrateFloor)
                 ) {
-                    remux to repairedInput
+                    Triple(remux, repairedInput, basis to audio)
                 } else {
                     repairedFile.delete()
-                    DiagLog.w("CompressorVerification", "first video timestamp repair failed verification; job=${diagnosticJobId(item)}")
+                    DiagLog.w("CompressorVerification", "$what failed verification; job=${diagnosticJobId(item)}")
                     null
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 runCatching { repairedFile.delete() }
-                DiagLog.w("CompressorVerification", "first video timestamp repair failed; job=${diagnosticJobId(item)}", e)
+                DiagLog.w("CompressorVerification", "$what failed; job=${diagnosticJobId(item)}", e)
                 null
             }
         } ?: return null
 
-        val (remux, repairedInput) = repaired
-        s.remuxResult = remux.copy(message = "Restored source video start time")
+        val (remux, repairedInput, audioBefore) = repaired
+        val (basis, audio) = audioBefore
+        val restoredPadding = basis == CandidateContainerRepair.AudioBasis.END_PADDING
+        s.remuxResult = remux.copy(message = CandidateContainerRepair.message(pts != null, basis))
         s.outputFile = remux.outputFile
         s.outputUri = Uri.fromFile(remux.outputFile)
         s.outputSize = repairedInput.outputSize
@@ -2643,8 +2659,13 @@ class BatchCompressorViewModel internal constructor(
                 stage = StageEvent.Stage.FINALIZE, reasonCode = StageEvent.Reason.CANDIDATE_FINALIZED,
                 elapsedMs = s.elapsedMs,
                 fields = mapOf(
-                    "operation" to "restore_first_video_timestamp", "candidateBytes" to s.outputSize,
-                    "restoredFirstVideoPtsUs" to pts
+                    "operation" to CandidateContainerRepair.operation(pts != null), "candidateBytes" to s.outputSize,
+                    "restoredFirstVideoPtsUs" to pts,
+                    // What the candidate's copy read before the rewrite, beside the source's value,
+                    // which the rewritten file was then verified to hold.
+                    "restoredAudioEndPadding" to restoredPadding,
+                    "audioEndPaddingBefore" to if (restoredPadding) audio?.outputConfig?.get("encoderPadding") ?: 0 else null,
+                    "audioEndPaddingSource" to if (restoredPadding) audio?.sourceConfig?.get("encoderPadding") ?: 0 else null
                 )
             )
         )

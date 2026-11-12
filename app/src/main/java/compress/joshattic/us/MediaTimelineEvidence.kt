@@ -16,6 +16,12 @@ import java.util.concurrent.CancellationException
  * not frame loss). There is no count tolerance: one missing frame is a mismatch at any length,
  * and a retimed middle frame is a mismatch even when the count and duration agree. A timeline
  * with a repeated or reversed presentation time is ambiguous and never matches.
+ *
+ * Every sample counts, whether or not the source's edit list presents it. MediaExtractor, which
+ * both timelines are read with, lists the whole sample table, and a player built on it can show
+ * what it lists: to such a player a candidate that holds only what an edit list presents is that
+ * many frames short, and frames it does not hold were compared by nothing. Decided November 12
+ * (docs/DEVICE_VALIDATION.md, section 6): such a source keeps its original.
  */
 object MediaTimelineEvidence {
     data class Result(val matches: Boolean, val sourceFrames: Int, val outputFrames: Int,

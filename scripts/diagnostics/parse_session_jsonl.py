@@ -808,6 +808,15 @@ def audio_packet_differences(session: dict[str, Any]) -> list[dict[str, Any]]:
     (`countsRecorded` False, `explanation` "not recorded"). A build that records the rest gives
     the packet count on each side, where each starts, whether the output is the source one packet
     apart, and the configuration fields that differ.
+
+    `endPaddingOnly`: the copy is the source's audio in everything but the end padding the
+    platform reads for it (Media3's muxer writes a copied AAC track's edit on a 1/10,000 s
+    timescale). That is still a difference and the verifier refuses it; it is the one the app's
+    rewrite of the container puts right (a `finalize` stage with operation
+    `restore_audio_end_padding`, or the first timestamp repair with `restoredAudioEndPadding`).
+    Taken from the record's own `differsOnlyInEndPadding` when the build wrote it, else from the
+    fields: the same number of packets, no packet differing in bytes, flags or time, and the
+    padding the only configuration field that differs.
     """
     rows = []
     for r in session.get("stages", []):
@@ -823,6 +832,10 @@ def audio_packet_differences(session: dict[str, Any]) -> list[dict[str, Any]]:
             config_fields = [k for k in _AUDIO_CONFIG_FIELDS if source_config.get(k) != output_config.get(k)]
         config_differs = audio.get("sourceConfigSha256") != audio.get("outputConfigSha256")
         payload_differs = audio.get("sourcePayloadSha256") != audio.get("outputPayloadSha256")
+        padding_only = audio.get("differsOnlyInEndPadding")
+        if not isinstance(padding_only, bool):
+            padding_only = (counts and audio["sourcePackets"] == audio["outputPackets"] and not payload_differs
+                            and audio.get("firstMismatch") is None and config_fields == ["encoderPadding"])
         if not counts:
             explanation = "not recorded"
         elif audio.get("outputLacksFirstSourcePacket") is True:
@@ -833,6 +846,10 @@ def audio_packet_differences(session: dict[str, Any]) -> list[dict[str, Any]]:
             explanation = "the packet counts differ and the packets are not one position apart"
         elif payload_differs:
             explanation = "the same number of packets with different bytes"
+        elif padding_only and isinstance(source_config, dict) and isinstance(output_config, dict):
+            # An absent padding is 0 to a decoder.
+            explanation = ("the same packets; only the end padding differs "
+                           f"(source {source_config.get('encoderPadding') or 0}, output {output_config.get('encoderPadding') or 0} samples)")
         elif config_differs:
             explanation = "the same packets under a different decoder configuration"
         else:
@@ -846,6 +863,7 @@ def audio_packet_differences(session: dict[str, Any]) -> list[dict[str, Any]]:
             "sourceFirstPtsUs": audio.get("sourceFirstPtsUs"), "outputFirstPtsUs": audio.get("outputFirstPtsUs"),
             "firstMismatchKind": audio.get("firstMismatchKind"),
             "configFieldsThatDiffer": config_fields,
+            "endPaddingOnly": bool(padding_only),
             "explanation": explanation,
         })
     return rows

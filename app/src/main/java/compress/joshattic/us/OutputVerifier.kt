@@ -511,7 +511,7 @@ object OutputVerifier {
                 packetsCompared = input.audioPacketsCompared,
                 inferredStreamCopy = audioLooksStreamCopied && !input.audioPacketsIdentical,
                 packetsDiffer = input.audioPacketsDiffer,
-                identityFailure = input.audioEvidence?.evidence?.reason
+                identityFailure = input.audioEvidence?.failureReason
             ),
             hdr = "${input.sourceTrackProbe.hdrLabel} -> ${input.outputTrackProbe.hdrLabel}" +
                 if (colorComparison.basis == ColorMatchBasis.MEDIA3_ASSUMED_SDR) {
@@ -559,6 +559,8 @@ object OutputVerifier {
                     "firstMismatchKind" to a.evidence?.firstMismatchKind,
                     "outputLacksFirstSourcePacket" to a.evidence?.outputLacksFirstSourcePacket,
                     "outputHasExtraFirstPacket" to a.evidence?.outputHasExtraFirstPacket,
+                    // The one difference a rewrite of the container puts right (CandidateContainerRepair).
+                    "differsOnlyInEndPadding" to a.differsOnlyInEndPadding,
                     "sourceConfig" to a.sourceConfig, "outputConfig" to a.outputConfig) }),
             verified = when (input.mode) {
                 BatchQualityMode.REMUX_ONLY -> remuxVerified

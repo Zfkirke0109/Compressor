@@ -229,10 +229,32 @@ sample for sample. The third is still unknown: whether the job's original is bui
 synthetic file, since the original is not available.
 So no acceptance rule and no pipeline stage was changed. The verifier
 still compares every sample of the source's table, and such a source is still kept as the
-original. Whether a candidate that holds every sample the source *presents* should be accepted is
-a decision about what a complete timeline means, not a defect to patch: the two extra samples are
-outside the file's own presentation, yet they are in the sample table the platform extractor
-lists, so a player built on that listing may show them.
+original.
+
+**Decided (November 12, the owner's call delegated): a candidate that holds every sample the
+source presents does not pass while the source's table holds more.** A Perceptually Lossless
+output has to hold every video sample the platform's reader lists for its source. The reasons, in
+the order they weigh:
+
+- On the S26 the platform extractor lists all 168 samples (§8). That reader is the one the
+  verifier compares with and the one the app decodes a source with when it scores, and Android's
+  own player reads through the same extractor. So a player on this phone can show the two
+  samples, and to it a candidate without them is two frames shorter. Which players do show them
+  was not tested.
+- What a file presents depends on the reader: Media3 applies the edit list, and the platform does
+  not trim by it. What a file holds does not. The check should not turn on which player is used.
+- Frames a candidate does not hold were compared by nothing. Passing it would claim transparency
+  for content no measurement looked at.
+- With Replace Originals on, the two samples would be gone for good.
+- The captured job's cause is still unproven, and it is one file in the captured batches. Keeping
+  its original costs that file's saving and nothing else.
+
+If such sources turn out to matter, the way to compress them is to carry the samples: hand the
+encoder every sample the table holds and write the source's edit list back, so that the candidate
+passes this same check. That is pipeline work for after an exact-source retest shows a real file
+is built this way. It is not a change to the verifier.
+`ScientificEvidenceSafetyTest` holds the rule at the verifier, with the candidate as Media3 writes
+it and with its first timestamp put back.
 
 `EditListTimelineDeviceTest` is the device observation. It runs with the default device checks,
 needs no clip, and takes two synthetic sources from the test APK
@@ -247,7 +269,9 @@ candidate's sample count differs from its source's (`timelineLocalization` on th
 The same run prints, without asserting anything, whether the first timestamp repair's pattern is
 seen in Media3's file on the phone and whether the repair's own remux then gives back the
 source's timeline (`b287-timeline … firstTimestampRepair …`). On the S26 it is seen, and the
-repair gives the source's timeline back (§8).
+repair gives the source's timeline back (§8). It prints the same for the audio end padding repair
+(`b287-timeline … endPaddingRepair …`, §8): whether a copied track differs from its source only
+in its end padding, and what the repair's rewrite then gives.
 
 ### The earlier AAC "decoder configuration differs"
 
@@ -285,9 +309,7 @@ padding it reports. None of that runs off a phone, and whether the b213 source c
 delay is not known. The device run therefore prints the app's audio comparison of the synthetic
 sources, which do carry one, for Media3's file, for the first timestamp repair and for the
 remuxed file (`b287-timeline … audio …`), with both sides' values when they differ. Nothing was
-relaxed. If the phone shows a copy that differs only in how its delay is written, whether that
-should pass is a decision about what identical audio means, to be taken on that observation. §8
-has what the S26 showed.
+relaxed. §8 has what the S26 showed, and the rule then decided on it.
 
 ## 7. What the alternate search and the 4K pipeline cost (v1.6.287 captures)
 
@@ -400,8 +422,38 @@ metadata remux the padding reads 0 again and the configuration matches. The cont
   which reported this reason after a Media3 transmux with no metadata remux. In b213 the payload
   digests also differed and the audio was one AAC frame (21,334 µs) out against the video, which a
   padding difference alone does not produce.
-- Nothing was relaxed. Whether a copy that differs from its source only in the padding written
-  for it may pass is a decision about what identical audio means.
+- Nothing was relaxed, and the rule below keeps it so.
+
+**Decided (November 12, the owner's call delegated): a copy that differs from its source only in
+end padding does not pass as it is. It is repaired instead.** Identical audio keeps meaning the
+same packets under the configuration the platform reads, the padding included, because a decoder
+that honours the padding plays such a copy that many samples short. Two samples are 42 µs at
+48 kHz, which nobody hears, but a tolerance would need a bound and a reason for the bound, and the
+repair needs neither: the phone showed that the platform's muxer writes the same track with the
+source's padding. So:
+
+- When a candidate's video timeline matches and its audio differs from the source's in nothing but
+  the end padding, the batch rewrites the file once with the platform's muxer, the rewrite the
+  first timestamp repair already makes, and judges the rewritten file by the unchanged rules. If
+  it still differs, the original is kept, as before.
+- The first timestamp repair, which required identical audio before it started, also starts from
+  a copy that differs only in end padding: the one rewrite puts both right.
+- Neither is tried on a file the platform's muxer has already written (a source with a location,
+  whose metadata remux ran). Its padding is what that muxer writes, and writing it again changes
+  nothing.
+- The record says what was done: a `finalize` stage with operation `restore_audio_end_padding`,
+  or `restoredAudioEndPadding` on the first timestamp repair's, each with the padding before the
+  rewrite and the source's. A copy the verifier still refuses reads "end padding differs (source
+  N, output M samples)" and carries `differsOnlyInEndPadding`.
+
+What holds this, and where. On the build machine, `Media3MuxerObservationTest` runs Media3's own
+muxer and the app's comparison calls its copy of the tail file's track different in the end
+padding and nothing else, and its copy of the control's track identical. `AudioEndPaddingTest`
+holds what counts as only the end padding and when a rewrite is tried, and
+`ScientificEvidenceSafetyTest` that the verifier still refuses such a copy. **The repair itself
+has not run on a phone.** The S26 run above shows the padding restored by the metadata remux,
+which is the same muxer; the default device checks now print what the repair's own rewrite gives
+(`b287-timeline … endPaddingRepair …`).
 
 **The fallback check** (`--fallback`, the same phone and build, a clip from the normal profile).
 All three batches made a real first full encode (encoded, finalized and structurally verified)

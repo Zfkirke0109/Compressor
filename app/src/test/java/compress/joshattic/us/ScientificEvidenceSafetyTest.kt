@@ -90,4 +90,71 @@ class ScientificEvidenceSafetyTest {
         }
     }
 
+    // ---- The two rules decided on November 12 --------------------------------------------------
+
+    @Test fun aCandidateHoldingOnlyWhatTheSourcesEditListPresentsKeepsTheOriginal() {
+        // Perceptually Lossless needs every video sample the platform's reader lists for the
+        // source. A source can hold samples its edit list does not present (the synthetic file: 168
+        // in its table, 166 presented), and Media3 hands on only the presented ones. On the S26 the
+        // platform extractor lists all 168, so to a player built on it such a candidate is two
+        // frames short, and frames a candidate does not hold were compared by nothing.
+        val table = LongArray(168) { 97_488L + it * 41_708L }
+        val presented = table.copyOf(166)
+        // As Media3 writes it, the first timestamp moved to zero, and with that timestamp put back.
+        for (candidate in listOf(presented.copyOf().also { it[0] = 0 }, presented)) {
+            val timeline = MediaTimelineEvidence.compare(table, candidate)
+            assertFalse(timeline.matches)
+            assertEquals(168 to 166, timeline.sourceFrames to timeline.outputFrames)
+            // Nothing to repair: a rewrite of the container restores no frame.
+            assertNull(timeline.firstVideoPtsToRestoreUs)
+            val report = OutputVerifier.verify(audioInput().copy(audioPacketsIdentical = true, videoTimeline = timeline))
+            assertFalse(report.verified)
+            assertFalse(report.replacementSafe)
+            assertTrue("frameCountMatches" in report.failingChecks())
+            assertEquals("complete video timeline not verified: frame count 168 -> 166", report.replacementBlockReason)
+        }
+        // With every sample carried the same input passes.
+        val whole = MediaTimelineEvidence.compare(table, table)
+        assertTrue(OutputVerifier.verify(audioInput().copy(audioPacketsIdentical = true, videoTimeline = whole)).verified)
+    }
+
+    /** The input as OutputVerifier.captureInput fills it from an audio comparison. */
+    private fun withAudio(outcome: AudioTrackIdentity.Outcome) = audioInput().copy(
+        audioPacketsIdentical = outcome.result == AudioTrackIdentity.Result.IDENTICAL,
+        audioPacketsCompared = outcome.packets,
+        audioPacketsDiffer = outcome.result == AudioTrackIdentity.Result.DIFFERENT,
+        audioEvidence = outcome
+    )
+
+    @Test fun aCopyThatDiffersOnlyInItsEndPaddingIsNotIdenticalAudio() {
+        // No tolerance. What the S26 read for Media3's copy of an AAC track: every packet the
+        // source's, and the configuration the source's except 2 samples of end padding where the
+        // source has 0. The verifier refuses it and says in what it differs. The pipeline rewrites
+        // such a file once and judges the result by this same rule (CandidateContainerRepair,
+        // AudioEndPaddingTest).
+        val asc = byteArrayOf(0x11, 0x90.toByte(), 0x56, 0xe5.toByte(), 0x00)
+        fun config(padding: Int) = AudioTrackIdentity.Config("audio/mp4a-latm", 2, 48_000, 1024, padding, listOf(asc, null, null))
+        fun packets() = (0 until 329).map { AudioPacketEvidence.Packet(byteArrayOf(it.toByte(), 7), it * 21_333L, 1) }.iterator()
+        val copy = AudioTrackIdentity.compareTimed(packets(), packets(), config(0), config(2), 0, 0)
+        assertTrue(copy.differsOnlyInEndPadding)
+        val report = OutputVerifier.verify(withAudio(copy))
+        assertFalse(report.verified)
+        assertFalse(report.replacementSafe)
+        assertTrue("audioBitratePass" in report.failingChecks())
+        assertEquals("audio packet, decoder configuration or A/V timing identity was not proven", report.replacementBlockReason)
+        assertEquals(
+            "audio preservation could not be verified (end padding differs (source 0, output 2 samples); " +
+                "the packets and the rest of the configuration match)",
+            report.audioBasis
+        )
+        val recorded = report.structuralEvidence["audioPacketEvidence"] as Map<*, *>
+        assertEquals(true, recorded["differsOnlyInEndPadding"])
+        assertEquals("decoder configuration differs", recorded["reason"])
+        // The same packets under the source's own configuration are the source's audio.
+        val same = AudioTrackIdentity.compareTimed(packets(), packets(), config(0), config(0), 0, 0)
+        val passing = OutputVerifier.verify(withAudio(same))
+        assertTrue(passing.verified)
+        assertEquals(false, (passing.structuralEvidence["audioPacketEvidence"] as Map<*, *>)["differsOnlyInEndPadding"])
+    }
+
 }

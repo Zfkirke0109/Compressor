@@ -18,8 +18,10 @@ import java.nio.channels.SeekableByteChannel
  * lost by the encoder, the muxer or the metadata remux. The capture cannot say whether that file is
  * built so. This reads the boxes that answer it, when a timeline comparison fails.
  *
- * Evidence only. It decides nothing: the verifier still compares every sample of the source's
- * table, and a count that differs still keeps the original.
+ * Evidence only. It decides nothing: the verifier compares every sample of the source's table,
+ * and a count that differs keeps the original. That is the rule and no longer an open question
+ * (decided November 12, MediaTimelineEvidence): the platform's reader lists the samples an edit
+ * list leaves out, so to a player built on it a candidate without them is short.
  *
  * Pure (java.nio only), so it is tested without a device. Unfragmented MP4/MOV, one video track.
  * scripts/diagnostics/mp4_edit_timeline.py is the same reading for files on a workstation.

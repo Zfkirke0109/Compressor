@@ -235,4 +235,38 @@ class Media3MuxerObservationTest {
             assertEquals("$name: presented length is exact in 1/10,000 s", expectedPadding == 0, presentedSamples * movieTimescale % 48_000L == 0L)
         }
     }
+
+    @Test
+    fun aCopiedAacTrackDiffersFromItsSourceInTheEndPaddingAndInNothingElse() {
+        // The premise of the audio end padding repair (CandidateContainerRepair), held against what
+        // Media3's muxer really writes. Its copy of a track whose length is not a whole number of
+        // 1/10,000 s is the source's audio in every packet, in the configuration and in the delay,
+        // and differs only in the padding a reader derives from the rounded edit. The app's own
+        // comparison has to call exactly that "only the end padding", and call the copy of a track
+        // whose length is exact identical. A Media3 upgrade that changes how the edit is written
+        // fails here and not as repairs that silently stop, or start, in the field.
+        fun hex(text: String) = ByteArray(text.length / 2) { text.substring(2 * it, 2 * it + 2).toInt(16).toByte() }
+        fun config(track: Media3Host.Track): AudioTrackIdentity.Config {
+            val csd = track.codecData.map(::hex)
+            return AudioTrackIdentity.Config(track.mime, 2, 48_000, track.encoderDelay, track.encoderPadding, List(3) { csd.getOrNull(it) })
+        }
+        // Equal digests are equal payloads: each digest stands in for the packet it was taken over.
+        fun packets(track: Media3Host.Track) = track.payloadDigests.indices.map {
+            AudioPacketEvidence.Packet(track.payloadDigests[it].toByteArray(), track.timesUs[it], 1)
+        }.iterator()
+        for ((name, paddingOnly) in listOf("edit_tail_168.mp4" to true, "edit_whole_168.mp4" to false)) {
+            val result = transmux(name)
+            val before = result.before.getValue("audio")
+            val after = result.after.getValue("audio")
+            val outcome = AudioTrackIdentity.compareTimed(packets(before), packets(after), config(before), config(after), 0, 0)
+            assertEquals("$name: ${outcome.failureReason}", paddingOnly, outcome.differsOnlyInEndPadding)
+            assertEquals(name, if (paddingOnly) AudioTrackIdentity.Result.DIFFERENT else AudioTrackIdentity.Result.IDENTICAL, outcome.result)
+            if (paddingOnly) {
+                assertEquals(
+                    "end padding differs (source 0, output 2 samples); the packets and the rest of the configuration match",
+                    outcome.failureReason
+                )
+            }
+        }
+    }
 }

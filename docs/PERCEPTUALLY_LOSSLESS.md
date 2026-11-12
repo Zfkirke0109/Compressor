@@ -29,6 +29,10 @@ The video verdict requires **all** of:
 1. **Structural parity** (`OutputVerifier`): resolution, frame rate, frame count, duration,
    rotation, HDR/colour metadata, audio codec/channels/sample rate, and metadata survive intact;
    the output is strictly smaller than the source. A failure here is terminal.
+   The frame count is the whole timeline: every video sample the platform's reader lists for the
+   source has to be in the output, at the same time relative to the first. Samples outside the
+   source's edit list count too, because that reader lists them and a player built on it can show
+   them (decided November 12; `docs/DEVICE_VALIDATION.md` §6).
 2. **Sampled pixel measurement** (`VmafPairScorer`, libvmaf 3.0.0, model `vmaf_v0.6.1`, luma,
    8-bit, native resolution, no rescaling, **no phone transform**: `VmafPairScorer` passes
    `phoneModel = false` explicitly, pinned by `VmafPairScorer.PRODUCTION_PHONE_MODEL` and a unit
@@ -206,6 +210,13 @@ Audio is never covered by the video gate.
   inferred copy whose packets were not compared all keep the original. `job_c0f82bb62f94` would be
   kept today. In b184 all 21 accepted outputs with audio were bit-identical copies, so this changes
   none of them.
+- **Identical includes the configuration (decided November 12).** The comparison covers every
+  packet, its time against the video, and the decoder configuration the platform reads, encoder
+  delay and end padding included. A copy that differs only in end padding, which Media3's muxer
+  can write for a copied AAC track, is still a difference and does not pass; there is no
+  tolerance. The batch rewrites such a file once with the platform's muxer, as it does to restore
+  a first video timestamp, and judges the result by this same rule (`CandidateContainerRepair`;
+  `docs/DEVICE_VALIDATION.md` §8).
 
 ## 4. Validating the definition: a 2AFC / ABX procedure
 
