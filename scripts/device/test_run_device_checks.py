@@ -10,7 +10,7 @@ import unittest
 
 
 class DeviceChecksTest(unittest.TestCase):
-    def run_checks(self, result, relative=False, installed=False, options=()):
+    def run_checks(self, result, relative=False, installed=False, options=(), instrument_status=0):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
@@ -29,7 +29,7 @@ class DeviceChecksTest(unittest.TestCase):
                 '  echo INSTALL_FAILED_VERSION_DOWNGRADE >&2; exit 1\n'
                 'fi\n'
                 'if [[ "$1 $2" == "shell date +%s.%N" ]]; then printf "1794198030.123456789\\r\\n"; fi\n'
-                'if [[ "$1 $2 $3" == "shell am instrument" ]]; then printf "%s\\n" "$TEST_RESULT"; fi\n'
+                'if [[ "$1 $2 $3" == "shell am instrument" ]]; then printf "%s\\n" "$TEST_RESULT"; exit "$INSTRUMENT_STATUS"; fi\n'
             )
             adb.chmod(0o755)
             clip = root / "camera clips" / "test.mp4"
@@ -43,6 +43,7 @@ class DeviceChecksTest(unittest.TestCase):
                 env={
                     **os.environ, "PATH": f"{root}:{os.environ['PATH']}", "TEST_RESULT": result,
                     "CALLS": str(calls), "ALREADY_INSTALLED": "1" if installed else "0",
+                    "INSTRUMENT_STATUS": str(instrument_status),
                 },
                 text=True, capture_output=True, check=False
             )
@@ -106,6 +107,24 @@ class DeviceChecksTest(unittest.TestCase):
         proc, report, _, _ = self.run_checks("INSTRUMENTATION_STATUS_CODE: -4\nOK (3 tests)", options=("--fallback",))
         self.assertEqual(2, proc.returncode, proc.stdout + proc.stderr)
         self.assertIsNotNone(report)
+
+    def test_a_run_the_device_refuses_to_start_ends_incomplete_and_says_why(self):
+        # What the S26 printed when asked to run the tests in the Secure Folder user. am exited
+        # non-zero, and the script used to stop there without a verdict or an exit code of its own.
+        refused = ("java.lang.SecurityException: Shell does not have permission to access user 150\n"
+                   "onError: commandError=true message=Shell does not have permission to access user 150")
+        proc, report, _, _ = self.run_checks(refused, installed=True, instrument_status=1)
+        self.assertEqual(2, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("Shell does not have permission to access user 150", report)
+        self.assertIn("the tests did not start", proc.stdout)
+        self.assertIn("device checks incomplete", proc.stdout)
+        self.assertNotIn("device checks passed", proc.stdout)
+
+    def test_a_failing_run_is_reported_as_failed_whatever_am_returns(self):
+        proc, report, _, _ = self.run_checks("FAILURES!!!\nTests run: 1,  Failures: 1", instrument_status=1)
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("FAILURES!!!", report)
+        self.assertIn("device checks failed", proc.stdout)
 
     def test_an_unknown_option_is_refused_before_anything_runs(self):
         proc, report, _, calls = self.run_checks("OK (1 test)", options=("--falback",))

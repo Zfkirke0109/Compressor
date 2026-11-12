@@ -14,8 +14,11 @@
 #   CLIP.mp4      a short (10-30 s) SDR H.264/HEVC clip with AAC audio. It is pushed to
 #                 /data/local/tmp and read by the test through the shell; it is never uploaded
 #                 anywhere else.
-#   ANDROID_USER  optional user id (150 for the Secure Folder profile the batches run in). The
-#                 debug APK and its test APK must be installed for that user.
+#   ANDROID_USER  optional user id; the debug APK and its test APK must be installed for that
+#                 user. Leave it out for the normal profile. On the S26 (SM-S948U, Android 17) the
+#                 Secure Folder user 150 refuses the shell ("Shell does not have permission to
+#                 access user 150"), so these tests cannot run there; run them in the normal
+#                 profile. A run the device refuses to start is reported incomplete (exit 2).
 #   --installed   use a matched app and test APK pair already installed for that user.
 #   --fallback    run only SaferRungFallbackDeviceTest instead: three real Perceptually Lossless
 #                 batches over CLIP in which a test's candidate veto refuses a first full encode,
@@ -78,7 +81,8 @@ LOG_START="$(adb shell 'date +%s.%N' | tr -d '\r')"
   adb shell am instrument -w -r "${USER_ARGS[@]}" \
     -e class "$TEST_CLASSES" \
     -e sourceVideo "$REMOTE" \
-    "$PKG.test/androidx.test.runner.AndroidJUnitRunner"
+    "$PKG.test/androidx.test.runner.AndroidJUnitRunner" ||
+    echo "# am instrument exited with status $?"
 } | tee "$OUT"
 if grep -Eq 'FAILURES!!!|INSTRUMENTATION_FAILED:|^INSTRUMENTATION_STATUS_CODE: -[12][[:space:]]*$' "$OUT"; then
   echo "device checks failed. See $OUT"
@@ -86,6 +90,11 @@ if grep -Eq 'FAILURES!!!|INSTRUMENTATION_FAILED:|^INSTRUMENTATION_STATUS_CODE: -
 fi
 if grep -Eq '^INSTRUMENTATION_STATUS_CODE: -[34][[:space:]]*$|AssumptionViolated' "$OUT" ||
    ! grep -Eq '^[[:space:]]*OK \([1-9][0-9]* tests?\)[[:space:]]*$' "$OUT"; then
+  if grep -q 'does not have permission to access user' "$OUT"; then
+    echo "the tests did not start: this device refuses the shell for user ${USER_ID:-0}; run them in the normal profile"
+  elif grep -q '^# am instrument exited with status' "$OUT"; then
+    echo "the tests did not start or did not finish: am instrument exited with an error"
+  fi
   echo "device checks incomplete. See $OUT"
   exit 2
 fi

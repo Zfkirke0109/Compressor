@@ -39,8 +39,11 @@ to the phone over ADB, and deleted from `/data/local/tmp` after use.
 **Smoke (items 1-4), about 5 minutes:**
 
 ```sh
-scripts/device/run-device-checks.sh /path/to/short_sdr_clip.mp4 150   # 150 = the Secure Folder user
+scripts/device/run-device-checks.sh /path/to/short_sdr_clip.mp4   # the normal profile
 ```
+
+On the S26 (Android 17) the Secure Folder user refuses the shell, so the checks cannot run there
+(§8). Give an `ANDROID_USER` only for a profile that lets the shell start tests.
 
 The default command builds and installs the local debug and test APKs for that user. When testing
 an Android CI build, install the matched app and test APKs from its `pl-device-controls-ci-<run>`
@@ -131,8 +134,8 @@ A real first-encode failure cannot be produced on demand, so `SaferRungFallbackD
 the first candidate with a test-only `CandidateVeto` and lets production do everything after it:
 
 ```sh
-scripts/device/run-device-checks.sh --fallback /path/to/disposable_copy.mp4 150
-scripts/device/run-device-checks.sh --installed --fallback /path/to/disposable_copy.mp4 150
+scripts/device/run-device-checks.sh --fallback /path/to/disposable_copy.mp4
+scripts/device/run-device-checks.sh --installed --fallback /path/to/disposable_copy.mp4
 ```
 
 It runs three real Perceptually Lossless batches over a copy of the clip in the app's cache and
@@ -216,11 +219,11 @@ what it is written to do, in this order: its parser leaves out the two samples o
 presentation, and its muxer zeroes the first video timestamp. No stage drops a frame it was
 handed.
 
-Three things are still not observed. Whether the job's original is built like the synthetic file
-is unknown: it is not available. Nothing a phone does is covered by a host run: what
-`MediaExtractor` lists for such a source, what the decoder and the encoder do between Media3's
-parser and its muxer, what the remux writes. And the host run has no codec, so it shows what the
-muxer does with the timestamps it is handed, not that a phone's encoder hands it the same ones.
+A host run leaves three things open. The phone has since answered two of them (§8):
+`MediaExtractor` lists all 168 samples of such a source, and a real export on the S26, with its
+decoder and encoder, carries 166 and starts its video at zero, which the app's remux then copies
+sample for sample. The third is still unknown: whether the job's original is built like the
+synthetic file, since the original is not available.
 So no acceptance rule and no pipeline stage was changed. The verifier
 still compares every sample of the source's table, and such a source is still kept as the
 original. Whether a candidate that holds every sample the source *presents* should be accepted is
@@ -240,7 +243,8 @@ candidate's sample count differs from its source's (`timelineLocalization` on th
 
 The same run prints, without asserting anything, whether the first timestamp repair's pattern is
 seen in Media3's file on the phone and whether the repair's own remux then gives back the
-source's timeline (`b287-timeline … firstTimestampRepair …`).
+source's timeline (`b287-timeline … firstTimestampRepair …`). On the S26 it is seen, and the
+repair gives the source's timeline back (§8).
 
 ### The earlier AAC "decoder configuration differs"
 
@@ -279,7 +283,8 @@ delay is not known. The device run therefore prints the app's audio comparison o
 sources, which do carry one, for Media3's file, for the first timestamp repair and for the
 remuxed file (`b287-timeline … audio …`), with both sides' values when they differ. Nothing was
 relaxed. If the phone shows a copy that differs only in how its delay is written, whether that
-should pass is a decision about what identical audio means, to be taken on that observation.
+should pass is a decision about what identical audio means, to be taken on that observation. §8
+has what the S26 showed.
 
 ## 7. What the alternate search and the 4K pipeline cost (v1.6.287 captures)
 
@@ -336,3 +341,61 @@ certification. What inside a 4K window takes the time (decode, frame preparation
 separable from these records; the Perfetto trace in §5.3 is the measurement for that. The 1080p
 certification windows include the opt-in VMAF v1 shadow (about 0.8 s of each 1.8 s); 4K windows do
 not run it.
+
+## 8. v1.6.299 on the S26, normal profile (November 12)
+
+The matched v1.6.299 app and test APKs from Android CI #299 were installed over ADB on the
+SM-S948U (Android 17), and the default checks were run with `--installed` in the normal profile.
+All 12 tests passed, in 166 s: the four pipeline tests, the three production-evidence tests, the
+two frame-packing tests and the three edit-list timeline tests. The fallback check (§6) was not
+part of that run.
+
+The Secure Folder could not be used. Asked to start the tests for user 150, the phone answered
+`SecurityException: Shell does not have permission to access user 150` and nothing ran. The
+script stopped there without a verdict; it now reports such a run as incomplete and says why.
+Behaviour in the Secure Folder is checked by using the app there and exporting its log.
+
+The real Perceptually Lossless batch that the production-evidence test runs over the supplied clip
+kept the original, measured below the PL quality gate, so that clip made no full encode.
+
+**What the phone counted** (`b287-timeline`), Media3 re-encoding the video to HEVC and copying
+the audio:
+
+| | `edit_tail_168.mp4` | `edit_whole_168.mp4` |
+|---|---|---|
+| Platform extractor, source | 168 samples, first at 97,488 µs | 168, first at 97,488 µs |
+| Presented by the source's edit list | 166 (2 after the edit ends) | 168 |
+| Reported by Media3's export | 166 frames | 168 |
+| Media3's file | 166 samples, first at 0 | 168, first at 0 |
+| App's remux, read / written | 166 / 166 | 168 / 168 |
+| Final file | 166, first at 0 | 168, first at 0 |
+| Stage named | `source_edit_list` | `none` |
+
+As on the build machine, the count changes where Media3 reads what the source's edit list
+presents, and Media3's file starts its video at zero. The platform extractor, which the verifier
+compares against, lists all 168 samples of the source. No stage after Media3's read loses a frame.
+This is the synthetic source: the job's original has not been retested.
+
+**The first timestamp repair.** For the control file the comparator proposed restoring 97,488 µs.
+After the repair's remux the timelines matched: 168 samples, the first at 97,500 µs (12 µs from
+the source, inside the 1,000 µs tolerance), and the audio compared identical, at most 12 µs apart.
+For the tail file no repair was proposed (168 → 166), as intended.
+
+**The copied AAC track.** For the tail file, Media3's file differs from the source in one decoder
+configuration field: the platform reads its encoder padding as 2 samples where the source has 0.
+The AudioSpecificConfig bytes (`119056e500`), the 1,024-sample delay, the packet count (329), the
+first timestamp (−21,333 µs) and the first packet's payload are the same. The comparison stops at
+the first difference, so the line does not show the later packets; on the build machine every
+packet was kept. The app reports this as "decoder configuration differs". After the app's
+metadata remux the padding reads 0 again and the configuration matches. The control file's track
+(376 packets) reads padding 0 throughout. These are the paddings the build machine predicted (§6).
+
+- So a copied AAC track can fail the audio check as "decoder configuration differs" with nothing
+  changed but the end padding Media3's muxer writes, when the app does not remux the file
+  afterwards.
+- That is not shown to be the cause of b213's case (`job_6d1173f4c0f9`) or its November 9 repeat,
+  which reported this reason after a Media3 transmux with no metadata remux. In b213 the payload
+  digests also differed and the audio was one AAC frame (21,334 µs) out against the video, which a
+  padding difference alone does not produce.
+- Nothing was relaxed. Whether a copy that differs from its source only in the padding written
+  for it may pass is a decision about what identical audio means.
