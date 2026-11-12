@@ -12,7 +12,10 @@ from pathlib import Path
 def replay_ledger(events, epoch):
     reserved, applied, final_profiles = {}, set(), {}
     pending_reset = None
-    result = dict(accepted=[], uncertain=[], quarantined=[], errors=[], ignored=0, finalProfiles=final_profiles)
+    # rotations: how many times the journal was restarted because it was full. Events before a
+    # rotation are in the app's archive, not here, so accepted and finalProfiles then describe
+    # only what happened since; the reservations it carried over stay unrepeatable.
+    result = dict(accepted=[], uncertain=[], quarantined=[], errors=[], ignored=0, finalProfiles=final_profiles, rotations=0)
     for index, raw in enumerate(events):
         event = raw.get('fields', raw)
         kind, identity = event.get('ledgerEvent'), event.get('evidenceId')
@@ -29,6 +32,15 @@ def replay_ledger(events, epoch):
             continue
         if kind in ('IGNORED', 'DUPLICATE'):
             result['ignored'] += 1; continue
+        if kind == 'ROTATED':
+            result['rotations'] += 1; continue
+        if kind == 'CARRIED':
+            # A reservation made before a rotation: its effect is not in these events, and the
+            # same measurement must not appear as a new one.
+            if identity: applied.add(scope)
+            continue
+        # APPLY_UNCONFIRMED: the aggregate write was not confirmed on disk. The reservation stays
+        # open and is reported as uncertain below, exactly as a RESERVED with nothing after it.
         if kind not in ('RESERVED','APPLIED'): continue
         if not identity or event.get('durablyJournaled') is False:
             result['errors'].append(dict(index=index,reason='missing identity or journal write failed')); continue

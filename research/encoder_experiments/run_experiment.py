@@ -41,6 +41,28 @@ FROZEN_GATE = {"verdictModel": "vmaf_v0.6.1", "phoneModel": False, "windowMeanMi
                "probeSelectionMargins": {"mean": 0.5, "p5": 1.25, "min": 1.0},
                "minComparedFramesPerWindow": 12}
 SETTINGS = ("maxBFrames", "longGop", "saferRungRetry", "shadowCalibration")
+# What a batch was asked to do besides the experiment's own switches (run_identity.batchSettings).
+# None of these is an arm: an arm that also changed codec, frame rate, mode or metadata handling
+# would be credited with that change's bytes, so every arm must record them and record them equal.
+BATCH_SETTINGS = ("quality", "codecOption", "frameRateOption", "metadataPrivacy")
+
+
+def _batch_settings(identity: dict[str, Any]) -> dict[str, Any]:
+    """The non-arm settings of one capture, or an error: a pilot arm must record every one."""
+    batch = identity.get("batchSettings")
+    if not isinstance(batch, dict):
+        raise SystemExit("error: capture does not record the batch settings (codec, frame rate, mode); "
+                         "a pilot arm needs a build that records them")
+    missing = [k for k in BATCH_SETTINGS if batch.get(k) in (None, "")]
+    if missing:
+        raise SystemExit(f"error: batch settings missing from the capture: {missing}")
+    # The protocol runs every arm on the same untouched originals. An arm that replaced them
+    # changed the next arm's sources; a batch driven by an instrumented test is not a field run.
+    if batch.get("replaceOriginals") is not False:
+        raise SystemExit("error: pilot arms must run with Replace Originals off")
+    if batch.get("testCandidateVeto"):
+        raise SystemExit("error: this batch was run by an instrumented test (attempts were refused by the test); it is not a pilot arm")
+    return {k: batch[k] for k in BATCH_SETTINGS}
 
 
 def load_manifest(path: str) -> dict[str, Any]:
@@ -229,6 +251,7 @@ def ingest(manifest: dict[str, Any], arm: str, capture: str, batch: str, out_dir
     settings = {k: scoring.get(k) for k in SETTINGS}
     if settings != arms[arm]["settings"]:
         raise SystemExit(f"error: captured settings for {arm} differ: {settings}")
+    batch_settings = _batch_settings(identity)
     if not str(start.get("buildTag") or "").startswith(manifest["identity"]["requiredBuildTagPrefix"]):
         raise SystemExit("error: unexpected build tag")
     if not start.get("buildCommit") or not snapshot.get("sha256"):
@@ -274,6 +297,7 @@ def ingest(manifest: dict[str, Any], arm: str, capture: str, batch: str, out_dir
     result = {"arm": arm, "batchId": batch, "capture": os.path.basename(capture), "scope": scope,
               "buildCommit": start["buildCommit"], "buildTag": start["buildTag"],
               "frozenGate": scoring["frozenGate"], "settings": settings,
+              "batchSettings": batch_settings,
               "learnedSnapshotSha256": snapshot["sha256"],
               "sourceManifestSha256": summary["sourceManifestSha256"],
               "batchWallMs": summary["totalElapsedMs"],
@@ -315,6 +339,17 @@ def table(results: dict[str, dict[str, Any]], baseline: str, manifest: dict[str,
         raise SystemExit("error: arm builds or gates are missing or differ")
     if any(r.get("exhaustivePerceptualLossless") is not True for r in results.values()):
         raise SystemExit("error: every arm must be an Exhaustive-mode capture")
+    # Arms may differ only in what the experiment varies. Codec, frame rate, mode and metadata
+    # handling are recorded per arm and must be the same in all of them.
+    for label, res in results.items():
+        recorded = res.get("batchSettings")
+        if not isinstance(recorded, dict) or any(recorded.get(k) in (None, "") for k in BATCH_SETTINGS):
+            raise SystemExit(f"error: arm {label} does not record its batch settings; ingest it again from its capture")
+    for key in BATCH_SETTINGS:
+        values = {label: res["batchSettings"][key] for label, res in results.items()}
+        if len(set(values.values())) != 1:
+            raise SystemExit(f"error: arms differ in a setting outside the experiment: {key} is "
+                             + ", ".join(f"{v!r} in {label}" for label, v in sorted(values.items())))
     source_manifests = {r.get("sourceManifestSha256") for r in results.values()}
     if len(source_manifests) != 1 or not next(iter(source_manifests)):
         raise SystemExit("error: captured source manifest digests differ or are missing")

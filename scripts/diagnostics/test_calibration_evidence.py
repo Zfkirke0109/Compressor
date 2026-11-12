@@ -5,6 +5,25 @@ class EvidenceTest(unittest.TestCase):
     def event(self, event='APPLIED', kind='VISUAL_PASS', epoch='current'):
         return dict(ledgerEvent=event, evidenceId='a'*64, profileKey='p', proposedAfter='next', after='next',
                     observation=dict(kind=kind,policyEpoch=epoch,sourceId='b'*64))
+    def test_an_update_the_app_could_not_confirm_on_disk_stays_uncertain(self):
+        # The app records APPLY_UNCONFIRMED when the aggregate write was not known to be durable.
+        r=replay_ledger([self.event('RESERVED'),dict(self.event('APPLY_UNCONFIRMED'),after=None)], 'current')
+        self.assertEqual(r['accepted'],[]);self.assertEqual(len(r['uncertain']),1)
+        self.assertEqual(r['finalProfiles'],{});self.assertEqual(r['status'],'REQUIRES_REVIEW')
+    def test_a_rotated_journal_is_replayed_from_the_rotation_and_says_so(self):
+        # A full journal is restarted with one CARRIED line per reservation made before it. Their
+        # effects are in the archive, not here; the same measurement must not count as a new one.
+        carried=dict(ledgerEvent='CARRIED', evidenceId='a'*64, profileKey='p')
+        later=dict(self.event('RESERVED'), evidenceId='c'*64)
+        r=replay_ledger([dict(ledgerEvent='ROTATED', carriedReservations=1), carried, later,
+                         dict(self.event(), evidenceId='c'*64)], 'current')
+        self.assertEqual(r['rotations'],1)
+        self.assertEqual([row['evidenceId'] for row in r['accepted']],['c'*64])
+        self.assertEqual(r['errors'],[]);self.assertEqual(r['status'],'REPLAYED')
+        repeated=replay_ledger([dict(ledgerEvent='ROTATED'), carried, self.event('RESERVED'), self.event()], 'current')
+        self.assertEqual(repeated['accepted'],[])
+        self.assertEqual(repeated['errors'][0]['reason'],'duplicate reservation')
+        self.assertEqual(replay_ledger([self.event('RESERVED'),self.event()], 'current')['rotations'],0)
     def test_reserved_is_uncertain_not_a_completed_observation(self):
         r=replay_ledger([self.event('RESERVED')], 'current')
         self.assertEqual(r['accepted'],[]);self.assertEqual(len(r['uncertain']),1)

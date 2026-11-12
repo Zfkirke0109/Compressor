@@ -167,6 +167,13 @@ class RecordingProfileStore(
         delegate.write(key, value)
         if (before != value) runCatching { onWrite(key, before, value) }
     }
+    override fun writeDurably(key: String, value: String): Boolean {
+        val before = delegate.read(key)
+        val durable = delegate.writeDurably(key, value)
+        // Reported whether or not it reached disk: the value is in effect in this process.
+        if (before != value && delegate.read(key) == value) runCatching { onWrite(key, before, value) }
+        return durable
+    }
     override fun snapshot(): Map<String, String> = delegate.snapshot()
     override fun clear() = delegate.clear()
 }

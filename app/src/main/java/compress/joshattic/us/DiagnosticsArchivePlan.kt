@@ -125,6 +125,23 @@ object DiagnosticsArchivePlan {
     }.filter { it.second.isFile && it.second.length() > 0L }
 
     /** Paths inside the archive. */
+    /**
+     * A new, empty file in [directory] to build one archive in. Its name is its own: the download
+     * name ([fileName]) is stamped to the second, so two exports of one scope started in the same
+     * second share it, and building both in a file of that name let each truncate the other's
+     * archive and delete it when done.
+     */
+    fun stagingFile(directory: java.io.File): java.io.File {
+        directory.mkdirs()
+        return java.io.File.createTempFile("archive-", ".zip", directory)
+    }
+
+    /** Whether a staging file last written at [lastModifiedMs] was left by an export that never finished. */
+    fun isAbandonedStaging(lastModifiedMs: Long, nowMs: Long): Boolean = nowMs - lastModifiedMs > ABANDONED_STAGING_MS
+
+    /** Far longer than building and copying one archive takes, so a running export's file is never swept. */
+    const val ABANDONED_STAGING_MS = 6L * 60 * 60 * 1000
+
     fun runEntryPath(batchId: String, fileName: String): String = "runs/$batchId/$fileName"
     fun crashEntryPath(reportName: String): String = "crashes/$reportName"
     const val LOGCAT_ENTRY = "device/logcat.txt"

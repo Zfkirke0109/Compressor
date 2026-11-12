@@ -38,6 +38,16 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         fun read(key: String): String?
         fun write(key: String, value: String)
 
+        /**
+         * Write [value] and say whether it is known to be on durable storage. The learning ledger
+         * records an update as applied only when this returns true. A store with nothing to
+         * persist to is its own storage.
+         */
+        fun writeDurably(key: String, value: String): Boolean {
+            write(key, value)
+            return true
+        }
+
         fun writeObservation(key: String, value: String, observation: LearningObservation?): Boolean {
             write(key, value)
             return true
@@ -69,6 +79,12 @@ class SmartPerceptualProfileEngine(private val store: ProfileStore) {
         override fun write(key: String, value: String) {
             prefs.edit().putString(key, value).apply()
         }
+
+        // commit(), not apply(): apply() returns before the value is on disk, so the ledger was
+        // recording an update as applied that a process death could still lose, and on restart
+        // the same measurement was then refused as a duplicate of an update that never landed.
+        @Suppress("ApplySharedPref")
+        override fun writeDurably(key: String, value: String): Boolean = prefs.edit().putString(key, value).commit()
 
         override fun snapshot(): Map<String, String> =
             prefs.all.entries.mapNotNull { (k, v) -> (v as? String)?.let { k to it } }.toMap()

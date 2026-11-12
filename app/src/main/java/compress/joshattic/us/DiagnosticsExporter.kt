@@ -179,7 +179,14 @@ object DiagnosticsExporter {
         } else null
 
         val staging = File(context.cacheDir, "diagnostics_export").apply { mkdirs() }
-        val archive = File(staging, displayName)
+        // Archives a killed export left behind. Each export now stages in a file of its own, so
+        // nothing else would ever overwrite or remove them.
+        val now = System.currentTimeMillis()
+        staging.listFiles()?.forEach { if (DiagnosticsArchivePlan.isAbandonedStaging(it.lastModified(), now)) runCatching { it.delete() } }
+        val archive = runCatching { DiagnosticsArchivePlan.stagingFile(staging) }.getOrElse {
+            Log.w(TAG, "diagnostics archive staging failed", it)
+            return ExportResult.Failed("Could not build the archive: ${it.message ?: "no staging file"}")
+        }
         val entries = mutableListOf<DiagnosticsArchivePlan.Entry>()
         val built = runCatching {
             ZipOutputStream(archive.outputStream().buffered()).use { zip ->

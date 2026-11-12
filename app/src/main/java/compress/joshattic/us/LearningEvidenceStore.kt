@@ -9,6 +9,8 @@ import java.util.UUID
 class LearningEvidenceStore(
     private val delegate: SmartPerceptualProfileEngine.ProfileStore,
     journal: File,
+    // The journal's size bound. Only tests pass another value, to fill one without writing 32 MiB.
+    private val maxBytes: Long = MAX_BYTES,
     private val onEvent: (Map<String, Any?>) -> Unit = {}
 ) : SmartPerceptualProfileEngine.ProfileStore by delegate {
     private val state = journalState(journal)
@@ -18,6 +20,10 @@ class LearningEvidenceStore(
      * RESERVED without APPLIED is explicitly uncertain, never a completed observation. The
      * before/after snapshots allow offline reconstruction and targeted recovery; existing v4
      * profiles are retained, with their legacy aggregate provenance rather than invented labels.
+     *
+     * APPLIED is recorded only once the aggregate write is itself durable. When the store cannot
+     * confirm that, the record says APPLY_UNCONFIRMED and learning stops for this process: the
+     * ledger never claims an update a restart could lose.
      */
     override fun writeObservation(key: String, value: String, observation: LearningObservation?): Boolean = synchronized(state) {
         val fields = linkedMapOf<String, Any?>("ledgerVersion" to 1,
@@ -38,14 +44,30 @@ class LearningEvidenceStore(
         }
         if (!append(fields + mapOf("ledgerEvent" to "RESERVED", "effectApplied" to null))) return@synchronized false
         state.seen += scopedId
-        delegate.write(key, value)
+        val durable = runCatching { delegate.writeDurably(key, value) }.getOrDefault(false)
+        if (!durable) {
+            append(fields + mapOf("eventId" to UUID.randomUUID().toString(), "ledgerEvent" to "APPLY_UNCONFIRMED",
+                "effectApplied" to null, "reason" to "the aggregate write was not confirmed on durable storage"))
+            state.writable = false
+            // The caller is told what this process now reads back, which is what it will act on.
+            return@synchronized runCatching { delegate.read(key) == value }.getOrDefault(false)
+        }
         append(fields + mapOf("eventId" to UUID.randomUUID().toString(), "ledgerEvent" to "APPLIED", "effectApplied" to true, "after" to value))
         true
     }
 
+    /**
+     * The explicit reset. It is also the way out of every state in which the journal can no
+     * longer be appended to: full beyond what a rotation can free, cut off mid-line by a killed
+     * write, or left by a reset that never finished. A reset is the one operation that needs
+     * nothing the journal holds, so such a journal is set aside as the archive and a new one is
+     * started with this reset's own record. If that cannot be written either, nothing has
+     * changed and the reset is refused.
+     */
     override fun clear() = synchronized(state) {
         // The explicit reset operation retains its audit history; ordinary upgrades never call it.
-        check(append(mapOf("ledgerVersion" to 1, "ledgerEvent" to "RESET_STARTED", "timestampMs" to System.currentTimeMillis()))) {
+        val started = mapOf("ledgerVersion" to 1, "ledgerEvent" to "RESET_STARTED", "timestampMs" to System.currentTimeMillis())
+        check(append(started) || restartJournal(started)) {
             "Learning history could not record the reset; profiles were kept unchanged."
         }
         try {
@@ -60,11 +82,13 @@ class LearningEvidenceStore(
         state.seen.clear()
     }
 
+    private fun line(fields: Map<String, Any?>): ByteArray = (JsonText.render(fields).replace("\n", "") + "\n").toByteArray()
+
     private fun append(fields: Map<String, Any?>): Boolean {
         val journal = state.journal
         val ok = state.writable && runCatching {
-            val bytes = (JsonText.render(fields).replace("\n", "") + "\n").toByteArray()
-            check(journal.length() + bytes.size <= MAX_BYTES) { "learning evidence journal full" }
+            val bytes = line(fields)
+            if (journal.length() + bytes.size > maxBytes) rotate(bytes.size)
             journal.parentFile?.mkdirs()
             FileOutputStream(journal, true).use { out -> out.write(bytes); out.fd.sync() }
             true
@@ -74,18 +98,68 @@ class LearningEvidenceStore(
         return ok
     }
 
+    /**
+     * Make room in a full journal without forgetting what has already trained. The full file is
+     * kept as the one archive, and the journal starts again with one short line per live
+     * reservation, so a repeated measurement is refused after the rotation and after a restart
+     * exactly as before it. The aggregate is not touched: this is not a reset.
+     *
+     * The new file is complete and synced before it replaces the old one in a single rename, so
+     * there is a journal at every moment. Throws, leaving the journal as it was, when the
+     * reservations alone would not fit: learning then pauses, as it did for any full journal.
+     */
+    private fun rotate(needed: Int) {
+        val journal = state.journal
+        val fresh = File(journal.parentFile, journal.name + ROTATING_SUFFIX)
+        try {
+            FileOutputStream(fresh, false).use { out ->
+                out.write(line(mapOf("ledgerVersion" to 1, "ledgerEvent" to "ROTATED", "timestampMs" to System.currentTimeMillis(),
+                    "carriedReservations" to state.seen.size, "archivedBytes" to journal.length())))
+                for (id in state.seen) out.write(carried(id))
+                out.fd.sync()
+            }
+            check(fresh.length() + needed <= maxBytes) { "learning evidence journal full of live reservations" }
+            journal.copyTo(File(journal.parentFile, journal.name + ARCHIVE_SUFFIX), overwrite = true)
+            check(fresh.renameTo(journal)) { "learning evidence journal could not be rotated" }
+        } finally {
+            fresh.delete()
+        }
+    }
+
+    /** Start a new journal whose first record is [first], keeping the old one as the archive. */
+    private fun restartJournal(first: Map<String, Any?>): Boolean {
+        val journal = state.journal
+        val fresh = File(journal.parentFile, journal.name + ROTATING_SUFFIX)
+        val ok = runCatching {
+            journal.parentFile?.mkdirs()
+            FileOutputStream(fresh, false).use { out ->
+                out.write(line(first + mapOf("replacedJournalBytes" to journal.length())))
+                out.fd.sync()
+            }
+            if (journal.isFile) journal.copyTo(File(journal.parentFile, journal.name + ARCHIVE_SUFFIX), overwrite = true)
+            check(fresh.renameTo(journal)) { "learning evidence journal could not be replaced" }
+            true
+        }.getOrDefault(false)
+        fresh.delete()
+        if (ok) state.writable = true
+        runCatching { onEvent(first + mapOf("durablyJournaled" to ok, "journalRestarted" to ok)) }
+        return ok
+    }
+
     private class JournalState(val journal: File) {
         val seen = mutableSetOf<String>()
         var writable = true
 
         init {
+            // A rotation that never finished: the journal it was to replace is still the journal.
+            runCatching { File(journal.parentFile, journal.name + ROTATING_SUFFIX).delete() }
             runCatching {
                 var resetPending = false
                 if (journal.exists()) {
                     require(journal.length() <= MAX_BYTES) { "learning evidence journal exceeds bound" }
                     journal.bufferedReader().useLines { lines -> lines.forEach { line ->
                         require(line.endsWith("}")) { "incomplete ledger tail; aggregate learning paused" }
-                        if (line.contains("\"ledgerEvent\": \"RESERVED\"")) {
+                        if (line.contains("\"ledgerEvent\": \"RESERVED\"") || line.contains("\"ledgerEvent\": \"CARRIED\"")) {
                             val id = checkNotNull(idPattern.find(line)?.groupValues?.get(1))
                             val profileJson = checkNotNull(profilePattern.find(line)?.groupValues?.get(1))
                             seen += scopedId(profileJson, id)
@@ -104,11 +178,21 @@ class LearningEvidenceStore(
 
     companion object {
         const val MAX_BYTES = 32L * 1024 * 1024
+        /** The previous full journal, or the one an explicit reset set aside. One is kept. */
+        const val ARCHIVE_SUFFIX = ".archive"
+        private const val ROTATING_SUFFIX = ".rotating"
         private val journals = mutableMapOf<File, WeakReference<JournalState>>()
         private val idPattern = Regex("\\\"evidenceId\\\": \\\"([0-9a-f]{64})\\\"")
         private val profilePattern = Regex(""""profileKey": ("(?:\\.|[^"\\])*")""")
 
         private fun scopedId(profileJson: String, evidenceId: String): String = "$profileJson\u0000$evidenceId"
+
+        /** A reservation carried into a rotated journal, in the shape the loader reads one in. */
+        private fun carried(scopedId: String): ByteArray {
+            val profileJson = scopedId.substringBeforeLast('\u0000')
+            val evidenceId = scopedId.substringAfterLast('\u0000')
+            return "{\"ledgerVersion\": 1, \"ledgerEvent\": \"CARRIED\", \"evidenceId\": \"$evidenceId\", \"profileKey\": $profileJson}\n".toByteArray()
+        }
 
         private fun journalState(file: File): JournalState {
             val path = runCatching { file.canonicalFile }.getOrElse { file.absoluteFile.normalize() }

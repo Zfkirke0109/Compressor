@@ -31,8 +31,12 @@ learningKeySuffix`): an arm never reads or writes the baseline's learned ratios.
 Ingestion requires a completed PL batch run in Exhaustive mode (Fast mode lets each arm's learned
 history decide which sources are probed at all) with exactly the manifest sources, a unique job record
 per source, matching name hash/size, a sampled source fingerprint, the captured production gate,
-arm settings, build identity, and starting learned-state snapshot. The table requires every arm,
-the same build and exact source fingerprints across arms. It reports batch wall time separately
+arm settings, build identity, and starting learned-state snapshot. It also requires the capture
+to record what the batch was asked to do besides the experiment's own switches (mode, codec,
+frame rate, metadata handling), with Replace Originals off, and refuses a batch that an
+instrumented test drove. The table requires every arm, the same build, exact source fingerprints
+across arms, and those other settings equal in every arm: an arm that also changed codec would
+otherwise be credited with the codec's bytes. It reports batch wall time separately
 from summed per-job elapsed time and thermal cooldown, lists the thermal state each measured job
 started in, and prints every arm's starting learned snapshot; differing
 snapshots confound any claimed arm effect. Each arm result is written once; a

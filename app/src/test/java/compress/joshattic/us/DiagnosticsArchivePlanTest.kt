@@ -67,6 +67,39 @@ class DiagnosticsArchivePlanTest {
     }
 
     @Test
+    fun twoExportsNamedInTheSameSecondAreBuiltInDifferentFiles() {
+        // The download name is stamped to the second, so two exports of one scope can share it.
+        val runs = listOf(Run("batch_1794292368590", 1794292368590L))
+        val first = DiagnosticsArchivePlan.fileName("1.6.294", "20261112-170000", Scope.EVERYTHING, runs)
+        assertEquals(first, DiagnosticsArchivePlan.fileName("1.6.294", "20261112-170000", Scope.EVERYTHING, runs))
+        val directory = java.nio.file.Files.createTempDirectory("staging").toFile()
+        try {
+            val a = DiagnosticsArchivePlan.stagingFile(java.io.File(directory, "diagnostics_export"))
+            val b = DiagnosticsArchivePlan.stagingFile(java.io.File(directory, "diagnostics_export"))
+            assertTrue(a.isFile && b.isFile)
+            assertTrue(a.canonicalPath != b.canonicalPath)
+            assertEquals(a.parentFile, b.parentFile)
+            // One export finishing and deleting its file leaves the other's alone.
+            a.writeText("first"); b.writeText("second")
+            assertTrue(a.delete())
+            assertEquals("second", b.readText())
+        } finally {
+            directory.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun onlyAStagingFileNoRunningExportCouldOwnIsSwept() {
+        val now = 1_794_292_368_590L
+        assertTrue(!DiagnosticsArchivePlan.isAbandonedStaging(now, now))
+        assertTrue(!DiagnosticsArchivePlan.isAbandonedStaging(now - 60L * 60 * 1000, now))
+        assertTrue(!DiagnosticsArchivePlan.isAbandonedStaging(now - DiagnosticsArchivePlan.ABANDONED_STAGING_MS, now))
+        assertTrue(DiagnosticsArchivePlan.isAbandonedStaging(now - DiagnosticsArchivePlan.ABANDONED_STAGING_MS - 1, now))
+        // A clock set back never makes a fresh file look abandoned.
+        assertTrue(!DiagnosticsArchivePlan.isAbandonedStaging(now + 5_000, now))
+    }
+
+    @Test
     fun fileNamesCarryAppVersionTimestampAndScope() {
         assertEquals(
             "Compressor-v1.6.163-20260924-132315-AllRuns.zip",

@@ -44,7 +44,12 @@ def test_a_changed_threshold_or_a_two_factor_arm_is_rejected():
     assert any("one factor at a time" in p for p in problems)
 
 
-def _capture(batch, jobs, arm="A0", exhaustive=True, full_hash=False, extra=()):
+BATCH_SETTINGS = {"replaceOriginals": False, "backupBeforeReplace": False, "useShizukuFallback": False,
+                  "metadataPrivacy": "KEEP_ALL", "quality": "Perceptually Lossless", "codecOption": "AUTO",
+                  "frameRateOption": "ORIGINAL", "exhaustivePerceptualLossless": True}
+
+
+def _capture(batch, jobs, arm="A0", exhaustive=True, full_hash=False, extra=(), batch_settings=BATCH_SETTINGS):
     fd, path = tempfile.mkstemp(suffix=".jsonl")
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps({"type": "session_start", "batchId": batch, "mode": "Perceptually Lossless",
@@ -52,9 +57,12 @@ def _capture(batch, jobs, arm="A0", exhaustive=True, full_hash=False, extra=()):
                              "exhaustivePerceptualLossless": exhaustive}) + "\n")
         fh.write(json.dumps({"type": "learned_state_snapshot", "batchId": batch, "sha256": "snapshot"}) + "\n")
         settings = next(a["settings"] for a in MANIFEST["arms"] if a["id"] == arm)
-        fh.write(json.dumps({"type": "run_identity", "batchId": batch,
-                             "scoring": {"frozenGate": MANIFEST["frozenGate"], "verdictModel": "vmaf_v0.6.1",
-                                         "verdictPhoneModel": False, "fullSourceHash": full_hash, **settings}}) + "\n")
+        identity = {"type": "run_identity", "batchId": batch,
+                    "scoring": {"frozenGate": MANIFEST["frozenGate"], "verdictModel": "vmaf_v0.6.1",
+                                "verdictPhoneModel": False, "fullSourceHash": full_hash, **settings}}
+        if batch_settings is not None:
+            identity["batchSettings"] = batch_settings
+        fh.write(json.dumps(identity) + "\n")
         for rec in extra:
             fh.write(json.dumps({"batchId": batch, **rec}) + "\n")
         for j in jobs:
@@ -292,6 +300,66 @@ def test_ingest_rejects_contradictory_accepted_savings():
                 assert "final acceptance" in str(exc)
             else:
                 raise AssertionError(f"contradictory savings admitted: {fields}")
+
+
+def _two_arms(base_settings=BATCH_SETTINGS, arm_settings=BATCH_SETTINGS):
+    m = copy.deepcopy(MANIFEST)
+    m["sources"] = [{"jobId": "job_a", "nameHash": "name-job_a", "sourceBytes": 1000}]
+    jobs = [{"jobId": "job_a", "sourceSize": 1000, "outputSize": 900, "countsAsRealCompression": True,
+             "terminal": "TRANSCODED_SMALLER"}]
+    out = tempfile.mkdtemp()
+    r.ingest(m, "A0", _capture("b0", jobs, batch_settings=base_settings), "b0", out)
+    r.ingest(m, "A1", _capture("b1", jobs, "A1", batch_settings=arm_settings), "b1", out)
+    return {n: json.load(open(os.path.join(out, f"{n}.json"))) for n in ("A0", "A1")}
+
+
+def test_a_setting_outside_the_experiment_must_be_recorded_and_equal_in_every_arm():
+    # Only the four experiment switches used to be compared, so an HEVC baseline against an H.264
+    # arm passed every identity check and its codec's bytes were credited to the arm.
+    same = _two_arms()
+    assert same["A0"]["batchSettings"] == {"quality": "Perceptually Lossless", "codecOption": "AUTO",
+                                            "frameRateOption": "ORIGINAL", "metadataPrivacy": "KEEP_ALL"}
+    assert r.table(same, "A0")["matchedSources"] == 1
+    for key, other in (("codecOption", "H264"), ("frameRateOption", "FPS_30"), ("quality", "High Quality"),
+                       ("metadataPrivacy", "STRIP_LOCATION")):
+        results = _two_arms(arm_settings={**BATCH_SETTINGS, key: other})
+        try:
+            r.table(results, "A0")
+        except SystemExit as exc:
+            assert "outside the experiment" in str(exc) and key in str(exc), exc
+            assert repr(other) in str(exc) and "A1" in str(exc), exc
+        else:
+            raise AssertionError(f"arms that differ in {key} were compared")
+    # A result written before the settings were kept cannot vouch for them.
+    older = _two_arms()
+    del older["A1"]["batchSettings"]
+    try:
+        r.table(older, "A0")
+    except SystemExit as exc:
+        assert "does not record its batch settings" in str(exc), exc
+    else:
+        raise AssertionError("an arm without recorded batch settings was compared")
+
+
+def test_ingest_refuses_a_capture_that_cannot_be_a_pilot_arm():
+    m = copy.deepcopy(MANIFEST)
+    m["sources"] = [{"jobId": "job_a", "nameHash": "name-job_a", "sourceBytes": 1000}]
+    jobs = [{"jobId": "job_a", "sourceSize": 1000, "outputSize": 0, "countsAsRealCompression": False}]
+    for settings, expected in (
+            (None, "does not record the batch settings"),
+            ({k: v for k, v in BATCH_SETTINGS.items() if k != "codecOption"}, "codecOption"),
+            ({**BATCH_SETTINGS, "frameRateOption": ""}, "frameRateOption"),
+            # The protocol's originals are shared by every arm and must stay as they are.
+            ({**BATCH_SETTINGS, "replaceOriginals": True}, "Replace Originals off"),
+            ({k: v for k, v in BATCH_SETTINGS.items() if k != "replaceOriginals"}, "Replace Originals off"),
+            # A batch an instrumented test drove: its attempts were refused by the test, not measured.
+            ({**BATCH_SETTINGS, "testCandidateVeto": True}, "instrumented test")):
+        try:
+            r.ingest(m, "A0", _capture("b0", jobs, batch_settings=settings), "b0", tempfile.mkdtemp())
+        except SystemExit as exc:
+            assert expected in str(exc), (settings, exc)
+        else:
+            raise AssertionError(f"admitted a capture with batch settings {settings}")
 
 
 def test_report_separates_misalignment_from_measured_rejections():
