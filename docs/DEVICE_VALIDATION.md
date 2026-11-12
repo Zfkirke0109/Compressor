@@ -154,7 +154,10 @@ What to know before running it:
 - **The clip decides whether anything is tested.** Items 1 and 3 need a clip whose ladder selects
   a marginal trial on that device with its current learned state. Otherwise they are skipped and
   the script exits 2 (incomplete), never 0. The run log prints the rungs and verdicts it saw
-  (`b287-fallback …`).
+  (`b287-fallback …`), skipped or not.
+- **Only the full probe ladder can select one,** so the clip must be at most 1920 × 1088 pixels.
+  A larger source gets the short ladder, which does not bisect after a pass: when its first rung
+  passes there is no marginal rung below a passing one to try.
 - It budgets two full encodes of the clip per batch. Use a disposable copy; replace-original must
   be off and is asserted off; the copy's SHA-256 is compared before and after every batch.
 - It turns the opt-in safer-rung retry switch on (off for the control) and restores it afterwards.
@@ -399,3 +402,15 @@ metadata remux the padding reads 0 again and the configuration matches. The cont
   padding difference alone does not produce.
 - Nothing was relaxed. Whether a copy that differs from its source only in the padding written
   for it may pass is a decision about what identical audio means.
+
+**The fallback check** (`--fallback`, the same phone and build, a clip from the normal profile).
+All three batches made a real first full encode (encoded, finalized and structurally verified)
+and the test refused it; in each, the refusal was recorded as `test_rejected`, nothing
+was learned from it, every attempt was closed and the source was unchanged. Control 2 passed: with
+the retry experiment off, production kept the original after that one encode, left no candidate
+in the cache and started no second attempt. Items 1 and 3 were skipped: the clip's ladder measured
+one rung, 0.75, and it passed, so there was no marginal trial and no measured safer rung, and no
+retry was recorded after the refusal. One passing rung is what the short ladder gives a source above
+1920 × 1088; the report did not say the clip's size, because the script dropped the tests' printed
+lines from a run it judged incomplete. It now keeps them for every outcome. The encode that follows
+a refused trial at the safer measured ratio has still not run on a device.

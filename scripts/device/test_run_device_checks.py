@@ -10,7 +10,7 @@ import unittest
 
 
 class DeviceChecksTest(unittest.TestCase):
-    def run_checks(self, result, relative=False, installed=False, options=(), instrument_status=0):
+    def run_checks(self, result, relative=False, installed=False, options=(), instrument_status=0, logcat=""):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
@@ -30,6 +30,7 @@ class DeviceChecksTest(unittest.TestCase):
                 'fi\n'
                 'if [[ "$1 $2" == "shell date +%s.%N" ]]; then printf "1794198030.123456789\\r\\n"; fi\n'
                 'if [[ "$1 $2 $3" == "shell am instrument" ]]; then printf "%s\\n" "$TEST_RESULT"; exit "$INSTRUMENT_STATUS"; fi\n'
+                'if [[ "$1" == logcat ]]; then printf "%s\\n" "$LOGCAT_OUTPUT"; fi\n'
             )
             adb.chmod(0o755)
             clip = root / "camera clips" / "test.mp4"
@@ -43,7 +44,7 @@ class DeviceChecksTest(unittest.TestCase):
                 env={
                     **os.environ, "PATH": f"{root}:{os.environ['PATH']}", "TEST_RESULT": result,
                     "CALLS": str(calls), "ALREADY_INSTALLED": "1" if installed else "0",
-                    "INSTRUMENT_STATUS": str(instrument_status),
+                    "INSTRUMENT_STATUS": str(instrument_status), "LOGCAT_OUTPUT": logcat,
                 },
                 text=True, capture_output=True, check=False
             )
@@ -124,6 +125,24 @@ class DeviceChecksTest(unittest.TestCase):
         proc, report, _, _ = self.run_checks("FAILURES!!!\nTests run: 1,  Failures: 1", instrument_status=1)
         self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
         self.assertIn("FAILURES!!!", report)
+        self.assertIn("device checks failed", proc.stdout)
+
+    def test_an_incomplete_run_keeps_what_the_tests_printed(self):
+        # The fallback test prints each batch's rungs before it skips, which is what says which clip
+        # to try next, so an incomplete run collects those lines as a passing one does.
+        printed = ("11-12 21:41:30.000  1  2 I System.out: b287-fallback saferRetry=true refuse=[1] rungs=0.75:passed\n"
+                   "11-12 21:41:31.000  1  2 I System.out: something another test printed")
+        proc, report, _, _ = self.run_checks("INSTRUMENTATION_STATUS_CODE: -4\nOK (3 tests)", options=("--fallback",), logcat=printed)
+        self.assertEqual(2, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("b287-fallback saferRetry=true refuse=[1] rungs=0.75:passed", report)
+        self.assertNotIn("something another test printed", report)
+        self.assertIn("device checks incomplete", proc.stdout)
+
+    def test_a_failed_run_keeps_what_the_tests_printed(self):
+        printed = "11-12 21:41:30.000  1  2 I System.out: b287-timeline edit_tail_168.mp4 stage=source_edit_list"
+        proc, report, _, _ = self.run_checks("FAILURES!!!\nTests run: 1,  Failures: 1", logcat=printed)
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("b287-timeline edit_tail_168.mp4 stage=source_edit_list", report)
         self.assertIn("device checks failed", proc.stdout)
 
     def test_an_unknown_option_is_refused_before_anything_runs(self):

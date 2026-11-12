@@ -84,23 +84,33 @@ LOG_START="$(adb shell 'date +%s.%N' | tr -d '\r')"
     "$PKG.test/androidx.test.runner.AndroidJUnitRunner" ||
     echo "# am instrument exited with status $?"
 } | tee "$OUT"
+# The verdict is read from the instrumentation output alone, before anything else is appended.
+VERDICT=passed
 if grep -Eq 'FAILURES!!!|INSTRUMENTATION_FAILED:|^INSTRUMENTATION_STATUS_CODE: -[12][[:space:]]*$' "$OUT"; then
-  echo "device checks failed. See $OUT"
-  exit 1
-fi
-if grep -Eq '^INSTRUMENTATION_STATUS_CODE: -[34][[:space:]]*$|AssumptionViolated' "$OUT" ||
+  VERDICT=failed
+elif grep -Eq '^INSTRUMENTATION_STATUS_CODE: -[34][[:space:]]*$|AssumptionViolated' "$OUT" ||
    ! grep -Eq '^[[:space:]]*OK \([1-9][0-9]* tests?\)[[:space:]]*$' "$OUT"; then
-  if grep -q 'does not have permission to access user' "$OUT"; then
-    echo "the tests did not start: this device refuses the shell for user ${USER_ID:-0}; run them in the normal profile"
-  elif grep -q '^# am instrument exited with status' "$OUT"; then
-    echo "the tests did not start or did not finish: am instrument exited with an error"
-  fi
-  echo "device checks incomplete. See $OUT"
-  exit 2
+  VERDICT=incomplete
 fi
 # The b177 tests print what the platform reported (durations, window starts, record fields) to
 # System.out, which lands in logcat rather than the instrumentation output; the fallback test
 # prints each batch's rungs, attempts, retry and certification the same way, and the timeline test
-# what each stage counted.
+# what each stage counted. They are collected whatever the verdict: a skipped or failed run is when
+# they say most, such as which rungs a clip's ladder measured when it selected no marginal trial.
 adb logcat -t "$LOG_START" -s System.out:I | grep -E "b177-(fixture|evidence)|b287-(fallback|timeline)" | tee -a "$OUT" || true
+case "$VERDICT" in
+  failed)
+    echo "device checks failed. See $OUT"
+    exit 1
+    ;;
+  incomplete)
+    if grep -q 'does not have permission to access user' "$OUT"; then
+      echo "the tests did not start: this device refuses the shell for user ${USER_ID:-0}; run them in the normal profile"
+    elif grep -q '^# am instrument exited with status' "$OUT"; then
+      echo "the tests did not start or did not finish: am instrument exited with an error"
+    fi
+    echo "device checks incomplete. See $OUT"
+    exit 2
+    ;;
+esac
 echo "device checks passed; see $OUT"
