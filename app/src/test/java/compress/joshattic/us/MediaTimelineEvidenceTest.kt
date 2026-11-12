@@ -115,6 +115,29 @@ class MediaTimelineEvidenceTest {
         assertFalse(result.outputHasExtraFirstPacket)
     }
 
+    @Test fun eachPayloadHashCoversEveryPacketItsTrackHolds() {
+        fun sha256(packets: List<AudioPacketEvidence.Packet>): String {
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            packets.forEach { digest.update(it.payload) }
+            return digest.digest().joinToString("") { "%02x".format(it) }
+        }
+        // An output without the source's last packet: the counts differ, so the hashes beside them
+        // must too. They used to stop where the shorter track ended and read equal.
+        val shortOutput = AudioPacketEvidence.compare(aac(50).iterator(), aac(49).iterator(), "config", "config", 0, 0)
+        assertEquals(50 to 49, shortOutput.sourcePackets to shortOutput.outputPackets)
+        assertEquals(sha256(aac(50)), shortOutput.sourceHash)
+        assertEquals(sha256(aac(49)), shortOutput.outputHash)
+        assertNotEquals(shortOutput.sourceHash, shortOutput.outputHash)
+        // The mirror case, several packets long, and the one-packet offset of b213's shape.
+        val longOutput = AudioPacketEvidence.compare(aac(47).iterator(), aac(50).iterator(), "config", "config", 0, 0)
+        assertEquals(sha256(aac(47)) to sha256(aac(50)), longOutput.sourceHash to longOutput.outputHash)
+        val offset = AudioPacketEvidence.compare(aac(342).iterator(), aac(341, first = 1).iterator(), "configA", "configB", 0, 0)
+        assertEquals(sha256(aac(342)) to sha256(aac(341, first = 1)), offset.sourceHash to offset.outputHash)
+        // Equal tracks still hash equal.
+        val same = AudioPacketEvidence.compare(aac(50).iterator(), aac(50).iterator(), "config", "config", 0, 0)
+        assertEquals(sha256(aac(50)) to sha256(aac(50)), same.sourceHash to same.outputHash)
+    }
+
     @Test fun anExtraLeadingPacketIsToldApartFromAMissingOne() {
         val result = AudioPacketEvidence.compare(aac(341, first = 1).iterator(), aac(342).iterator(), "config", "config", 0, 0)
         assertFalse(result.identical)

@@ -15,6 +15,8 @@ import java.security.MessageDigest
 object AudioPacketEvidence {
     data class Packet(val payload: ByteArray, val ptsUs: Long, val flags: Int)
     data class Result(val identical: Boolean, val packets: Int, val bytes: Long = 0,
+        // SHA-256 over every payload of that side's track, in order, past the other side's end too,
+        // so each describes the track whose packet count stands beside it.
         val sourceHash: String? = null, val outputHash: String? = null,
         val maxSkewUs: Long = 0, val firstMismatch: Int? = null, val reason: String? = null,
         // What a single reason hides (a differing configuration is reported first and used to be
@@ -94,12 +96,14 @@ object AudioPacketEvidence {
             // The one packet after the common run decides the offset-by-one question for it.
             if (source.hasNext()) {
                 val next = source.next()
+                sourceDigest.update(next.payload)
                 sourcePackets++
                 previousOutput?.let { if (!it.contentEquals(next.payload)) lacksFirst = false }
-                while (source.hasNext()) { source.next(); sourcePackets++ }
+                while (source.hasNext()) { sourceDigest.update(source.next().payload); sourcePackets++ }
             }
             while (output.hasNext()) {
                 val next = output.next()
+                outputDigest.update(next.payload)
                 if (outputPackets == packets) previousSource?.let { if (!it.contentEquals(next.payload)) extraFirst = false }
                 outputPackets++
             }
