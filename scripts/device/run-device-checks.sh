@@ -6,7 +6,7 @@
 # The batch test leaves replace-original off and checks the source hash afterwards.
 #
 # Usage:
-#   scripts/device/run-device-checks.sh [--installed] CLIP.mp4 [ANDROID_USER]
+#   scripts/device/run-device-checks.sh [--installed] [--fallback] CLIP.mp4 [ANDROID_USER]
 #
 #   CLIP.mp4      a short (10-30 s) SDR H.264/HEVC clip with AAC audio. It is pushed to
 #                 /data/local/tmp and read by the test through the shell; it is never uploaded
@@ -14,6 +14,15 @@
 #   ANDROID_USER  optional user id (150 for the Secure Folder profile the batches run in). The
 #                 debug APK and its test APK must be installed for that user.
 #   --installed   use a matched app and test APK pair already installed for that user.
+#   --fallback    run only SaferRungFallbackDeviceTest instead: three real Perceptually Lossless
+#                 batches over CLIP in which a test's candidate veto refuses a first full encode,
+#                 so the retry at the safer measured ratio runs with real encodes and its own
+#                 verification and certification. CLIP must be one whose probe ladder selects a
+#                 marginal trial on this device (a lower rung that only clears the bar under a
+#                 higher one that passes); otherwise the run is reported incomplete. Budget two
+#                 full encodes of CLIP per batch. The opt-in safer-rung retry switch is turned on
+#                 for the run and put back afterwards; replace-original must be off. Writes
+#                 CLIP.fallback-checks.txt.
 #
 # Writes the instrumentation output next to the clip as CLIP.device-checks.txt.
 # Exit 2 means the validation was incomplete (skipped tests, zero tests or missing results).
@@ -21,11 +30,16 @@
 # scripts/diagnostics/resilient_capture.sh; start that first to keep the Compressor* log tags.
 set -euo pipefail
 INSTALL_LOCAL=true
-if [[ "${1:-}" == --installed ]]; then
-  INSTALL_LOCAL=false
+FALLBACK=false
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --installed) INSTALL_LOCAL=false ;;
+    --fallback) FALLBACK=true ;;
+    *) echo "unknown option: $1" >&2; exit 64 ;;
+  esac
   shift
-fi
-CLIP="${1:?usage: run-device-checks.sh [--installed] CLIP.mp4 [ANDROID_USER]}"
+done
+CLIP="${1:?usage: run-device-checks.sh [--installed] [--fallback] CLIP.mp4 [ANDROID_USER]}"
 CLIP_DIR="$(cd -- "$(dirname -- "$CLIP")" && pwd -P)"
 CLIP="$CLIP_DIR/$(basename -- "$CLIP")"
 USER_ID="${2:-}"
@@ -34,6 +48,10 @@ TEST_PACKAGE=compress.joshattic.us
 TEST_CLASSES="$TEST_PACKAGE.PipelineDeviceTest,$TEST_PACKAGE.ProductionEvidenceDeviceTest,$TEST_PACKAGE.FramePackingDeviceTest"
 REMOTE="/data/local/tmp/compressor_smoke_$$.mp4"
 OUT="${CLIP%.*}.device-checks.txt"
+if "$FALLBACK"; then
+  TEST_CLASSES="$TEST_PACKAGE.SaferRungFallbackDeviceTest"
+  OUT="${CLIP%.*}.fallback-checks.txt"
+fi
 CLIP_SHA="$(sha256sum "$CLIP" | cut -c1-16)"
 
 adb get-state >/dev/null
@@ -69,6 +87,7 @@ if grep -Eq '^INSTRUMENTATION_STATUS_CODE: -[34][[:space:]]*$|AssumptionViolated
   exit 2
 fi
 # The b177 tests print what the platform reported (durations, window starts, record fields) to
-# System.out, which lands in logcat rather than the instrumentation output.
-adb logcat -t "$LOG_START" -s System.out:I | grep -E "b177-(fixture|evidence)" | tee -a "$OUT" || true
+# System.out, which lands in logcat rather than the instrumentation output; the fallback test
+# prints each batch's rungs, attempts, retry and certification the same way.
+adb logcat -t "$LOG_START" -s System.out:I | grep -E "b177-(fixture|evidence)|b287-fallback" | tee -a "$OUT" || true
 echo "device checks passed; see $OUT"

@@ -49,6 +49,9 @@ object CertificationStatus {
     const val SKIPPED_CODEC_DOWNGRADE = "skipped_output_codec_is_a_downgrade"
     const val SKIPPED_VMAF_UNAVAILABLE = "skipped_vmaf_native_unavailable"
     const val SKIPPED_GEOMETRY_ABOVE_CAP = "skipped_geometry_above_pixel_scoring_cap"
+    // An instrumented test's CandidateVeto refused the candidate before it was scored. Never
+    // written by the app, whose view model is built with a veto that refuses nothing.
+    const val SKIPPED_TEST_VETO = "skipped_refused_by_test_candidate_veto"
 
     /**
      * Why [pixelCertifiable] was false, or null when it was true.

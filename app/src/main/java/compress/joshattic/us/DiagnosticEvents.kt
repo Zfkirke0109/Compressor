@@ -52,6 +52,8 @@ data class StageEvent(
         const val CERT_UNAVAILABLE = "cert_unavailable"
         const val CERT_MISALIGNED = "cert_misaligned"
         const val CERT_PARTIAL = "cert_partial_unavailable"
+        /** An instrumented test's CandidateVeto refused the candidate; nothing was scored. Never written by the app. */
+        const val CERT_TEST_REJECTED = "cert_test_rejected"
         const val RUNG_MEASURED = "rung_measured"
         const val RUNG_MISALIGNED = "rung_misaligned"
         const val RUNG_UNAVAILABLE = "rung_unavailable"

@@ -220,6 +220,7 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "replacements": replacements(session),
         "frameCountChanges": frame_count_changes(session),
         "audioPacketDifferences": audio_packet_differences(session),
+        "testInjection": test_injection(session),
         "silentRejections": len(silent_rejections),
         "learnedStateIdentity": (start or {}).get("learnedStateIdentity"),
         "terminals": dict(terminals.most_common()),
@@ -316,6 +317,8 @@ def safer_rung_retries(jobs: list[dict[str, Any]], stages: list[dict[str, Any]] 
         return None
     return {
         "retried": len(rows),
+        # A retry an instrumented test provoked (CandidateVeto) is not a recovered quality failure.
+        "afterTestRejection": sum(1 for _, o, _ in rows if o and o[0] == "test_rejected"),
         "certifiedAfterRetry": sum(1 for _, _, j in rows if j is not None and j.get("countsAsRealCompression") is True),
         "secondAttemptOutcomes": dict(Counter(o[1] for _, o, _ in rows if len(o) > 1).most_common()),
         "terminals": dict(Counter(str(j.get("terminal")) if j is not None else "CANCELLED" for _, _, j in rows).most_common()),
@@ -848,6 +851,28 @@ def audio_packet_differences(session: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def test_injection(session: dict[str, Any]) -> dict[str, Any] | None:
+    """Whether an instrumented test refused candidates in this session (the app's CandidateVeto).
+
+    The app's own view model is built with a veto that refuses nothing, so a batch a person ran
+    has neither marker and this is None. SaferRungFallbackDeviceTest builds its own to make a first
+    full encode fail on demand: its `run_identity` carries `batchSettings.testCandidateVeto`, each
+    refused attempt has a `certify` stage with reason `cert_test_rejected` (nothing was scored) and
+    a ledger outcome of `test_rejected`. Such a session's retries, kept originals and terminals
+    describe the test, not the media, and must not be pooled with field captures.
+    """
+    settings = (session.get("identity") or {}).get("batchSettings")
+    installed = isinstance(settings, dict) and settings.get("testCandidateVeto") is True
+    refused = [r for r in session.get("stages", []) if r.get("stage") == "certify" and r.get("reasonCode") == "cert_test_rejected"]
+    if not installed and not refused:
+        return None
+    return {
+        "vetoInstalled": installed,
+        "refusedAttempts": [{"jobId": r.get("jobId"), "attemptIndex": r.get("attemptIndex"), "usedRatio": r.get("usedRatio"),
+                             "reason": r.get("injectedRejection")} for r in refused],
+    }
+
+
 def replacements(session: dict[str, Any]) -> dict[str, Any]:
     """Replacement requests and how each ended, from the `replace` stage and the batch settings.
 
@@ -925,7 +950,16 @@ def v1_shadow_pairs(jobs: list[dict[str, Any]]) -> list[tuple[float, float]]:
 
 
 def render(s: dict[str, Any]) -> str:
-    out = [
+    out = []
+    injection = s.get("testInjection")
+    if injection:
+        refused = injection["refusedAttempts"]
+        out.append(f"  !! TEST CAPTURE : an instrumented test's candidate veto "
+                   f"{'was installed' if injection['vetoInstalled'] else 'refused candidates (no run identity marker)'};"
+                   f" {len(refused)} attempt(s) were refused by the test, not by a measurement"
+                   + (": " + ", ".join(f"{r['jobId']} attempt {r['attemptIndex']} at {r['usedRatio']}" for r in refused[:8]) if refused else "")
+                   + ". Not field evidence.")
+    out += [
         f"  batch          : {s['batchId']}  build={s['buildCommit']}  mode={s['mode']}",
         f"  jobs           : {s['jobs']}",
         f"  source bytes   : {s['sourceBytes']:,}",
@@ -1012,6 +1046,8 @@ def render(s: dict[str, Any]) -> str:
         out.append(
             f"  safer-rung retry: {retries['retried']} job(s) retried, {retries['certifiedAfterRetry']} certified after retry;"
             f" second attempts {retries.get('secondAttemptOutcomes')}; {retries['terminals']}"
+            + (f"; {retries['afterTestRejection']} followed a test's refusal, not a measured failure"
+               if retries.get("afterTestRejection") else "")
         )
     audio = s.get("audioClaims") or {}
     if audio.get("requestedCopyObservedOther"):

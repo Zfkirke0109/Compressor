@@ -244,7 +244,15 @@ data class BatchCompressorUiState(
 }
 
 @OptIn(UnstableApi::class)
-class BatchCompressorViewModel(application: Application) : AndroidViewModel(application) {
+class BatchCompressorViewModel internal constructor(
+    application: Application,
+    // Refuses nothing in the app (CandidateVeto.NONE). Only an instrumented test supplies another.
+    private val candidateVeto: CandidateVeto
+) : AndroidViewModel(application) {
+
+    /** The constructor the app's ViewModel factory uses: no candidate veto. */
+    constructor(application: Application) : this(application, CandidateVeto.NONE)
+
     private val _uiState = MutableStateFlow(BatchCompressorUiState())
     val uiState = _uiState.asStateFlow()
 
@@ -1043,6 +1051,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // Every full encode of this job, append-only, each finished exactly once (b177 F3).
         val ledger = AttemptLedger()
         var certificationDecision: compress.joshattic.us.quality.CertificationDecision? = null
+        // Why a test's CandidateVeto refused the current attempt; always null in the app.
+        var injectedRejection: String? = null
         // Safer-rung retry (SaferRungRetry): retries used, and the size check's overshoot for it.
         var retriesThisItem = 0
         var retryOvershoot: Double? = null
@@ -1064,6 +1074,7 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             floorRecoveryDecision = null
             pixelCertifiedThisRun = false
             certificationDecision = null
+            injectedRejection = null
             diagnosticCertWindowScores = null
             diagnosticCertBandingDiag = null
             diagnosticCertV1Scores = null
@@ -1155,7 +1166,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                 "codecOption" to codec.name,
                 "frameRateOption" to frameRate.name,
                 "exhaustivePerceptualLossless" to exhaustivePerceptualLossless
-            )
+            ).also {
+                // An instrumented test's batch: attempts may be refused by the test, not by a
+                // measurement. Absent from every batch the app itself runs.
+                if (candidateVeto !== CandidateVeto.NONE) it["testCandidateVeto"] = true
+            }
         }
         _uiState.value.items.filter { it.isAlreadyCompressed }.forEach { skippedItem ->
             recordDiagnosticJob(
@@ -2379,7 +2394,9 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         when (certifyPixels(s)) {
             CertStep.CONTINUE -> Unit
             CertStep.ENDED -> return false
-            CertStep.RETRY -> return retrySaferRung(s, "certification ${s.certificationDecision?.wire}")
+            CertStep.RETRY -> return retrySaferRung(
+                s, if (s.injectedRejection != null) "a test's candidate veto" else "certification ${s.certificationDecision?.wire}"
+            )
         }
         if (!applyPerceptualVerdict(s)) return false
         return true
@@ -2670,7 +2687,12 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             plannedWindows = QualityProbePolicy.probeWindows(item.durationMs * 1000L, QualityProbePolicy.windowDurationUs(item.originalFps.toDouble())).size,
             width = item.originalWidth, height = item.originalHeight
         )
-        val certOutcome = if (!perceptualPlan.pixelCertifiable) PairScoreOutcome.Unavailable else
+        // Test seam, inert in the app (CandidateVeto.NONE refuses nothing). A refused candidate is
+        // not scored: the outcome handed on is "unavailable", which no certification basis accepts,
+        // and CandidateVeto.stands keeps a veto from ever standing in for a pass.
+        val vetoReason = candidateVeto.reject(s.ledger.currentIndex, perceptualPlan.targetRatio)
+        s.injectedRejection = vetoReason
+        val certOutcome = if (vetoReason != null || !perceptualPlan.pixelCertifiable) PairScoreOutcome.Unavailable else
             s.floorRecoveryCertScores?.let { PairScoreOutcome.Scored(it) }
             ?: qualityProber.certify(
                 item.sourceUri, outputFile, item.durationMs, item.originalFps.toDouble(),
@@ -2692,26 +2714,28 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             defaultRatio = perceptualPlan.defaultRatio,
             outcome = certOutcome
         )
-        val certOk = gate.accepted
+        val certOk = CandidateVeto.stands(gate.accepted, vetoReason)
         // What the outcome is evidence of (CertificationDecision). It decides what a non-pass is
         // called and taught.
         val decision = gate.decision
         s.certificationDecision = decision
         // Pixel proof requires BOTH a pass AND a fully measured sample — see
         // QualityProbePolicy.isPixelCertified.
-        s.diagnosticCertStatus = CertificationStatus.forOutcome(certOutcome)
+        s.diagnosticCertStatus = if (vetoReason != null) CertificationStatus.SKIPPED_TEST_VETO
+            else CertificationStatus.forOutcome(certOutcome)
         s.pixelCertifiedThisRun = gate.pixelCertified
         DiagLog.i(
             "CompressorProbe",
             "certification; job=${diagnosticJobId(item)}; usedRatio=${perceptualPlan.targetRatio}; " +
-                "windows=${certScores?.size ?: 0}; pass=$certOk; decision=${decision.wire}; " +
-                "scores=${certScores?.joinToString { "%.1f/%.1f/%.1f".format(java.util.Locale.US, it.mean, it.p5, it.min) } ?: "unmeasured"}"
+                "windows=${certScores?.size ?: 0}; pass=$certOk; decision=${if (vetoReason != null) CandidateVeto.WIRE else decision.wire}; " +
+                "scores=${certScores?.joinToString { "%.1f/%.1f/%.1f".format(java.util.Locale.US, it.mean, it.p5, it.min) } ?: "unmeasured"}" +
+                (vetoReason?.let { "; refused by a test's candidate veto: $it" } ?: "")
         )
         run.diagnostics.stage(
             StageEvent(
                 sourceKey = item.sourceUri.toString(), attempt = s.phases.token.attempt, attemptIndex = s.ledger.currentIndex,
                 stage = StageEvent.Stage.CERTIFY,
-                reasonCode = when (decision) {
+                reasonCode = if (vetoReason != null) StageEvent.Reason.CERT_TEST_REJECTED else when (decision) {
                     CertificationDecision.PASSED -> StageEvent.Reason.CERT_PASSED
                     CertificationDecision.MEASURED_FAILURE -> StageEvent.Reason.CERT_MEASURED_FAILURE
                     CertificationDecision.INSUFFICIENT_EVIDENCE -> StageEvent.Reason.CERT_INSUFFICIENT
@@ -2729,7 +2753,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                     "configId" to s.ledger.current?.configId,
                     "shadowV1" to shadow.reason,
                     "plannedWindows" to (certOutcome as? PairScoreOutcome.Incomplete)?.plannedWindows
-                ) + StageEvent.windowFields("cert", certScores)
+                ) + StageEvent.windowFields("cert", certScores) +
+                    (vetoReason?.let { mapOf("injectedRejection" to it) } ?: emptyMap())
             )
         )
         if (certOk) return CertStep.CONTINUE
@@ -2741,6 +2766,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         // visibly lose quality" and the learning engine is not told anything.
         val certMeasured = decision.isMeasuredNegative
         val certReason = when {
+            vetoReason != null ->
+                "candidate refused by an instrumented test before pixel certification ($vetoReason); nothing was measured"
             decision == CertificationDecision.MISALIGNED ->
                 "pixel certification rejected: output frames could not be " +
                     "time-aligned with the source (frame loss or retiming)"
@@ -2765,7 +2792,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
         s.diagnosticDiscardedVideoBitrate = s.encodeAttempt?.reportedAverageVideoBitrate?.takeIf { it > 0 }
         // Learning, once per attempt: this attempt's measured failure is recorded here and nowhere
         // else, whether or not a retry follows. A retry is a separate attempt at a separate ratio.
-        val learned = CertificationFailure.learn(
+        // A test's veto is not an observation of this output: nothing is written for it at all.
+        val learned = if (vetoReason != null) null else CertificationFailure.learn(
             learningEngine, decision, perceptualPlan.profileKey, perceptualPlan.targetRatio,
             certReason, perceptualPlan.floorRatio, s.measuredOvershoot,
             observationFor(s, LearningObservation.Kind.VISUAL_REJECT)
@@ -2780,10 +2808,11 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             DiagLog.i(
                 "CompressorLearning",
                 "result=unmeasured; profileKey=${perceptualPlan.profileKey.asKey()}; usedRatio=${perceptualPlan.targetRatio}; " +
-                    "decision=${decision.wire}; reason=$certReason; learned state unchanged (no evidence)"
+                    "decision=${if (vetoReason != null) CandidateVeto.WIRE else decision.wire}; reason=$certReason; " +
+                    "learned state unchanged (no evidence)"
             )
         }
-        s.ledger.finish(decision.wire, s.outputSize, s.lastEncodeMs)
+        s.ledger.finish(if (vetoReason != null) CandidateVeto.WIRE else decision.wire, s.outputSize, s.lastEncodeMs)
         runCatching { outputFile.delete() }
         if (saferRungRetryAllowed(s, decision)) return CertStep.RETRY
         recordDiagnosticJob(
@@ -2814,7 +2843,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
             certBandingDiag = s.diagnosticCertBandingDiag,
             certV1Scores = s.diagnosticCertV1Scores,
             certificationStatus = s.diagnosticCertStatus,
-            certificationDecision = decision,
+            // Certification did not run on a candidate a test refused: no decision, not "unavailable".
+            certificationDecision = decision.takeIf { vetoReason == null },
             encoderConfig = s.encodeAttempt?.configDelta?.compact(),
             media3Input = s.diagnosticMedia3Input,
             precedingCooldownMs = s.precedingHandoffCooldownMs,
@@ -2928,7 +2958,8 @@ class BatchCompressorViewModel(application: Application) : AndroidViewModel(appl
                         "denial" to denial, "usedRatio" to plan.targetRatio, "saferRatio" to safer,
                         "predictedBytes" to predicted, "overshootPreClamp" to overshoot,
                         "thermalStatus" to thermal, "freeBytes" to free, "lastEncodeMs" to s.lastEncodeMs,
-                        "trigger" to (decision?.wire ?: "candidate_verification_failed")
+                        "trigger" to (if (s.injectedRejection != null) CandidateVeto.WIRE
+                            else decision?.wire ?: "candidate_verification_failed")
                     )
                 )
             )

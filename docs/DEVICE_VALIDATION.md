@@ -118,3 +118,53 @@ phone can show now:
 5. Settings to confirm before each arm (Settings, Experiments): safer-rung retry, B-frames, longer
    keyframe interval, VMAF v1 shadow calibration, and (on for every arm when no computer can hash
    the originals) Pilot: full source hash. The `run_identity` record repeats them.
+
+## 6. The fallback after a rejected first encode (v1.6.287 round)
+
+The Secure Folder run of v1.6.287 selected one marginal trial (`job_1e25c8805630`: 0.75 only
+cleared the bar, 0.80 passed with the selection margin) and its 0.75 encode certified. The encode
+that follows a rejected trial, at the safer measured ratio, has therefore never run on a device.
+A real first-encode failure cannot be produced on demand, so `SaferRungFallbackDeviceTest` refuses
+the first candidate with a test-only `CandidateVeto` and lets production do everything after it:
+
+```sh
+scripts/device/run-device-checks.sh --fallback /path/to/disposable_copy.mp4 150
+scripts/device/run-device-checks.sh --installed --fallback /path/to/disposable_copy.mp4 150
+```
+
+It runs three real Perceptually Lossless batches over a copy of the clip in the app's cache and
+writes `disposable_copy.fallback-checks.txt`:
+
+1. the first encode is refused, the retry is decided by `SaferRungRetry`, and the second encode is
+   verified, certified and accepted or kept as the original by the unchanged rules. The test does
+   not decide that verdict: it checks that an acceptance rests on every planned window with at
+   least 12 compared frames and mean 95.5 / p5 91 / min 84, and that either way the attempt ledger
+   has two closed attempts and no refused candidate is left in the cache;
+2. control: with the retry experiment off, a refusal keeps the original after one encode;
+3. control: a second refusal keeps the original and never starts a third encode.
+
+What to know before running it:
+
+- **The clip decides whether anything is tested.** Items 1 and 3 need a clip whose ladder selects
+  a marginal trial on that device with its current learned state. Otherwise they are skipped and
+  the script exits 2 (incomplete), never 0. The run log prints the rungs and verdicts it saw
+  (`b287-fallback …`).
+- It budgets two full encodes of the clip per batch. Use a disposable copy; replace-original must
+  be off and is asserted off; the copy's SHA-256 is compared before and after every batch.
+- It turns the opt-in safer-rung retry switch on (off for the control) and restores it afterwards.
+- Starting a batch clears the app's cached outputs, as it does in the app: run it when no results
+  are waiting to be saved.
+- The real second encode's result reaches the learned profile exactly as it would in the app. A
+  refused attempt writes nothing there, and its records say what it was: `run_identity` carries
+  `batchSettings.testCandidateVeto`, the attempt's `certify` stage has reason `cert_test_rejected`
+  and its ledger outcome is `test_rejected`. `parse_session_jsonl.py` opens such a session's
+  report with `!! TEST CAPTURE`. Do not pool these sessions with field captures.
+
+The veto cannot make a candidate pass and the app never installs one: the app's view model is
+built with the veto that refuses nothing, `CandidateVetoTest` fails the unit tests if the main
+source set gains another, and the CI build reads the packaged app's DEX for a second
+implementation (`scripts/ci/verify_no_test_veto.py`).
+
+Not covered by this check: the retry after a candidate fails structural verification (the other
+trigger of the same fallback), and the learning write a real measured failure makes. Both remain
+covered by JVM tests only.

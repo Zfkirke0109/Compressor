@@ -866,5 +866,48 @@ def test_an_audio_packet_difference_says_what_differed_or_that_it_was_not_record
     assert "configuration differs in sampleRate, csd0Hex" in text and "audio packets: same" not in text
 
 
+def test_a_capture_from_the_candidate_veto_test_is_marked_and_its_retry_is_not_a_recovered_failure():
+    path = write([
+        start(),
+        {"type": "run_identity", "batchId": "b1", "batchSettings": {"replaceOriginals": False, "testCandidateVeto": True}},
+        {"type": "stage", "batchId": "b1", "jobId": "j", "stage": "certify", "reasonCode": "cert_test_rejected", "attemptIndex": 1,
+         "usedRatio": 0.75, "accepted": False, "pixelCertified": False, "injectedRejection": "first full encode refused"},
+        {"type": "stage", "batchId": "b1", "jobId": "j", "stage": "retry", "reasonCode": "retry_allowed", "attemptIndex": 1,
+         "usedRatio": 0.75, "saferRatio": 0.8, "trigger": "test_rejected"},
+        {"type": "stage", "batchId": "b1", "jobId": "j", "stage": "certify", "reasonCode": "cert_passed", "attemptIndex": 2,
+         "usedRatio": 0.8, "accepted": True, "pixelCertified": True},
+        job("j", batchId="b1", jobId="j", terminal="TRANSCODED_SMALLER", countsAsRealCompression=True, verified=True,
+            outputSize=800, sourceSize=1000, attemptsStarted=2,
+            attempts="0.75:test_rejected:cand=760:encodeMs=9000:n=1:token=1;0.80:accepted:cand=800:encodeMs=9400:n=2:token=2"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["testInjection"] == {"vetoInstalled": True, "refusedAttempts": [
+        {"jobId": "j", "attemptIndex": 1, "usedRatio": 0.75, "reason": "first full encode refused"}]}, s["testInjection"]
+    assert s["saferRungRetries"]["retried"] == 1 and s["saferRungRetries"]["afterTestRejection"] == 1
+    from parse_session_jsonl import render
+    text = render(s)
+    assert text.startswith("  !! TEST CAPTURE : an instrumented test's candidate veto was installed; 1 attempt(s) were refused by the test"), text[:200]
+    assert "j attempt 1 at 0.75. Not field evidence." in text
+    assert "1 followed a test's refusal, not a measured failure" in text
+
+
+def test_a_batch_the_app_ran_carries_no_test_marker():
+    path = write([
+        start(),
+        {"type": "run_identity", "batchId": "b1", "batchSettings": {"replaceOriginals": False}},
+        {"type": "stage", "batchId": "b1", "jobId": "j", "stage": "certify", "reasonCode": "cert_unavailable", "attemptIndex": 1},
+        job("j", batchId="b1", jobId="j", terminal="TRANSCODED_SMALLER", countsAsRealCompression=True, verified=True,
+            outputSize=800, sourceSize=1000, attemptsStarted=2,
+            attempts="0.85:measured_below_bar:cand=760:encodeMs=9000;0.90:accepted:cand=800:encodeMs=9400"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["testInjection"] is None
+    assert s["saferRungRetries"]["afterTestRejection"] == 0
+    from parse_session_jsonl import render
+    assert "TEST CAPTURE" not in render(s) and "test's refusal" not in render(s)
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

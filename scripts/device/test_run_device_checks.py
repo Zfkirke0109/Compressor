@@ -10,7 +10,7 @@ import unittest
 
 
 class DeviceChecksTest(unittest.TestCase):
-    def run_checks(self, result, relative=False, installed=False):
+    def run_checks(self, result, relative=False, installed=False, options=()):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
@@ -37,7 +37,7 @@ class DeviceChecksTest(unittest.TestCase):
             clip.write_bytes(b"synthetic clip")
             arg = str(clip.relative_to(root) if relative else clip)
             calls = root / "calls.txt"
-            args = ["--installed", arg, "150"] if installed else [arg]
+            args = [*options, "--installed", arg, "150"] if installed else [*options, arg]
             proc = subprocess.run(
                 ["bash", str(script), *args], cwd=root,
                 env={
@@ -46,7 +46,7 @@ class DeviceChecksTest(unittest.TestCase):
                 },
                 text=True, capture_output=True, check=False
             )
-            report = clip.with_suffix(".device-checks.txt")
+            report = clip.with_suffix(".fallback-checks.txt" if "--fallback" in options else ".device-checks.txt")
             return (
                 proc, report.read_text() if report.exists() else None,
                 hashlib.sha256(clip.read_bytes()).hexdigest()[:16],
@@ -81,6 +81,35 @@ class DeviceChecksTest(unittest.TestCase):
         self.assertIn("compress.joshattic.us.FramePackingDeviceTest", instrument)
         self.assertNotIn("logcat -c", calls)
         self.assertTrue(any("logcat -t 1794198030.123456789 " in call for call in calls))
+
+
+    def test_fallback_mode_runs_only_the_fallback_test_and_writes_its_own_report(self):
+        proc, report, digest, calls = self.run_checks("OK (3 tests)", installed=True, options=("--fallback",))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        instrument = next(call for call in calls if call.startswith("shell am instrument "))
+        self.assertIn("-e class compress.joshattic.us.SaferRungFallbackDeviceTest -e sourceVideo ", instrument)
+        self.assertNotIn("PipelineDeviceTest", instrument)
+        self.assertIn("--user 150", instrument)
+        self.assertIn(f"sha256={digest}", report)
+        self.assertFalse(any(call.startswith("install ") for call in calls))
+
+    def test_the_default_run_does_not_include_the_fallback_test(self):
+        _, _, _, calls = self.run_checks("OK (1 test)")
+        instrument = next(call for call in calls if call.startswith("shell am instrument "))
+        self.assertNotIn("SaferRungFallbackDeviceTest", instrument)
+
+    def test_a_fallback_run_without_a_marginal_trial_is_incomplete_not_passed(self):
+        # The test skips (assumption) when the clip's ladder selects no marginal trial.
+        proc, report, _, _ = self.run_checks("INSTRUMENTATION_STATUS_CODE: -4\nOK (3 tests)", options=("--fallback",))
+        self.assertEqual(2, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIsNotNone(report)
+
+    def test_an_unknown_option_is_refused_before_anything_runs(self):
+        proc, report, _, calls = self.run_checks("OK (1 test)", options=("--falback",))
+        self.assertEqual(64, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("unknown option: --falback", proc.stderr)
+        self.assertEqual([], calls)
+        self.assertIsNone(report)
 
 
 if __name__ == "__main__":

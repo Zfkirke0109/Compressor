@@ -78,6 +78,10 @@ jobs:
       - name: Gate generated DEX method sizes
         run: python3 scripts/ci/verify_dex_method_budget.py app/build/outputs/apk/debug/*.apk
 
+      # The app APK only: the instrumentation APK holds the fallback test's refusing veto by design.
+      - name: Gate the app against a candidate veto other than the one that refuses nothing
+        run: python3 scripts/ci/verify_no_test_veto.py app/build/outputs/apk/debug/app-debug.apk
+
       - name: Compile Android instrumentation tests
         run: ./gradlew :app:compileDebugAndroidTestKotlin --console=plain
 
