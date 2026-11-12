@@ -19,14 +19,24 @@ def features(previous, current, width):
                 bandingRisk=sum(0<g<=3 for g in gradients)/len(gradients))
 
 
+def decode_command(source, w, h):
+    """The FFmpeg command that decodes the feature frames.
+
+    It maps 0:v:0 explicitly. Left to itself FFmpeg picks the video stream of highest resolution,
+    which in a file with two video tracks need not be the one whose geometry ffprobe was asked for
+    above, nor the one scoring_parity.py scores (it maps 0:v:0 too): the proposed windows would
+    then describe a track nothing else looks at.
+    """
+    return ['ffmpeg','-nostdin','-v','error','-noautorotate','-i',str(source),'-map','0:v:0','-an',
+            '-vf',f'fps=2,scale={w}:{h},format=gray','-f','rawvideo','-pix_fmt','gray','pipe:1']
+
+
 def measure(source):
     meta=json.loads(subprocess.check_output(['ffprobe','-v','error','-select_streams','v:0',
-        '-show_entries','stream=width,height','-of','json',str(source)],text=True))['streams'][0]
+        '-show_entries','stream=width,height','-of','json',str(source)],text=True,stdin=subprocess.DEVNULL))['streams'][0]
     scale=min(160/meta['width'],160/meta['height'])
     w=max(2,int(meta['width']*scale)//2*2);h=max(2,int(meta['height']*scale)//2*2)
-    command=['ffmpeg','-v','error','-noautorotate','-i',str(source),'-an','-vf',f'fps=2,scale={w}:{h},format=gray',
-             '-f','rawvideo','-pix_fmt','gray','pipe:1']
-    process=subprocess.Popen(command,stdout=subprocess.PIPE)
+    process=subprocess.Popen(decode_command(source,w,h),stdout=subprocess.PIPE,stdin=subprocess.DEVNULL)
     previous=None;windows=[];bucket=[];index=0
     try:
         while True:
@@ -47,7 +57,7 @@ def measure(source):
     return dict(schemaVersion=1,researchOnly=True,sourceSha256=digest.hexdigest(),sampledFrames=index,
                 featureRaster=[w,h],featureRate=2,windows=windows,selected=hard_windows(windows),
                 trailingPartialWindowOmittedFrames=len(bucket),
-                ffmpegVersion=subprocess.check_output(['ffmpeg','-version'],text=True).splitlines()[0],
+                ffmpegVersion=subprocess.check_output(['ffmpeg','-version'],text=True,stdin=subprocess.DEVNULL).splitlines()[0],
                 calibration='none; compare with fixed and whole-file audits before Android integration')
 
 if __name__=='__main__':

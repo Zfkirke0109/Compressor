@@ -45,6 +45,9 @@ SETTINGS = ("maxBFrames", "longGop", "saferRungRetry", "shadowCalibration")
 # None of these is an arm: an arm that also changed codec, frame rate, mode or metadata handling
 # would be credited with that change's bytes, so every arm must record them and record them equal.
 BATCH_SETTINGS = ("quality", "codecOption", "frameRateOption", "metadataPrivacy")
+# The phone and platform an arm ran on (session_start). A hardware encoder is part of the result:
+# an arm run on another model or Android version differs from the baseline in more than its factor.
+DEVICE = ("manufacturer", "deviceModel", "sdkInt")
 
 
 def _batch_settings(identity: dict[str, Any]) -> dict[str, Any]:
@@ -252,6 +255,9 @@ def ingest(manifest: dict[str, Any], arm: str, capture: str, batch: str, out_dir
     if settings != arms[arm]["settings"]:
         raise SystemExit(f"error: captured settings for {arm} differ: {settings}")
     batch_settings = _batch_settings(identity)
+    device = {k: start.get(k) for k in DEVICE}
+    if any(v in (None, "") for v in device.values()):
+        raise SystemExit(f"error: capture does not record the device it ran on: {[k for k, v in device.items() if v in (None, '')]}")
     if not str(start.get("buildTag") or "").startswith(manifest["identity"]["requiredBuildTagPrefix"]):
         raise SystemExit("error: unexpected build tag")
     if not start.get("buildCommit") or not snapshot.get("sha256"):
@@ -298,6 +304,7 @@ def ingest(manifest: dict[str, Any], arm: str, capture: str, batch: str, out_dir
               "buildCommit": start["buildCommit"], "buildTag": start["buildTag"],
               "frozenGate": scoring["frozenGate"], "settings": settings,
               "batchSettings": batch_settings,
+              "device": device,
               "learnedSnapshotSha256": snapshot["sha256"],
               "sourceManifestSha256": summary["sourceManifestSha256"],
               "batchWallMs": summary["totalElapsedMs"],
@@ -350,6 +357,17 @@ def table(results: dict[str, dict[str, Any]], baseline: str, manifest: dict[str,
         if len(set(values.values())) != 1:
             raise SystemExit(f"error: arms differ in a setting outside the experiment: {key} is "
                              + ", ".join(f"{v!r} in {label}" for label, v in sorted(values.items())))
+    # One phone, one Android version: the same encoders and decoders in every arm.
+    for label, res in results.items():
+        recorded = res.get("device")
+        if not isinstance(recorded, dict) or any(recorded.get(k) in (None, "") for k in DEVICE):
+            raise SystemExit(f"error: arm {label} does not record the device it ran on; ingest it again from its capture")
+    for key in DEVICE:
+        values = {label: res["device"][key] for label, res in results.items()}
+        if len(set(values.values())) != 1:
+            raise SystemExit(f"error: arms ran on different devices or platforms: {key} is "
+                             + ", ".join(f"{v!r} in {label}" for label, v in sorted(values.items())))
+    device = {k: results[baseline]["device"][k] for k in DEVICE}
     source_manifests = {r.get("sourceManifestSha256") for r in results.values()}
     if len(source_manifests) != 1 or not next(iter(source_manifests)):
         raise SystemExit("error: captured source manifest digests differ or are missing")
@@ -432,6 +450,7 @@ def table(results: dict[str, dict[str, Any]], baseline: str, manifest: dict[str,
             "fullSourceHashArms": hashed_arms,
             "sameStartingLearnedSnapshot": len(set(snapshots.values())) == 1,
             "startingLearnedSnapshots": snapshots, "comparisonBasis": "matched-source observational",
+            "device": device,
             "arms": arms, "changedSources": changed}
 
 
@@ -449,6 +468,9 @@ def markdown(t: dict[str, Any]) -> str:
            "|---|---|" + "---:|" * len(cols)]
     for label, a in t["arms"].items():
         out.append(f"| {label} | `{a['batchId']}` | " + " | ".join(f"{a[k]:,}" for k, _ in cols) + " |")
+    device = t.get("device") or {}
+    if device:
+        out += ["", f"Every arm ran on {device.get('manufacturer')} {device.get('deviceModel')}, Android SDK {device.get('sdkInt')}."]
     hashed = t.get("fullSourceHashArms") or []
     out += ["", ("Full source SHA-256 matched before and after every job, and across arms, in: " + ", ".join(hashed)
                  + ". Batch wall time includes the hashing; job times do not.")

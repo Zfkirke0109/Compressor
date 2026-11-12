@@ -34,9 +34,11 @@ per source, matching name hash/size, a sampled source fingerprint, the captured 
 arm settings, build identity, and starting learned-state snapshot. It also requires the capture
 to record what the batch was asked to do besides the experiment's own switches (mode, codec,
 frame rate, metadata handling), with Replace Originals off, and refuses a batch that an
-instrumented test drove. The table requires every arm, the same build, exact source fingerprints
-across arms, and those other settings equal in every arm: an arm that also changed codec would
-otherwise be credited with the codec's bytes. It reports batch wall time separately
+instrumented test drove, and it keeps the phone model, manufacturer and Android SDK level the
+capture names. The table requires every arm, the same build, exact source fingerprints across
+arms, those other settings equal in every arm, and one device and Android version throughout:
+an arm that also changed codec, or ran on another phone's encoder, would otherwise be credited
+with that difference. It reports batch wall time separately
 from summed per-job elapsed time and thermal cooldown, lists the thermal state each measured job
 started in, and prints every arm's starting learned snapshot; differing
 snapshots confound any claimed arm effect. Each arm result is written once; a

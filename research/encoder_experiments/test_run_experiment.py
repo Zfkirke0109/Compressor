@@ -49,12 +49,15 @@ BATCH_SETTINGS = {"replaceOriginals": False, "backupBeforeReplace": False, "useS
                   "frameRateOption": "ORIGINAL", "exhaustivePerceptualLossless": True}
 
 
-def _capture(batch, jobs, arm="A0", exhaustive=True, full_hash=False, extra=(), batch_settings=BATCH_SETTINGS):
+DEVICE = {"manufacturer": "samsung", "deviceModel": "SM-S948U", "sdkInt": 37}
+
+
+def _capture(batch, jobs, arm="A0", exhaustive=True, full_hash=False, extra=(), batch_settings=BATCH_SETTINGS, device=DEVICE):
     fd, path = tempfile.mkstemp(suffix=".jsonl")
     with os.fdopen(fd, "w") as fh:
         fh.write(json.dumps({"type": "session_start", "batchId": batch, "mode": "Perceptually Lossless",
                              "selectedCount": len(jobs), "buildTag": "pr44-test", "buildCommit": "test-commit",
-                             "exhaustivePerceptualLossless": exhaustive}) + "\n")
+                             "exhaustivePerceptualLossless": exhaustive, **device}) + "\n")
         fh.write(json.dumps({"type": "learned_state_snapshot", "batchId": batch, "sha256": "snapshot"}) + "\n")
         settings = next(a["settings"] for a in MANIFEST["arms"] if a["id"] == arm)
         identity = {"type": "run_identity", "batchId": batch,
@@ -302,15 +305,53 @@ def test_ingest_rejects_contradictory_accepted_savings():
                 raise AssertionError(f"contradictory savings admitted: {fields}")
 
 
-def _two_arms(base_settings=BATCH_SETTINGS, arm_settings=BATCH_SETTINGS):
+def _two_arms(base_settings=BATCH_SETTINGS, arm_settings=BATCH_SETTINGS, base_device=DEVICE, arm_device=DEVICE):
     m = copy.deepcopy(MANIFEST)
     m["sources"] = [{"jobId": "job_a", "nameHash": "name-job_a", "sourceBytes": 1000}]
     jobs = [{"jobId": "job_a", "sourceSize": 1000, "outputSize": 900, "countsAsRealCompression": True,
              "terminal": "TRANSCODED_SMALLER"}]
     out = tempfile.mkdtemp()
-    r.ingest(m, "A0", _capture("b0", jobs, batch_settings=base_settings), "b0", out)
-    r.ingest(m, "A1", _capture("b1", jobs, "A1", batch_settings=arm_settings), "b1", out)
+    r.ingest(m, "A0", _capture("b0", jobs, batch_settings=base_settings, device=base_device), "b0", out)
+    r.ingest(m, "A1", _capture("b1", jobs, "A1", batch_settings=arm_settings, device=arm_device), "b1", out)
     return {n: json.load(open(os.path.join(out, f"{n}.json"))) for n in ("A0", "A1")}
+
+
+def test_every_arm_must_have_run_on_the_same_phone_and_android_version():
+    # Matched originals on two phones passed: the device a capture names was not kept, so an S23
+    # arm against an S26 baseline credited the encoder's difference to the arm's switch.
+    same = _two_arms()
+    assert same["A0"]["device"] == DEVICE
+    t = r.table(same, "A0")
+    assert t["device"] == DEVICE
+    assert "Every arm ran on samsung SM-S948U, Android SDK 37." in r.markdown(t)
+    for key, other in (("deviceModel", "SM-S918U1"), ("sdkInt", 36), ("manufacturer", "Google")):
+        results = _two_arms(arm_device={**DEVICE, key: other})
+        try:
+            r.table(results, "A0")
+        except SystemExit as exc:
+            assert "different devices or platforms" in str(exc) and key in str(exc), exc
+            assert repr(other) in str(exc) and "A1" in str(exc), exc
+        else:
+            raise AssertionError(f"arms that differ in {key} were compared")
+    older = _two_arms()
+    del older["A1"]["device"]
+    try:
+        r.table(older, "A0")
+    except SystemExit as exc:
+        assert "does not record the device" in str(exc), exc
+    else:
+        raise AssertionError("an arm without a recorded device was compared")
+    # A capture that does not name its device cannot be an arm.
+    m = copy.deepcopy(MANIFEST)
+    m["sources"] = [{"jobId": "job_a", "nameHash": "name-job_a", "sourceBytes": 1000}]
+    jobs = [{"jobId": "job_a", "sourceSize": 1000, "outputSize": 0, "countsAsRealCompression": False}]
+    for device in ({}, {**DEVICE, "deviceModel": ""}, {k: v for k, v in DEVICE.items() if k != "sdkInt"}):
+        try:
+            r.ingest(m, "A0", _capture("b0", jobs, device=device), "b0", tempfile.mkdtemp())
+        except SystemExit as exc:
+            assert "does not record the device" in str(exc), (device, exc)
+        else:
+            raise AssertionError(f"admitted a capture with device {device}")
 
 
 def test_a_setting_outside_the_experiment_must_be_recorded_and_equal_in_every_arm():
