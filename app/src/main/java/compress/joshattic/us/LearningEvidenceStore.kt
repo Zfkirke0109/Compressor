@@ -24,6 +24,9 @@ class LearningEvidenceStore(
      * APPLIED is recorded only once the aggregate write is itself durable. When the store cannot
      * confirm that, the record says APPLY_UNCONFIRMED and learning stops for this process: the
      * ledger never claims an update a restart could lose.
+     *
+     * Until its APPLIED is recorded a reservation is open, and a rotation carries every record
+     * written for it as it was written (see [rotate]).
      */
     override fun writeObservation(key: String, value: String, observation: LearningObservation?): Boolean = synchronized(state) {
         val fields = linkedMapOf<String, Any?>("ledgerVersion" to 1,
@@ -42,17 +45,21 @@ class LearningEvidenceStore(
             append(fields + mapOf("ledgerEvent" to "DUPLICATE", "effectApplied" to false))
             return@synchronized false
         }
-        if (!append(fields + mapOf("ledgerEvent" to "RESERVED", "effectApplied" to null))) return@synchronized false
+        val reservation = append(fields + mapOf("ledgerEvent" to "RESERVED", "effectApplied" to null)) ?: return@synchronized false
         state.seen += scopedId
+        state.open[scopedId] = mutableListOf(reservation)
         val durable = runCatching { delegate.writeDurably(key, value) }.getOrDefault(false)
         if (!durable) {
+            // Still open afterwards: no effect is recorded, so the reservation stays uncertain.
             append(fields + mapOf("eventId" to UUID.randomUUID().toString(), "ledgerEvent" to "APPLY_UNCONFIRMED",
                 "effectApplied" to null, "reason" to "the aggregate write was not confirmed on durable storage"))
+                ?.let { state.open[scopedId]?.add(it) }
             state.writable = false
             // The caller is told what this process now reads back, which is what it will act on.
             return@synchronized runCatching { delegate.read(key) == value }.getOrDefault(false)
         }
         append(fields + mapOf("eventId" to UUID.randomUUID().toString(), "ledgerEvent" to "APPLIED", "effectApplied" to true, "after" to value))
+            ?.let { state.open.remove(scopedId) }
         true
     }
 
@@ -67,12 +74,12 @@ class LearningEvidenceStore(
     override fun clear() = synchronized(state) {
         // The explicit reset operation retains its audit history; ordinary upgrades never call it.
         val started = mapOf("ledgerVersion" to 1, "ledgerEvent" to "RESET_STARTED", "timestampMs" to System.currentTimeMillis())
-        check(append(started) || restartJournal(started)) {
+        check(append(started) != null || restartJournal(started)) {
             "Learning history could not record the reset; profiles were kept unchanged."
         }
         try {
             delegate.clear()
-            check(append(mapOf("ledgerVersion" to 1, "ledgerEvent" to "RESET", "timestampMs" to System.currentTimeMillis()))) {
+            check(append(mapOf("ledgerVersion" to 1, "ledgerEvent" to "RESET", "timestampMs" to System.currentTimeMillis())) != null) {
                 "Profile reset completion could not be recorded; learning is paused."
             }
         } catch (e: Exception) {
@@ -80,29 +87,41 @@ class LearningEvidenceStore(
             throw e
         }
         state.seen.clear()
+        state.open.clear()
     }
 
     private fun line(fields: Map<String, Any?>): ByteArray = (JsonText.render(fields).replace("\n", "") + "\n").toByteArray()
 
-    private fun append(fields: Map<String, Any?>): Boolean {
+    /** Appends [fields] as one line and returns the bytes written, or null when nothing was. */
+    private fun append(fields: Map<String, Any?>): ByteArray? {
         val journal = state.journal
-        val ok = state.writable && runCatching {
+        val written = if (!state.writable) null else runCatching {
             val bytes = line(fields)
             if (journal.length() + bytes.size > maxBytes) rotate(bytes.size)
             journal.parentFile?.mkdirs()
             FileOutputStream(journal, true).use { out -> out.write(bytes); out.fd.sync() }
-            true
-        }.getOrDefault(false)
-        if (!ok) state.writable = false
-        runCatching { onEvent(fields + mapOf("durablyJournaled" to ok)) }
-        return ok
+            bytes
+        }.getOrNull()
+        if (written == null) state.writable = false
+        runCatching { onEvent(fields + mapOf("durablyJournaled" to (written != null))) }
+        return written
     }
 
     /**
      * Make room in a full journal without forgetting what has already trained. The full file is
-     * kept as the one archive, and the journal starts again with one short line per live
-     * reservation, so a repeated measurement is refused after the rotation and after a restart
-     * exactly as before it. The aggregate is not touched: this is not a reset.
+     * kept as the one archive, and the journal starts again with the reservations, so a repeated
+     * measurement is refused after the rotation and after a restart exactly as before it. The
+     * aggregate is not touched: this is not a reset.
+     *
+     * A reservation whose effect is recorded is carried as one short line. One that is still open
+     * is carried as every record written for it, exactly as written. The journal can fill between
+     * an observation's reservation and its effect; the effect is then recorded after the rotation
+     * and must still be replayed against its reservation
+     * (scripts/diagnostics/calibration_evidence.py). And a reservation that never had an effect
+     * must still read as uncertain. A short line stands for an effect recorded before the
+     * rotation: with one in its place the replay rejected the effect that followed, and took a
+     * reservation without an effect for a completed one. The ROTATED record counts both:
+     * carriedReservations is all of them, openReservations those carried whole.
      *
      * The new file is complete and synced before it replaces the old one in a single rename, so
      * there is a journal at every moment. Throws, leaving the journal as it was, when the
@@ -114,8 +133,9 @@ class LearningEvidenceStore(
         try {
             FileOutputStream(fresh, false).use { out ->
                 out.write(line(mapOf("ledgerVersion" to 1, "ledgerEvent" to "ROTATED", "timestampMs" to System.currentTimeMillis(),
-                    "carriedReservations" to state.seen.size, "archivedBytes" to journal.length())))
-                for (id in state.seen) out.write(carried(id))
+                    "carriedReservations" to state.seen.size, "openReservations" to state.open.size, "archivedBytes" to journal.length())))
+                for (id in state.seen) if (id !in state.open) out.write(carried(id))
+                for (records in state.open.values) records.forEach { out.write(it) }
                 out.fd.sync()
             }
             check(fresh.length() + needed <= maxBytes) { "learning evidence journal full of live reservations" }
@@ -147,7 +167,11 @@ class LearningEvidenceStore(
     }
 
     private class JournalState(val journal: File) {
+        /** Every reservation since the last reset: a measurement in here never trains again. */
         val seen = mutableSetOf<String>()
+
+        /** The reservations with no APPLIED recorded, each with every record written for it, in order. */
+        val open = linkedMapOf<String, MutableList<ByteArray>>()
         var writable = true
 
         init {
@@ -162,11 +186,17 @@ class LearningEvidenceStore(
                         if (line.contains("\"ledgerEvent\": \"RESERVED\"") || line.contains("\"ledgerEvent\": \"CARRIED\"")) {
                             val id = checkNotNull(idPattern.find(line)?.groupValues?.get(1))
                             val profileJson = checkNotNull(profilePattern.find(line)?.groupValues?.get(1))
-                            seen += scopedId(profileJson, id)
+                            val scope = scopedId(profileJson, id)
+                            seen += scope
+                            // A CARRIED line stands for a reservation whose effect was recorded.
+                            if (line.contains("\"ledgerEvent\": \"RESERVED\"")) open[scope] = mutableListOf(record(line))
                         }
+                        if (line.contains("\"ledgerEvent\": \"APPLY_UNCONFIRMED\"")) scopeOf(line)?.let { open[it]?.add(record(line)) }
+                        if (line.contains("\"ledgerEvent\": \"APPLIED\"")) scopeOf(line)?.let { open.remove(it) }
                         if (line.contains("\"ledgerEvent\": \"RESET_STARTED\"")) resetPending = true
                         if (line.contains("\"ledgerEvent\": \"RESET\"")) {
                             seen.clear()
+                            open.clear()
                             resetPending = false
                         }
                     } }
@@ -186,6 +216,16 @@ class LearningEvidenceStore(
         private val profilePattern = Regex(""""profileKey": ("(?:\\.|[^"\\])*")""")
 
         private fun scopedId(profileJson: String, evidenceId: String): String = "$profileJson\u0000$evidenceId"
+
+        /** The reservation a record of [line] belongs to, or null when the line names none. */
+        private fun scopeOf(line: String): String? {
+            val id = idPattern.find(line)?.groupValues?.get(1) ?: return null
+            val profileJson = profilePattern.find(line)?.groupValues?.get(1) ?: return null
+            return scopedId(profileJson, id)
+        }
+
+        /** [line], read back from the journal, as the bytes it was written as. */
+        private fun record(line: String): ByteArray = (line + "\n").toByteArray()
 
         /** A reservation carried into a rotated journal, in the shape the loader reads one in. */
         private fun carried(scopedId: String): ByteArray {

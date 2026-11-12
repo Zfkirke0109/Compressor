@@ -14,7 +14,10 @@ def replay_ledger(events, epoch):
     pending_reset = None
     # rotations: how many times the journal was restarted because it was full. Events before a
     # rotation are in the app's archive, not here, so accepted and finalProfiles then describe
-    # only what happened since; the reservations it carried over stay unrepeatable.
+    # only what happened since; the reservations it carried over stay unrepeatable. A reservation
+    # still open at the rotation is carried as every record written for it, exactly as written,
+    # so its effect, recorded after the rotation, is replayed against it here, and one that never
+    # had an effect is still uncertain.
     result = dict(accepted=[], uncertain=[], quarantined=[], errors=[], ignored=0, finalProfiles=final_profiles, rotations=0)
     for index, raw in enumerate(events):
         event = raw.get('fields', raw)
@@ -35,8 +38,9 @@ def replay_ledger(events, epoch):
         if kind == 'ROTATED':
             result['rotations'] += 1; continue
         if kind == 'CARRIED':
-            # A reservation made before a rotation: its effect is not in these events, and the
-            # same measurement must not appear as a new one.
+            # A reservation whose effect was recorded before a rotation: the effect is not in these
+            # events, and the same measurement must not appear as a new one. An effect after it
+            # has no reservation here to be checked against, and is an error below.
             if identity: applied.add(scope)
             continue
         # APPLY_UNCONFIRMED: the aggregate write was not confirmed on disk. The reservation stays

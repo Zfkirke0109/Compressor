@@ -24,6 +24,30 @@ class EvidenceTest(unittest.TestCase):
         self.assertEqual(repeated['accepted'],[])
         self.assertEqual(repeated['errors'][0]['reason'],'duplicate reservation')
         self.assertEqual(replay_ledger([self.event('RESERVED'),self.event()], 'current')['rotations'],0)
+    def test_a_reservation_still_open_at_a_rotation_is_carried_whole(self):
+        # The journal can fill between an observation's reservation and its effect. The app then
+        # carries that reservation as it was written, and its effect, recorded after the
+        # rotation, replays against it (LearningLedgerTest holds the app to that shape).
+        done=dict(ledgerEvent='CARRIED', evidenceId='c'*64, profileKey='p')
+        r=replay_ledger([dict(ledgerEvent='ROTATED', carriedReservations=2, openReservations=1), done,
+                         self.event('RESERVED'), self.event()], 'current')
+        self.assertEqual([row['evidenceId'] for row in r['accepted']],['a'*64])
+        self.assertEqual(r['finalProfiles'],{'p':'next'})
+        self.assertEqual(r['errors'],[]);self.assertEqual(r['status'],'REPLAYED')
+        # One whose effect was never confirmed is carried with that record and stays uncertain.
+        unconfirmed=replay_ledger([dict(ledgerEvent='ROTATED', openReservations=1), self.event('RESERVED'),
+                                   dict(self.event('APPLY_UNCONFIRMED'),after=None)], 'current')
+        self.assertEqual(len(unconfirmed['uncertain']),1);self.assertEqual(unconfirmed['accepted'],[])
+        self.assertEqual(unconfirmed['status'],'REQUIRES_REVIEW')
+        # So does one the process died after reserving, which has no other record.
+        alone=replay_ledger([dict(ledgerEvent='ROTATED', openReservations=1), done, self.event('RESERVED')], 'current')
+        self.assertEqual(len(alone['uncertain']),1);self.assertEqual(alone['accepted'],[])
+        self.assertEqual(alone['errors'],[]);self.assertEqual(alone['status'],'REQUIRES_REVIEW')
+        # A short line before the effect, as the app wrote one before, gives that effect no
+        # reservation to be checked against: it cannot be accepted.
+        short=replay_ledger([dict(ledgerEvent='ROTATED'), dict(done, evidenceId='a'*64), self.event()], 'current')
+        self.assertEqual(short['accepted'],[]);self.assertEqual(short['finalProfiles'],{})
+        self.assertEqual(short['errors'][0]['reason'],'unreserved or repeated effect')
     def test_reserved_is_uncertain_not_a_completed_observation(self):
         r=replay_ledger([self.event('RESERVED')], 'current')
         self.assertEqual(r['accepted'],[]);self.assertEqual(len(r['uncertain']),1)

@@ -216,10 +216,31 @@ class LearningLedgerTest {
 
     // ---- A journal that can no longer be appended to -------------------------------------------
 
-    private fun events(journal: java.io.File): List<String> =
-        journal.readLines().map { checkNotNull(Regex("\"ledgerEvent\": \"([A-Z_]+)\"").find(it)).groupValues[1] }
+    private fun event(line: String): String = checkNotNull(Regex("\"ledgerEvent\": \"([A-Z_]+)\"").find(line)).groupValues[1]
+
+    private fun events(journal: java.io.File): List<String> = journal.readLines().map(::event)
 
     private fun nth(i: Int) = evidence().copy(configId = "config-$i")
+
+    /** What [journal] holds about [observation], refusals of a repeat aside. */
+    private fun recordsOf(journal: java.io.File, observation: LearningObservation): List<String> =
+        journal.readLines().filter { it.contains(observation.id) && event(it) != "DUPLICATE" }
+
+    /**
+     * Trains new observations from [first] on through [store] until its [journal] has rotated, and
+     * returns the next unused index. A rotation is seen as the journal getting shorter: every
+     * write lengthens it otherwise.
+     */
+    private fun trainUntilRotated(store: LearningEvidenceStore, journal: java.io.File, first: Int): Int {
+        var next = first
+        while (true) {
+            val before = journal.length()
+            assertTrue("observation $next was refused", store.writeObservation("profile", "value-$next", nth(next)))
+            next++
+            if (journal.length() < before) return next
+            assertTrue("the journal did not rotate", next < first + 100)
+        }
+    }
 
     @Test fun aFullJournalRotatesAndStillRefusesWhatHasAlreadyTrained() {
         val directory = Files.createTempDirectory("ledger-rotation").toFile()
@@ -247,6 +268,93 @@ class LearningLedgerTest {
             assertEquals("value-${trained - 1}", base.read("profile"))
             // And a new one still trains.
             assertTrue(reopened.writeObservation("profile", "new", nth(trained)))
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun aReservationStillOpenWhenTheJournalFillsIsCarriedWholeSoItsEffectReplaysAgainstIt() {
+        val directory = Files.createTempDirectory("ledger-rotation-open").toFile()
+        try {
+            val trained = 10
+            // The same writes twice. First with room to spare, to learn how long the journal is after
+            // each line: every field has a fixed length (ids, event UUIDs, 13-digit times).
+            val probeFile = directory.resolve("probe.jsonl")
+            val lengths = ArrayList<Long>()
+            val probe = LearningEvidenceStore(SmartPerceptualProfileEngine.InMemoryProfileStore(), probeFile,
+                onEvent = { lengths += probeFile.length() })
+            for (i in 0..trained) assertTrue(probe.writeObservation("profile", "value-$i", nth(i)))
+            assertEquals(2 * (trained + 1), lengths.size)
+            // Then under a bound that only the last observation's effect crosses: the journal fills
+            // after that observation was reserved and before its effect is recorded.
+            val bound = lengths.last() - 1
+            val base = SmartPerceptualProfileEngine.InMemoryProfileStore()
+            val file = directory.resolve("evidence.jsonl")
+            val archive = java.io.File(directory, "evidence.jsonl" + LearningEvidenceStore.ARCHIVE_SUFFIX)
+            val store = LearningEvidenceStore(base, file, maxBytes = bound)
+            for (i in 0 until trained) assertTrue(store.writeObservation("profile", "value-$i", nth(i)))
+            assertFalse("rotated too early", archive.exists())
+            assertTrue(store.writeObservation("profile", "value-$trained", nth(trained)))
+            assertEquals("value-$trained", base.read("profile"))
+            val reservation = archive.readLines().last()
+            assertEquals("RESERVED", event(reservation))
+            assertTrue(reservation.contains(nth(trained).id))
+
+            // The reservations whose effects were recorded are carried as one short line each. The
+            // open one is carried whole, exactly as it was written, and its effect follows it, so the
+            // replay (calibration_evidence.py) pairs the two as it would have without the rotation.
+            assertEquals(listOf("ROTATED") + List(trained) { "CARRIED" } + listOf("RESERVED", "APPLIED"), events(file))
+            val records = recordsOf(file, nth(trained))
+            assertEquals(reservation, records.first())
+            assertEquals("APPLIED", event(records.last()))
+            assertTrue(records.last().contains("\"after\": \"value-$trained\""))
+
+            // Its effect is recorded now, so the next rotation carries it as one short line.
+            trainUntilRotated(store, file, trained + 1)
+            assertEquals(listOf("CARRIED"), recordsOf(file, nth(trained)).map(::event))
+            // Still refused, in this process and after a restart.
+            assertFalse(store.writeObservation("profile", "again", nth(trained)))
+            val reopened = LearningEvidenceStore(base, file.copyTo(directory.resolve("reopened.jsonl")), maxBytes = bound)
+            assertFalse(reopened.writeObservation("profile", "again", nth(trained)))
+        } finally { directory.deleteRecursively() }
+    }
+
+    @Test fun aReservationWithNoRecordedEffectStaysWholeThroughEveryRotationAndRestart() {
+        val directory = Files.createTempDirectory("ledger-rotation-uncertain").toFile()
+        try {
+            val bound = 16_000L
+            // The aggregate write could not be confirmed on disk, and that process stopped learning.
+            val unconfirmedBase = SmartPerceptualProfileEngine.InMemoryProfileStore()
+            val unconfirmed = directory.resolve("unconfirmed.jsonl")
+            assertTrue(LearningEvidenceStore(store(unconfirmedBase, durable = false), unconfirmed, maxBytes = bound)
+                .writeObservation("profile", "unconfirmed", nth(0)))
+            assertEquals(listOf("RESERVED", "APPLY_UNCONFIRMED"), events(unconfirmed))
+            // The process died after the aggregate write and before its effect was recorded.
+            val killedBase = SmartPerceptualProfileEngine.InMemoryProfileStore()
+            val completed = directory.resolve("completed.jsonl")
+            assertTrue(LearningEvidenceStore(killedBase, completed, maxBytes = bound).writeObservation("profile", "killed", nth(0)))
+            val killed = directory.resolve("killed.jsonl").also { it.writeText(completed.readLines().first() + "\n") }
+            assertEquals(listOf("RESERVED"), events(killed))
+
+            for ((base, start) in listOf(unconfirmedBase to unconfirmed, killedBase to killed)) {
+                val open = recordsOf(start, nth(0))
+                // After a restart learning resumes, and the journal fills and rotates, more than once.
+                // Each rotation carries the records exactly as written: the replay still finds a
+                // reservation with no effect, uncertain, as it did before any rotation.
+                val journal = start.copyTo(directory.resolve("restarted-${start.name}"))
+                val store = LearningEvidenceStore(base, journal, maxBytes = bound)
+                var next = trainUntilRotated(store, journal, 1)
+                assertEquals(open, recordsOf(journal, nth(0)))
+                next = trainUntilRotated(store, journal, next)
+                assertEquals(open, recordsOf(journal, nth(0)))
+                assertEquals("ROTATED", events(java.io.File(directory, journal.name + LearningEvidenceStore.ARCHIVE_SUFFIX)).first())
+                // A restart reads them back as still open, and the next rotation carries them whole again.
+                val again = journal.copyTo(directory.resolve("again-${start.name}"))
+                val restarted = LearningEvidenceStore(base, again, maxBytes = bound)
+                trainUntilRotated(restarted, again, next)
+                assertEquals(open, recordsOf(again, nth(0)))
+                // And the measurement is still refused.
+                assertFalse(store.writeObservation("profile", "again", nth(0)))
+                assertFalse(restarted.writeObservation("profile", "again", nth(0)))
+            }
         } finally { directory.deleteRecursively() }
     }
 
