@@ -7,10 +7,16 @@
     <!-- Rollback copies of a user's original video and the journal naming the file each belongs
          to (ReplacementJournal). They mean something only on this device, while a replacement is
          in flight or being recovered, and must not travel to a backup or another device. -->
+    <!-- Each run's diagnostics (DiagnosticsRecorder, DiagLog): session records with full source
+         SHA-256s and source fingerprints, frame traces, and, when the experiment that keeps them is
+         on, encoded copies of the user's videos. They describe runs on this device; exporting them
+         is the user's own act, and a backup or a new phone must not carry them. -->
     <cloud-backup>
         <exclude domain="file" path="replace_recovery" />
+        <exclude domain="file" path="diagnostics" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="file" path="replace_recovery" />
+        <exclude domain="file" path="diagnostics" />
     </device-transfer>
 </data-extraction-rules>

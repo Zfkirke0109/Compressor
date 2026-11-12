@@ -14,4 +14,6 @@
          to (ReplacementJournal). They mean something only on this device, while a replacement is
          in flight or being recovered, and must not travel to a backup or another device. -->
     <exclude domain="file" path="replace_recovery" />
+    <!-- Each run's diagnostics: see data_extraction_rules.xml. -->
+    <exclude domain="file" path="diagnostics" />
 </full-backup-content>
