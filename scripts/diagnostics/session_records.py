@@ -101,7 +101,11 @@ def _read_zip_records(path: str) -> list[dict[str, Any]]:
 
 
 def read_manifest(path: str) -> dict[str, Any] | None:
-    """The archive's manifest.json, or None for a text capture or an archive without one."""
+    """The archive's manifest.json, or None for a text capture or an archive without a usable one.
+
+    A manifest that is valid JSON but not an object (a list, a string, a number) is not a manifest:
+    callers read fields off the result, and the session records are still worth reporting.
+    """
     if not path.lower().endswith(".zip"):
         return None
     import zipfile
@@ -111,6 +115,7 @@ def read_manifest(path: str) -> dict[str, Any] | None:
             return None
         with archive.open("manifest.json") as fh:
             try:
-                return json.loads(fh.read().decode("utf-8", "replace"))
+                manifest = json.loads(fh.read().decode("utf-8", "replace"))
             except ValueError:
                 return None
+            return manifest if isinstance(manifest, dict) else None

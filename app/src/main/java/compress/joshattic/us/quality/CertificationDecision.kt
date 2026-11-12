@@ -28,8 +28,9 @@ enum class CertificationDecision(val wire: String) {
     /**
      * Some windows scored, every scored window had enough frames and cleared the bar, and at least
      * one planned window produced no evidence (b177 F1). Not a measurement of the sample: never
-     * pixel certification, never taught. Where the plan tolerated absent evidence structurally,
-     * it tolerates this the same way (CertificationGate).
+     * pixel certification, never taught, and never accepted. Every CertificationGate basis
+     * requires a complete, passing sample, so structural verification cannot stand in for the
+     * missing windows: the candidate is rejected and the original kept.
      */
     PARTIAL("partial_unavailable"),
 

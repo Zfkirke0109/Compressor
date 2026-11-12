@@ -115,6 +115,36 @@ def test_a_diagnostics_zip_reads_every_run_newest_first_and_its_manifest():
         assert read_manifest(os.path.join(tmp, "plain.txt")) is None
 
 
+def test_a_manifest_that_is_not_an_object_is_no_manifest_and_the_sessions_are_still_reported():
+    import subprocess
+    import sys
+    import zipfile
+
+    from session_records import read_manifest
+
+    start = {"type": "session_start", "batchId": "batch_1790270611232", "buildCommit": "abc1234", "mode": "PL"}
+    job = {"type": "job", "batchId": "batch_1790270611232", "nameHash": "b2", "terminal": "TRANSCODED_SMALLER",
+           "sourceSize": 1000, "outputSize": 900, "countsAsRealCompression": True, "verified": True}
+    summarizer = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parse_session_jsonl.py")
+    with tempfile.TemporaryDirectory() as tmp:
+        for i, text in enumerate(['["invalid"]', '"a string"', '42', 'null', 'true', '{not json']):
+            path = os.path.join(tmp, f"capture{i}.zip")
+            with zipfile.ZipFile(path, "w") as z:
+                z.writestr("runs/batch_1790270611232/session.jsonl", json.dumps(start) + "\n" + json.dumps(job) + "\n")
+                z.writestr("manifest.json", text)
+            assert read_manifest(path) is None, text
+            # The summariser used to call .get on the list and die before printing anything.
+            done = subprocess.run([sys.executable, summarizer, path], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            assert done.returncode == 0, (text, done.stderr[-300:])
+            assert "batch_1790270611232" in done.stdout and "archive        :" not in done.stdout, (text, done.stdout[:300])
+        # An object is still read.
+        path = os.path.join(tmp, "good.zip")
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("runs/batch_1790270611232/session.jsonl", json.dumps(start) + "\n" + json.dumps(job) + "\n")
+            z.writestr("manifest.json", json.dumps({"appVersionName": "1.6.293", "files": []}))
+        assert read_manifest(path) == {"appVersionName": "1.6.293", "files": []}
+
+
 def test_zip_member_identity_supplies_legacy_ids_and_rejects_conflicts():
     import zipfile
 

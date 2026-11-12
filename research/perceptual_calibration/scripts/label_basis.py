@@ -15,6 +15,8 @@ holdout. Until such labels exist this module answers "no" to every request to re
 Fields kept apart on every row:
   policy_label           1/0 from the frozen production gate (or empty)
   measurement_status     adequate | insufficient | unavailable | misaligned | partial | not_run
+                         | not_recorded (the row carries neither certification field: an older
+                         capture, or a dataset that dropped them; nothing is known either way)
   structural_status      passed | failed | not_run
   human_visibility_label 1 (not visible) / 0 (visible) / empty; only from a human protocol
 """
@@ -36,12 +38,25 @@ _DECISION_STATUS = {
 }
 
 
+def _text(value: Any) -> str:
+    """A field as text; None, an empty value and a missing table cell (NaN) are all absent."""
+    if value is None or (isinstance(value, float) and value != value):
+        return ""
+    return str(value).strip()
+
+
 def measurement_status(record: Mapping[str, Any]) -> str:
-    """From a job record: whether its pixel evidence was an adequate measurement at all."""
-    decision = record.get("certificationDecision")
+    """From a job record: whether its pixel evidence was an adequate measurement at all.
+
+    `not_run` is a claim: the record says certification did not run. A record that carries
+    neither certification field makes no claim, and is `not_recorded`.
+    """
+    decision = _text(record.get("certificationDecision"))
     if decision in _DECISION_STATUS:
         return _DECISION_STATUS[decision]
-    status = str(record.get("certificationStatus") or "")
+    status = _text(record.get("certificationStatus"))
+    if not decision and not status:
+        return "not_recorded"
     if "insufficient" in status:
         return "insufficient"
     if "misalign" in status:

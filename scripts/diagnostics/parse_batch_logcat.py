@@ -30,6 +30,10 @@ STRUCTURED_JOB_FIELDS = ENVELOPE_FIELDS | {
     "effectiveMode", "plannedOutputMime", "plannedTargetRatio",
     "plannedTargetVideoBitrate", "plannedDecisionReason", "wasStreamCopy", "verdict",
     "verified", "pixelCertified", "replacementSafe", "blockReason", "fallbackReason", "discardedVideoBitrate",
+    # What the pixel evidence was evidence of, and whether the structural check passed apart from
+    # the verdict. research/perceptual_calibration reads these (label_basis); without them every
+    # row's measurement read "not_run", a measured pass or failure included.
+    "certificationDecision", "certificationStatus", "structuralVerified",
     "probedRatios", "pixelProvenRatio", "probeDetail",
     "probeWindowScores", "probePairDiag", "certWindowScores", "thermalStart", "thermalEnd", "precedingCooldownMs",
     "materializationMode", "originalReuseBlockReason", "copyAvoidedBytes",

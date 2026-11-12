@@ -91,6 +91,20 @@ def test_measurement_status_keeps_absence_apart_from_failure():
     assert measurement_status({"certificationStatus": "ran_misalignment_rejected"}) == "misaligned"
     assert measurement_status({"certificationStatus": "ran_unavailable"}) == "unavailable"
     assert measurement_status({"certificationStatus": "skipped_hdr_not_pixel_validated"}) == "not_run"
+    assert measurement_status({"certificationStatus": "ran_scored"}) == "adequate"
+    assert measurement_status({"certificationDecision": "passed", "certificationStatus": "ran_scored"}) == "adequate"
+
+
+def test_a_row_without_either_certification_field_is_not_recorded_rather_than_not_run():
+    # What a dataset looked like when ingestion dropped both fields: a measured pass and a measured
+    # failure both read "not_run". Absence is not a claim that certification did not run.
+    assert measurement_status({}) == "not_recorded"
+    assert measurement_status({"certificationDecision": None, "certificationStatus": ""}) == "not_recorded"
+    assert measurement_status({"certificationDecision": float("nan"), "certificationStatus": float("nan")}) == "not_recorded"
+    assert measurement_status({"pixelCertified": True, "verified": True}) == "not_recorded"
+    # A table cell that is missing beside one that is present.
+    assert measurement_status({"certificationDecision": float("nan"), "certificationStatus": "ran_unavailable"}) == "unavailable"
+    assert measurement_status({"certificationDecision": "measured_below_bar", "certificationStatus": float("nan")}) == "adequate"
 
 
 def test_structural_status_prefers_the_structural_field():
