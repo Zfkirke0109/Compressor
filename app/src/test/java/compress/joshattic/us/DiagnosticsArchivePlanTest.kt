@@ -121,6 +121,48 @@ class DiagnosticsArchivePlanTest {
         assertEquals("crashes/crash-1790273718621.log", DiagnosticsArchivePlan.crashEntryPath("crash-1790273718621.log"))
     }
 
+    // A run's name carries the wall clock at its start. These set that clock back a day.
+
+    @Test
+    fun afterTheClockIsSetBackTheCurrentRunIsTheOneThatStartedLast() {
+        val day = 86_400_000L
+        val t = 1_790_000_000_000L
+        // In the order they started: two batches and a self-check between them, then the clock went
+        // back and a third batch started, with a self-check after it.
+        val names = listOf("batch_${t + 200}", "selfcheck_${t + 250}", "batch_${t + 300}", "batch_${t - day + 100}", "selfcheck_${t - day + 120}")
+        val places = names.withIndex().associate { (i, name) -> name to (i + 1).toLong() }
+        // By name alone the batch that started last looks the oldest, and was never the current run.
+        val byName = DiagnosticsArchivePlan.sortedNewestFirst(names)
+        assertEquals("batch_${t + 300}", DiagnosticsArchivePlan.runsFor(Scope.CURRENT_RUN, byName).first().batchId)
+
+        val byPlace = DiagnosticsArchivePlan.sortedNewestFirst(names) { places[it] }
+        assertEquals(names.reversed(), byPlace.map { it.batchId })
+        assertEquals(listOf("batch_${t - day + 100}", "selfcheck_${t - day + 120}"),
+            DiagnosticsArchivePlan.runsFor(Scope.CURRENT_RUN, byPlace).map { it.batchId })
+        assertEquals(listOf("batch_${t + 300}", "selfcheck_${t + 250}"),
+            DiagnosticsArchivePlan.runsFor(Scope.PREVIOUS_RUN, byPlace).map { it.batchId })
+
+        // Crash reports carry only the clock: the previous run's window does not come out empty
+        // because the batch after it is dated before it.
+        val crashes = listOf("crash-${t + 400}.log", "crash-${t - day + 150}.log")
+        assertEquals(listOf("crash-${t + 400}.log"),
+            DiagnosticsArchivePlan.crashReportsFor(Scope.PREVIOUS_RUN, DiagnosticsArchivePlan.runsFor(Scope.PREVIOUS_RUN, byPlace), byPlace, crashes))
+        assertTrue("crash-${t - day + 150}.log" in
+            DiagnosticsArchivePlan.crashReportsFor(Scope.CURRENT_RUN, DiagnosticsArchivePlan.runsFor(Scope.CURRENT_RUN, byPlace), byPlace, crashes))
+    }
+
+    @Test
+    fun runsAnEarlierBuildRecordedComeAfterEveryRunWithAPlace() {
+        val t = 1_790_000_000_000L
+        val names = listOf("batch_${t + 900}", "batch_${t + 100}", "batch_${t + 500}", "batch_${t + 50}")
+        val places = mapOf("batch_${t + 100}" to 1L, "batch_${t + 500}" to 2L)
+        assertEquals(listOf("batch_${t + 500}", "batch_${t + 100}", "batch_${t + 900}", "batch_${t + 50}"),
+            DiagnosticsArchivePlan.sortedNewestFirst(names) { places[it] }.map { it.batchId })
+        // With no places at all the order is the name order it always was.
+        assertEquals(DiagnosticsArchivePlan.sortedNewestFirst(names).map { it.batchId },
+            names.sortedByDescending { DiagnosticsArchivePlan.startedAtOf(it) })
+    }
+
     @Test
     fun theManifestListsBuildDeviceScopeRunsAndFiles() {
         val json = DiagnosticsArchivePlan.manifest(
@@ -139,6 +181,18 @@ class DiagnosticsArchivePlanTest {
         )) {
             assertTrue("manifest should contain $expected:\n$json", json.contains(expected))
         }
+    }
+
+    @Test
+    fun theManifestCarriesEachRunsPlaceInTheStartOrder() {
+        val json = DiagnosticsArchivePlan.manifest(
+            identity = emptyMap(), exportedAt = "20261112-220000", scope = Scope.ALL_RUNS,
+            currentBatchId = "batch_1789913600000", previousBatchId = "batch_1790000000300",
+            includedRuns = listOf(Run("batch_1789913600000", 1789913600000L, 7L), Run("batch_1790000000300", 1790000000300L)),
+            entries = emptyList()
+        )
+        assertTrue(json, json.contains("\"sequence\": 7"))
+        assertTrue(json, json.contains("\"sequence\": null"))
     }
 
     @Test

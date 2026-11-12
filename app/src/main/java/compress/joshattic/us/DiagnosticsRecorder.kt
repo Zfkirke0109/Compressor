@@ -620,14 +620,17 @@ class DiagnosticsRecorder private constructor(
             // Retention: keep the newest runs, so the export stays one archive a phone can send
             // and the folder cannot grow without bound. Older runs have been exported already or
             // are no longer wanted.
+            val root = File(context.filesDir, "diagnostics")
             runCatching {
                 val names = runDirectories(context).map { it.name }
-                DiagnosticsRetention.runsToPruneBeforeStart(names, batchId).forEach { name ->
-                    File(context.filesDir, "diagnostics/$name").deleteRecursively()
+                DiagnosticsRetention.runsToPruneBeforeStart(names, batchId) { RunSequence.of(File(root, it)) }.forEach { name ->
+                    File(root, name).deleteRecursively()
                 }
             }
             val file = runCatching {
-                val dir = File(context.filesDir, "diagnostics/$batchId").apply { mkdirs() }
+                val dir = File(root, batchId).apply { mkdirs() }
+                // Its place in the start order, unless the decision log already gave it one.
+                RunSequence.stamp(root, dir)
                 File(dir, "session.jsonl")
             }.getOrNull()
             return DiagnosticsRecorder(batchId, file, buildIdentity(context)).also {

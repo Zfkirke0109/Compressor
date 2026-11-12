@@ -89,6 +89,30 @@ class DiagnosticsRetentionTest {
         )
     }
 
+    @Test
+    fun runsThatRecordedTheirPlaceArePrunedInTheOrderTheyStarted() {
+        // Thirty retained runs whose names are no guide to the order they started in.
+        val names = (1..30).map { "batch_${ONE_DAY + ((it * 7919) % 30) * MINUTE}" }
+        val places = names.withIndex().associate { (i, name) -> name to (i + 1).toLong() }
+
+        val prune = DiagnosticsRetention.runsToPruneBeforeStart(names, "batch_$A_MONTH_LATER") { places[it] }
+
+        assertEquals("the first to start goes, not the oldest name", listOf(names.first()), prune)
+        assertEquals(listOf(names.minBy { DiagnosticsArchivePlan.startedAtOf(it) }),
+            DiagnosticsRetention.runsToPruneBeforeStart(names, "batch_$A_MONTH_LATER"))
+    }
+
+    @Test
+    fun runsFromAnEarlierBuildGoBeforeEveryRunWithAPlace() {
+        val earlierBuild = (1..5).map { "batch_${A_MONTH_LATER + it * MINUTE}" }
+        val placed = (1..26).map { "batch_${ONE_DAY + it * MINUTE}" }
+        val places = placed.withIndex().associate { (i, name) -> name to (i + 1).toLong() }
+
+        val prune = DiagnosticsRetention.runsToPruneBeforeStart(earlierBuild + placed, "batch_${ONE_DAY + 99 * MINUTE}") { places[it] }
+
+        assertEquals(earlierBuild.take(2), prune)
+    }
+
     private companion object {
         const val MINUTE = 60_000L
         const val ONE_DAY = 1_790_000_000_000L

@@ -151,7 +151,9 @@ object DiagnosticsExporter {
      * then streamed into Downloads, so a failed write never leaves a half archive there.
      */
     fun exportArchive(context: Context, scope: DiagnosticsArchivePlan.Scope, includeEvidenceFiles: Boolean = true): ExportResult {
-        val runs = DiagnosticsArchivePlan.sortedNewestFirst(DiagnosticsRecorder.runDirectories(context).map { it.name })
+        val runs = DiagnosticsArchivePlan.sortedNewestFirst(DiagnosticsRecorder.runDirectories(context).map { it.name }) {
+            RunSequence.of(File(context.filesDir, "diagnostics/$it"))
+        }
         val included = DiagnosticsArchivePlan.runsFor(scope, runs)
         if (included.isEmpty() && scope != DiagnosticsArchivePlan.Scope.EVERYTHING) {
             return ExportResult.Empty(

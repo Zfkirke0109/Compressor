@@ -28,12 +28,24 @@ object DiagnosticsArchivePlan {
         EVERYTHING("Everything", "Everything");
     }
 
-    /** A run directory on the device. [startedAtMs] comes from the batch id ("batch_<epochMs>"). */
-    data class Run(val batchId: String, val startedAtMs: Long)
+    /**
+     * A run directory on the device. [startedAtMs] comes from the batch id ("batch_<epochMs>") and
+     * is the wall clock at its start; [sequence] is its place in the start order ([RunSequence]).
+     */
+    data class Run(val batchId: String, val startedAtMs: Long, val sequence: Long? = null)
 
-    /** Newest run first; batch ids that carry no epoch sort last. */
-    fun sortedNewestFirst(batchIds: Collection<String>): List<Run> =
-        batchIds.map { Run(it, startedAtOf(it)) }.sortedByDescending { it.startedAtMs }
+    /**
+     * Newest run first. Runs that recorded their place in the start order come by that place, and
+     * before every run that did not, since those were recorded by an earlier build. Those come by the
+     * time in their names, and batch ids that carry no epoch sort last. [sequenceOf] gives a run's
+     * place; without it every run is ordered by its name.
+     */
+    fun sortedNewestFirst(batchIds: Collection<String>, sequenceOf: (String) -> Long? = { null }): List<Run> =
+        batchIds.map { Run(it, startedAtOf(it), sequenceOf(it)) }.sortedWith(
+            compareByDescending<Run> { it.sequence != null }
+                .thenByDescending { it.sequence ?: 0L }
+                .thenByDescending { it.startedAtMs }
+        )
 
     /**
      * Directory names under `diagnostics/` that are runs: batches, and the scorer self-checks
@@ -66,9 +78,11 @@ object DiagnosticsArchivePlan {
         val batches = batchesNewestFirst(newestFirst)
         val index = if (scope == Scope.CURRENT_RUN) 0 else 1
         val batch = batches.getOrNull(index) ?: return emptyList()
-        val after = batches.getOrNull(index - 1)?.startedAtMs ?: Long.MAX_VALUE
-        val before = batches.getOrNull(index + 1)?.startedAtMs ?: Long.MIN_VALUE
-        val selfChecks = newestFirst.filter { !isBatch(it) && it.startedAtMs > before && it.startedAtMs < after }
+        // "Between" is a position in [newestFirst], not a time: the clock in a run's name can have
+        // been set back since an earlier run started.
+        val newer = batches.getOrNull(index - 1)?.let(newestFirst::indexOf) ?: -1
+        val older = batches.getOrNull(index + 1)?.let(newestFirst::indexOf) ?: newestFirst.size
+        val selfChecks = newestFirst.filterIndexed { position, run -> !isBatch(run) && position > newer && position < older }
         return listOf(batch) + selfChecks
     }
 
@@ -87,7 +101,11 @@ object DiagnosticsArchivePlan {
         val reports = crashReportNames.filter { CrashReportPlan.isReportName(it) || CrashReportPlan.isExitRecordName(it) }.sorted()
         if (scope == Scope.ALL_RUNS || scope == Scope.EVERYTHING) return reports
         val run = runs.firstOrNull(::isBatch) ?: return emptyList()
-        val next = batchesNewestFirst(newestFirst).lastOrNull { it.startedAtMs > run.startedAtMs }?.startedAtMs ?: Long.MAX_VALUE
+        // Crash reports carry only the wall clock. The window ends where the next batch started,
+        // unless the clock was set back before it did: then it stays open rather than come out
+        // empty, and may include a later run's reports, each named with its own time.
+        val batches = batchesNewestFirst(newestFirst)
+        val next = batches.getOrNull(batches.indexOf(run) - 1)?.startedAtMs?.takeIf { it > run.startedAtMs } ?: Long.MAX_VALUE
         return reports.filter { name ->
             val at = crashEpochOf(name)
             at >= run.startedAtMs && at < next
@@ -197,7 +215,7 @@ object DiagnosticsArchivePlan {
         root["currentBatchId"] = currentBatchId
         root["previousBatchId"] = previousBatchId
         root["includesEvidenceFiles"] = includeEvidenceFiles
-        root["runs"] = includedRuns.map { linkedMapOf("batchId" to it.batchId, "startedAtMs" to it.startedAtMs) }
+        root["runs"] = includedRuns.map { linkedMapOf("batchId" to it.batchId, "startedAtMs" to it.startedAtMs, "sequence" to it.sequence) }
         root["files"] = entries.map { linkedMapOf("path" to it.path, "bytes" to it.bytes, "sha256" to it.sha256) }
         return JsonText.render(root)
     }
