@@ -115,6 +115,35 @@ def test_a_diagnostics_zip_reads_every_run_newest_first_and_its_manifest():
         assert read_manifest(os.path.join(tmp, "plain.txt")) is None
 
 
+def test_runs_come_in_the_order_they_started_when_the_manifest_gives_it():
+    import zipfile
+
+    from session_records import zip_session_entries
+
+    # Started in this order: 300, then the clock went back a day and 100 started. The manifest of a
+    # build that records each run's place says so; the epochs in the names say the opposite.
+    first, second, legacy = "batch_1790000000300", "batch_1789913600100", "batch_1790000000900"
+    manifest = {"manifestVersion": 2, "scope": "ALL_RUNS", "files": [], "runs": [
+        {"batchId": second, "startedAtMs": 1789913600100, "sequence": 2},
+        {"batchId": first, "startedAtMs": 1790000000300, "sequence": 1},
+        # A run an earlier build recorded has no place and comes after every run that has one.
+        {"batchId": legacy, "startedAtMs": 1790000000900, "sequence": None},
+    ]}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "capture.zip")
+        with zipfile.ZipFile(path, "w") as z:
+            for batch in (first, second, legacy):
+                z.writestr(f"runs/{batch}/session.jsonl", json.dumps({"type": "session_start", "batchId": batch}) + "\n")
+            z.writestr("manifest.json", json.dumps(manifest))
+        assert zip_session_entries(path) == [f"runs/{b}/session.jsonl" for b in (second, first, legacy)]
+        # Without places (an older export, or a manifest that is not an object) the epochs decide.
+        with zipfile.ZipFile(path, "w") as z:
+            for batch in (first, second, legacy):
+                z.writestr(f"runs/{batch}/session.jsonl", json.dumps({"type": "session_start", "batchId": batch}) + "\n")
+            z.writestr("manifest.json", json.dumps(["not", "an", "object"]))
+        assert zip_session_entries(path) == [f"runs/{b}/session.jsonl" for b in (legacy, first, second)]
+
+
 def test_a_manifest_that_is_not_an_object_is_no_manifest_and_the_sessions_are_still_reported():
     import subprocess
     import sys

@@ -68,13 +68,39 @@ def _run_epoch(entry_name: str) -> int:
     return int(suffix) if suffix.isdigit() else -1
 
 
+def _run_places(path: str) -> dict[str, int]:
+    """Each run's place in the start order, as the archive's manifest lists it.
+
+    The epoch in a run's name is the wall clock at its start, and that clock can be set back, so
+    exports from builds that record each run's place (RunSequence, from 85e969f) list it in the
+    manifest. Runs without one, and every run of an older export, are absent here.
+    """
+    places: dict[str, int] = {}
+    for run in (read_manifest(path) or {}).get("runs") or []:
+        if isinstance(run, dict) and isinstance(run.get("batchId"), str):
+            place = run.get("sequence")
+            if type(place) is int and place > 0:
+                places[run["batchId"]] = place
+    return places
+
+
 def zip_session_entries(path: str) -> list[str]:
-    """`runs/<batchId>/session.jsonl` entries of an archive, newest run first."""
+    """`runs/<batchId>/session.jsonl` entries of an archive, newest run first.
+
+    Runs with a place in the start order come by that place and before every run without one,
+    which an earlier build recorded; those come by the epoch in their names, as the app orders them.
+    """
     import zipfile
 
     with zipfile.ZipFile(path) as archive:
         names = [n for n in archive.namelist() if n.startswith("runs/") and n.endswith("/session.jsonl")]
-    return sorted(names, key=_run_epoch, reverse=True)
+    places = _run_places(path)
+
+    def newest_first(name: str) -> tuple[bool, int, int]:
+        place = places.get(name.split("/")[1])
+        return (place is not None, place or 0, _run_epoch(name))
+
+    return sorted(names, key=newest_first, reverse=True)
 
 
 def _read_zip_records(path: str) -> list[dict[str, Any]]:
