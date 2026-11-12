@@ -26,6 +26,74 @@ class DiagnosticsRetentionTest {
     fun nothingIsPrunedUnderTheCap() {
         assertTrue(DiagnosticsRetention.runsToPrune(listOf("batch_1790000001000", "batch_1790000002000")).isEmpty())
     }
+
+    // A run's name carries the wall clock at its start. The three below set that clock back.
+
+    @Test
+    fun theRunBeingStartedIsNeverTheOneDeletedWhenTheClockWasSetBack() {
+        val retained = (1..30).map { "batch_${A_MONTH_LATER + it * MINUTE}" }
+        val incoming = "batch_$ONE_DAY"
+
+        val prune = DiagnosticsRetention.runsToPruneBeforeStart(retained, incoming)
+
+        assertEquals("the oldest retained run makes room, so the cap holds", listOf(retained.first()), prune)
+        // The same once the incoming directory exists, as it does when its decision log was written first.
+        assertEquals(listOf(retained.first()), DiagnosticsRetention.runsToPruneBeforeStart(retained + incoming, incoming))
+    }
+
+    @Test
+    fun aRunRecordedSinceTheClockWasSetBackOutlivesTheRunsRecordedBeforeIt() {
+        val recordedBefore = (1..29).map { "batch_${A_MONTH_LATER + it * MINUTE}" }
+        val recordedSince = "batch_$ONE_DAY"
+        val incoming = "batch_${ONE_DAY + 60 * MINUTE}"
+
+        val prune = DiagnosticsRetention.runsToPruneBeforeStart(recordedBefore + recordedSince, incoming)
+
+        assertEquals(listOf(recordedBefore.first()), prune)
+        assertTrue("the previous run is the newest thing on the device", recordedSince !in prune)
+    }
+
+    @Test
+    fun runsDatedAfterTheOneBeingStartedGoFirstOldestFirst() {
+        val datedBefore = (1..20).map { "batch_${ONE_DAY - it * MINUTE}" }
+        val datedAfter = (1..12).map { "batch_${A_MONTH_LATER + it * MINUTE}" }
+
+        val prune = DiagnosticsRetention.runsToPruneBeforeStart(datedBefore + datedAfter, "batch_$ONE_DAY")
+
+        assertEquals(datedAfter.take(3), prune)
+        assertEquals(DiagnosticsRetention.MAX_RUNS, datedBefore.size + datedAfter.size - prune.size + 1)
+    }
+
+    @Test
+    fun aClockThatNeverWentBackPrunesOldestFirstAsBefore() {
+        val retained = (1..34).map { "batch_${ONE_DAY + it * MINUTE}" } + "selfcheck_${ONE_DAY + 90_000L}" + "crashes"
+        val incoming = "batch_$A_MONTH_LATER"
+
+        val prune = DiagnosticsRetention.runsToPruneBeforeStart(retained, incoming)
+
+        // 35 runs and the incoming one: six go, and the self-check dated between the first two batches is the second.
+        assertEquals(
+            listOf("batch_${ONE_DAY + MINUTE}", "selfcheck_${ONE_DAY + 90_000L}") + (2..5).map { "batch_${ONE_DAY + it * MINUTE}" },
+            prune
+        )
+        assertEquals(prune, DiagnosticsRetention.runsToPrune(retained + incoming))
+    }
+
+    @Test
+    fun aDirectoryThatIsNotARunTakesNoSlot() {
+        val retained = (1..30).map { "batch_${ONE_DAY + it * MINUTE}" }
+        assertTrue(DiagnosticsRetention.runsToPruneBeforeStart(retained, "selftest_token").isEmpty())
+        assertEquals(
+            listOf(retained.first()),
+            DiagnosticsRetention.runsToPruneBeforeStart(retained + "batch_$A_MONTH_LATER", "selftest_token")
+        )
+    }
+
+    private companion object {
+        const val MINUTE = 60_000L
+        const val ONE_DAY = 1_790_000_000_000L
+        const val A_MONTH_LATER = ONE_DAY + 31L * 24 * 60 * MINUTE
+    }
 }
 
 class DiagnosticsSelfCheckRunsTest {
