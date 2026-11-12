@@ -168,3 +168,59 @@ implementation (`scripts/ci/verify_no_test_veto.py`).
 Not covered by this check: the retry after a candidate fails structural verification (the other
 trigger of the same fallback), and the learning write a real measured failure makes. Both remain
 covered by JVM tests only.
+
+## 7. What the alternate search and the 4K pipeline cost (v1.6.287 captures)
+
+No default was changed on these numbers. They are what the two v1.6.287 device runs recorded,
+read with `audit_pl_capture.py` (`summary.json`: `alternateSearch`, `stageTime`); each source ran
+once, so they describe the policy on those sources and are not a controlled comparison.
+
+```sh
+python3 scripts/diagnostics/audit_pl_capture.py EXPORT.zip --batch batch_<id> --out audit/
+```
+
+**Alternate AVC search** (Secure Folder run, 30 jobs). It runs only after the HEVC ladder found no
+smaller measured plan, on the same source and planned windows, so its time is added to the item
+and its yield is a plan the primary did not give:
+
+| | |
+| --- | --- |
+| jobs where it ran | 21 of 30 |
+| AVC rungs measured | 63, all failed |
+| rung time | 194.9 s, against 169.9 s for the HEVC ladders of the same jobs |
+| share of those 21 items' time | 53.1 % |
+| share of the whole batch's item time | 12.5 % |
+| ladders with a passed or marginal rung | 0 |
+| plans taken from it | 0 (all 21 jobs kept the original) |
+| highest AVC rung within 1.0 / 2.0 points of every gate | 4 / 6 of 21 |
+| HEVC ladder stopped below the ratio AVC reached | 16 of 21 (HEVC 0.95, AVC 0.97) |
+
+Across every Perceptually Lossless batch retained in the two exports (builds b213 to b287, 14
+batches with an alternate ladder, many of them repeats of one 13-file set) it ran 119 times over
+357 rungs and 1,100.9 s and never produced a passed or marginal rung. The regular-profile run of
+7 jobs never needed it.
+
+Before changing its default, a matched device run should answer what these captures cannot: in 16
+of the 21 jobs the HEVC ladder stopped at 0.95 and never measured 0.97, so the two codecs were not
+compared at the same top ratio; four AVC ladders missed by less than a point; and every run here
+is one phone (SM-S948U). The S23's encoders are a separate question.
+
+**Stage time by resolution** (jobs that made a full encode):
+
+| | 4K, regular profile | 1080p, Secure Folder |
+| --- | --- | --- |
+| jobs / media | 5 / 69.2 s | 7 / 8,893 s |
+| probe ladder | 192.1 s | 174.8 s |
+| full encode | 38.6 s (0.56 s per media second) | 870.1 s (0.10 s per media second) |
+| verification | 3.2 s | 62.8 s |
+| certification | 121.1 s | 41.1 s |
+| whole item | 359.1 s (5.19 s per media second) | 1,149.5 s (0.13 s per media second) |
+| scoring (probe + certification) share | 87.2 % | 18.8 % |
+| one scored window, mean wall time | 11.3 s probe, 11.9 s certification | 2.0 s probe, 1.8 s certification |
+
+On these short 4K clips the pipeline's time is pixel scoring, not encoding: a 4K window costs
+about six times a 1080p one and each clip is scored on every ladder rung and again at
+certification. What inside a 4K window takes the time (decode, frame preparation, libvmaf) is not
+separable from these records; the Perfetto trace in §5.3 is the measurement for that. The 1080p
+certification windows include the opt-in VMAF v1 shadow (about 0.8 s of each 1.8 s); 4K windows do
+not run it.

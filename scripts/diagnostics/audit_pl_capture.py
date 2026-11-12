@@ -16,6 +16,7 @@ import csv
 import hashlib
 import json
 import math
+import re
 import statistics
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -204,6 +205,7 @@ def ladder_summary(job_id, identity, rows, role, lineage, reason, classification
                 encodeShapeId=shape, ladderRole=role, lineage=lineage, notComparableBecause=reason,
                 jobClassification=classification, firstSequence=min(map(order, rows)),
                 rungs=len({order(w) for w in rows}), scoredWindows=len(rows),
+                rungVerdicts=dict(Counter(v for v in {order(w): w['rungVerdict'] for w in rows}.values() if v)),
                 inadequateWindows=sum(not w['adequateFrames'] for w in rows),
                 ratios=sorted({w['ratio'] for w in rows if w['ratio'] is not None}),
                 rungIds=list(dict.fromkeys(w['rungId'] for w in sorted(rows, key=order))),
@@ -307,6 +309,126 @@ def size_gate_rows(stages):
     return rows
 
 
+RESOLUTION_CLASSES = [(3000, '4K'), (2200, '1440p'), (1700, '1080p'), (1, '720p_or_less')]
+USABLE_VERDICTS = ('passed', 'marginal')
+
+
+def resolution_class(job):
+    """By the long side, so a portrait 2160x3840 file is 4K."""
+    long_side = max(job.get('w') or 0, job.get('h') or 0)
+    return next((name for floor, name in RESOLUTION_CLASSES if long_side >= floor), 'unknown')
+
+
+def wall_ms(timing):
+    """`wall=` of one window's recorded timing ("wall=11884,queue=822,v0=..."), or None."""
+    found = re.search(r'(?:^|,)wall=(\d+)', timing or '')
+    return int(found.group(1)) if found else None
+
+
+def job_cost(job, stages, windows):
+    """Where one job's recorded time went. Nothing is estimated: a part the build did not record is None.
+
+    Probe time is each rung's own `rungMs` (its encode, both decodes and the scoring of its
+    windows), by the role of the ladder the rung belongs to. Verification runs from the attempt's
+    first `finalize` event (the candidate exists) to its `verify` event, so it includes a
+    first-timestamp repair and a bitrate-floor recovery where they ran; certification runs from
+    the `verify` event to the `certify` event of the final certification. Both are summed over
+    attempts.
+    """
+    role_of = {w['sequence']: w['ladderRole'] for w in windows if w['stage'] == 'probe_rung'}
+    probe = {}
+    for r in stages:
+        if r.get('stage') != 'probe_rung': continue
+        role = role_of.get(r.get('sequence')) or r.get('ladderRole') or 'unknown'
+        entry = probe.setdefault(role, dict(rungs=0, rungMs=0))
+        entry['rungs'] += 1
+        entry['rungMs'] += r.get('rungMs') or 0
+    encodes = [r for r in stages if r.get('reasonCode') == 'encode_completed']
+    verify_ms = certify_ms = None
+    for attempt in sorted({r.get('attemptIndex') for r in encodes}):
+        def elapsed(stage, first=False, keep=lambda r: True):
+            found = [r.get('elapsedMs') for r in stages if r.get('attemptIndex') == attempt and r.get('stage') == stage
+                     and keep(r) and r.get('elapsedMs') is not None]
+            return (found[0] if first else found[-1]) if found else None
+        finalized, verified = elapsed('finalize', first=True), elapsed('verify')
+        certified = elapsed('certify', keep=lambda r: r.get('scope') != 'floor_recovery')
+        if finalized is not None and verified is not None: verify_ms = (verify_ms or 0) + max(0, verified - finalized)
+        if verified is not None and certified is not None: certify_ms = (certify_ms or 0) + max(0, certified - verified)
+    return dict(resolutionClass=resolution_class(job), mediaSeconds=(job.get('durationMs') or 0) / 1000.0 or None,
+                probeByRole=probe, encodes=len(encodes),
+                encodeMs=sum(r.get('encodeMs') or 0 for r in encodes) if encodes else None,
+                verifyMs=verify_ms, certifyMs=certify_ms, itemMs=job.get('elapsedMs'))
+
+
+def alternate_search_cost(sources, ladders):
+    """What the alternate-codec probe search cost, and what it gave, on the jobs where it ran.
+
+    The alternate ladder runs only after the primary found no smaller measured plan, on the same
+    source and the same planned windows, so its time is added to the item and its benefit is a
+    plan the primary did not give: both are read off the records, without a second run. This is
+    what the policy did on these sources, not a comparison of the two codecs: a primary ladder
+    that stopped at its first failing rung may never have measured the ratio the alternate reached
+    (`primaryStoppedBelowAlternateTop`).
+    """
+    by_job = defaultdict(list)
+    for l in ladders: by_job[l['jobId']].append(l)
+    ran = [s for s in sources if 'alternate' in s['cost']['probeByRole']]
+    alternates = [l for s in ran for l in by_job[s['jobId']] if l['ladderRole'] == 'alternate']
+    rung_ms = sum(s['cost']['probeByRole']['alternate']['rungMs'] for s in ran)
+    item_ms = sum(s['cost']['itemMs'] or 0 for s in ran)
+    all_ms = sum(s['cost']['itemMs'] or 0 for s in sources)
+    measured = [l for l in alternates if l['worstMargin'] is not None]
+
+    def top(job_id, role):
+        return max((l['highestMeasuredRatio'] for l in by_job[job_id]
+                    if l['ladderRole'] == role and l['highestMeasuredRatio'] is not None), default=None)
+    stopped_below = sum(1 for s in ran if top(s['jobId'], 'primary') is not None and top(s['jobId'], 'alternate') is not None
+                        and top(s['jobId'], 'primary') < top(s['jobId'], 'alternate'))
+    return dict(
+        jobs=len(ran), ofJobs=len(sources),
+        rungs=sum(s['cost']['probeByRole']['alternate']['rungs'] for s in ran), rungMs=rung_ms,
+        primaryRungMsOnThoseJobs=sum(s['cost']['probeByRole'].get('primary', {}).get('rungMs', 0) for s in ran),
+        itemMsOnThoseJobs=item_ms, shareOfThoseItems=rung_ms / item_ms if item_ms else None,
+        shareOfAllItems=rung_ms / all_ms if all_ms else None,
+        rungVerdicts=dict(sum((Counter(l['rungVerdicts']) for l in alternates), Counter())),
+        laddersWithUsableRung=sum(1 for l in alternates if any(l['rungVerdicts'].get(v) for v in USABLE_VERDICTS)),
+        plansTakenFromAlternate=sum(1 for s in ran if s['marginLadderRole'] == 'alternate'),
+        certifiedFromAlternate=sum(1 for s in ran if s['marginLadderRole'] == 'alternate' and s['classification'] == 'certified_smaller'),
+        jobTerminals=dict(Counter(s['terminal'] for s in ran)),
+        medianWorstMargin=statistics.median(l['worstMargin'] for l in measured) if measured else None,
+        withinPointsOfAllGates={str(d): sum(-d <= l['worstMargin'] < 0 for l in measured) for d in POINTS},
+        primaryStoppedBelowAlternateTop=stopped_below,
+        basis="each rung's recorded rungMs and each job's recorded elapsedMs; observational, one run per source")
+
+
+def stage_time(sources, windows):
+    """Recorded time per stage by resolution class, over the jobs that made a full encode."""
+    out = {}
+    for name in [n for _, n in RESOLUTION_CLASSES] + ['unknown']:
+        group = [s for s in sources if s['cost']['resolutionClass'] == name and s['cost']['encodes']]
+        if not group: continue
+        ids = {s['jobId'] for s in group}
+
+        def total(key):
+            values = [s['cost'][key] for s in group if s['cost'][key] is not None]
+            return sum(values) if values else None
+        media = total('mediaSeconds')
+        item = total('itemMs')
+        probe = sum(role['rungMs'] for s in group for role in s['cost']['probeByRole'].values())
+        scoring = {}
+        for stage in ['probe_rung', 'certify']:
+            walls = [w for w in (wall_ms(x['timingRaw']) for x in windows if x['jobId'] in ids and x['stage'] == stage) if w is not None]
+            scoring[stage] = dict(timedWindows=len(walls), wallMs=sum(walls), meanWallMs=sum(walls) / len(walls) if walls else None)
+        out[name] = dict(jobs=len(group), encodes=sum(s['cost']['encodes'] for s in group), mediaSeconds=media,
+                         sourceBytes=sum(s.get('sourceSize') or 0 for s in group),
+                         probeMs=probe, encodeMs=total('encodeMs'), verifyMs=total('verifyMs'), certifyMs=total('certifyMs'),
+                         itemMs=item, itemSecondsPerMediaSecond=item / 1000.0 / media if item and media else None,
+                         encodeSecondsPerMediaSecond=total('encodeMs') / 1000.0 / media if total('encodeMs') and media else None,
+                         scoringShareOfItem=(probe + (total('certifyMs') or 0)) / item if item else None,
+                         scoringWindows=scoring)
+    return out
+
+
 def analyze_tables(records):
     """Every table of the audit, by name. [analyze] returns the four the earlier callers unpack."""
     jobs = [r for r in records if r.get('type') == 'job']
@@ -404,7 +526,7 @@ def analyze_tables(records):
                    splitRequiresFamilyReview=True,
                    learningEvents=[r for r in events if r.get('type') == 'learned_state_update'],
                    encoderName=(j.get('encoderConfig') or '').partition('encoder=')[2].split(';')[0] or None,
-                   colorMetadata=None, rawPerFrameEvidenceAvailable=False)
+                   colorMetadata=None, rawPerFrameEvidenceAvailable=False, cost=job_cost(j, stages, ws))
         for w in ws:
             # requestedOutputCodec is what THIS window's rung encoded with. It used to repeat the
             # job's planned codec on every window, AVC rungs included; that is jobPlannedOutputCodec.
@@ -451,6 +573,10 @@ def analyze_tables(records):
                'withinPointsOfAllGates': {str(d): sum(-d <= s['worstMargin'] < 0 for s in measured) for d in POINTS},
                'rejectsWithoutMeasuredMargin': len(rejects) - len(measured),
                'perCodec': per_codec, 'bppBins': hist,
+               'alternateSearch': alternate_search_cost(sources, ladders),
+               'stageTime': stage_time(sources, windows),
+               'stageTimeBasis': 'recorded per-rung, per-encode and per-item times of jobs that made a full encode; verification '
+                                 'and certification are differences of recorded elapsed times; scoring is probe plus certification',
                'nonMonotonicComparisons': len(monotonic),
                'nonMonotonicBasis': 'same ladder (attempt, attempt index, rung codec, actual encoder, request shape) and same window',
                'nonMonotonicByCodec': dict(Counter(codec_key(m['rungCodec']) for m in monotonic)),

@@ -292,6 +292,107 @@ class ReportingTest(unittest.TestCase):
         self.assertEqual(summary['rejectRequestedOutputCodecs'], {HEVC: 1})
         self.assertEqual(summary['classifications'], {'measured_probe_failure': 1})
 
+    def test_the_alternate_search_reports_what_it_cost_and_that_it_gave_nothing(self):
+        # The captured job: one HEVC rung, three AVC rungs at 4,000 ms each, original kept.
+        records = cross_codec_job()
+        records[-1]['elapsedMs'] = 20000
+        other = [rung(300, 0.90, HEVC, QTI_HEVC, (97.0, 93.0, 90.0), job='job_other', verdict='passed', config='c300'),
+                 job('job_other', terminal='TRANSCODED_SMALLER', elapsedMs=60000)]
+        cost = audit_pl_capture.analyze_tables(records + other)['summary']['alternateSearch']
+        self.assertEqual((cost['jobs'], cost['ofJobs'], cost['rungs'], cost['rungMs']), (1, 2, 3, 12000))
+        self.assertEqual(cost['primaryRungMsOnThoseJobs'], 4000)
+        self.assertEqual(cost['itemMsOnThoseJobs'], 20000)
+        self.assertAlmostEqual(cost['shareOfThoseItems'], 0.6)
+        self.assertAlmostEqual(cost['shareOfAllItems'], 12000 / 80000)
+        self.assertEqual(cost['rungVerdicts'], {'failed': 3})
+        self.assertEqual((cost['laddersWithUsableRung'], cost['plansTakenFromAlternate'], cost['certifiedFromAlternate']), (0, 0, 0))
+        self.assertEqual(cost['jobTerminals'], {'SKIPPED_WOULD_DEGRADE': 1})
+        # AVC at 0.97 missed the mean gate by 2.97 points: outside 2.5, inside 5.
+        self.assertAlmostEqual(cost['medianWorstMargin'], C9_AVC_97[0] - 95.5)
+        self.assertEqual((cost['withinPointsOfAllGates']['2.5'], cost['withinPointsOfAllGates']['5']), (0, 1))
+        # Both ladders reached 0.97 here.
+        self.assertEqual(cost['primaryStoppedBelowAlternateTop'], 0)
+
+    def test_an_alternate_plan_that_was_taken_is_counted_as_its_yield(self):
+        records = [rung(1, 0.95, HEVC, QTI_HEVC, (94.0, 90.0, 85.0), config='h95'),
+                   rung(2, 0.97, AVC, QTI_AVC, (97.0, 93.0, 90.0), config='a97', verdict='passed'),
+                   alternate_search(3, selected=AVC),
+                   job(terminal='TRANSCODED_SMALLER', mime=AVC, outputSize=100, savedBytes=30, countsAsRealCompression=True,
+                       pixelCertified=True, finalAccepted=True, verified=True, elapsedMs=16000)]
+        tables = audit_pl_capture.analyze_tables(records)
+        cost = tables['summary']['alternateSearch']
+        self.assertEqual(tables['sources'][0]['classification'], 'certified_smaller')
+        self.assertEqual((cost['jobs'], cost['rungs'], cost['rungMs']), (1, 1, 4000))
+        self.assertEqual((cost['laddersWithUsableRung'], cost['plansTakenFromAlternate'], cost['certifiedFromAlternate']), (1, 1, 1))
+        # The primary stopped at 0.95 and never measured the ratio the alternate passed at.
+        self.assertEqual(cost['primaryStoppedBelowAlternateTop'], 1)
+        self.assertEqual(cost['withinPointsOfAllGates'], {str(d): 0 for d in audit_pl_capture.POINTS})
+
+    def test_a_run_without_an_alternate_search_reports_none_and_divides_by_nothing(self):
+        records = [rung(1, 0.90, HEVC, QTI_HEVC, (97.0, 93.0, 90.0), verdict='passed'), job(terminal='TRANSCODED_SMALLER')]
+        cost = audit_pl_capture.analyze_tables(records)['summary']['alternateSearch']
+        self.assertEqual((cost['jobs'], cost['rungs'], cost['rungMs']), (0, 0, 0))
+        self.assertIsNone(cost['shareOfThoseItems'])
+        self.assertIsNone(cost['shareOfAllItems'])
+        self.assertIsNone(cost['medianWorstMargin'])
+
+    def test_stage_time_is_summed_from_recorded_events_by_resolution_class(self):
+        def event(stage, reason, attempt_index, elapsed, **extra):
+            return dict(type='stage', stage=stage, reasonCode=reason, jobId='job_4k', sequence=elapsed, attempt=7,
+                        attemptIndex=attempt_index, elapsedMs=elapsed, **extra)
+        timing = 'wall=11000,queue=800,v0=1200+150,cambi=0,v1=0+0'
+        records = [
+            rung(1, 0.90, HEVC, QTI_HEVC, (97.0, 93.0, 90.0), job='job_4k', verdict='passed', config='p90', rungMs=30000,
+                 probeTiming=timing),
+            # First attempt: encoded, verified after a first-timestamp repair, certified.
+            event('encode', 'encode_completed', 1, 40000, encodeMs=8000),
+            event('finalize', 'candidate_finalized', 1, 40100),
+            event('finalize', 'candidate_finalized', 1, 42900, operation='restore_first_video_timestamp'),
+            event('verify', 'structural_passed', 1, 43000),
+            event('certify', 'cert_measured_failure', 1, 55000, certMean='94.0', certP5='92.0', certMin='90.0', certFrames='36',
+                  certWindowIds=WINDOW, certTiming='wall=12000,queue=900,v0=1300+100,cambi=0,v1=0+0'),
+            # The retry: a failed floor recovery's certification is not the final certification.
+            event('encode', 'encode_completed', 2, 64000, encodeMs=9000),
+            event('finalize', 'candidate_finalized', 2, 64100),
+            event('certify', 'cert_unavailable', 2, 66000, scope='floor_recovery'),
+            event('verify', 'structural_failed', 2, 66100),
+            # Portrait: the long side decides the class.
+            job('job_4k', terminal='UNEXPECTED_REMUX', w=2160, h=3840, fps=60, durationMs=10000, elapsedMs=70000, sourceSize=150000000),
+            # A job that never encoded is not in the stage table.
+            rung(900, 0.97, HEVC, QTI_HEVC, C9_HEVC_97, job='job_keep', config='k97'),
+            job('job_keep', w=3840, h=2160, durationMs=5000, elapsedMs=9000),
+        ]
+        stage = audit_pl_capture.analyze_tables(records)['summary']['stageTime']
+        self.assertEqual(list(stage), ['4K'])
+        row = stage['4K']
+        self.assertEqual((row['jobs'], row['encodes'], row['mediaSeconds'], row['sourceBytes']), (1, 2, 10.0, 150000000))
+        self.assertEqual((row['probeMs'], row['encodeMs'], row['itemMs']), (30000, 17000, 70000))
+        # 43000 - 40100 for the first attempt (repair included) and 66100 - 64100 for the retry.
+        self.assertEqual(row['verifyMs'], 2900 + 2000)
+        # 55000 - 43000; the retry was never certified.
+        self.assertEqual(row['certifyMs'], 12000)
+        self.assertAlmostEqual(row['itemSecondsPerMediaSecond'], 7.0)
+        self.assertAlmostEqual(row['encodeSecondsPerMediaSecond'], 1.7)
+        self.assertAlmostEqual(row['scoringShareOfItem'], (30000 + 12000) / 70000)
+        self.assertEqual(row['scoringWindows'], {'probe_rung': dict(timedWindows=1, wallMs=11000, meanWallMs=11000.0),
+                                                 'certify': dict(timedWindows=1, wallMs=12000, meanWallMs=12000.0)})
+
+    def test_time_a_build_did_not_record_stays_unknown(self):
+        self.assertEqual(audit_pl_capture.wall_ms('queue=3,wall=250,v0=1+2'), 250)
+        self.assertIsNone(audit_pl_capture.wall_ms('queue=3,firewall=250'))
+        self.assertIsNone(audit_pl_capture.wall_ms(None))
+        self.assertEqual(audit_pl_capture.resolution_class(dict(w=1080, h=1920)), '1080p')
+        self.assertEqual(audit_pl_capture.resolution_class(dict(w=1280, h=720)), '720p_or_less')
+        self.assertEqual(audit_pl_capture.resolution_class(dict()), 'unknown')
+        # An encode with no finalize, verify or certify events and no item time: nothing is invented.
+        records = [dict(type='stage', stage='encode', reasonCode='encode_completed', jobId='job_old', sequence=5, attempt=1,
+                        attemptIndex=1, encodeMs=7000),
+                   job('job_old', terminal='TRANSCODED_SMALLER', w=1920, h=1080)]
+        row = audit_pl_capture.analyze_tables(records)['summary']['stageTime']['1080p']
+        self.assertEqual((row['encodeMs'], row['probeMs']), (7000, 0))
+        for key in ['verifyMs', 'certifyMs', 'itemMs', 'mediaSeconds', 'itemSecondsPerMediaSecond', 'scoringShareOfItem']:
+            self.assertIsNone(row[key], key)
+
     def test_the_cli_keeps_its_arguments_and_files_and_adds_the_new_tables(self):
         records = [dict(type='session_start', mode='Perceptually Lossless')] + cross_codec_job() + [dict(type='session_summary')]
         with tempfile.TemporaryDirectory() as d:
