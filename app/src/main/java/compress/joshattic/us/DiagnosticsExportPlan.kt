@@ -54,7 +54,14 @@ object DiagnosticsExportPlan {
         // crash so far has had to be inferred from a pid change in the export.
         "AndroidRuntime",
         // CrashRecorder's confirmation that a report was written to filesDir.
-        "CompressorCrash"
+        "CompressorCrash",
+        // Media3's muxer wrapper. It logs one thing in 1.11.0: "Shifting first video timestamp
+        // from N to zero.", when it moves the first video sample of a file that also has audio.
+        // That move is what the first timestamp repair undoes, and until now a capture could only
+        // infer it from the two files' timestamps (b287 job_782a717d3217: 97,488 us). The line
+        // holds a number and nothing about the file. Media3MuxerObservationTest runs the wrapper
+        // on the build machine and fails if the line or the behaviour changes.
+        "MuxerWrapper"
     )
 
     /**

@@ -16,6 +16,8 @@ to the phone over ADB, and deleted from `/data/local/tmp` after use.
 | b169 totals, all 23 winners, all 29 size gates and every recorded encode request replay through the production Kotlin | `B169ObservationalReplayTest` (partial observational: rounded scores, no frame counts, no initial learned state) |
 | Production scoring is v0.6.1 without the phone transform | `DiagnosticEventsTest.productionScoringIsPlainV061WithoutThePhoneTransform` |
 | Media3's MP4 parser hands on only the samples a source's edit list presents, and the app's reading of an edit list matches it sample for sample | `Media3ParserParityTest` (Media3 1.11.0's own `Mp4Extractor` run on the JVM over 1,558 edit shapes of a synthetic source) |
+| With audio present Media3's muxer moves the first video timestamp to zero and no other, which is the pattern the first timestamp repair recognises and undoes | `Media3MuxerObservationTest` (Media3 1.11.0's own `MuxerWrapper` and default muxer run on the JVM, read back, and held against `MediaTimelineEvidence.compare`) |
+| A copied AAC track keeps every packet, its AudioSpecificConfig and its encoder delay through Media3's muxer; its padding follows a rounded edit | `Media3MuxerObservationTest` |
 
 ## 2. What only the phone can show
 
@@ -192,10 +194,34 @@ and after every sample, with and without a sync table, single and repeated edits
 difference, now fixed: a sample kept from before an edit's start was timed one microsecond early
 (Media3 rounds toward zero; the reading floored). No count differed.
 
-Two things are still not observed. Whether the job's original is built like the synthetic file
-is unknown: it is not available. And nothing a phone does is covered by a host run: what
-`MediaExtractor` lists for such a source, what the codecs and Media3's muxer make of 166 frames,
-what the remux writes. So no acceptance rule and no pipeline stage was changed. The verifier
+The 97,488 µs is observed there too. `Media3MuxerObservationTest` feeds the samples the parser
+hands on into Media3's own `MuxerWrapper` and default muxer, the last stage of every Transformer
+export, with no codec in between. With an audio track present the wrapper moves the first video
+sample's timestamp to zero and logs, with the number,
+
+    MuxerWrapper: Shifting first video timestamp from 97488 to zero.
+
+No other frame moves by more than a microsecond, no frame is added or dropped (166 in, 166 out;
+168 in, 168 out for the control), and the video track is written without an edit list, so nothing
+in the file compensates. That is exactly the pattern `MediaTimelineEvidence.compare` looks for
+before it proposes the first timestamp repair, and the test holds the comparator against what
+Media3 really writes: it proposes restoring 97,488 µs, and with only that timestamp put back the
+two timelines match. Written without an audio track, the same muxer moves the whole video
+timeline to start at zero, which the comparator counts as the same timeline: the reason the
+repair applies only to a source with audio. The app's log export now collects the `MuxerWrapper`
+tag, so a capture carries Media3's own line.
+
+So for a source built like the synthetic one, both numbers the capture recorded are Media3 doing
+what it is written to do, in this order: its parser leaves out the two samples outside the
+presentation, and its muxer zeroes the first video timestamp. No stage drops a frame it was
+handed.
+
+Three things are still not observed. Whether the job's original is built like the synthetic file
+is unknown: it is not available. Nothing a phone does is covered by a host run: what
+`MediaExtractor` lists for such a source, what the decoder and the encoder do between Media3's
+parser and its muxer, what the remux writes. And the host run has no codec, so it shows what the
+muxer does with the timestamps it is handed, not that a phone's encoder hands it the same ones.
+So no acceptance rule and no pipeline stage was changed. The verifier
 still compares every sample of the source's table, and such a source is still kept as the
 original. Whether a candidate that holds every sample the source *presents* should be accepted is
 a decision about what a complete timeline means, not a defect to patch: the two extra samples are
@@ -212,7 +238,48 @@ it fails, the device does not behave as the reading says and the message carries
 is the evidence to act on. From this build a batch also records these counts itself whenever a
 candidate's sample count differs from its source's (`timelineLocalization` on the `verify` stage).
 
-Still pending either way: a retest with the exact source, if a copy can be found.
+The same run prints, without asserting anything, whether the first timestamp repair's pattern is
+seen in Media3's file on the phone and whether the repair's own remux then gives back the
+source's timeline (`b287-timeline … firstTimestampRepair …`).
+
+### The earlier AAC "decoder configuration differs"
+
+A separate case, and not explained by the two findings above. b213 `job_6d1173f4c0f9` kept its
+original on its copied audio. What that capture recorded: the video timelines matched frame for
+frame (438 and 438, both starting at zero); 342 audio packets were compared; the reason given
+was "decoder configuration differs"; the two files' payload digests differed as well; the first
+packet already mismatched; and the largest audio-against-video difference was 21,334 µs. That
+build recorded neither side's packet count nor which configuration field differed, and the
+original is not available, so the cause is not proven. What can be said:
+
+- Both video timelines start at zero, so Media3's move of the first video timestamp has no part
+  in it.
+- 21,334 µs is one AAC frame at 48 kHz (1,024 samples is 21,333.3 µs). Payloads that differ from
+  the first packet on, a one-frame timing difference and a different configuration are together
+  what one packet more or fewer at the start of a track looks like when the two streams are read
+  in step. From this round a mismatch records which: both packet counts, both first timestamps,
+  what the first differing packet differed in, whether one stream is the other shifted by one
+  packet, and both sides' configuration values (the hash covers the codec, channels, sample
+  rate, the configuration bytes, and the encoder delay and padding the platform reports).
+- One AAC frame is also exactly what Media3 moves. On the build machine
+  (`Media3MuxerObservationTest`), an AAC track that reaches Media3's muxer wrapper with a
+  1,024-sample encoder delay, as FFmpeg writes one, has every timestamp handed to the muxer
+  21,333 µs early, the first of them negative, and the muxer writes an edit that starts after the
+  delay. Read back by Media3 nothing is lost: every packet, the AudioSpecificConfig and the
+  delay are unchanged, 329 packets in and 329 out. The edit is rewritten on the muxer's movie
+  timescale of 1/10,000 s, so a track whose presented length is not a whole number of those
+  units gains end padding (2 samples for the 329-packet synthetic track, none for the 376-packet
+  one). A track without an encoder delay goes through untouched and gets no edit.
+
+So a copied AAC track that carries an encoder delay is a place where a source and its copy can
+come to differ in what the capture recorded, depending on how the platform extractor applies
+each file's edit: whether it drops the delay's packet, moves the timestamps, and what delay and
+padding it reports. None of that runs off a phone, and whether the b213 source carried such a
+delay is not known. The device run therefore prints the app's audio comparison of the synthetic
+sources, which do carry one, for Media3's file, for the first timestamp repair and for the
+remuxed file (`b287-timeline … audio …`), with both sides' values when they differ. Nothing was
+relaxed. If the phone shows a copy that differs only in how its delay is written, whether that
+should pass is a decision about what identical audio means, to be taken on that observation.
 
 ## 7. What the alternate search and the 4K pipeline cost (v1.6.287 captures)
 

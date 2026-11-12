@@ -14,14 +14,19 @@ import androidx.media3.extractor.SeekMap;
 import androidx.media3.extractor.TrackOutput;
 import androidx.media3.extractor.mp4.Mp4Extractor;
 import androidx.media3.extractor.text.SubtitleParser;
+import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
+import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
- * Feeds a whole MP4 to Media3's Mp4Extractor and reports the video samples it emits: the samples
- * a player or a Transformer export is handed to decode. See README.md in this directory.
+ * Feeds a whole MP4 to Media3's Mp4Extractor and reports the samples it emits: the samples a
+ * player or a Transformer export is handed. See README.md in this directory.
  */
 public final class Media3Mp4Probe {
 
@@ -33,14 +38,39 @@ public final class Media3Mp4Probe {
     /** Mp4Extractor's flag for reading the sample table as stored. */
     public static int ignoreEditListsFlag() { return Mp4Extractor.FLAG_WORKAROUND_IGNORE_EDIT_LISTS; }
 
-    private static final class Track implements TrackOutput {
-        final int type;
-        final List<Long> timesUs = new ArrayList<>();
+    /** What Media3 logged as a warning or an error since the last call, oldest first. */
+    public static List<String> drainLog() { return android.util.Log.drain(); }
+
+    /** One emitted sample: its payload only when the read asked for payloads. */
+    public static final class Sample {
+        public final long timeUs;
+        public final int flags;
+        public final byte[] payload;
+
+        Sample(long timeUs, int flags, byte[] payload) {
+            this.timeUs = timeUs;
+            this.flags = flags;
+            this.payload = payload;
+        }
+
+        public boolean isKeyFrame() { return (flags & C.BUFFER_FLAG_KEY_FRAME) != 0; }
+    }
+
+    /** One track as the extractor emitted it, samples in emission order. */
+    public static final class Track implements TrackOutput {
+        public final int type;
+        public Format format;
+        public final List<Sample> samples = new ArrayList<>();
+        private final boolean keepPayloads;
+        private ByteArrayOutputStream pending = new ByteArrayOutputStream();
         private final byte[] scratch = new byte[1 << 16];
 
-        Track(int type) { this.type = type; }
+        Track(int type, boolean keepPayloads) {
+            this.type = type;
+            this.keepPayloads = keepPayloads;
+        }
 
-        @Override public void format(Format format) { }
+        @Override public void format(Format format) { this.format = format; }
 
         @Override public int sampleData(DataReader input, int length, boolean allowEndOfInput, int sampleDataPart) throws IOException {
             int read = input.read(scratch, 0, Math.min(length, scratch.length));
@@ -48,23 +78,42 @@ public final class Media3Mp4Probe {
                 if (allowEndOfInput) return C.RESULT_END_OF_INPUT;
                 throw new EOFException();
             }
+            if (keepPayloads) pending.write(scratch, 0, read);
             return read;
         }
 
-        @Override public void sampleData(ParsableByteArray data, int length, int sampleDataPart) { data.skipBytes(length); }
+        @Override public void sampleData(ParsableByteArray data, int length, int sampleDataPart) {
+            if (keepPayloads) {
+                byte[] bytes = new byte[length];
+                data.readBytes(bytes, 0, length);
+                pending.write(bytes, 0, length);
+            } else {
+                data.skipBytes(length);
+            }
+        }
 
-        @Override public void sampleMetadata(long timeUs, int flags, int size, int offset, CryptoData cryptoData) { timesUs.add(timeUs); }
+        @Override public void sampleMetadata(long timeUs, int flags, int size, int offset, CryptoData cryptoData) {
+            byte[] payload = null;
+            if (keepPayloads) {
+                byte[] all = pending.toByteArray();
+                payload = Arrays.copyOfRange(all, all.length - offset - size, all.length - offset);
+                pending = new ByteArrayOutputStream();
+            }
+            samples.add(new Sample(timeUs, flags, payload));
+        }
+
+        public String kind() {
+            return type == C.TRACK_TYPE_VIDEO ? "video" : type == C.TRACK_TYPE_AUDIO ? "audio" : "other";
+        }
     }
 
     /**
-     * The presentation time, in microseconds and in the order emitted, of every sample of the
-     * file's one video track.
+     * Every track of a complete, unfragmented MP4 as Mp4Extractor emits it.
      *
-     * @param file a complete, unfragmented MP4.
      * @param flags Mp4Extractor flags. 0 is the extractor's default, which applies edit lists;
-     *     Mp4Extractor.FLAG_WORKAROUND_IGNORE_EDIT_LISTS gives the sample table as stored.
+     *     {@link #ignoreEditListsFlag()} gives the sample table as stored.
      */
-    public static long[] videoTimesUs(final byte[] file, int flags) throws IOException {
+    public static List<Track> readTracks(final byte[] file, int flags, final boolean keepPayloads) throws IOException {
         final List<Track> tracks = new ArrayList<>();
         final int[] position = {0};
         DataReader reader = (buffer, offset, length) -> {
@@ -78,7 +127,7 @@ public final class Media3Mp4Probe {
         Mp4Extractor extractor = new Mp4Extractor(SubtitleParser.Factory.UNSUPPORTED, flags);
         extractor.init(new ExtractorOutput() {
             @Override public TrackOutput track(int id, int type) {
-                Track track = new Track(type);
+                Track track = new Track(type, keepPayloads);
                 tracks.add(track);
                 return track;
             }
@@ -99,15 +148,61 @@ public final class Media3Mp4Probe {
             }
         }
         extractor.release();
+        return tracks;
+    }
+
+    /**
+     * The presentation time, in microseconds and in the order emitted, of every sample of the
+     * file's one video track.
+     */
+    public static long[] videoTimesUs(byte[] file, int flags) throws IOException {
         Track video = null;
-        for (Track track : tracks) {
+        for (Track track : readTracks(file, flags, false)) {
             if (track.type != C.TRACK_TYPE_VIDEO) continue;
             if (video != null) throw new IOException("more than one video track");
             video = track;
         }
         if (video == null) throw new IOException("no video track");
-        long[] times = new long[video.timesUs.size()];
-        for (int i = 0; i < times.length; i++) times[i] = video.timesUs.get(i);
+        long[] times = new long[video.samples.size()];
+        for (int i = 0; i < times.length; i++) times[i] = video.samples.get(i).timeUs;
         return times;
+    }
+
+    /**
+     * The file's video and audio tracks in plain JDK types, keyed "video" and "audio": timesUs
+     * (long[], emission order), payloadDigests (String[], SHA-256 of each sample), codecData
+     * (hex of each initialization buffer), mime, encoderDelay and encoderPadding (Integer; the
+     * gapless values Media3 derives from an audio edit list, or -1 when it has none).
+     */
+    public static Map<String, Map<String, Object>> describe(byte[] file) throws Exception {
+        Map<String, Map<String, Object>> described = new LinkedHashMap<>();
+        for (Track track : readTracks(file, 0, true)) {
+            if (track.kind().equals("other")) continue;
+            if (described.containsKey(track.kind())) throw new IOException("more than one " + track.kind() + " track");
+            Map<String, Object> one = new LinkedHashMap<>();
+            long[] times = new long[track.samples.size()];
+            String[] digests = new String[track.samples.size()];
+            MessageDigest sha = MessageDigest.getInstance("SHA-256");
+            for (int i = 0; i < times.length; i++) {
+                times[i] = track.samples.get(i).timeUs;
+                digests[i] = hex(sha.digest(track.samples.get(i).payload));
+            }
+            List<String> codecData = new ArrayList<>();
+            for (byte[] data : track.format.initializationData) codecData.add(hex(data));
+            one.put("timesUs", times);
+            one.put("payloadDigests", digests);
+            one.put("codecData", codecData);
+            one.put("mime", track.format.sampleMimeType);
+            one.put("encoderDelay", track.format.encoderDelay);
+            one.put("encoderPadding", track.format.encoderPadding);
+            described.put(track.kind(), one);
+        }
+        return described;
+    }
+
+    private static String hex(byte[] bytes) {
+        StringBuilder text = new StringBuilder(bytes.length * 2);
+        for (byte b : bytes) text.append(String.format("%02x", b));
+        return text.toString();
     }
 }

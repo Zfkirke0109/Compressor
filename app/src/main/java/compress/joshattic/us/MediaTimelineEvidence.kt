@@ -45,8 +45,9 @@ object MediaTimelineEvidence {
         }
         return if (firstMismatch == null) result(true, maxSkew)
         else {
-            // Media3 1.11's MuxerWrapper can zero the first video PTS when audio is present.
-            // Identify that exact pattern while continuing to reject the original candidate.
+            // Media3 1.11's MuxerWrapper zeroes the first video PTS, and no other, when audio is
+            // present (Media3MuxerObservationTest runs it and holds this branch against what it
+            // writes). Identify that exact pattern while continuing to reject the original candidate.
             val restore = sourceOrigin?.takeIf { origin ->
                 firstMismatch == 1 && outputOrigin == 0L && origin > toleranceUs &&
                     origin < output[1] && (1 until source.size).all { i ->

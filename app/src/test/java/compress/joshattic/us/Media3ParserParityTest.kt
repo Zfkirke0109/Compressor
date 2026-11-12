@@ -1,19 +1,10 @@
 package compress.joshattic.us
 
-import org.junit.AfterClass
+import compress.joshattic.us.Mp4Boxes.one
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
-import org.junit.BeforeClass
 import org.junit.Test
-import java.io.ByteArrayOutputStream
-import java.io.File
-import java.io.InputStream
-import java.io.OutputStream
-import java.lang.reflect.InvocationTargetException
-import java.lang.reflect.Method
-import java.net.URLClassLoader
 import java.nio.ByteBuffer
-import java.nio.file.Files
 
 /**
  * Mp4EditTimeline against the parser it describes.
@@ -39,114 +30,26 @@ import java.nio.file.Files
  * exact samples kept and their times to the microsecond, so a Media3 upgrade that changes how an
  * edit list is applied fails here, and names the first shape that differs.
  *
- * Media3 needs a few Android classes that only throw off a device. src/test/media3host holds
- * small replacements and the probe, compiled here into a temporary directory and loaded with the
- * Media3 jars in a class loader of their own, so no other test sees a replaced Android class.
+ * Media3Host says how Media3 is run off a device and why no other test is affected by it.
+ * Media3MuxerObservationTest is the next stage of the same path: what Media3's muxer does with
+ * the samples the parser hands on.
  */
 class Media3ParserParityTest {
 
-    companion object {
-        private lateinit var loader: URLClassLoader
-        private lateinit var compiled: File
-        private lateinit var videoTimesUs: Method
-        private lateinit var media3Version: String
-        private var ignoreEditLists = 0
-
-        private fun inModule(path: String): File =
-            listOf(path, "app/$path").map(::File).firstOrNull { it.exists() } ?: error("$path not found from ${File("").absolutePath}")
-
-        /** The jar a class of the unit-test classpath comes from, without initializing the class. */
-        private fun jarOf(className: String): File {
-            val type = Class.forName(className, false, Media3ParserParityTest::class.java.classLoader)
-            val location = type.protectionDomain?.codeSource?.location ?: error("$className has no code source")
-            return File(location.toURI())
-        }
-
-        @BeforeClass
-        @JvmStatic
-        fun compileTheProbe() {
-            val sources = inModule("src/test/media3host").walkTopDown().filter { it.isFile && it.extension == "java" }.toList()
-            check(sources.any { it.name == "Media3Mp4Probe.java" }) { "the probe's source is missing from src/test/media3host" }
-            // The Media3 classes the app ships, the Guava they call, and the SDK stubs for every
-            // Android class the replacements do not cover.
-            val libraries = listOf(
-                "androidx.media3.extractor.mp4.Mp4Extractor",
-                "androidx.media3.common.Format",
-                "androidx.media3.container.NalUnitUtil",
-                "com.google.common.collect.ImmutableList",
-                "android.os.Parcelable"
-            ).map(::jarOf).distinct()
-            compiled = Files.createTempDirectory("media3host").toFile()
-            // The JDK's compiler and platform class loader, by name: unit tests are compiled
-            // against the Android API surface, which has neither, and run on a JDK, which has both.
-            val compiler = Class.forName("javax.tools.ToolProvider").getMethod("getSystemJavaCompiler").invoke(null)
-                ?: error("no Java compiler in this JVM: the unit tests must run on a JDK")
-            val run = Class.forName("javax.tools.Tool")
-                .getMethod("run", InputStream::class.java, OutputStream::class.java, OutputStream::class.java, Array<String>::class.java)
-            val log = ByteArrayOutputStream()
-            val arguments = arrayOf("-d", compiled.path, "-classpath", libraries.joinToString(File.pathSeparator), "-proc:none", "-nowarn", "-Xlint:none") +
-                sources.map { it.path }
-            val status = run.invoke(compiler, null, log, log, arguments) as Int
-            check(status == 0) { "the host probe did not compile against this build's Media3:\n$log" }
-            // The compiled replacements come first, and the parent holds only the JDK.
-            val jdkOnly = ClassLoader::class.java.getMethod("getPlatformClassLoader").invoke(null) as ClassLoader
-            loader = URLClassLoader((listOf(compiled) + libraries).map { it.toURI().toURL() }.toTypedArray(), jdkOnly)
-            val probe = loader.loadClass("hostprobe.Media3Mp4Probe")
-            videoTimesUs = probe.getMethod("videoTimesUs", ByteArray::class.java, Int::class.javaPrimitiveType)
-            media3Version = probe.getMethod("media3Version").invoke(null) as String
-            ignoreEditLists = probe.getMethod("ignoreEditListsFlag").invoke(null) as Int
-        }
-
-        @AfterClass
-        @JvmStatic
-        fun closeTheProbe() {
-            if (::loader.isInitialized) loader.close()
-            if (::compiled.isInitialized) compiled.deleteRecursively()
-        }
-    }
+    private val media3Version get() = Media3Host.version
+    private val ignoreEditLists get() = Media3Host.ignoreEditLists
 
     /** The video sample times Media3's extractor emits for [file], in the order it emits them. */
-    private fun media3(file: ByteArray, flags: Int = 0): LongArray = try {
-        videoTimesUs.invoke(null, file, flags) as LongArray
-    } catch (e: InvocationTargetException) {
-        throw AssertionError(
-            "Media3 $media3Version's Mp4Extractor did not run on the build machine: ${e.targetException}. " +
-                "If that names an android method, src/test/media3host needs a replacement for its class.",
-            e.targetException
-        )
-    }
+    private fun media3(file: ByteArray, flags: Int = 0): LongArray = Media3Host.videoTimesUs(file, flags)
 
-    private class Box(val kind: String, val start: Int, val end: Int)
-
-    private fun boxes(data: ByteArray, start: Int, end: Int): List<Box> {
-        val buffer = ByteBuffer.wrap(data)
-        val found = ArrayList<Box>()
-        var p = start
-        while (p + 8 <= end) {
-            var size = buffer.getInt(p).toLong() and 0xFFFFFFFFL
-            val kind = String(data, p + 4, 4, Charsets.ISO_8859_1)
-            var header = 8
-            if (size == 1L) {
-                size = buffer.getLong(p + 8)
-                header = 16
-            } else if (size == 0L) {
-                size = (end - p).toLong()
-            }
-            check(size >= header && p + size <= end) { "malformed box '$kind' at $p" }
-            found += Box(kind, p + header, (p + size).toInt())
-            p += size.toInt()
-        }
-        return found
-    }
-
-    private fun moovOf(file: ByteArray): ByteArray = boxes(file, 0, file.size).single { it.kind == "moov" }.let { file.copyOfRange(it.start, it.end) }
+    private fun moovOf(file: ByteArray): ByteArray = Mp4Boxes.moovPayload(file)
 
     /**
      * One of the synthetic sources, and where its video track's edit list and sync table are, so
      * an edit can be rewritten in place. No sample data is touched and no box changes size.
      */
     private inner class Fixture(name: String) {
-        val bytes: ByteArray = inModule("src/androidTest/assets/$name").readBytes()
+        val bytes: ByteArray = Media3Host.inModule("src/androidTest/assets/$name").readBytes()
         val movieTimescale: Long
         val timescale: Long
         private val elst: Int
@@ -160,25 +63,19 @@ class Media3ParserParityTest {
 
         init {
             val data = ByteBuffer.wrap(bytes)
-            val moov = boxes(bytes, 0, bytes.size).single { it.kind == "moov" }
-            val inMoov = boxes(bytes, moov.start, moov.end)
-            fun timescaleAt(header: Box) = data.getInt(header.start + 4 + if (bytes[header.start].toInt() == 1) 16 else 8).toLong() and 0xFFFFFFFFL
-            movieTimescale = timescaleAt(inMoov.single { it.kind == "mvhd" })
-            val video = inMoov.filter { it.kind == "trak" }.single { trak ->
-                val mdia = boxes(bytes, trak.start, trak.end).single { it.kind == "mdia" }
-                val hdlr = boxes(bytes, mdia.start, mdia.end).single { it.kind == "hdlr" }
-                String(bytes, hdlr.start + 8, 4, Charsets.ISO_8859_1) == "vide"
-            }
-            val inTrack = boxes(bytes, video.start, video.end)
-            val mdia = inTrack.single { it.kind == "mdia" }
-            val inMedia = boxes(bytes, mdia.start, mdia.end)
-            timescale = timescaleAt(inMedia.single { it.kind == "mdhd" })
-            val minf = inMedia.single { it.kind == "minf" }
-            val stbl = boxes(bytes, minf.start, minf.end).single { it.kind == "stbl" }
-            stssKind = boxes(bytes, stbl.start, stbl.end).single { it.kind == "stss" }.start - 4
-            val edts = inTrack.single { it.kind == "edts" }
+            val moov = Mp4Boxes.moov(bytes)
+            movieTimescale = Mp4Boxes.timescale(bytes, Mp4Boxes.boxes(bytes, moov.start, moov.end).one("mvhd"))
+            val video = Mp4Boxes.track(bytes, "vide")
+            val inTrack = Mp4Boxes.boxes(bytes, video.start, video.end)
+            val mdia = inTrack.one("mdia")
+            val inMedia = Mp4Boxes.boxes(bytes, mdia.start, mdia.end)
+            timescale = Mp4Boxes.timescale(bytes, inMedia.one("mdhd"))
+            val minf = inMedia.one("minf")
+            val stbl = Mp4Boxes.boxes(bytes, minf.start, minf.end).one("stbl")
+            stssKind = Mp4Boxes.boxes(bytes, stbl.start, stbl.end).one("stss").start - 4
+            val edts = inTrack.one("edts")
             edtsKind = edts.start - 4
-            elst = boxes(bytes, edts.start, edts.end).single { it.kind == "elst" }.start
+            elst = Mp4Boxes.boxes(bytes, edts.start, edts.end).one("elst").start
             check(bytes[elst].toInt() == 0 && data.getInt(elst + 4) == 2) { "$name: expected a version 0 edit list of two entries" }
             emptyEdit = data.getInt(elst + 8).toLong() and 0xFFFFFFFFL
             check(data.getInt(elst + 12) == -1) { "$name: expected the first edit to be empty" }

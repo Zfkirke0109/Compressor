@@ -62,6 +62,20 @@ import kotlin.coroutines.resumeWithException
  *
  * A failure here is a result, not a broken test: it means this device does not behave as the
  * reading above says, and its message carries the counts that say how.
+ *
+ * The run also prints, and asserts nothing about, three things only a phone can show:
+ *
+ *  - the app's audio comparison of the copied AAC track, for Media3's file and for the remuxed
+ *    one (`... audio ...`). Both assets carry an AAC track with an encoder-delay edit, the kind an
+ *    earlier capture (b213 job_6d1173f4c0f9) may have had when it read "decoder configuration
+ *    differs". On the build machine Media3's muxer keeps every packet, the configuration and the
+ *    delay, and writes the edit rounded (Media3MuxerObservationTest); what the platform
+ *    extractor reports for the two files is what these lines add, with both sides' values when
+ *    they differ.
+ *  - whether the first timestamp repair's pattern is seen in Media3's file, and whether the
+ *    repair's own remux then gives back the source's timeline (`... firstTimestampRepair ...`).
+ *    Media3's muxer moves the first video timestamp to zero when the file has audio and logs
+ *    "Shifting first video timestamp from N to zero." under the tag MuxerWrapper.
  */
 @UnstableApi
 @RunWith(AndroidJUnit4::class)
@@ -108,6 +122,48 @@ class EditListTimelineDeviceTest {
         }
     }
 
+    /** The app's own audio comparison of [candidate] against [source], as text. Never fails the test. */
+    private fun audioLine(source: File, candidate: File, sourceVideoOriginUs: Long?, outputVideoOriginUs: Long?): String = runCatching {
+        val outcome = AudioTrackIdentity.compare(
+            context, Uri.fromFile(source), candidate, sourceVideoOriginUs, outputVideoOriginUs, requirePresentationProof = true
+        )
+        val e = outcome.evidence
+        "result=${outcome.result} packets=${outcome.packets} reason=${e?.reason} maxSkewUs=${e?.maxSkewUs} " +
+            "sourcePackets=${e?.sourcePackets} outputPackets=${e?.outputPackets} " +
+            "sourceFirstPtsUs=${e?.sourceFirstPtsUs} outputFirstPtsUs=${e?.outputFirstPtsUs} " +
+            "firstMismatch=${e?.firstMismatch}/${e?.firstMismatchKind} " +
+            "sourceConfig=${outcome.sourceConfig} outputConfig=${outcome.outputConfig}"
+    }.getOrElse { "unavailable (${it.javaClass.simpleName}: ${it.message})" }
+
+    /**
+     * What the first timestamp repair would do with Media3's file, printed and never asserted:
+     * the timestamp the comparator proposes to restore, the audio comparison the repair requires
+     * first, and whether the repair's own remux then matches the source's timeline.
+     */
+    private fun printFirstTimestampRepair(name: String, source: File, raw: File, rawTimeline: MediaTimelineEvidence.Result) {
+        val restoreUs = rawTimeline.firstVideoPtsToRestoreUs
+        if (restoreUs == null) {
+            println("b287-timeline $name firstTimestampRepair proposed=false rawReason=${rawTimeline.reason}")
+            return
+        }
+        println("b287-timeline $name audio raw, as the repair compares it: " + audioLine(source, raw, rawTimeline.sourceOriginUs, restoreUs))
+        runCatching {
+            val repaired = File(context.cacheDir, "timeline_repaired_$name").also { scratch += it; it.delete() }
+            Mp4MetadataRemuxer.remuxSourceWithoutReencode(
+                context, Uri.fromFile(raw), repaired, VideoMetadataSnapshot(latitude = 12.5, longitude = -45.25),
+                restoreFirstVideoPtsUs = restoreUs
+            )
+            val after = MediaTimelineEvidence.inspect(context, Uri.fromFile(source), repaired)
+            println(
+                "b287-timeline $name firstTimestampRepair proposed=true restoreUs=$restoreUs matchesAfter=${after.matches} " +
+                    "samplesAfter=${after.outputFrames} originAfterUs=${after.outputOriginUs} maxSkewAfterUs=${after.maxSkewUs} reasonAfter=${after.reason}"
+            )
+            println("b287-timeline $name audio after the repair: " + audioLine(source, repaired, after.sourceOriginUs, after.outputOriginUs))
+        }.onFailure {
+            println("b287-timeline $name firstTimestampRepair proposed=true restoreUs=$restoreUs remux failed: ${it.javaClass.simpleName}: ${it.message}")
+        }
+    }
+
     private class Counts(
         val edit: Mp4EditTimeline.Evidence,
         /** What the platform extractor lists for the source: the verifier's reference. */
@@ -130,12 +186,16 @@ class EditListTimelineDeviceTest {
         val exported = export(source, raw)
         // The verifier's own reader, on the file exactly as Media3 closed it.
         val rawTimeline = MediaTimelineEvidence.inspect(context, Uri.fromFile(source), raw)
+        // Observations on Media3's file, before the metadata remux replaces it. Printed only.
+        println("b287-timeline $name audio raw: " + audioLine(source, raw, rawTimeline.sourceOriginUs, rawTimeline.outputOriginUs))
+        printFirstTimestampRepair(name, source, raw, rawTimeline)
         // The remux runs only for a source with a location to write. These coordinates are made up.
         val remux = Mp4MetadataRemuxer.remuxWithSourceMetadata(
             context, raw, VideoMetadataSnapshot(latitude = 12.5, longitude = -45.25)
         )
         scratch += remux.outputFile
         val finalTimeline = MediaTimelineEvidence.inspect(context, Uri.fromFile(source), remux.outputFile)
+        println("b287-timeline $name audio final: " + audioLine(source, remux.outputFile, finalTimeline.sourceOriginUs, finalTimeline.outputOriginUs))
         val stage = TimelineLocalization.localize(
             sourceTableSamples = finalTimeline.sourceFrames,
             sourcePresentedSamples = edit!!.presentedSamples,

@@ -69,6 +69,14 @@ class DiagnosticsExportPlanTest {
     }
 
     @Test
+    fun media3sMuxerTagIsIncludedBecauseItIsTheOnlyPlaceTheTimestampShiftIsStated() {
+        // "Shifting first video timestamp from N to zero." is Media3's own record of the move the
+        // first timestamp repair undoes; without the tag a capture can only infer it.
+        assertTrue("MuxerWrapper" in DiagnosticsExportPlan.DIAGNOSTIC_TAGS)
+        assertTrue("MuxerWrapper:V" in DiagnosticsExportPlan.logcatDumpArgsAllProcesses())
+    }
+
+    @Test
     fun anEmptyTagListIsRejectedRatherThanSilentlyCapturingEverything() {
         // `logcat -s` with no tags is not "no filter" — but an empty list here would also mean the
         // caller has a bug, and producing a file either way would hide it.
