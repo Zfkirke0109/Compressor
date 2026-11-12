@@ -600,13 +600,31 @@ class DiagnosticsRecorder private constructor(
         }
 
         /** Every run directory under `diagnostics/` that holds a session or decision log. */
-        fun runDirectories(context: Context): List<File> {
-            val root = File(context.filesDir, "diagnostics")
+        fun runDirectories(context: Context): List<File> = runDirectories(File(context.filesDir, "diagnostics"))
+
+        /** Every run directory under [root] that holds a session or decision log. */
+        internal fun runDirectories(root: File): List<File> {
             if (!root.isDirectory) return emptyList()
             return root.listFiles().orEmpty().filter { dir ->
                 dir.isDirectory && DiagnosticsArchivePlan.isRunDirectoryName(dir.name) &&
                     (File(dir, "session.jsonl").isFile || File(dir, "decisions.log").isFile)
             }
+        }
+
+        /**
+         * The directory [runId] writes to under [root]: room is made for it first (keep the newest
+         * runs, so the export stays one archive a phone can send and the folder cannot grow without
+         * bound), then it is created and given its place in the start order. Every run starts
+         * here, whichever file it opens first: a batch's decision log and session record, the
+         * synthetic self-test's session, and the scorer self-check, which writes only a decision
+         * log and used to make no room at all. Null when the directory cannot be created.
+         */
+        internal fun openRunDirectory(root: File, runId: String): File? {
+            runCatching {
+                DiagnosticsRetention.runsToPruneBeforeStart(runDirectories(root).map { it.name }, runId) { RunSequence.of(File(root, it)) }
+                    .forEach { name -> File(root, name).deleteRecursively() }
+            }
+            return runCatching { File(root, runId).apply { mkdirs() }.also { RunSequence.stamp(root, it) } }.getOrNull()
         }
 
         fun start(
@@ -617,22 +635,7 @@ class DiagnosticsRecorder private constructor(
             learnedStateIdentity: String? = null,
             exhaustivePerceptualLossless: Boolean? = null
         ): DiagnosticsRecorder {
-            // Retention: keep the newest runs, so the export stays one archive a phone can send
-            // and the folder cannot grow without bound. Older runs have been exported already or
-            // are no longer wanted.
-            val root = File(context.filesDir, "diagnostics")
-            runCatching {
-                val names = runDirectories(context).map { it.name }
-                DiagnosticsRetention.runsToPruneBeforeStart(names, batchId) { RunSequence.of(File(root, it)) }.forEach { name ->
-                    File(root, name).deleteRecursively()
-                }
-            }
-            val file = runCatching {
-                val dir = File(root, batchId).apply { mkdirs() }
-                // Its place in the start order, unless the decision log already gave it one.
-                RunSequence.stamp(root, dir)
-                File(dir, "session.jsonl")
-            }.getOrNull()
+            val file = openRunDirectory(File(context.filesDir, "diagnostics"), batchId)?.let { File(it, "session.jsonl") }
             return DiagnosticsRecorder(batchId, file, buildIdentity(context)).also {
                 it.sessionStart(mode, selectedCount, learnedStateIdentity, exhaustivePerceptualLossless)
             }

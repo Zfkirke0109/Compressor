@@ -66,14 +66,9 @@ object DiagLog {
      */
     @Synchronized
     fun attach(context: Context, batchId: String): Any = attachTo(
-        runCatching {
-            val root = File(context.filesDir, "diagnostics")
-            val dir = File(root, batchId).apply { mkdirs() }
-            // A batch's decision log is opened before its session record, a self-check's is its
-            // only file: whichever comes first gives the run its place in the start order.
-            RunSequence.stamp(root, dir)
-            File(dir, "decisions.log")
-        }.getOrNull()
+        // A batch's decision log is opened before its session record, and a self-check's is its
+        // only file: whichever opens the run directory first makes room for it and places it.
+        DiagnosticsRecorder.openRunDirectory(File(context.filesDir, "diagnostics"), batchId)?.let { File(it, "decisions.log") }
     )
 
     /** [attach] without a Context, so the ownership rules are testable on the JVM. */
