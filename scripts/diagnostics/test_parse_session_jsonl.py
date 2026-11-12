@@ -818,5 +818,53 @@ def test_a_frame_count_change_is_reported_with_the_stage_it_was_localized_to():
     assert "old 168 -> 166 video samples (source first timestamp 97488 us); first changed at: not localized" in text
     assert "first changed at: source_edit_list" in text and "first changed at: metadata_remux" in text
 
+def _audio(job_id, **audio):
+    d = {"result": "DIFFERENT", "packets": 342, "sourceConfigSha256": "aa", "outputConfigSha256": "bb",
+         "sourcePayloadSha256": "cc", "outputPayloadSha256": "dd", "maxSkewUs": 21334, "firstMismatch": 0,
+         "reason": "decoder configuration differs"}
+    d.update(audio)
+    return {"type": "stage", "batchId": "b1", "jobId": job_id, "stage": "verify", "reasonCode": "structural_failed", "attemptIndex": 1,
+            "structuralEvidence": {"audioPacketEvidence": d}}
+
+
+def test_an_audio_packet_difference_says_what_differed_or_that_it_was_not_recorded():
+    aac = {"mime": "audio/mp4a-latm", "channels": 2, "sampleRate": 48000, "encoderDelay": None, "encoderPadding": None,
+           "csdSizes": [2, None, None], "csd0Hex": "1190"}
+    path = write([
+        start(),
+        # b213 job_6d1173f4c0f9 as captured: one reason, no counts, no configuration fields.
+        _audio("old"),
+        # The same numbers from a build that records the rest: the output starts one packet late.
+        _audio("late", packets=341, sourcePackets=342, outputPackets=341, sourceFirstPtsUs=0, outputFirstPtsUs=21333,
+               firstMismatchKind="payload differs", outputLacksFirstSourcePacket=True, outputHasExtraFirstPacket=False,
+               sourceConfig=dict(aac, encoderDelay=2112), outputConfig=aac),
+        # Identical packets, only the configuration differs.
+        _audio("config", sourcePayloadSha256="cc", outputPayloadSha256="cc", maxSkewUs=0, firstMismatch=None,
+               sourcePackets=342, outputPackets=342, sourceFirstPtsUs=0, outputFirstPtsUs=0,
+               outputLacksFirstSourcePacket=False, outputHasExtraFirstPacket=False,
+               sourceConfig=aac, outputConfig=dict(aac, csd0Hex="1210", sampleRate=44100)),
+        # A matching copy is not a difference.
+        _audio("same", result="IDENTICAL", outputConfigSha256="aa", outputPayloadSha256="cc", reason=None),
+        *[job(j, batchId="b1", jobId=j) for j in ("old", "late", "config", "same")],
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    rows = {d["jobId"]: d for d in s["audioPacketDifferences"]}
+    assert set(rows) == {"old", "late", "config"}, rows
+    assert rows["old"]["countsRecorded"] is False and rows["old"]["explanation"] == "not recorded"
+    assert rows["old"]["configFieldsThatDiffer"] is None and rows["old"]["configDiffers"] and rows["old"]["payloadDiffers"]
+    assert rows["late"]["explanation"] == "the output is the source without its first packet"
+    assert rows["late"]["configFieldsThatDiffer"] == ["encoderDelay"], rows["late"]
+    assert (rows["late"]["sourcePackets"], rows["late"]["outputPackets"], rows["late"]["outputFirstPtsUs"]) == (342, 341, 21333)
+    assert rows["config"]["explanation"] == "the same packets under a different decoder configuration"
+    assert rows["config"]["configFieldsThatDiffer"] == ["sampleRate", "csd0Hex"] and not rows["config"]["payloadDiffers"]
+    from parse_session_jsonl import render
+    text = render(s)
+    assert "old decoder configuration differs over 342 compared packet(s), max skew 21334 us; this build recorded neither" in text
+    assert "source 342 / output 341 packets, first at 0 / 21333 us; the output is the source without its first packet; " \
+           "configuration differs in encoderDelay" in text
+    assert "configuration differs in sampleRate, csd0Hex" in text and "audio packets: same" not in text
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

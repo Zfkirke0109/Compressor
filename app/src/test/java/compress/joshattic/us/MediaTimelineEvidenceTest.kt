@@ -92,6 +92,74 @@ class MediaTimelineEvidenceTest {
         assertNull(shifted.firstVideoPtsToRestoreUs)
     }
 
+    /** AAC at 48 kHz: one packet every 21,333 us, each with its own payload. */
+    private fun aac(count: Int, first: Int = 0, shiftUs: Long = 0) = (first until first + count).map {
+        AudioPacketEvidence.Packet(byteArrayOf((it % 127).toByte(), (it / 127).toByte(), 7), it * 21_333L + shiftUs, 1)
+    }
+
+    @Test fun anOutputThatLacksTheSourcesFirstPacketSaysSoBesideTheConfigurationReason() {
+        // b213 job_6d1173f4c0f9 read only "decoder configuration differs", with a skew of 21,334 us
+        // (one AAC frame) and different payload hashes. Whether a packet was missing was not recorded.
+        val result = AudioPacketEvidence.compare(aac(342).iterator(), aac(341, first = 1).iterator(), "configA", "configB", 0, 0)
+        assertFalse(result.identical)
+        assertEquals("decoder configuration differs", result.reason)
+        assertEquals(342, result.sourcePackets)
+        assertEquals(341, result.outputPackets)
+        assertEquals(341, result.packets)
+        assertEquals(0L, result.sourceFirstPtsUs)
+        assertEquals(21_333L, result.outputFirstPtsUs)
+        assertEquals("payload differs", result.firstMismatchKind)
+        assertEquals(0, result.firstMismatch)
+        assertEquals(21_333L, result.maxSkewUs)
+        assertTrue(result.outputLacksFirstSourcePacket)
+        assertFalse(result.outputHasExtraFirstPacket)
+    }
+
+    @Test fun anExtraLeadingPacketIsToldApartFromAMissingOne() {
+        val result = AudioPacketEvidence.compare(aac(341, first = 1).iterator(), aac(342).iterator(), "config", "config", 0, 0)
+        assertFalse(result.identical)
+        assertEquals("payload differs", result.reason)
+        assertEquals(341 to 342, result.sourcePackets to result.outputPackets)
+        assertTrue(result.outputHasExtraFirstPacket)
+        assertFalse(result.outputLacksFirstSourcePacket)
+    }
+
+    @Test fun streamsThatAreNotOnePacketApartClaimNoOffset() {
+        // Identical: nothing to explain.
+        val same = AudioPacketEvidence.compare(aac(50).iterator(), aac(50).iterator(), "config", "config", 0, 0)
+        assertTrue(same.identical)
+        assertNull(same.firstMismatchKind)
+        assertEquals(50 to 50, same.sourcePackets to same.outputPackets)
+        assertFalse(same.outputLacksFirstSourcePacket || same.outputHasExtraFirstPacket)
+        // The same packets, later against the video: timing alone, no packet missing.
+        val late = AudioPacketEvidence.compare(aac(50).iterator(), aac(50, shiftUs = 21_333).iterator(), "config", "config", 0, 0)
+        assertEquals("presentation time differs against video by 21333us", late.firstMismatchKind)
+        assertFalse(late.outputLacksFirstSourcePacket || late.outputHasExtraFirstPacket)
+        // One packet rewritten in the middle of equal-length streams.
+        val edited = aac(50).toMutableList().also { it[20] = AudioPacketEvidence.Packet(byteArrayOf(9, 9, 9), it[20].ptsUs, 1) }
+        val middle = AudioPacketEvidence.compare(aac(50).iterator(), edited.iterator(), "config", "config", 0, 0)
+        assertEquals(20, middle.firstMismatch)
+        assertEquals("payload differs", middle.firstMismatchKind)
+        assertFalse(middle.outputLacksFirstSourcePacket || middle.outputHasExtraFirstPacket)
+        // Two packets short at the front is not "lacks the first packet".
+        val two = AudioPacketEvidence.compare(aac(50).iterator(), aac(48, first = 2).iterator(), "config", "config", 0, 0)
+        assertEquals(50 to 48, two.sourcePackets to two.outputPackets)
+        assertFalse(two.outputLacksFirstSourcePacket)
+        // Digital silence, one packet short and late: every packet carries the same bytes, so it
+        // matches at any offset and nothing says WHICH packet is missing.
+        fun silence(count: Int, shiftUs: Long = 0) = (0 until count).map { AudioPacketEvidence.Packet(byteArrayOf(0, 0, 0), it * 21_333L + shiftUs, 1) }
+        val silent = AudioPacketEvidence.compare(silence(50).iterator(), silence(49, shiftUs = 21_333).iterator(), "config", "config", 0, 0)
+        assertEquals(50 to 49, silent.sourcePackets to silent.outputPackets)
+        assertEquals("presentation time differs against video by 21333us", silent.firstMismatchKind)
+        assertFalse(silent.outputLacksFirstSourcePacket || silent.outputHasExtraFirstPacket)
+        // The last packet missing: counts differ by one, but the packets are not offset.
+        val tail = AudioPacketEvidence.compare(aac(50).iterator(), aac(49).iterator(), "config", "config", 0, 0)
+        assertEquals("packet count differs", tail.reason)
+        assertEquals("packet count differs", tail.firstMismatchKind)
+        assertEquals(49, tail.firstMismatch)
+        assertFalse(tail.outputLacksFirstSourcePacket || tail.outputHasExtraFirstPacket)
+    }
+
     private fun packets(shift: Long=0, flags: Int=1) = listOf(0L,23000L,46000L).map {
         AudioPacketEvidence.Packet(byteArrayOf(1,2,3),it+shift,flags)
     }.iterator()

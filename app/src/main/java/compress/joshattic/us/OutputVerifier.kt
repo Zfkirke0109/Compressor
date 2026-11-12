@@ -553,7 +553,13 @@ object OutputVerifier {
                     "sourceConfigSha256" to a.sourceConfigHash, "outputConfigSha256" to a.outputConfigHash,
                     "sourcePayloadSha256" to a.evidence?.sourceHash, "outputPayloadSha256" to a.evidence?.outputHash,
                     "maxSkewUs" to a.evidence?.maxSkewUs, "firstMismatch" to a.evidence?.firstMismatch,
-                    "reason" to a.evidence?.reason) }),
+                    "reason" to a.evidence?.reason,
+                    "sourcePackets" to a.evidence?.sourcePackets, "outputPackets" to a.evidence?.outputPackets,
+                    "sourceFirstPtsUs" to a.evidence?.sourceFirstPtsUs, "outputFirstPtsUs" to a.evidence?.outputFirstPtsUs,
+                    "firstMismatchKind" to a.evidence?.firstMismatchKind,
+                    "outputLacksFirstSourcePacket" to a.evidence?.outputLacksFirstSourcePacket,
+                    "outputHasExtraFirstPacket" to a.evidence?.outputHasExtraFirstPacket,
+                    "sourceConfig" to a.sourceConfig, "outputConfig" to a.outputConfig) }),
             verified = when (input.mode) {
                 BatchQualityMode.REMUX_ONLY -> remuxVerified
                 BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance

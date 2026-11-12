@@ -16,7 +16,10 @@ object AudioTrackIdentity {
     /** The result plus how many packets were compared, for the record ("bit-identical, N packets"). */
     data class Outcome(val result: Result, val packets: Int,
         val evidence: AudioPacketEvidence.Result? = null,
-        val sourceConfigHash: String? = null, val outputConfigHash: String? = null)
+        val sourceConfigHash: String? = null, val outputConfigHash: String? = null,
+        // What each hash was taken over, so "decoder configuration differs" can say in what:
+        // codec, channels, sample rate, encoder delay and padding, and the codec-specific data.
+        val sourceConfig: Map<String, Any?>? = null, val outputConfig: Map<String, Any?>? = null)
 
     private const val DEFAULT_SAMPLE_CAPACITY = 1 shl 20
 
@@ -69,7 +72,9 @@ object AudioTrackIdentity {
                     timedPackets(outputExtractor, capacityOf(of), cancellationCheck),
                     sc, oc, sourceVideoOriginUs, outputVideoOriginUs)
                 Outcome(if (evidence.identical) Result.IDENTICAL else if (sc == null || oc == null)
-                    Result.UNAVAILABLE else Result.DIFFERENT, evidence.packets, evidence, sc, oc)
+                    Result.UNAVAILABLE else Result.DIFFERENT, evidence.packets, evidence, sc, oc,
+                    // Only when it did not match: the passing record stays as small as it was.
+                    if (evidence.identical) null else describeConfig(sf), if (evidence.identical) null else describeConfig(of))
             }
         } catch (e: CancellationException) { throw e }
         catch (_: Exception) { Outcome(Result.UNAVAILABLE, 0) }
@@ -85,6 +90,26 @@ object AudioTrackIdentity {
         }
         if (tracks.size != 1) return null // No proof for an unexamined second track.
         return tracks.single().also { extractor.selectTrack(it) }
+    }
+
+    /**
+     * The fields [configHash] covers, readable. Codec parameters only: an AAC AudioSpecificConfig
+     * is a few bytes naming the object type, sample rate and channel layout. Other codecs' data
+     * can embed a digest of the audio (FLAC STREAMINFO), so only its size is given for them.
+     */
+    private fun describeConfig(format: MediaFormat): Map<String, Any?> {
+        val mime = format.getString(MediaFormat.KEY_MIME)
+        fun int(key: String) = if (format.containsKey(key)) format.getInteger(key) else null
+        val csd = (0..2).map { format.getByteBuffer("csd-$it")?.duplicate()?.let { b -> ByteArray(b.remaining()).also { b.get(it) } } }
+        return linkedMapOf(
+            "mime" to mime,
+            "channels" to int(MediaFormat.KEY_CHANNEL_COUNT),
+            "sampleRate" to int(MediaFormat.KEY_SAMPLE_RATE),
+            "encoderDelay" to int(MediaFormat.KEY_ENCODER_DELAY),
+            "encoderPadding" to int(MediaFormat.KEY_ENCODER_PADDING),
+            "csdSizes" to csd.map { it?.size },
+            "csd0Hex" to csd[0]?.takeIf { mime == MediaFormat.MIMETYPE_AUDIO_AAC && it.size <= 64 }?.joinToString("") { "%02x".format(it) }
+        )
     }
 
     private fun configHash(format: MediaFormat): String? {

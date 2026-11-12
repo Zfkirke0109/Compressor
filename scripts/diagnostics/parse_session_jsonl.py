@@ -219,6 +219,7 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "dispositions": dispositions(jobs),
         "replacements": replacements(session),
         "frameCountChanges": frame_count_changes(session),
+        "audioPacketDifferences": audio_packet_differences(session),
         "silentRejections": len(silent_rejections),
         "learnedStateIdentity": (start or {}).get("learnedStateIdentity"),
         "terminals": dict(terminals.most_common()),
@@ -791,6 +792,62 @@ def frame_count_changes(session: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+_AUDIO_CONFIG_FIELDS = ("mime", "channels", "sampleRate", "encoderDelay", "encoderPadding", "csdSizes", "csd0Hex")
+
+
+def audio_packet_differences(session: dict[str, Any]) -> list[dict[str, Any]]:
+    """Verify stages whose copied audio did not compare as the source's packets, and in what.
+
+    The verifier reports one reason, and a differing decoder configuration comes first: b213
+    job_6d1173f4c0f9 read "decoder configuration differs" over 342 packets with different payload
+    hashes and a 21,334 us skew, one AAC frame at 48 kHz, and nothing more. That capture cannot say
+    whether the output lacked a packet or which configuration field differed, so its row says so
+    (`countsRecorded` False, `explanation` "not recorded"). A build that records the rest gives
+    the packet count on each side, where each starts, whether the output is the source one packet
+    apart, and the configuration fields that differ.
+    """
+    rows = []
+    for r in session.get("stages", []):
+        if r.get("stage") != "verify":
+            continue
+        audio = (r.get("structuralEvidence") or {}).get("audioPacketEvidence") or {}
+        if audio.get("result") != "DIFFERENT":
+            continue
+        counts = isinstance(audio.get("sourcePackets"), int) and isinstance(audio.get("outputPackets"), int)
+        source_config, output_config = audio.get("sourceConfig"), audio.get("outputConfig")
+        config_fields = None
+        if isinstance(source_config, dict) and isinstance(output_config, dict):
+            config_fields = [k for k in _AUDIO_CONFIG_FIELDS if source_config.get(k) != output_config.get(k)]
+        config_differs = audio.get("sourceConfigSha256") != audio.get("outputConfigSha256")
+        payload_differs = audio.get("sourcePayloadSha256") != audio.get("outputPayloadSha256")
+        if not counts:
+            explanation = "not recorded"
+        elif audio.get("outputLacksFirstSourcePacket") is True:
+            explanation = "the output is the source without its first packet"
+        elif audio.get("outputHasExtraFirstPacket") is True:
+            explanation = "the output is the source with one extra packet in front"
+        elif audio["sourcePackets"] != audio["outputPackets"]:
+            explanation = "the packet counts differ and the packets are not one position apart"
+        elif payload_differs:
+            explanation = "the same number of packets with different bytes"
+        elif config_differs:
+            explanation = "the same packets under a different decoder configuration"
+        else:
+            explanation = "the same packets at a different time against the video"
+        rows.append({
+            "jobId": r.get("jobId"), "attemptIndex": r.get("attemptIndex"), "reason": audio.get("reason"),
+            "packetsCompared": audio.get("packets"), "maxSkewUs": audio.get("maxSkewUs"), "firstMismatch": audio.get("firstMismatch"),
+            "configDiffers": config_differs, "payloadDiffers": payload_differs,
+            "countsRecorded": counts,
+            "sourcePackets": audio.get("sourcePackets"), "outputPackets": audio.get("outputPackets"),
+            "sourceFirstPtsUs": audio.get("sourceFirstPtsUs"), "outputFirstPtsUs": audio.get("outputFirstPtsUs"),
+            "firstMismatchKind": audio.get("firstMismatchKind"),
+            "configFieldsThatDiffer": config_fields,
+            "explanation": explanation,
+        })
+    return rows
+
+
 def replacements(session: dict[str, Any]) -> dict[str, Any]:
     """Replacement requests and how each ended, from the `replace` stage and the batch settings.
 
@@ -986,6 +1043,18 @@ def render(s: dict[str, Any]) -> str:
                    f" (source first timestamp {change['sourceOriginUs']} us); first changed at: {change['firstChangedStage']}"
                    + (f" ({change['reason']})" if change.get("reason") else
                       " (one measurement after the remux; this build recorded no per-stage counts)"))
+    for d in s.get("audioPacketDifferences") or []:
+        line = f"  !! audio packets: {d['jobId']} {d['reason']} over {d['packetsCompared']} compared packet(s), max skew {d['maxSkewUs']} us"
+        if d["countsRecorded"]:
+            line += (f"; source {d['sourcePackets']} / output {d['outputPackets']} packets, first at {d['sourceFirstPtsUs']} / "
+                     f"{d['outputFirstPtsUs']} us; {d['explanation']}")
+            if d.get("configFieldsThatDiffer"):
+                line += "; configuration differs in " + ", ".join(d["configFieldsThatDiffer"])
+            elif d["configDiffers"]:
+                line += "; configuration hashes differ and the fields were not recorded"
+        else:
+            line += "; this build recorded neither side's packet count nor which configuration field differed"
+        out.append(line)
     repl = s.get("replacements") or {}
     if repl.get("recorded"):
         out.append(f"  replacements   : replace originals at start={repl.get('replaceOriginalsAtStart')};"
