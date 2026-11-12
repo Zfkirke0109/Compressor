@@ -39,8 +39,13 @@ import kotlin.coroutines.resumeWithException
  * longer available, so which stage first differed is not known for that file. Media3 1.11.0's MP4
  * parser applies the edit list and leaves out samples that start after an edit ends, while
  * MediaExtractor returns the whole sample table: a source whose media runs past its presentation
- * edit would give those numbers with no stage losing a frame. That is a reading of the code, not
- * an observation, and this is the observation.
+ * edit would give those numbers with no stage losing a frame.
+ *
+ * The parser's half of that is observed on the build machine: Media3ParserParityTest runs Media3's
+ * own Mp4Extractor over edit_tail_168.mp4 and it hands on 166 of the 168 samples. Everything else
+ * needs a phone, and this is that observation: what the platform extractor lists for the source,
+ * what the decoder, the encoder and Media3's muxer make of the samples they are handed, and what
+ * the app's metadata remux writes.
  *
  * It needs no clip. The two assets are synthetic (scripts/device/make_edit_list_timeline_fixture.py:
  * ffmpeg test pattern, portrait rotation tag, HEVC with B-frames, variable frame rate, AAC):

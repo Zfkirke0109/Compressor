@@ -120,6 +120,17 @@ class EditTimelineTest(unittest.TestCase):
         self.assertEqual(e['presentedSamples'], 10)
         self.assertLess(e['presentedFirstUs'], 0)
 
+    def test_a_sample_kept_from_before_an_edits_start_is_timed_as_media3_times_it(self):
+        # Media3 rounds a time toward zero. The sync sample kept for decoding sits 12,000 units of
+        # 1/90,000 s before the edit's start: 133,333.3 us, so -133,333 and not the -133,334 that
+        # flooring gives. The app's Media3ParserParityTest holds this rule against Media3 itself.
+        stamps = [i * 3000 for i in range(10)]
+        movie(self.path(), stamps, movie_timescale=90000, edits=[(15000, 12000)], sync=[0, 6])
+        parsed = timeline.parse(self.path())
+        times = [t for _, t in timeline.presented(parsed['tracks'][0], parsed['movieTimescale'])]
+        self.assertEqual(times[:6], [-133333, -100000, -66666, -33333, 0, 33333])
+        self.assertEqual(timeline.evidence(self.path())['presentedFirstUs'], -133333)
+
     def test_the_first_changed_stage_says_whether_the_missing_frames_were_ever_presented(self):
         stamps = [ticks(i * 39_300) for i in range(168)]
         end_us = (165 * 39_300 + 166 * 39_300) // 2

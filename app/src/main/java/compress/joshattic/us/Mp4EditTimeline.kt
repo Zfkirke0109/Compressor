@@ -23,6 +23,11 @@ import java.nio.channels.SeekableByteChannel
  *
  * Pure (java.nio only), so it is tested without a device. Unfragmented MP4/MOV, one video track.
  * scripts/diagnostics/mp4_edit_timeline.py is the same reading for files on a workstation.
+ *
+ * It is a second implementation of Media3's rule, so Media3ParserParityTest runs Media3's own
+ * Mp4Extractor on the build machine and holds this against it: the samples kept and the time of
+ * each, over edits that end and start around every sample of a synthetic source. A Media3
+ * upgrade that changes how an edit list is applied fails there.
  */
 object Mp4EditTimeline {
 
@@ -137,8 +142,10 @@ object Mp4EditTimeline {
         val sync: BooleanArray?, val edits: List<Pair<Long, Long>>?
     )
 
-    /** The moov box's payload to evidence; null when it has no single video track to describe. */
-    internal fun fromMoov(moov: ByteArray): Evidence? = runCatching {
+    private class Movie(val timescale: Long, val duration: Long, val video: Track)
+
+    /** The movie header and the one video track; null when the moov does not hold exactly that. */
+    private fun movie(moov: ByteArray): Movie? {
         val data = ByteBuffer.wrap(moov)
         val mvhd = data.find(MVHD, 0, moov.size) ?: return null
         val movieVersion = data.get(mvhd.start).toInt()
@@ -146,7 +153,24 @@ object Mp4EditTimeline {
         val movieDuration = if (movieVersion == 1) data.getLong(mvhd.start + 4 + 20) else data.getInt(mvhd.start + 4 + 12).toLong() and 0xFFFFFFFFL
         if (movieTimescale <= 0) return null
         val videos = boxes(data, 0, moov.size).filter { it.kind == TRAK }.mapNotNull { track(data, it) }
-        val track = videos.singleOrNull() ?: return null
+        return Movie(movieTimescale, movieDuration, videos.singleOrNull() ?: return null)
+    }
+
+    /**
+     * The presentation time of every sample Media3 keeps, in stored order: what its extractor
+     * hands on, sample for sample. Media3ParserParityTest holds this against Media3's own parser.
+     */
+    internal fun presentedTimesUs(moov: ByteArray): LongArray? = runCatching {
+        val movie = movie(moov) ?: return null
+        presented(movie.video, movie.timescale).map { it.second }.toLongArray()
+    }.getOrNull()
+
+    /** The moov box's payload to evidence; null when it has no single video track to describe. */
+    internal fun fromMoov(moov: ByteArray): Evidence? = runCatching {
+        val movie = movie(moov) ?: return null
+        val track = movie.video
+        val movieTimescale = movie.timescale
+        val movieDuration = movie.duration
         val kept = presented(track, movieTimescale)
         val keptIndices = BooleanArray(track.timestamps.size).also { flags -> kept.forEach { flags[it.first] = true } }
         val edits = track.edits.orEmpty()
@@ -227,7 +251,9 @@ object Mp4EditTimeline {
      */
     private fun presented(track: Track, movieTimescale: Long): List<Pair<Int, Long>> {
         val ts = track.timestamps
-        fun us(value: Long, base: Long) = Math.floorDiv(value * 1_000_000L, base)
+        // Toward zero, as Media3's Util.scaleLargeTimestamp rounds. A sample kept from before an
+        // edit's start has a negative offset, and flooring it would be a microsecond early.
+        fun us(value: Long, base: Long) = value * 1_000_000L / base
         val edits = track.edits ?: return ts.indices.map { it to us(ts[it], track.timescale) }
         if (edits.size == 1 && edits[0].first == 0L) return ts.indices.map { it to us(ts[it] - edits[0].second, track.timescale) }
         fun isSync(i: Int) = track.sync?.get(i) ?: true

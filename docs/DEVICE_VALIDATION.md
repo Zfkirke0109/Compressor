@@ -15,6 +15,7 @@ to the phone over ADB, and deleted from `/data/local/tmp` after use.
 | The retry is offered only after a measured failure with a measured safer rung | `SaferRungRetryTest` |
 | b169 totals, all 23 winners, all 29 size gates and every recorded encode request replay through the production Kotlin | `B169ObservationalReplayTest` (partial observational: rounded scores, no frame counts, no initial learned state) |
 | Production scoring is v0.6.1 without the phone transform | `DiagnosticEventsTest.productionScoringIsPlainV061WithoutThePhoneTransform` |
+| Media3's MP4 parser hands on only the samples a source's edit list presents, and the app's reading of an edit list matches it sample for sample | `Media3ParserParityTest` (Media3 1.11.0's own `Mp4Extractor` run on the JVM over 1,558 edit shapes of a synthetic source) |
 
 ## 2. What only the phone can show
 
@@ -177,13 +178,35 @@ source held 168 video samples and the output 166, with the source's first video 
 longer available. Media3 1.11.0's MP4 parser applies the edit list and leaves out samples that
 start after an edit ends, while `MediaExtractor` returns the whole sample table, so a source whose
 media runs two frames past its presentation edit would give those numbers with no stage losing a
-frame. That is a reading of the code and of a synthetic file with FFmpeg, not an observation on a
-phone, so no acceptance rule and no pipeline stage was changed on it.
+frame.
 
-`EditListTimelineDeviceTest` is the observation. It runs with the default device checks, needs no
-clip, and takes two synthetic sources from the test APK (`scripts/device/make_edit_list_timeline_fixture.py`:
-168 samples with 166 inside the edit, and the same streams with all 168 inside it) through the
-platform extractor, a real Media3 export and the app's metadata remux. The run log prints what
+The parser's half of that is observed, on the build machine. `Media3ParserParityTest` runs
+Media3 1.11.0's own `Mp4Extractor`, the class the app ships, over the synthetic source built to
+that shape. It hands on 166 of the 168 samples, the first at 97,488 µs; with edit lists ignored
+the same extractor returns all 168; and the control file, whose samples are all inside the edit,
+is read as 168. The count therefore changes at Media3's read of such a source, before a decoder,
+an encoder, a muxer or the remux has run. The same test holds the app's own reading of an edit
+list (`Mp4EditTimeline`, which names the stage in a capture) against Media3's, sample for sample
+and to the microsecond, over 1,558 edit shapes: an edit ending and starting one unit before, at
+and after every sample, with and without a sync table, single and repeated edits. That found one
+difference, now fixed: a sample kept from before an edit's start was timed one microsecond early
+(Media3 rounds toward zero; the reading floored). No count differed.
+
+Two things are still not observed. Whether the job's original is built like the synthetic file
+is unknown: it is not available. And nothing a phone does is covered by a host run: what
+`MediaExtractor` lists for such a source, what the codecs and Media3's muxer make of 166 frames,
+what the remux writes. So no acceptance rule and no pipeline stage was changed. The verifier
+still compares every sample of the source's table, and such a source is still kept as the
+original. Whether a candidate that holds every sample the source *presents* should be accepted is
+a decision about what a complete timeline means, not a defect to patch: the two extra samples are
+outside the file's own presentation, yet they are in the sample table the platform extractor
+lists, so a player built on that listing may show them.
+
+`EditListTimelineDeviceTest` is the device observation. It runs with the default device checks,
+needs no clip, and takes two synthetic sources from the test APK
+(`scripts/device/make_edit_list_timeline_fixture.py`: 168 samples with 166 inside the edit, and
+the same streams with all 168 inside it) through the platform extractor, a real Media3 export and
+the app's metadata remux. The run log prints what
 each stage counted (`b287-timeline …`) and the stage `TimelineLocalization` names from them. If
 it fails, the device does not behave as the reading says and the message carries the counts; that
 is the evidence to act on. From this build a batch also records these counts itself whenever a

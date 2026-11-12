@@ -138,6 +138,18 @@ class Mp4EditTimelineTest {
     }
 
     @Test
+    fun aSampleKeptFromBeforeAnEditsStartIsTimedAsMedia3TimesIt() {
+        // Media3 rounds a time toward zero. The sync sample kept for decoding sits 12,000 units of
+        // 1/90,000 s before the edit's start: 133,333.3 us, so -133,333 and not the -133,334 that
+        // flooring gives. Media3ParserParityTest holds the same thing against Media3 itself.
+        val moov = moov((0 until 10).map { it * 3000L }, movieTimescale = 90_000, edits = listOf(15_000L to 12_000L), sync = listOf(0, 6))
+        assertEquals(-133_333L, evidence(moov).presentedFirstUs)
+        val times = checkNotNull(Mp4EditTimeline.presentedTimesUs(moov))
+        assertEquals(listOf(-133_333L, -100_000L, -66_666L, -33_333L, 0L, 33_333L), times.take(6))
+        assertEquals(10, times.size)
+    }
+
+    @Test
     fun aFileIsReadByWalkingPastItsMediaData() {
         val stamps = (0 until 168).map { ticks(it * 39_300L) }
         val endUs = (165 * 39_300L + 166 * 39_300L) / 2

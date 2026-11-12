@@ -21,6 +21,12 @@ sample data is touched.
 Prints what each file holds and presents (scripts/diagnostics/mp4_edit_timeline.py) and, when
 ffprobe is available, what ffmpeg's demuxer and decoder make of it with the edit list applied and
 ignored. Requires ffmpeg with libx265 and aac.
+
+The app keeps the two files in app/src/androidTest/assets (the device test, and
+Media3ParserParityTest, which runs Media3's own parser over them on the build machine) and their
+moov boxes in app/src/test/resources/edit_*.moov (the JVM reader tests). The parity test fails
+unless those are the same boxes, so after regenerating replace both: copy the files to the
+assets, and write mp4_edit_timeline.read_moov(file) for each to the resources.
 """
 import json
 import os

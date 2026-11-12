@@ -186,9 +186,16 @@ def presented(track, movie_timescale, reorder=16):
     every edit, empty ones included, advances the time at which the next one is presented.
     [reorder] bounds the out-of-order search as the track's maxNumReorderSamples does; 16 is the
     most HEVC and H.264 allow, so it never ends the search early.
+
+    The app's Mp4EditTimeline is the same reading, and its Media3ParserParityTest holds it against
+    Media3's own Mp4Extractor, sample for sample. Keep the two in step.
     """
     ts, scale = track['timestamps'], track['timescale']
-    us = lambda value, base: value * 1_000_000 // base
+    def us(value, base):
+        # Toward zero, as Media3's Util.scaleLargeTimestamp rounds: a sample kept from before an
+        # edit's start has a negative offset, and flooring it would be a microsecond early.
+        scaled = abs(value) * 1_000_000 // base
+        return -scaled if value < 0 else scaled
     edits = track['edits']
     if edits is None: return [(i, us(t, scale)) for i, t in enumerate(ts)]
     if len(edits) == 1 and edits[0][0] == 0:
