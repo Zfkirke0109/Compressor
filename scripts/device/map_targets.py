@@ -49,8 +49,11 @@ def main(argv: list[str]) -> int:
                 })
     for m in found:
         print(f"{m['jobId']}  {m['class']:<32} size {'ok' if m['sizeMatches'] == 'True' else 'DIFFERENT'}  {m['path']}")
-    missing = sorted(set(r["jobId"] for r in targets.values()) - {m["jobId"] for m in found})
-    print(f"{len(found)} of {len(targets)} target cases found; {len(missing)} missing")
+    # Cases, not files: copies of one file in several folders are listed above but found once.
+    cases = {m["jobId"] for m in found}
+    missing = sorted(set(r["jobId"] for r in targets.values()) - cases)
+    copies = f" ({len(found)} matching files)" if len(found) != len(cases) else ""
+    print(f"{len(cases)} of {len(targets)} target cases found{copies}; {len(missing)} missing")
     if args.out:
         with open(args.out, "w", encoding="utf-8", newline="") as f:
             w = csv.DictWriter(f, fieldnames=["jobId", "class", "path", "localBytes", "targetBytes", "sizeMatches"])
