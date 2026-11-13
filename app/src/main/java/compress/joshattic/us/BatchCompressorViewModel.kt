@@ -84,7 +84,7 @@ import kotlin.coroutines.resumeWithException
 // margin; sampled pixel certification remains the real quality gate for every pixel-proven encode.
 private const val PIXEL_PROVEN_UNDERSHOOT_TOLERANCE = 0.15
 
-private enum class BatchQualityPreset(val label: String, val targetRatio: Float) {
+internal enum class BatchQualityPreset(val label: String, val targetRatio: Float) {
     REMUX_ONLY("Remux Only", 1.0f),
     ORIGINAL("Perceptually Lossless", 0.85f),
     HIGH("High Quality", 0.70f),
@@ -92,7 +92,7 @@ private enum class BatchQualityPreset(val label: String, val targetRatio: Float)
     LOW("Low", 0.22f)
 }
 
-private enum class BatchFrameRateOption(val label: String, val targetFps: Int?) {
+internal enum class BatchFrameRateOption(val label: String, val targetFps: Int?) {
     ORIGINAL("Original", null),
     FPS120("120 fps", 120),
     FPS60("60 fps", 60),
@@ -100,7 +100,7 @@ private enum class BatchFrameRateOption(val label: String, val targetFps: Int?) 
     FPS24("24 fps", 24)
 }
 
-private enum class BatchCodecOption(val label: String) {
+internal enum class BatchCodecOption(val label: String) {
     AUTO("Auto"),
     AV1("AV1"),
     HEVC("HEVC"),
@@ -166,7 +166,18 @@ data class BatchVideoItem(
     // [currentOutputSize] is only the live file length while the muxer writes, a temporary footprint.
     val candidateOutputSize: Long = 0L,
     // True while [targetOutputSize] predates the resolved plan (before probes chose a ratio).
-    val estimateIsProvisional: Boolean = true
+    val estimateIsProvisional: Boolean = true,
+    // What the current phase is doing; shown only while the row is in that phase (PhaseDetail, R3).
+    // [message] holds durable text: an outcome, a refusal, a warning.
+    val detail: PhaseDetail? = null,
+    // Which attempt of this item is running or ran last, and why there was more than one (R4).
+    val attemptContext: AttemptContext? = null,
+    // How a requested replacement ended (ReplacementOutcome or ReplacementTransaction's outcome), and
+    // whether the copy saved instead reached the gallery. Null when no replacement was asked for.
+    val replacementOutcome: String? = null,
+    val copySaved: Boolean? = null,
+    // "Save all copies" published this output to the gallery and read it back whole.
+    val galleryCopySaved: Boolean = false
 ) {
     val displaySize: String get() = formatFileSize(originalSize)
     val outputDisplaySize: String get() = formatFileSize(outputSize)
@@ -585,9 +596,16 @@ class BatchCompressorViewModel internal constructor(
         }
     }
 
+    /**
+     * Applies an item's recommendation to the WHOLE batch: its quality, codec and frame rate are the
+     * batch's settings. The card shows each change (RecommendationPreview) and asks first; nothing
+     * changes while a batch runs.
+     */
     fun applyRecommendation(sourceUri: Uri) {
         _uiState.update { state ->
+            if (state.isCompressing) return@update state
             val recommendation = state.items.firstOrNull { it.sourceUri == sourceUri }?.recommendation ?: return@update state
+            val preview = RecommendationPreview.of(recommendation, state.qualityPreset, state.codecOption, state.frameRateOption)
             val quality = qualityFromLabel(recommendation.qualityPreset)
             val codec = codecFromLabel(recommendation.codecOption)
             val frameRate = frameRateFromLabel(recommendation.frameRateOption)
@@ -599,7 +617,13 @@ class BatchCompressorViewModel internal constructor(
                 items = state.items.map { item ->
                     if (item.isAlreadyCompressed) item else item.copy(targetOutputSize = estimateOutputSize(item, quality, codec, frameRate))
                 },
-                statusMessage = "${recommendation.title} applied. Manual controls remain available."
+                statusMessage = if (!preview.changesAnything) {
+                    "${recommendation.title}: the batch already uses these settings."
+                } else {
+                    "${recommendation.title} applied to the whole batch: ${preview.changes.joinToString("; ")}." +
+                        (if (preview.leavesPerceptuallyLossless) " Perceptually Lossless is off: outputs will be lossy." else "") +
+                        " Manual controls remain available."
+                }
             )
         }
     }
@@ -1410,12 +1434,17 @@ class BatchCompressorViewModel internal constructor(
         val token = AttemptToken("batch_${run.batchStartedAt}", index, attemptCounter.incrementAndGet())
         val provisional = estimateOutputSize(item, quality, codec, run.frameRate)
         updateItem(index) {
-            ItemProgressModel.begin(it, token, provisional).copy(
-                message = if (quality == BatchQualityPreset.REMUX_ONLY) {
-                    "Remuxing: video/audio copied unchanged • no re-encode • ${thermalWindow.thermalLabel}"
-                } else {
-                    "Preparing • est ~${formatFileSize(provisional)} (provisional, before measurement) • ${codec.label}${s.plannedFps?.let { fps -> " • ${fps}fps" } ?: " • source FPS"} • ${thermalWindow.thermalLabel}"
-                }
+            val started = ItemProgressModel.begin(it, token, provisional)
+            // The estimate is on the size line already; the detail says what is planned around it.
+            started.copy(
+                detail = PhaseDetail(
+                    started.phase,
+                    if (quality == BatchQualityPreset.REMUX_ONLY) {
+                        "Video and audio will be copied unchanged; no re-encode • ${thermalWindow.thermalLabel}"
+                    } else {
+                        "${codec.label}${s.plannedFps?.let { fps -> " • ${fps} fps" } ?: " • source frame rate"} • ${thermalWindow.thermalLabel}"
+                    }
+                )
             )
         }
         run.diagnostics.learningContext = DiagnosticsRecorder.LearningContext(item.sourceUri.toString(), token.attempt, 0)
@@ -1524,13 +1553,13 @@ class BatchCompressorViewModel internal constructor(
             val basePlan = buildPerceptualLosslessPlan(item, resolvedMime, run.exhaustivePerceptualLossless)
             if (basePlan.probeEligible) {
                 s.phases.enter(ItemPhase.PROBING)
-                s.phases.message("Probing quality: sampling windows with on-device VMAF…")
+                s.phases.detail("Probing quality: sampling windows with on-device VMAF…")
                 val probed = refinePlanWithPixelProbes(s, resolvedMime, basePlan)
                 val parseFailure = probed.sourceParseFailure
                 // Media3 cannot read this file. Measure again on a copy it may be able to read;
                 // the windows and the reference stay on the original (Media3InputNormalizer).
                 val measured = if (parseFailure != null && normaliseMedia3Input(s, parseFailure)) {
-                    s.phases.message("Probing quality on the rewritten copy: sampling windows with on-device VMAF…")
+                    s.phases.detail("Probing quality on the rewritten copy: sampling windows with on-device VMAF…")
                     refinePlanWithPixelProbes(s, resolvedMime, basePlan)
                 } else {
                     probed
@@ -1633,7 +1662,7 @@ class BatchCompressorViewModel internal constructor(
                 primaryPredictedNotSmaller = primary.sizeGateVerdict == "keep_original",
                 sourceParseFailed = primary.sourceParseFailure != null
             ) || !hasEncoder(MimeTypes.VIDEO_H264, s.item.toSourceInfo())) return null
-        s.phases.message("Trying H.264: measuring another encoder against the same PL gate…")
+        s.phases.detail("Trying H.264: measuring another encoder against the same PL gate…")
         val base = buildPerceptualLosslessPlan(s.item, MimeTypes.VIDEO_H264, exhaustive = true)
         val alternate = refinePlanWithPixelProbes(
             s, MimeTypes.VIDEO_H264, base, alternateCodecSearch = true
@@ -2029,7 +2058,7 @@ class BatchCompressorViewModel internal constructor(
                 s.candidateFiles += item.cacheOutputFile(context, run.quality)
                 val attempt = encodeReadingSource(s, safeResolvedMime)
                 s.encodeAttempt = attempt
-                s.phases.message("Finalizing: writing the source's metadata into the output…")
+                s.phases.detail("Finalizing: writing the source's metadata into the output…")
                 withContext(Dispatchers.IO) {
                     val remuxContext = currentCoroutineContext()
                     Mp4MetadataRemuxer.remuxWithSourceMetadata(
@@ -2184,7 +2213,7 @@ class BatchCompressorViewModel internal constructor(
                     throw e
                 }
                 if (!normaliseMedia3Input(s, e.failure)) throw e
-                s.phases.message("Encoding from the rewritten copy…")
+                s.phases.detail("Encoding from the rewritten copy…")
                 try {
                     encode()
                 } catch (again: SourceParseException) {
@@ -2257,7 +2286,7 @@ class BatchCompressorViewModel internal constructor(
             DiagLog.w("CompressorBatch", "media3 input; job=$job; ${failure.describe()}; ${s.diagnosticMedia3Input}")
             return false
         }
-        s.phases.message("The encoder cannot read this file as stored; rewriting its container (no re-encode)…")
+        s.phases.detail("The encoder cannot read this file as stored; rewriting its container (no re-encode)…")
         val target = File(Media3InputNormalizer.workDir(context.cacheDir), "media3input_${System.nanoTime()}.mp4")
         val result = withContext(Dispatchers.IO) {
             val ioContext = currentCoroutineContext()
@@ -2381,7 +2410,12 @@ class BatchCompressorViewModel internal constructor(
             CertStep.CONTINUE -> Unit
             CertStep.ENDED -> return false
             CertStep.RETRY -> return retrySaferRung(
-                s, if (s.injectedRejection != null) "a test's candidate veto" else "certification ${s.certificationDecision?.wire}"
+                s, if (s.injectedRejection != null) "a test's candidate veto" else "certification ${s.certificationDecision?.wire}",
+                when {
+                    s.injectedRejection != null -> RetryCause.TEST_VETO
+                    s.certificationDecision == CertificationDecision.MEASURED_FAILURE -> RetryCause.MEASURED_BELOW_BAR
+                    else -> RetryCause.NOT_CERTIFIED
+                }
             )
         }
         if (!applyPerceptualVerdict(s)) return false
@@ -2441,7 +2475,7 @@ class BatchCompressorViewModel internal constructor(
             item.originalSize > 0L && outputSize in 1 until item.originalSize
         ) {
             s.phases.enter(ItemPhase.CERTIFYING)
-            s.phases.message("Certifying pixels: encoder undershot the bitrate floor, checking real quality…")
+            s.phases.detail("Certifying pixels: encoder undershot the bitrate floor, checking real quality…")
             val recoveryOutcome = qualityProber.certify(
                 item.sourceUri, outputFile, item.durationMs, item.originalFps.toDouble(),
                 onWindowScored = { done, total -> s.phases.certifyStep(done, total) },
@@ -2686,7 +2720,7 @@ class BatchCompressorViewModel internal constructor(
             return CertStep.CONTINUE
         }
         s.phases.enter(ItemPhase.CERTIFYING)
-        s.phases.message("Certifying pixels: sampled VMAF check of the final output…")
+        s.phases.detail("Certifying pixels: sampled VMAF check of the final output…")
         // The v1 shadow runs only in the opt-in calibration mode, within its budget (ShadowCalibration).
         val shadow = ShadowCalibration.decide(
             enabled = EncoderExperiments.isShadowCalibrationEnabled(run.context),
@@ -2981,7 +3015,7 @@ class BatchCompressorViewModel internal constructor(
      * production, structural verification, certification and the verdict exactly as the first one
      * did. A second failure keeps the original; there is never a third encode.
      */
-    private suspend fun retrySaferRung(s: ItemRun, failure: String): Boolean {
+    private suspend fun retrySaferRung(s: ItemRun, failure: String, cause: RetryCause): Boolean {
         val plan = checkNotNull(s.perceptualPlan) { "retry without a plan" }
         val ratio = checkNotNull(plan.saferPassingRatio) { "retry without a safer rung" }
         val mime = checkNotNull(s.resolvedMime) { "retry without an output codec" }
@@ -2989,7 +3023,13 @@ class BatchCompressorViewModel internal constructor(
         s.run.saferRungRetries++
         val previous = s.phases.token
         val next = AttemptToken(previous.batchId, s.index, attemptCounter.incrementAndGet())
-        updateItem(s.index) { ItemProgressModel.handOver(it, previous, next) }
+        // The row says which of this item's attempts is running and why, until the item ends: the
+        // encoder's poller and later phases cannot overwrite it. The ordinal is the item's own.
+        val context = AttemptContext.saferRungRetry(
+            ordinal = s.ledger.currentIndex + 1, total = 1 + SaferRungRetry.MAX_RETRIES_PER_ITEM,
+            rejectedRatio = plan.targetRatio, saferRatio = ratio, why = cause
+        )
+        updateItem(s.index) { ItemProgressModel.handOver(it, previous, next, context) }
         s.phases = PhaseReporter(itemBoard, next)
         // The retry's record carries the safer rung's OWN probe evidence (b177 F2). b177 PL-B
         // job_478c2fa19100 recorded the .85 rung's windows under a .90 encode and the summariser
@@ -3018,7 +3058,6 @@ class BatchCompressorViewModel internal constructor(
         s.diagnosticTargetVideoBitrate = encodePlan.requestedVideoBitrate
         s.phases.planResolved(encodePlan.estimatedBytes)
         logEncoderPlan(s.item, s.effectiveQuality, s.run.codec, encodePlan, s.plannedFps)
-        s.phases.message(String.format(java.util.Locale.US, "Retrying at the safer measured ratio %.2f…", ratio))
         s.phases.enter(ItemPhase.ENCODING)
         if (!produceOutput(s)) return false
         s.phases.enter(ItemPhase.VERIFYING)
@@ -3129,7 +3168,7 @@ class BatchCompressorViewModel internal constructor(
         }
         runCatching { outputFile.delete() }
         if (perceptualPlan?.marginalRefinementTrial == true && saferRungRetryAllowed(s, decision = null)) {
-            return retrySaferRung(s, "candidate verification failed")
+            return retrySaferRung(s, "candidate verification failed", RetryCause.VERIFICATION_FAILED)
         }
         if (perceptualPlan != null && retainOriginalInsteadOfCopy(
                 context = context,
@@ -3366,7 +3405,9 @@ class BatchCompressorViewModel internal constructor(
                 updateItem(s.index) {
                     it.copy(
                         status = if (replacement.success) BatchItemStatus.Replaced else BatchItemStatus.SavedCopy,
-                        message = replacement.message
+                        message = replacement.message,
+                        replacementOutcome = replacement.outcome,
+                        copySaved = replacement.fields["copySaved"] as? Boolean
                     )
                 }
             }
@@ -3515,6 +3556,7 @@ class BatchCompressorViewModel internal constructor(
             val privacyMode = MetadataPrivacyMode.fromLabel(_uiState.value.metadataPrivacyMode)
             var saved = 0
             var unconfirmed = 0
+            val proven = mutableSetOf<Uri>()
             outputs.forEach { (item, file) ->
                 if (file.exists()) {
                     val result = saveFileToGallery(
@@ -3524,10 +3566,20 @@ class BatchCompressorViewModel internal constructor(
                         metadata = item.metadataSnapshot,
                         privacyMode = privacyMode
                     )
-                    if (result is GalleryPublication.Result.Published) saved++ else unconfirmed++
+                    if (result is GalleryPublication.Result.Published) {
+                        saved++
+                        proven += item.sourceUri
+                    } else {
+                        unconfirmed++
+                    }
                 }
             }
-            _uiState.update { it.copy(statusMessage = GallerySaveSummary.message(saved, unconfirmed, privacyMode.summary)) }
+            _uiState.update { state ->
+                state.copy(
+                    items = state.items.map { if (it.sourceUri in proven) it.copy(galleryCopySaved = true) else it },
+                    statusMessage = GallerySaveSummary.message(saved, unconfirmed, privacyMode.summary)
+                )
+            }
         }
     }
 
@@ -4576,7 +4628,7 @@ class BatchCompressorViewModel internal constructor(
                         // The encode is done; the item is not. The metadata remux, verification and
                         // certification follow, and any of them may still discard this output.
                         phases.encodeFinished()
-                        phases.message("Encoded; finalizing the output (metadata, container)…")
+                        phases.detail("Encoded; finalizing the output (metadata, container)…")
                         if (continuation.isActive) {
                             continuation.resume(
                                 EncodeAttemptResult(
@@ -4680,6 +4732,9 @@ class BatchCompressorViewModel internal constructor(
                 .build()
 
             transformer.start(composition, outputFile.absolutePath)
+            if (plannedFps != null && item.originalFps > plannedFps + 0.5f) {
+                phases.detail("Frame rate reduced to $plannedFps fps (source ${item.originalFps.toInt()} fps)")
+            }
 
             progressJob = viewModelScope.launch(Dispatchers.Main) {
                 while (continuation.isActive) {
@@ -4693,13 +4748,11 @@ class BatchCompressorViewModel internal constructor(
                     } else {
                         null
                     }
-                    phases.encodeProgress(progress, currentSize)
                     // The live file length is a temporary footprint: the muxer may reserve and later
-                    // truncate space, and the metadata remux rewrites the file. It is not the output size.
-                    phases.message(
-                        "Writing ${formatFileSize(currentSize)} (temporary, not the final size) • " +
-                            "est ${formatFileSize(estimatedOutputSize)}${plannedFps?.let { fps -> " • ${fps}fps" } ?: ""}"
-                    )
+                    // truncate space, and the metadata remux rewrites the file. The row's size line
+                    // names it so; nothing else is written here, so a detail or the attempt context
+                    // set elsewhere is never overwritten every 200 ms.
+                    phases.encodeProgress(progress, currentSize)
                     delay(200)
                 }
             }
@@ -4714,6 +4767,7 @@ class BatchCompressorViewModel internal constructor(
     ): Mp4MetadataRemuxResult = withContext(Dispatchers.IO) {
         val remuxContext = currentCoroutineContext()
         phases.enter(ItemPhase.REMUXING)
+        phases.detail("Copying the video and audio unchanged into a new file; no re-encode")
         val outputFile = item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
         val estimatedOutputSize = estimateOutputSize(
             item = item,
@@ -4735,7 +4789,6 @@ class BatchCompressorViewModel internal constructor(
                     null
                 }
                 phases.encodeProgress(progress, outputBytes)
-                phases.message("Remuxing: ${formatFileSize(outputBytes)} written (temporary) • est ${formatFileSize(estimatedOutputSize)} • no re-encode")
             }
         )
     }

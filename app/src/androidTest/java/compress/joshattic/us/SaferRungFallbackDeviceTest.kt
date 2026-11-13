@@ -109,9 +109,22 @@ class SaferRungFallbackDeviceTest {
     }
 
     /** One finished batch over [source]: its session records and what it left behind. */
+    /**
+     * The row says which attempt ran and why, in the item's own numbering (the batch-wide token of
+     * the retry is higher), and that a test, not a measurement, refused the first candidate.
+     */
+    private fun assertRetryExplained(batch: Batch, usedRatio: Double, saferRatio: Double) {
+        val context = batch.row.attemptContext
+        assertNotNull("the retried row lost its attempt context", context)
+        assertEquals(AttemptContext.saferRungRetry(2, 2, usedRatio, saferRatio, RetryCause.TEST_VETO), context)
+        println("b287-fallback row: ${context!!.label}: ${context.reason}; status=${batch.row.status} terminal=${batch.row.terminalResult}")
+    }
+
     private class Batch(
         val records: List<JSONObject>, val job: JSONObject, val stages: List<JSONObject>,
-        val refused: List<Pair<Int, Double>>, val leftovers: List<File>
+        val refused: List<Pair<Int, Double>>, val leftovers: List<File>,
+        /** The row as the batch left it: what the user saw at the end. */
+        val row: BatchVideoItem
     ) {
         fun stage(name: String, attemptIndex: Int? = null) = stages.filter {
             it.optString("stage") == name && (attemptIndex == null || it.optInt("attemptIndex", -1) == attemptIndex)
@@ -187,7 +200,7 @@ class SaferRungFallbackDeviceTest {
         val stages = records.filter { it.optString("type") == "stage" && it.optString("jobId") == jobId }
         // Starting a batch clears this directory, so whatever is in it now is this batch's.
         val leftovers = outputDir.listFiles().orEmpty().toList().also { scratch += it }
-        val batch = Batch(records, job, stages, refused.toList(), leftovers)
+        val batch = Batch(records, job, stages, refused.toList(), leftovers, vm.uiState.value.items.single())
         println(
             "b287-fallback saferRetry=$saferRetry refuse=$refuseAttempts refused=${batch.refused} terminal=${job.optString("terminal")} " +
                 "attempts=${job.opt("attempts")} probed=${job.opt("probedRatios")} " +
@@ -267,6 +280,7 @@ class SaferRungFallbackDeviceTest {
         val retry = allowedRetry(batch)
         val usedRatio = retry.getDouble("usedRatio")
         val saferRatio = retry.getDouble("saferRatio")
+        assertRetryExplained(batch, usedRatio, saferRatio)
         assertEquals(listOf(1), batch.refused.map { it.first })
         assertEquals(usedRatio, batch.refused.single().second, 1e-9)
         assertTrue("the fallback $saferRatio is not above the refused $usedRatio", saferRatio > usedRatio)
@@ -352,6 +366,7 @@ class SaferRungFallbackDeviceTest {
             "attempt 1 never reached certification (terminal ${batch.job.optString("terminal")}): nothing to refuse",
             batch.refused.any { it.first == 1 }
         )
+        assertEquals("no retry ran, so the row names no later attempt", null, batch.row.attemptContext)
         assertEquals(listOf(1), batch.refused.map { it.first })
         assertTrue("a retry was allowed with the experiment off", batch.stage("retry").none { it.optString("reasonCode") == StageEvent.Reason.RETRY_ALLOWED })
         assertEquals(1, batch.ledger.size)
@@ -370,6 +385,7 @@ class SaferRungFallbackDeviceTest {
     fun c_aSecondRefusalKeepsTheOriginalAndNeverStartsAThirdEncode() {
         val batch = runBatch(sourceCopy(), saferRetry = true, refuseAttempts = setOf(1, 2))
         val retry = allowedRetry(batch)
+        assertRetryExplained(batch, retry.getDouble("usedRatio"), retry.getDouble("saferRatio"))
         assertEquals(listOf(1, 2), batch.refused.map { it.first })
         assertEquals(retry.getDouble("usedRatio"), batch.refused[0].second, 1e-9)
         assertEquals(retry.getDouble("saferRatio"), batch.refused[1].second, 1e-9)

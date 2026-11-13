@@ -284,7 +284,8 @@ data class BatchItemMetrics(
     val savingsPerMinuteLabel: String
         get() {
             val mb = savedBytes.coerceAtLeast(0L) / (1024.0 * 1024.0)
-            return String.format(Locale.US, "%.1f MB saved/min", mb / elapsedSeconds * 60.0)
+            // A rate of size reduction, not of storage freed: the original may still sit beside the copy.
+            return String.format(Locale.US, "%.1f MB smaller/min", mb / elapsedSeconds * 60.0)
         }
     val batterySummary: String
         get() = "${batteryStart?.let { "$it%" } ?: "not available"} -> ${batteryEnd?.let { "$it%" } ?: "not available"}"

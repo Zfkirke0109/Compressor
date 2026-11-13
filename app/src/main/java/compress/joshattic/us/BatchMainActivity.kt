@@ -23,6 +23,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -262,7 +266,10 @@ private fun BatchCompressorScreen(
                     BatchItemCard(
                         index = index + 1,
                         item = item,
-                        recommendationEnabled = !state.isCompressing,
+                        batchRunning = state.isCompressing,
+                        replaceOriginals = state.replaceOriginals,
+                        settings = BatchSettingsView(state.qualityPreset, state.codecOption, state.frameRateOption),
+                        queuedCount = state.items.count { it.status == BatchItemStatus.Pending && !it.isAlreadyCompressed },
                         onApplyRecommendation = { viewModel.applyRecommendation(item.sourceUri) }
                     )
                 }
@@ -1165,11 +1172,22 @@ private fun PreservationReportCard(state: BatchCompressorUiState) {
     }
 }
 
+/** The batch settings a recommendation is compared with. */
+internal data class BatchSettingsView(val quality: String, val codec: String, val frameRate: String)
+
+/**
+ * One row of the batch. Identity first (a stable name area, the status below it when the window or
+ * the font is narrow), then what is happening to the original and the copy, then the active phase
+ * or the result. Durable warnings stay visible; the full verification evidence folds away.
+ */
 @Composable
-private fun BatchItemCard(
+internal fun BatchItemCard(
     index: Int,
     item: BatchVideoItem,
-    recommendationEnabled: Boolean,
+    batchRunning: Boolean,
+    replaceOriginals: Boolean,
+    settings: BatchSettingsView,
+    queuedCount: Int,
     onApplyRecommendation: () -> Unit
 ) {
     val skipped = item.status == BatchItemStatus.Skipped || item.isAlreadyCompressed
@@ -1182,133 +1200,304 @@ private fun BatchItemCard(
         colors = cardColors
     ) {
         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.Top,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        "$index. ${item.originalName}",
-                        style = MaterialTheme.typography.bodyLarge,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        "Original: ${item.originalWidth}x${item.originalHeight} • ${item.originalFps.toInt()}fps • ${item.displaySize}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                Spacer(modifier = Modifier.width(10.dp))
-                AssistChip(
-                    onClick = {},
-                    enabled = false,
-                    label = { Text(item.shortStatusLabel()) }
-                )
-            }
-
+            ItemHeader(index, item)
             Text(
-                item.preservationSummary(),
+                "Original: ${item.originalWidth}x${item.originalHeight} • ${item.originalFps.toInt()}fps • ${item.displaySize}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            val original = OriginalStatus.describe(item, replaceOriginals)
+            Text(
+                original.text,
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = if (original.tone == OriginalStatus.Tone.NEUTRAL) FontWeight.Normal else FontWeight.SemiBold,
+                color = when (original.tone) {
+                    OriginalStatus.Tone.WARNING -> MaterialTheme.colorScheme.error
+                    OriginalStatus.Tone.DONE -> MaterialTheme.colorScheme.primary
+                    OriginalStatus.Tone.NEUTRAL -> MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                modifier = Modifier.testTag(ItemCardTags.ORIGINAL_STATUS)
+            )
+            Text(
+                item.metadataSummary(),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            item.recommendation?.takeIf { item.status == BatchItemStatus.Pending }?.let { recommendation ->
-                HorizontalDivider()
-                Text(
-                    recommendation.summary,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Text(
-                    recommendation.reason,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                OutlinedButton(onClick = onApplyRecommendation, enabled = recommendationEnabled) {
-                    Text("Apply recommendation")
-                }
-            }
-
             if (item.status == BatchItemStatus.Compressing) {
-                // The phase and its own measured fraction (ItemProgressModel), never an encoder's
-                // 100 % presented as the item's: finalizing, verification and certification follow.
-                Text(
-                    ItemProgressModel.describe(item),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Text(
-                    item.activeSizeLine(),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                val fraction = item.phaseFraction
-                if (fraction != null) {
-                    LinearProgressIndicator(progress = { fraction.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
-                } else {
-                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                }
+                ActiveItemBlock(item)
+            } else {
+                ResultBlock(item)
             }
 
-            if (item.outputSize > 0L) {
-                HorizontalDivider()
-                Text(
-                    item.beforeAfterSummary(),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-
-            item.terminalResult?.let { terminal ->
-                Text(
-                    "Outcome: ${terminal.label}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (terminal.isFailure) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-
-            item.verificationReport?.let { report ->
-                HorizontalDivider()
-                Text("Verification", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
-                report.summaryLines.forEach { line ->
-                    Text(
-                        line,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                report.replacementBlockReason?.let { reason ->
-                    Text(
-                        "Replacement blocked: $reason",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error
-                    )
-                }
-            }
-
-            item.metrics?.let { metrics ->
-                Text(
-                    metrics.summary,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-
-            item.message?.let {
-                Text(
-                    it,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (item.status == BatchItemStatus.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
-                )
+            item.recommendation?.takeIf { item.status == BatchItemStatus.Pending && !batchRunning }?.let { recommendation ->
+                RecommendationSection(item, recommendation, settings, queuedCount, onApplyRecommendation)
             }
         }
+    }
+}
+
+/** Test tags for the parts of a row whose presence or absence a test checks. */
+internal object ItemCardTags {
+    const val STATUS = "item-status"
+    const val ORIGINAL_STATUS = "item-original-status"
+    const val PHASE = "item-phase"
+    const val ATTEMPT = "item-attempt"
+    const val SIZE = "item-size"
+    const val DETAIL = "item-phase-detail"
+    const val DETAILS_TOGGLE = "item-details-toggle"
+    const val SUGGESTION_TOGGLE = "item-suggestion-toggle"
+    const val APPLY_TO_BATCH = "item-apply-to-batch"
+}
+
+@Composable
+private fun ItemHeader(index: Int, item: BatchVideoItem) {
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        // A long name and a long status cannot share a narrow row: the status goes below it, so the
+        // name keeps a stable area. Large text narrows the row as much as a small window does.
+        val narrow = maxWidth < 360.dp || androidx.compose.ui.platform.LocalDensity.current.fontScale >= 1.3f
+        val name = @Composable { modifier: Modifier ->
+            Text(
+                "$index. ${item.originalName}",
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = modifier
+            )
+        }
+        if (narrow) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                name(Modifier)
+                StatusBadge(item)
+            }
+        } else {
+            Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                name(Modifier.weight(1f))
+                Spacer(modifier = Modifier.width(10.dp))
+                StatusBadge(item)
+            }
+        }
+    }
+}
+
+/** The row's status as readable, non-interactive text (a disabled chip greys its label out). */
+@Composable
+private fun StatusBadge(item: BatchVideoItem) {
+    val label = item.shortStatusLabel()
+    val failed = item.terminalResult?.isFailure == true || item.status == BatchItemStatus.Failed ||
+        item.replacementOutcome == ReplacementOutcome.AT_RISK_ORIGINAL_PRESERVED ||
+        item.replacementOutcome == ReplacementOutcome.AT_RISK_RECOVERY_RETAINED
+    val (container, content) = when {
+        failed -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
+        item.status == BatchItemStatus.Compressing -> MaterialTheme.colorScheme.primaryContainer to MaterialTheme.colorScheme.onPrimaryContainer
+        item.status == BatchItemStatus.Pending -> MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
+        else -> MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
+    }
+    Surface(
+        color = container,
+        contentColor = content,
+        shape = MaterialTheme.shapes.small,
+        modifier = Modifier
+            .testTag(ItemCardTags.STATUS)
+            .semantics(mergeDescendants = true) { contentDescription = "Status: $label" }
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+        )
+    }
+}
+
+@Composable
+private fun ActiveItemBlock(item: BatchVideoItem) {
+    // The phase and its own measured fraction (ItemProgressModel), never an encoder's 100 %
+    // presented as the item's: finalizing, verification and certification follow.
+    Text(
+        ItemProgressModel.describe(item),
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.primary,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.testTag(ItemCardTags.PHASE)
+    )
+    // Why the work restarted and why the estimate grew: kept for the whole retry (R4).
+    item.attemptContext?.let { attempt ->
+        Text(
+            "${attempt.label}: ${attempt.reason}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.tertiary,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.testTag(ItemCardTags.ATTEMPT)
+        )
+    }
+    Text(
+        item.activeSizeLine(),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.testTag(ItemCardTags.SIZE)
+    )
+    val fraction = item.phaseFraction
+    if (fraction != null) {
+        LinearProgressIndicator(progress = { fraction.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+    } else {
+        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+    }
+    // Only the current phase's own detail: text a finished phase wrote is obsolete (R3).
+    item.detail?.takeIf { it.phase == item.phase }?.let { detail ->
+        Text(
+            detail.text,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.testTag(ItemCardTags.DETAIL)
+        )
+    }
+    // Durable text written while the row is active (a warning) stays visible beside the phase.
+    item.message?.let {
+        Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable
+private fun ResultBlock(item: BatchVideoItem) {
+    item.terminalResult?.let { terminal ->
+        Text(
+            "Outcome: ${terminal.label}",
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (terminal.isFailure) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+            fontWeight = FontWeight.SemiBold
+        )
+    }
+    if (item.outputSize > 0L) {
+        Text(
+            item.beforeAfterSummary(),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+    }
+    item.attemptContext?.let { attempt ->
+        Text(
+            "${attempt.label}: ${attempt.reason}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.tertiary,
+            modifier = Modifier.testTag(ItemCardTags.ATTEMPT)
+        )
+    }
+    // Warnings are never folded away.
+    item.verificationReport?.replacementBlockReason?.let { reason ->
+        Text(
+            "Replacement blocked: $reason",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error
+        )
+    }
+    // An outcome, a failure or a replacement's account is shown; the long technical completion
+    // line of a verified output goes with the verification details.
+    val messageUpFront = item.status == BatchItemStatus.Failed || item.replacementOutcome != null || item.verificationReport == null
+    if (messageUpFront) {
+        item.message?.let {
+            Text(
+                it,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (item.status == BatchItemStatus.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+    val report = item.verificationReport
+    if (report != null || item.metrics != null || (!messageUpFront && item.message != null)) {
+        var expanded by rememberSaveable(item.sourceUri.toString()) { mutableStateOf(false) }
+        TextButton(
+            onClick = { expanded = !expanded },
+            modifier = Modifier.testTag(ItemCardTags.DETAILS_TOGGLE)
+        ) {
+            Text(if (expanded) "Hide verification details" else "Show verification details")
+        }
+        if (expanded) {
+            HorizontalDivider()
+            report?.summaryLines?.forEach { line ->
+                Text(line, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            item.metrics?.let { metrics ->
+                Text(metrics.summary, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (!messageUpFront) {
+                item.message?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            }
+        }
+    }
+}
+
+/**
+ * A recommendation is a rule of thumb about the kind of clip, and applying it changes the WHOLE
+ * batch's settings, not this file's. It is folded by default, says what it would change and
+ * whether that leaves Perceptually Lossless, and asks before applying (R5). Hidden while a batch runs.
+ */
+@Composable
+private fun RecommendationSection(
+    item: BatchVideoItem,
+    recommendation: CompressionRecommendation,
+    settings: BatchSettingsView,
+    queuedCount: Int,
+    onApply: () -> Unit
+) {
+    val preview = RecommendationPreview.of(recommendation, settings.quality, settings.codec, settings.frameRate)
+    var open by rememberSaveable("suggestion-" + item.sourceUri.toString()) { mutableStateOf(false) }
+    var confirming by remember { mutableStateOf(false) }
+    HorizontalDivider()
+    Text(
+        "Suggestion: ${recommendation.title}" +
+            when {
+                !preview.changesAnything -> " (the batch already uses it)"
+                preview.leavesPerceptuallyLossless -> " (would leave Perceptually Lossless)"
+                else -> ""
+            },
+        style = MaterialTheme.typography.bodySmall,
+        color = if (preview.leavesPerceptuallyLossless) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+        fontWeight = FontWeight.SemiBold
+    )
+    TextButton(onClick = { open = !open }, modifier = Modifier.testTag(ItemCardTags.SUGGESTION_TOGGLE)) {
+        Text(if (open) "Hide suggestion" else "Show suggestion")
+    }
+    if (open) {
+        Text(RecommendationPreview.estimateLine(recommendation), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(recommendation.reason, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (preview.changesAnything) {
+            Text("Applies to the whole batch, not only this file:", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
+            preview.changes.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
+            if (preview.leavesPerceptuallyLossless) {
+                Text(
+                    "Every output would be lossy, and the measured Perceptually Lossless checks would not apply.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+            OutlinedButton(onClick = { confirming = true }, modifier = Modifier.testTag(ItemCardTags.APPLY_TO_BATCH)) {
+                Text("Apply to entire batch…")
+            }
+        }
+    }
+    if (confirming) {
+        AlertDialog(
+            onDismissRequest = { confirming = false },
+            title = { Text("Change the whole batch?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("These settings apply to all $queuedCount queued file${if (queuedCount == 1) "" else "s"}:")
+                    preview.changes.forEach { Text("• $it") }
+                    if (preview.leavesPerceptuallyLossless) {
+                        Text("Outputs would be lossy: Perceptually Lossless would be off.", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { confirming = false; onApply() }) { Text("Apply to batch") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirming = false }) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -1335,9 +1524,9 @@ private fun BatchVideoItem.shortStatusLabel(): String {
         status == BatchItemStatus.Skipped || isAlreadyCompressed -> "Skipped"
         status == BatchItemStatus.Compressing ->
             phaseFraction?.takeIf { phase.hasFraction }?.let { "${phase.label} ${(it * 100f).toInt()}%" } ?: phase.label
-        status == BatchItemStatus.Done -> "Done"
+        status == BatchItemStatus.Done -> "Copy ready"
         status == BatchItemStatus.Replaced -> "Replaced"
-        status == BatchItemStatus.SavedCopy -> "Saved"
+        status == BatchItemStatus.SavedCopy -> "Copy saved"
         status == BatchItemStatus.Failed -> "Failed"
         status == BatchItemStatus.Cancelled -> "Cancelled"
         else -> "Ready"
@@ -1362,20 +1551,11 @@ private fun BatchVideoItem.activeSizeLine(): String {
     }
 }
 
-private fun BatchVideoItem.preservationSummary(): String {
+/** What the source carries; what happens to the original and the copy is OriginalStatus's line. */
+private fun BatchVideoItem.metadataSummary(): String {
     val date = if (metadataSnapshot.hasDate) "${metadataSnapshot.dateDiagnosticLabel} ✓" else "date —"
     val location = if (metadataSnapshot.hasLocation) "location ✓" else "location —"
-    val replacement = when (status) {
-        BatchItemStatus.Replaced -> "original replaced"
-        BatchItemStatus.SavedCopy -> "safe copy saved"
-        BatchItemStatus.Done -> "copy ready"
-        BatchItemStatus.Skipped -> "skipped"
-        BatchItemStatus.Failed -> "failed"
-        BatchItemStatus.Cancelled -> "cancelled"
-        BatchItemStatus.Compressing -> "compressing"
-        else -> "ready"
-    }
-    return "Metadata: $date • $location • $replacement"
+    return "Metadata: $date • $location"
 }
 
 private fun BatchVideoItem.beforeAfterSummary(): String {

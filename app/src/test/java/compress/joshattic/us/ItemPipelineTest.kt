@@ -187,14 +187,14 @@ class ItemPipelineTest {
         // already queued then arrives.
         b.update(0) { it.copy(status = BatchItemStatus.Cancelled, terminalResult = BatchTerminalResult.CANCELLED) }
         late!!.encodeProgress(0.99f, 999L)
-        late!!.message("Writing 999 MiB")
+        late!!.detail("Writing 999 MiB")
         late!!.enter(ItemPhase.CERTIFYING)
         val row = b.items[0]
         assertEquals(BatchItemStatus.Cancelled, row.status)
         assertEquals(0.5f, row.phaseFraction!!, 0f)
         assertEquals(100L, row.currentOutputSize)
         assertEquals(ItemPhase.ENCODING, row.phase)
-        assertFalse(row.message == "Writing 999 MiB")
+        assertFalse(row.detail?.text == "Writing 999 MiB")
     }
 
     @Test
@@ -218,12 +218,12 @@ class ItemPipelineTest {
         ItemPipeline(b).run(token, stages)
         // The first attempt's export poller fires once more after the handover.
         first!!.encodeProgress(0.97f, 258_300_000L)
-        first!!.message("stale")
+        first!!.detail("stale")
         val row = b.items[0]
         assertEquals(retryToken, row.attempt)
         // The pipeline's SAVING transition went to the attempt that owns the row.
         assertEquals(BatchItemStatus.Done, row.status)
-        assertFalse(row.message == "stale")
+        assertFalse(row.detail?.text == "stale")
         assertTrue(stages.finalized)
     }
 
@@ -247,5 +247,106 @@ class ItemPipelineTest {
         assertEquals(3, b.items[0].phaseStep)
         phases.certifyStep(1, 0)
         assertEquals(3, b.items[0].phaseStep)
+    }
+
+
+    // ---- R3: text a phase writes belongs to that phase -------------------------------------
+
+    @Test
+    fun aFinalizingDetailIsGoneOnceVerificationBegins() {
+        // The v1.6.311 recording at 00:08 and 02:31: "Verifying output" above "Finalizing: writing
+        // the source's metadata into the output…".
+        val b = board()
+        val phases = PhaseReporter(b, token)
+        phases.enter(ItemPhase.ENCODING)
+        phases.detail("Frame rate reduced to 30 fps (source 60 fps)")
+        phases.encodeProgress(0.5f, 10L)
+        assertEquals("a progress tick keeps the phase's detail", "Frame rate reduced to 30 fps (source 60 fps)", b.items[0].detail?.text)
+        phases.encodeFinished()
+        assertNull("the encoder's detail does not follow the row into finalizing", b.items[0].detail)
+        phases.detail("Finalizing: writing the source's metadata into the output…")
+        assertEquals(PhaseDetail(ItemPhase.FINALIZING, "Finalizing: writing the source's metadata into the output…"), b.items[0].detail)
+        phases.enter(ItemPhase.VERIFYING)
+        assertEquals(ItemPhase.VERIFYING, b.items[0].phase)
+        assertNull(b.items[0].detail)
+        phases.enter(ItemPhase.CERTIFYING)
+        phases.detail("Certifying pixels: sampled VMAF check of the final output…")
+        phases.certifyStep(2, 3)
+        assertEquals(ItemPhase.CERTIFYING, b.items[0].detail?.phase)
+        // Entering the phase the detail belongs to again does not clear it.
+        phases.enter(ItemPhase.CERTIFYING)
+        assertEquals(ItemPhase.CERTIFYING, b.items[0].detail?.phase)
+    }
+
+    @Test
+    fun aDurableMessageIsNotPhaseDetailAndSurvivesTransitions() {
+        val b = board()
+        b.update(0) { it.copy(message = "Backup copy saved.") }
+        val phases = PhaseReporter(b, token)
+        phases.enter(ItemPhase.ENCODING)
+        phases.detail("x")
+        phases.enter(ItemPhase.VERIFYING)
+        assertEquals("Backup copy saved.", b.items[0].message)
+    }
+
+    // ---- R4: the retry says which attempt it is, and why, for as long as it runs -------------
+
+    private fun retryContext() = AttemptContext.saferRungRetry(
+        ordinal = 2, total = 2, rejectedRatio = 0.77, saferRatio = 0.95, why = RetryCause.MEASURED_BELOW_BAR
+    )
+
+    @Test
+    fun theRetryExplanationSurvivesPollingAndEveryLaterPhase() {
+        val b = board()
+        // The batch-wide token of job_1ecc4136ae36's retry was 21; it was the item's second attempt.
+        val retryToken = AttemptToken(token.batchId, 0, 21)
+        b.update(0) { ItemProgressModel.handOver(it, token, retryToken, retryContext()) }
+        val retry = PhaseReporter(b, retryToken)
+        retry.planResolved(597_630_793L)
+        retry.enter(ItemPhase.ENCODING)
+        repeat(1_000) { tick -> retry.encodeProgress(tick / 1_000f, tick * 600_000L) }
+        retry.encodeFinished()
+        retry.detail("Finalizing: writing the source's metadata into the output…")
+        retry.enter(ItemPhase.VERIFYING)
+        retry.enter(ItemPhase.CERTIFYING)
+        retry.certifyStep(3, 3)
+        val row = b.items[0]
+        assertEquals(retryContext(), row.attemptContext)
+        assertEquals("Attempt 2 of 2", row.attemptContext!!.label)
+        assertTrue(row.attemptContext!!.reason, row.attemptContext!!.reason.startsWith("the first candidate (0.77) did not pass the quality check"))
+        assertTrue(row.attemptContext!!.reason.contains("safer measured ratio 0.95, which is larger"))
+        // It stays on the row once the item has ended.
+        b.update(0) { it.copy(status = BatchItemStatus.Done, terminalResult = BatchTerminalResult.TRANSCODED_SMALLER) }
+        assertEquals(retryContext(), b.items[0].attemptContext)
+    }
+
+    @Test
+    fun theFailedAttemptCannotChangeTheRetrysContext() {
+        val b = board()
+        val retryToken = AttemptToken(token.batchId, 0, 2)
+        val first = PhaseReporter(b, token)
+        b.update(0) { ItemProgressModel.handOver(it, token, retryToken, retryContext()) }
+        // Late callbacks of the first attempt, and a second hand-over in its name, change nothing.
+        first.detail("Writing 465 MiB (temporary)")
+        first.enter(ItemPhase.CERTIFYING)
+        b.update(0) { ItemProgressModel.handOver(it, token, AttemptToken(token.batchId, 0, 3), null) }
+        val row = b.items[0]
+        assertEquals(retryToken, row.attempt)
+        assertEquals(retryContext(), row.attemptContext)
+        assertNull(row.detail)
+    }
+
+    @Test
+    fun aNewRunOfTheItemStartsWithoutTheLastRunsState() {
+        val b = board()
+        b.update(0) {
+            it.copy(status = BatchItemStatus.SavedCopy, message = "old outcome", attemptContext = retryContext(),
+                detail = PhaseDetail(ItemPhase.CERTIFYING, "old"), replacementOutcome = ReplacementOutcome.AT_RISK_RECOVERY_RETAINED,
+                copySaved = false, galleryCopySaved = true)
+        }
+        b.update(0) { ItemProgressModel.begin(it, AttemptToken("batch_next", 0, 1), 1L) }
+        val row = b.items[0]
+        assertNull(row.message); assertNull(row.attemptContext); assertNull(row.detail)
+        assertNull(row.replacementOutcome); assertNull(row.copySaved); assertFalse(row.galleryCopySaved)
     }
 }

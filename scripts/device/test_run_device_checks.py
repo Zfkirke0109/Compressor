@@ -84,6 +84,7 @@ class DeviceChecksTest(unittest.TestCase):
         # The clip-free timeline localization and gallery publication run with the default checks.
         self.assertIn("compress.joshattic.us.EditListTimelineDeviceTest", instrument)
         self.assertIn("compress.joshattic.us.GalleryPublicationDeviceTest", instrument)
+        self.assertIn("compress.joshattic.us.BatchItemCardDeviceTest", instrument)
         self.assertNotIn("logcat -c", calls)
         self.assertTrue(any("logcat -t 1794198030.123456789 " in call for call in calls))
 

@@ -46,7 +46,10 @@ object ItemProgressModel {
     fun accepts(item: BatchVideoItem, token: AttemptToken): Boolean =
         item.attempt == token && item.status in ACTIVE
 
-    /** A new attempt owns the row from here on. */
+    /**
+     * A new attempt owns the row from here on. What an earlier run of the item left on it (its
+     * outcome text, attempt context, replacement and gallery state) is cleared with it.
+     */
     fun begin(item: BatchVideoItem, token: AttemptToken, provisionalEstimateBytes: Long): BatchVideoItem =
         item.copy(
             status = BatchItemStatus.Compressing,
@@ -59,12 +62,27 @@ object ItemProgressModel {
             currentOutputSize = 0L,
             candidateOutputSize = 0L,
             targetOutputSize = provisionalEstimateBytes,
-            estimateIsProvisional = true
+            estimateIsProvisional = true,
+            message = null,
+            detail = null,
+            attemptContext = null,
+            replacementOutcome = null,
+            copySaved = null,
+            galleryCopySaved = false
         )
+
+    /** The detail of [phase] survives a move into it; any other phase's detail is obsolete. */
+    private fun detailFor(item: BatchVideoItem, phase: ItemPhase): PhaseDetail? = item.detail?.takeIf { it.phase == phase }
 
     fun enter(item: BatchVideoItem, token: AttemptToken, phase: ItemPhase): BatchVideoItem {
         if (!accepts(item, token)) return item
-        return item.copy(phase = phase, phaseFraction = null, phaseStep = null, phaseSteps = null)
+        return item.copy(phase = phase, phaseFraction = null, phaseStep = null, phaseSteps = null, detail = detailFor(item, phase))
+    }
+
+    /** Text for the phase the row is in now; it disappears when the row leaves that phase (R3). */
+    fun detail(item: BatchVideoItem, token: AttemptToken, text: String): BatchVideoItem {
+        if (!accepts(item, token)) return item
+        return item.copy(detail = PhaseDetail(item.phase, text))
     }
 
     /**
@@ -91,7 +109,8 @@ object ItemProgressModel {
         return item.copy(
             phase = ItemPhase.FINALIZING,
             phaseFraction = null,
-            currentOutputSize = 0L
+            currentOutputSize = 0L,
+            detail = detailFor(item, ItemPhase.FINALIZING)
         )
     }
 
@@ -111,8 +130,9 @@ object ItemProgressModel {
     /**
      * A new attempt at the same item (the safer-rung retry) takes the row over from [previous].
      * From here, anything still arriving for [previous] is ignored. No-op unless [previous] owns it.
+     * [context] says which attempt this is and why, and stays on the row from here on (R4).
      */
-    fun handOver(item: BatchVideoItem, previous: AttemptToken, next: AttemptToken): BatchVideoItem {
+    fun handOver(item: BatchVideoItem, previous: AttemptToken, next: AttemptToken, context: AttemptContext? = null): BatchVideoItem {
         if (!accepts(item, previous)) return item
         return item.copy(
             attempt = next,
@@ -121,7 +141,9 @@ object ItemProgressModel {
             phaseStep = null,
             phaseSteps = null,
             currentOutputSize = 0L,
-            candidateOutputSize = 0L
+            candidateOutputSize = 0L,
+            detail = null,
+            attemptContext = context ?: item.attemptContext
         )
     }
 
@@ -176,10 +198,11 @@ class PhaseReporter(private val board: ItemBoard, val token: AttemptToken) {
     fun candidateReady(bytes: Long) = board.update(token.index) { ItemProgressModel.candidateReady(it, token, bytes) }
     fun certifyStep(done: Int, total: Int) = board.update(token.index) { ItemProgressModel.certifyStep(it, token, done, total) }
     fun planResolved(estimateBytes: Long) = board.update(token.index) { ItemProgressModel.planResolved(it, token, estimateBytes) }
-    /** A message for this attempt only; ignored once the item is terminal or re-attempted. */
-    fun message(text: String) = board.update(token.index) {
-        if (ItemProgressModel.accepts(it, token)) it.copy(message = text) else it
-    }
+    /**
+     * Text about the phase the row is in, for this attempt only: it disappears when the row moves to
+     * another phase, and is ignored once the item is terminal or re-attempted.
+     */
+    fun detail(text: String) = board.update(token.index) { ItemProgressModel.detail(it, token, text) }
     fun isCurrent(): Boolean = board.item(token.index)?.let { ItemProgressModel.accepts(it, token) } == true
 }
 
