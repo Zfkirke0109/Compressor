@@ -84,6 +84,15 @@ app_state() {
   LEFTOVERS=$(dsh run-as "$PKG" ls -1 files/replace_recovery | grep -c '^replace_recovery_' || true)
 }
 
+# The user's safer-rung retry switch as the app has it on disk: true, or false (also when it was
+# never set, which is its default). The fallback case changes it and must leave it as it found it.
+retry_switch() {
+  local xml
+  [ "$(dsh run-as "$PKG" id | cut -c1-4)" = "uid=" ] || die "run-as $PKG does not work here: install the debug build" 2
+  xml=$(adb exec-out run-as "$PKG" cat shared_prefs/encoder_experiments.xml 2>/dev/null)
+  if grep -qE '<boolean name="safer_rung_retry" value="true"' <<<"$xml"; then printf true; else printf false; fi
+}
+
 host_run() { printf '%s/%s' "$HOST_ROOT" "$1"; }
 manifest() { printf '%s/manifest.tsv' "$(host_run "$1")"; }
 
@@ -313,7 +322,20 @@ cmd_run_copy_tests() {
         [ -n "$FALLBACK_K" ] || die "the fallback case needs --fallback-baseline K (the B that selects a marginal trial)" 64
         fpath=$(field B "$FALLBACK_K" 5)
         [ -n "$fpath" ] || die "no B$FALLBACK_K in this run" 2
+        local switch_before switch_after
+        switch_before=$(retry_switch)
         instrument "$case" "$TEST_PACKAGE.SaferRungFallbackDeviceTest" -e sourceVideo "$fpath"
+        # The test changes the user's safer-rung retry switch and puts it back itself; if its process
+        # died first, the value it recorded is put back here, in an instrumentation run of its own.
+        instrument settings-restore "$TEST_PACKAGE.TestOwnedSettingsDeviceTest"
+        switch_after=$(retry_switch)
+        if [ "$switch_before" = "$switch_after" ]; then
+          printf 'retry-switch\tpassed\n' >>"$(host_run "$RUN")/verdicts.tsv"
+          say "settings     : the safer-rung retry switch is $switch_after, as before the fallback case"
+        else
+          printf 'retry-switch\tfailed\n' >>"$(host_run "$RUN")/verdicts.tsv"
+          warn "the safer-rung retry switch was $switch_before before the fallback case and is $switch_after now: set it back in the app's experiments"
+        fi
         ;;
       corpus)
         # Every B of this run, as "path:sha256:bytes": one copy-mode batch over copies of them all.
@@ -361,7 +383,7 @@ cmd_collect() {
   local host report
   host=$(host_run "$RUN"); report="$host/report.txt"
   adb exec-out run-as "$PKG" cat "files/pllab/$RUN/results.jsonl" >"$host/results.jsonl" 2>/dev/null || true
-  adb logcat -d -s System.out:I 2>/dev/null | tr -d '\r' | grep -E 'pllab-(result|batch)|b287-fallback|gallery-publication' >"$host/printed.txt" || true
+  adb logcat -d -s System.out:I 2>/dev/null | tr -d '\r' | grep -E 'pllab-(result|batch|settings)|b287-fallback|gallery-publication' >"$host/printed.txt" || true
   # The rendered row states (synthetic rows only), as PNGs.
   local png
   mkdir -p "$host/ui-evidence"

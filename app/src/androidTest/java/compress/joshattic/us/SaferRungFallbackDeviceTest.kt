@@ -46,7 +46,9 @@ import java.security.MessageDigest
  * (reported incomplete), never passed. Two controls run alongside: a refusal without the retry
  * experiment keeps the original after one encode, and a second refusal never starts a third.
  *
- * What it changes on the device, and puts back: the opt-in safer-rung retry switch. It reads a
+ * What it changes on the device, and puts back: the opt-in safer-rung retry switch, whose value is
+ * recorded on disk before it is first changed (TestOwnedSettings), so that a run whose process dies
+ * before its @After has it put back by the next run or by TestOwnedSettingsDeviceTest. It reads a
  * copy of the clip in the app's cache; Replace Originals must be off and is asserted off. Each
  * batch writes its usual diagnostics session, marked `testCandidateVeto` and `testHarnessRun`. It
  * plans from the user's learned state and learns into a store of its own (HarnessScope): the real
@@ -65,12 +67,13 @@ class SaferRungFallbackDeviceTest {
     private val context: Context = instrumentation.targetContext
     private val scratch = mutableListOf<File>()
     private val outputDir get() = File(context.cacheDir, "batch_compressed_videos")
-    private var saferRetryBefore = false
     private var running: BatchCompressorViewModel? = null
 
+    // The switch is the user's: an earlier run whose process died before its @After left the
+    // user's value recorded (TestOwnedSettings), and it is put back before anything else.
     @Before
-    fun rememberSettings() {
-        saferRetryBefore = EncoderExperiments.isSaferRungRetryEnabled(context)
+    fun putBackWhatAnEarlierRunLeft() {
+        TestOwnedSettings.restore(context)
     }
 
     @After
@@ -83,9 +86,9 @@ class SaferRungFallbackDeviceTest {
                 while (vm.uiState.value.isCompressing && System.currentTimeMillis() < deadline) Thread.sleep(200)
             }
         }
-        val restored = EncoderExperiments.setSaferRungRetryEnabled(context, saferRetryBefore)
+        val restored = runCatching { TestOwnedSettings.restore(context) }
         scratch.forEach { runCatching { it.delete() } }
-        assertTrue("could not restore the safer-rung retry switch to $saferRetryBefore", restored)
+        restored.getOrThrow()
     }
 
     private fun sha256(file: File): String = FileInputStream(file).use { input ->
@@ -166,7 +169,7 @@ class SaferRungFallbackDeviceTest {
      * test's, every attempt closed and nothing learned from a refused attempt.
      */
     private fun runBatch(source: File, saferRetry: Boolean, refuseAttempts: Set<Int>): Batch {
-        assertTrue("could not set the safer-rung retry switch", EncoderExperiments.setSaferRungRetryEnabled(context, saferRetry))
+        TestOwnedSettings.setSaferRungRetry(context, saferRetry)
         val before = sha256(source)
         val refused = java.util.Collections.synchronizedList(mutableListOf<Pair<Int, Double>>())
         val veto = CandidateVeto { attemptIndex, targetRatio ->

@@ -161,9 +161,15 @@ What to know before running it:
 - It budgets two full encodes of the clip per batch. Use a disposable copy; replace-original must
   be off and is asserted off; the copy's SHA-256 is compared before and after every batch.
 - It turns the opt-in safer-rung retry switch on (off for the control) and restores it afterwards.
+  The user's value is recorded on disk before the first change (`TestOwnedSettings`), and the
+  scripts run `TestOwnedSettingsDeviceTest` on its own after the test, so the switch is put back
+  even when the test's process dies first (an ADB drop ends `am instrument`, and the process).
 - Starting a batch clears the app's cached outputs, as it does in the app: run it when no results
   are waiting to be saved.
-- The real second encode's result reaches the learned profile exactly as it would in the app. A
+- The real second encode's result is learned exactly as the app would learn it, into a store of
+  the test's own (`HarnessScope`, since `1d9881f`): the batch plans from the user's learned state
+  and never writes the user's profile. The runs recorded in sections 8 to 10 predate that, and
+  their accepted attempts taught the user's profile. A
   refused attempt writes nothing there, and its records say what it was: `run_identity` carries
   `batchSettings.testCandidateVeto`, the attempt's `certify` stage has reason `cert_test_rejected`
   and its ledger outcome is `test_rejected`. `parse_session_jsonl.py` opens such a session's
@@ -649,6 +655,10 @@ What runs, and what each case shows:
 - `CorpusBatchDeviceTest`: one copy-mode batch over copies of every B, recording what each item
   ended as, with no expectation that any compresses.
 - `SaferRungFallbackDeviceTest` (`--fallback-baseline K`), on a B that selects a marginal trial.
+  It changes the user's safer-rung retry switch, so it records the user's value on disk first
+  (`TestOwnedSettings`). `TestOwnedSettingsDeviceTest` then runs on its own and puts back a value
+  a test whose process died before its `@After` could not, and the harness compares the switch
+  before the case and after it (`retry-switch`); a difference fails the run and says so.
 - `app-checks`, needing no media: `GalleryPublicationDeviceTest` (a save counts only when one row
   is published and reads back whole; a refused save leaves no row) and `BatchItemCardDeviceTest`
   (the row's states at 300 dp and 100-200 % text, saved as PNGs of synthetic rows for the report).

@@ -10,7 +10,8 @@ import unittest
 
 
 class DeviceChecksTest(unittest.TestCase):
-    def run_checks(self, result, relative=False, installed=False, options=(), instrument_status=0, logcat=""):
+    def run_checks(self, result, relative=False, installed=False, options=(), instrument_status=0, logcat="",
+                   settings_result="OK (1 test)"):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             repo = root / "repo"
@@ -29,6 +30,7 @@ class DeviceChecksTest(unittest.TestCase):
                 '  echo INSTALL_FAILED_VERSION_DOWNGRADE >&2; exit 1\n'
                 'fi\n'
                 'if [[ "$1 $2" == "shell date +%s.%N" ]]; then printf "1794198030.123456789\\r\\n"; fi\n'
+                'if [[ "$*" == *TestOwnedSettingsDeviceTest* ]]; then printf "%s\\n" "$SETTINGS_RESULT"; exit 0; fi\n'
                 'if [[ "$1 $2 $3" == "shell am instrument" ]]; then printf "%s\\n" "$TEST_RESULT"; exit "$INSTRUMENT_STATUS"; fi\n'
                 'if [[ "$1" == logcat ]]; then printf "%s\\n" "$LOGCAT_OUTPUT"; fi\n'
             )
@@ -45,6 +47,7 @@ class DeviceChecksTest(unittest.TestCase):
                     **os.environ, "PATH": f"{root}:{os.environ['PATH']}", "TEST_RESULT": result,
                     "CALLS": str(calls), "ALREADY_INSTALLED": "1" if installed else "0",
                     "INSTRUMENT_STATUS": str(instrument_status), "LOGCAT_OUTPUT": logcat,
+                    "SETTINGS_RESULT": settings_result,
                 },
                 text=True, capture_output=True, check=False
             )
@@ -100,11 +103,33 @@ class DeviceChecksTest(unittest.TestCase):
         self.assertIn("--user 150", instrument)
         self.assertIn(f"sha256={digest}", report)
         self.assertFalse(any(call.startswith("install ") for call in calls))
+        # The switch the test changed is put back in a run of its own, for the same user, after it.
+        instruments = [call for call in calls if call.startswith("shell am instrument ")]
+        self.assertEqual(2, len(instruments))
+        self.assertIn("-e class compress.joshattic.us.TestOwnedSettingsDeviceTest ", instruments[1])
+        self.assertIn("--user 150", instruments[1])
+        self.assertIn("# putting back test-owned settings", report)
 
     def test_the_default_run_does_not_include_the_fallback_test(self):
         _, _, _, calls = self.run_checks("OK (1 test)")
         instrument = next(call for call in calls if call.startswith("shell am instrument "))
         self.assertNotIn("SaferRungFallbackDeviceTest", instrument)
+        self.assertFalse(any("TestOwnedSettingsDeviceTest" in call for call in calls))
+
+    def test_a_fallback_run_whose_settings_were_not_put_back_fails(self):
+        proc, report, _, _ = self.run_checks("OK (3 tests)", options=("--fallback",),
+                                             settings_result="FAILURES!!!\nTests run: 1,  Failures: 1")
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("may not be the user's", proc.stdout)
+        self.assertIn("FAILURES!!!", report)
+
+    def test_the_settings_are_put_back_even_when_the_fallback_run_died(self):
+        # An ADB drop or a crash ends the fallback run; the switch is still put back after it.
+        proc, report, _, calls = self.run_checks("INSTRUMENTATION_RESULT: shortMsg=Process crashed.",
+                                                 options=("--fallback",), instrument_status=1)
+        self.assertEqual(2, proc.returncode, proc.stdout + proc.stderr)
+        self.assertTrue(any("TestOwnedSettingsDeviceTest" in call for call in calls))
+        self.assertIn("# putting back test-owned settings\nOK (1 test)", report)
 
     def test_a_fallback_run_without_a_marginal_trial_is_incomplete_not_passed(self):
         # The test skips (assumption) when the clip's ladder selects no marginal trial.

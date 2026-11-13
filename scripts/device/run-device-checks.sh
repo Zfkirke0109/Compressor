@@ -33,8 +33,10 @@
 #                 marginal trial on this device (a lower rung that only clears the bar under a
 #                 higher one that passes); otherwise the run is reported incomplete. Budget two
 #                 full encodes of CLIP per batch. The opt-in safer-rung retry switch is turned on
-#                 for the run and put back afterwards; replace-original must be off. Writes
-#                 CLIP.fallback-checks.txt.
+#                 for the run and put back afterwards, by the test and then, in a run of its own,
+#                 by TestOwnedSettingsDeviceTest, which puts back the value the test recorded on
+#                 disk if its process died first; the run fails if that does not pass.
+#                 replace-original must be off. Writes CLIP.fallback-checks.txt.
 #
 # Writes the instrumentation output next to the clip as CLIP.device-checks.txt.
 # Exit 2 means the validation was incomplete (skipped tests, zero tests or missing results).
@@ -98,12 +100,26 @@ elif grep -Eq '^INSTRUMENTATION_STATUS_CODE: -[34][[:space:]]*$|AssumptionViolat
    ! grep -Eq '^[[:space:]]*OK \([1-9][0-9]* tests?\)[[:space:]]*$' "$OUT"; then
   VERDICT=incomplete
 fi
+# The fallback test changes the user's safer-rung retry switch and puts it back itself. If its
+# process died first (an ADB drop ends am instrument, and the process with it), the value it
+# recorded on disk is put back here, in an instrumentation run of its own, whatever the verdict.
+if "$FALLBACK"; then
+  SETTINGS_OUT="$(adb shell am instrument -w -r "${USER_ARGS[@]}" \
+    -e class "$TEST_PACKAGE.TestOwnedSettingsDeviceTest" \
+    "$PKG.test/androidx.test.runner.AndroidJUnitRunner" 2>&1 | tr -d '\r')" || true
+  printf '# putting back test-owned settings\n%s\n' "$SETTINGS_OUT" >>"$OUT"
+  if grep -Eq 'FAILURES!!!|INSTRUMENTATION_FAILED:|Process crashed' <<<"$SETTINGS_OUT" ||
+     ! grep -Eq '^[[:space:]]*OK \([1-9][0-9]* tests?\)[[:space:]]*$' <<<"$SETTINGS_OUT"; then
+    echo "the safer-rung retry switch may not be the user's: putting it back did not pass (TestOwnedSettingsDeviceTest)"
+    VERDICT=failed
+  fi
+fi
 # The b177 tests print what the platform reported (durations, window starts, record fields) to
 # System.out, which lands in logcat rather than the instrumentation output; the fallback test
 # prints each batch's rungs, attempts, retry and certification the same way, and the timeline test
 # what each stage counted. They are collected whatever the verdict: a skipped or failed run is when
 # they say most, such as which rungs a clip's ladder measured when it selected no marginal trial.
-adb logcat -t "$LOG_START" -s System.out:I | grep -E "b177-(fixture|evidence)|b287-(fallback|timeline)|gallery-publication" | tee -a "$OUT" || true
+adb logcat -t "$LOG_START" -s System.out:I | grep -E "b177-(fixture|evidence)|b287-(fallback|timeline)|gallery-publication|pllab-settings" | tee -a "$OUT" || true
 case "$VERDICT" in
   failed)
     echo "device checks failed. See $OUT"

@@ -107,10 +107,15 @@ FAKE_ADB = textwrap.dedent(r'''
         if tamper:
             with open(device_path(tamper), "ab") as fh:
                 fh.write(b"\0")
+        # What the app's experiment store holds once this run is over (a test that changed it).
+        prefs = state.get("prefsAfterInstrument", {}).get(str(n))
+        if prefs is not None:
+            (app / "shared_prefs").mkdir(parents=True, exist_ok=True)
+            (app / "shared_prefs" / "encoder_experiments.xml").write_text(prefs)
         if "pllabPhase die" in cmd and not state.get("dieDoesNotCrash"):
             print("INSTRUMENTATION_RESULT: shortMsg=Process crashed.\nINSTRUMENTATION_CODE: 0")
         else:
-            print(state.get("instrumentResult", "OK (7 tests)"))
+            print(state.get("instrumentResults", {}).get(str(n), state.get("instrumentResult", "OK (7 tests)")))
         sys.exit(0)
     if cmd.startswith("sha256sum "):
         n = state.get("hashes", 0) + 1
@@ -370,6 +375,63 @@ class SafeCopyHarnessTest(unittest.TestCase):
         size = self.a.stat().st_size
         self.assertIn(f"-e pllabBaselines /storage/emulated/0/Documents/PLLabValidation/{run}/B-1.mp4:{self.a_sha}:{size}", instrument)
         self.assertNotIn("birthday", instrument)
+
+    def prefs_xml(self, retry):
+        return ("<?xml version='1.0' encoding='utf-8' standalone='yes' ?>\n<map>\n"
+                f'    <boolean name="safer_rung_retry" value="{"true" if retry else "false"}" />\n</map>\n')
+
+    def write_prefs(self, retry):
+        (self.fake / "app" / "shared_prefs").mkdir(parents=True, exist_ok=True)
+        (self.fake / "app" / "shared_prefs" / "encoder_experiments.xml").write_text(self.prefs_xml(retry))
+
+    def test_the_fallback_case_is_followed_by_putting_the_users_retry_switch_back(self):
+        self.write_prefs(False)
+        run = self.stage()
+        before = len(self.calls())
+        proc = self.run_harness("run-copy-tests", "--run", run, "--cases", "fallback", "--fallback-baseline", "1")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        instruments = [c for c in self.calls()[before:] if c.startswith("shell am instrument")]
+        self.assertEqual(2, len(instruments))
+        self.assertIn("SaferRungFallbackDeviceTest", instruments[0])
+        self.assertIn(f"-e sourceVideo /storage/emulated/0/Documents/PLLabValidation/{run}/B-1.mp4", instruments[0])
+        self.assertIn("TestOwnedSettingsDeviceTest", instruments[1])
+        verdicts = dict(line.split("\t") for line in (self.home / run / "verdicts.tsv").read_text().splitlines())
+        self.assertEqual({"fallback": "passed", "settings-restore": "passed", "retry-switch": "passed"}, verdicts)
+        self.assertIn("the safer-rung retry switch is false, as before the fallback case", proc.stdout)
+
+    def test_the_switch_is_put_back_even_when_the_fallback_process_died(self):
+        # The fallback run ends "Process crashed" (an ADB drop or a crash) with the switch left on;
+        # the restore runs anyway, in its own run, and puts it back.
+        self.write_prefs(False)
+        run = self.stage()
+        self.load()
+        n = self.state.get("instruments", 0)
+        self.state["instrumentResults"] = {str(n + 1): "INSTRUMENTATION_RESULT: shortMsg=Process crashed.\nINSTRUMENTATION_CODE: 0"}
+        self.state["prefsAfterInstrument"] = {str(n + 1): self.prefs_xml(True), str(n + 2): self.prefs_xml(False)}
+        self.save()
+        proc = self.run_harness("run-copy-tests", "--run", run, "--cases", "fallback", "--fallback-baseline", "1")
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        verdicts = dict(line.split("\t") for line in (self.home / run / "verdicts.tsv").read_text().splitlines())
+        self.assertEqual({"fallback": "crashed", "settings-restore": "passed", "retry-switch": "passed"}, verdicts)
+
+    def test_a_retry_switch_left_changed_fails_the_run_and_says_so(self):
+        self.write_prefs(False)
+        run = self.stage()
+        self.load()
+        n = self.state.get("instruments", 0)
+        self.state["prefsAfterInstrument"] = {str(n + 1): self.prefs_xml(True)}
+        self.save()
+        proc = self.run_harness("run-copy-tests", "--run", run, "--cases", "fallback", "--fallback-baseline", "1")
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("retry-switch\tfailed", (self.home / run / "verdicts.tsv").read_text())
+        self.assertIn("was false before the fallback case and is true now", proc.stderr)
+
+    def test_a_switch_never_set_reads_as_its_default(self):
+        # No experiment store at all: the switch is off, and a run that leaves it off passes.
+        run = self.stage()
+        proc = self.run_harness("run-copy-tests", "--run", run, "--cases", "fallback", "--fallback-baseline", "1")
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("retry-switch\tpassed", (self.home / run / "verdicts.tsv").read_text())
 
     def test_the_fixture_cases_need_the_fixture(self):
         run = self.stage()
