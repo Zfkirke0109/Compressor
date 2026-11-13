@@ -560,9 +560,9 @@ the phone before the test.
   recorded as `test_rejected`, certified nothing (`cert_test_rejected`) and wrote nothing to the
   learned profile. Production allowed the retry and encoded the measured safer rung, 0.80, from the
   same ladder, on the same planned windows and with its own encoder configuration. That encode
-  passed structural verification and its own certification on every planned window, with window
-  means of 96.37, 97.54 and 96.54, and was accepted after one retry; its result alone reached the
-  learned profile.
+  passed structural verification and its own certification on all three planned windows, 36 frames
+  each (means 96.37, 97.54 and 96.54; p5 93.47, 95.41 and 92.90; minimums 90.85, 95.27 and 91.83),
+  and was accepted after one retry; its result alone reached the learned profile.
 - With the experiment off, the plan was the passing 0.80. Refused, it left the original in place
   after that one encode, with no retry, no output and nothing left in the cache.
 - With both attempts refused, the original was kept after the second, and no third encode started.
@@ -595,8 +595,13 @@ source's.
 accepted the 0.75 trial with a bit-identical audio copy, and the timeline test printed what §9
 recorded.
 
-**Not covered.** The 168 → 166 clip is not on the phone, so there was no exact-source retest. The
-records of the parity self-check and the three fallback batches were not collected with the
-default batch's: what is above is the instrumentation output, the lines the tests print and what
-the tests assert. No crash was recorded; the three exit records are the force-stops
-`am instrument` makes when it starts and finishes.
+The three fallback batches' own records, collected afterwards, say the same. Each run identity
+records the veto, Replace Originals off and the retry switch as the test set it (on, off, on). The
+ledgers read 0.75 `test_rejected` then 0.80 `accepted`; 0.80 `test_rejected`; and 0.75 then 0.80
+`test_rejected`. Every refused attempt passed structural verification and then certified nothing
+(`cert_test_rejected`, no windows), the accepted 0.80 output is the one the batch kept, and the
+only learned-state update in the three batches is that attempt's.
+
+**Not covered.** The 168 → 166 clip is not on the phone, so there was no exact-source retest. No
+crash was recorded; the three exit records are the force-stops `am instrument` makes when it starts
+and finishes.
