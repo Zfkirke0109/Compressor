@@ -748,3 +748,43 @@ the bottom; in the app the row scrolls.
 
 Not covered: an exact-source retest of the 168 to 166 case (the original is not on the phone),
 a real camera file needing the end padding repair, and the S23.
+
+### The row again, on v1.6.324 (November 13, 23:12 UTC)
+
+The owner installed the matched v1.6.324 APKs from `10079d0` over v1.6.322 and reran the
+clip-free case in the same run (`run-copy-tests --cases app-checks`). It passed, 10 of 10
+(`GalleryPublicationDeviceTest` 5, `BatchItemCardDeviceTest` 5), and the three originals and
+their baselines were checked before and after it: 132 checks in the run now, all unchanged.
+
+Five of the seven images are the v1.6.322 run's, byte for byte. The open suggestion differs only
+in the touch ripple on the button the test had just tapped. The row of a replacement that left
+the original incomplete now reads "Original at risk" in its badge, as `01b4605` intended.
+
+That row is now built as production leaves it, with the encode's terminal result, and its image
+showed what was still wrong below the badge: the result block read "Outcome: Compressed", in the
+colour of a success. The code behind it had the same blind spot at the end of a batch. Fixed in
+`74effae`:
+
+- **The outcome line.** After a replacement that left the original at risk it reads "Outcome:
+  Compressed, but replacing the original failed"; after one not made with no copy saved either,
+  "…, but the original was not replaced". It is drawn as a success only on a row whose badge is
+  not an alarm.
+- **The end of the batch.** The end message warned only about failed encodes, and a failed
+  replacement is not one: a batch that left an original at risk ended "Finished N outputs" with
+  no warning above the list, a cancelled batch cleared the warning altogether, and the only
+  notice was that item's row, wherever in the list it was. All three endings (finished,
+  cancelled, stopped by an unhandled failure) now count every row whose badge is an alarm:
+  originals at risk first, with "do not clear the app's storage" when an intact copy is held
+  only there, then failed items, then originals neither replaced nor saved as a copy.
+- **"Saved … by real compression."** The finish line still used the label the summary card had
+  dropped for reading as freed space. It now reads "Accepted size reduction (real compression)".
+- **"Original untouched"** on a row whose replacement was written, failed and rolled back. The
+  bytes are the original's, but the file was not left alone: it reads "Original restored intact
+  after a failed replacement".
+
+These are tested on the JVM (each of the eight new tests fails with the old behaviour put back)
+and asserted by `BatchItemCardDeviceTest`, which also renders the rolled-back row. They change
+words about what already happened, not what a replacement does. They have not been seen on the
+phone: v1.6.324 predates them. The end-of-batch message has no device test: the harness makes a
+replacement fail below the batch, in the replacement IO, and the app has no hook to make one fail
+inside a batch.
