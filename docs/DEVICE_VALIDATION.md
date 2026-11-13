@@ -468,7 +468,7 @@ retry was recorded after the refusal. One passing rung is what the short ladder 
 1920 × 1088; the report did not say the clip's size, because the script dropped the tests' printed
 lines from a run it judged incomplete. It now keeps them for every outcome. The encode that follows
 a refused trial at the safer measured ratio has still not run on a device under the test; §9 has
-production making it twice after a real certification failure.
+production making it twice after a real certification failure, and §10 the test passing.
 
 ## 9. v1.6.311 on the S26, normal profile (November 12)
 
@@ -495,7 +495,7 @@ test; no batch has needed the rewrite yet (below).
 every rung failed on both ladders (HEVC 0.90, 0.95 and 0.97; AVC 0.85, 0.95 and 0.97), so no batch
 reached a full encode, there was nothing to refuse, and all three tests were skipped (`attempt 1
 never reached certification (terminal SKIPPED_WOULD_DEGRADE): nothing to refuse`). The encode at
-the safer measured ratio after a refused trial has still not run under the test.
+the safer measured ratio after a refused trial had still not run under the test; it has since (§10).
 
 **A batch over the phone's videos.** The owner then ran v1.6.311 in Perceptually Lossless over the
 phone's videos, in the normal profile with Replace Originals off: 58 items from 54 distinct
@@ -543,3 +543,60 @@ Every original's SHA-256 was unchanged after the run (58 of 58), and no replacem
   androidx.test's runner failed on UiAutomation's `DeadObjectException`, and no frame of the app's
   code was in it. The other 20 records are exits (11 other, 7 user requested, 1 package updated,
   1 low memory), all before the batch.
+
+## 10. The remaining checks on v1.6.311 (November 13, 03:38 UTC)
+
+The same phone, build and profile as §9, with the APKs already installed. The default and fallback
+checks ran through `scripts/device/run-device-checks.sh --installed` from `e284cb5`, and
+`ScoringParityDeviceTest` with the controls `make_scoring_controls.py` writes at that commit,
+pushed to `/data/local/tmp/compressor-controls` and checked file by file against their SHA-256 on
+the phone before the test.
+
+**The fallback check passed**, all three tests, in 103 s, on the 55 s 1080 × 1920 clip of
+`job_a26e9d113c47`. Its ladder measured what it measured in §9's batch: 0.70 failed, 0.80 passed,
+0.75 marginal.
+
+- With the retry experiment on, the test's veto refused the first full encode, at 0.75. It was
+  recorded as `test_rejected`, certified nothing (`cert_test_rejected`) and wrote nothing to the
+  learned profile. Production allowed the retry and encoded the measured safer rung, 0.80, from the
+  same ladder, on the same planned windows and with its own encoder configuration. That encode
+  passed structural verification and its own certification on every planned window, with window
+  means of 96.37, 97.54 and 96.54, and was accepted after one retry; its result alone reached the
+  learned profile.
+- With the experiment off, the plan was the passing 0.80. Refused, it left the original in place
+  after that one encode, with no retry, no output and nothing left in the cache.
+- With both attempts refused, the original was kept after the second, and no third encode started.
+
+In each batch every attempt was closed in the ledger, the batch recorded that a veto ran, Replace
+Originals was off and the source's SHA-256 was unchanged. This is the encode after a refused trial
+at the safer measured ratio that §6 and §8 left open.
+
+The clip has the same source fingerprint as `job_e95e8acc950f`, the 1080 × 1920 Secure Folder
+source of `docs/reviews/S26_HARDWARE_PL_20261029.md`: its winner stayed at 0.80 and 35,604,009
+bytes on v1.6.275, its 0.75 probe missed only the probe mean margin, the size model estimated
+33,366,670 bytes at 0.75 and 35,531,863 at 0.80, and the notes asked for that item to be run again
+with the safer-rung retry on and replacement off. Both encodes have now run. In §9's batch the 0.75
+refinement was selected and certified on its first attempt, on three windows of 36 frames each
+(means 95.91, 96.98 and 96.06; p5 92.85, 95.08 and 91.84; minimums 90.98, 94.56 and 91.69), at
+33,448,361 bytes, 2,155,648 fewer than the v1.6.275 winner. Here, with it refused, the 0.80
+fallback came out at 35,604,009 bytes, the same size to the byte as that winner. Each is within
+0.25 % of the model's estimate.
+
+**The scoring parity controls passed**, regenerated at `e284cb5`: each of the 11 gave its expected
+outcome. Identity, remux, lossless, PTS origin, VFR jitter and motion context decoded to identical
+frames and scored `PASSED`; tag mutation did the same, with its color tags shown to differ;
+internal deletion was `MISALIGNED`; corrupt was `UNAVAILABLE`; and the one-frame offset and the
+chroma mutation decoded to different frames. The one-frame offset scored `MEASURED_FAILURE`. The
+chroma mutation, which shifts only U and V, scored `PASSED`, because VMAF v0.6.1, the gates' metric,
+reads only luma; the control checks what it is built to show, that its frames differ from the
+source's.
+
+**The default checks**, on the same clip, passed, 12 of 12, in 63 s. The production-evidence batch
+accepted the 0.75 trial with a bit-identical audio copy, and the timeline test printed what §9
+recorded.
+
+**Not covered.** The 168 → 166 clip is not on the phone, so there was no exact-source retest. The
+records of the parity self-check and the three fallback batches were not collected with the
+default batch's: what is above is the instrumentation output, the lines the tests print and what
+the tests assert. No crash was recorded; the three exit records are the force-stops
+`am instrument` makes when it starts and finishes.
