@@ -7,6 +7,10 @@
 # EditListTimelineDeviceTest needs no clip: it runs two synthetic sources from the test APK through
 # the platform extractor, a real Media3 export and the metadata remux, and says at which of them a
 # video sample count first changes (the 168 -> 166 case of the v1.6.287 regular-profile run).
+# GalleryPublicationDeviceTest needs no clip either: it saves bytes the test makes to a test-owned
+# row in Movies/PLLabTest through this device's MediaStore, checks that a save is counted only when
+# one row was published and read back whole and that a refused save leaves no row behind, and
+# deletes every row it inserted.
 #
 # Usage:
 #   scripts/device/run-device-checks.sh [--installed] [--fallback] CLIP.mp4 [ANDROID_USER]
@@ -51,7 +55,7 @@ CLIP="$CLIP_DIR/$(basename -- "$CLIP")"
 USER_ID="${2:-}"
 PKG=io.github.zfkirke0109.galaxycompressor
 TEST_PACKAGE=compress.joshattic.us
-TEST_CLASSES="$TEST_PACKAGE.PipelineDeviceTest,$TEST_PACKAGE.ProductionEvidenceDeviceTest,$TEST_PACKAGE.FramePackingDeviceTest,$TEST_PACKAGE.EditListTimelineDeviceTest"
+TEST_CLASSES="$TEST_PACKAGE.PipelineDeviceTest,$TEST_PACKAGE.ProductionEvidenceDeviceTest,$TEST_PACKAGE.FramePackingDeviceTest,$TEST_PACKAGE.EditListTimelineDeviceTest,$TEST_PACKAGE.GalleryPublicationDeviceTest"
 REMOTE="/data/local/tmp/compressor_smoke_$$.mp4"
 OUT="${CLIP%.*}.device-checks.txt"
 if "$FALLBACK"; then
@@ -97,7 +101,7 @@ fi
 # prints each batch's rungs, attempts, retry and certification the same way, and the timeline test
 # what each stage counted. They are collected whatever the verdict: a skipped or failed run is when
 # they say most, such as which rungs a clip's ladder measured when it selected no marginal trial.
-adb logcat -t "$LOG_START" -s System.out:I | grep -E "b177-(fixture|evidence)|b287-(fallback|timeline)" | tee -a "$OUT" || true
+adb logcat -t "$LOG_START" -s System.out:I | grep -E "b177-(fixture|evidence)|b287-(fallback|timeline)|gallery-publication" | tee -a "$OUT" || true
 case "$VERDICT" in
   failed)
     echo "device checks failed. See $OUT"

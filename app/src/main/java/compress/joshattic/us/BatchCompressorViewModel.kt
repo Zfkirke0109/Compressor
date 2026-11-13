@@ -348,43 +348,29 @@ class BatchCompressorViewModel internal constructor(
      *
      * Each copy is settled by digest: when the file still holds the staged original, or holds the
      * verified output, it is whole and the copy is deleted. Otherwise the copy may be the last
-     * intact original, so it is saved to the gallery and the user is told; if that fails it stays
-     * where it is and they are told that. Nothing here writes to the file being replaced.
+     * intact original, so it is saved to the gallery and the user is told. It is deleted only when
+     * that gallery copy is published and reads back as the staged bytes; otherwise it stays where it
+     * is, with its entry, and they are told that. Nothing here writes to the file being replaced.
      */
     private fun recoverInterruptedReplacements() = viewModelScope.launch(Dispatchers.IO) {
         val context = getApplication<Application>()
-        val leftovers = runCatching {
-            ReplacementJournal.leftovers(File(context.filesDir, BatchCacheRetention.RECOVERY_DIRECTORY))
-        }.getOrDefault(emptyList())
-        var preserved = 0
-        var held = 0
-        for (leftover in leftovers) {
-            val journal = leftover.journal
-            val targetDigest = journal?.takeIf { it.state == ReplacementJournalEntry.STAGED }?.let { entry ->
-                runCatching {
+        val outcome = runCatching {
+            ReplacementRecovery.recoverLeftovers(
+                File(context.filesDir, BatchCacheRetention.RECOVERY_DIRECTORY),
+                targetSha256 = { entry ->
                     context.contentResolver.openInputStream(Uri.parse(entry.targetUri))?.use { ReplacementContentProof.sha256(it) }
-                }.getOrNull()
-            }
-            val verdict = ReplacementRecovery.classify(journal, targetDigest)
-            DiagLog.w(
-                "CompressorBatch",
-                "replacement recovery; job=${journal?.jobId ?: "unknown"}; verdict=${verdict.name}; copyBytes=${leftover.recoveryCopy.length()}"
+                },
+                preserve = { leftover, expectedSha256 ->
+                    saveFileToGallery(
+                        context, leftover.recoveryCopy,
+                        ReplacementRecovery.recoveredName(leftover.journal, leftover.recoveryCopy.lastModified()),
+                        expectedSha256 = expectedSha256
+                    )
+                },
+                log = { DiagLog.w("CompressorBatch", it) }
             )
-            if (!verdict.preserveCopy) {
-                ReplacementJournal.discard(leftover.recoveryCopy)
-                continue
-            }
-            val saved = saveFileToGallery(
-                context, leftover.recoveryCopy, ReplacementRecovery.recoveredName(journal, leftover.recoveryCopy.lastModified())
-            ) != null
-            if (saved) {
-                ReplacementJournal.discard(leftover.recoveryCopy)
-                preserved++
-            } else {
-                held++
-            }
-        }
-        ReplacementRecovery.notice(preserved, held)?.let { notice -> _uiState.update { it.copy(statusMessage = notice) } }
+        }.getOrNull() ?: return@launch
+        ReplacementRecovery.notice(outcome.preserved, outcome.held)?.let { notice -> _uiState.update { it.copy(statusMessage = notice) } }
     }
 
     private data class PerceptualLosslessPlan(
@@ -3528,19 +3514,20 @@ class BatchCompressorViewModel internal constructor(
         viewModelScope.launch(Dispatchers.IO) {
             val privacyMode = MetadataPrivacyMode.fromLabel(_uiState.value.metadataPrivacyMode)
             var saved = 0
+            var unconfirmed = 0
             outputs.forEach { (item, file) ->
                 if (file.exists()) {
-                    val savedUri = saveFileToGallery(
+                    val result = saveFileToGallery(
                         context = context,
                         file = file,
                         targetName = item.outputName(qualityFromLabel(item.outputMode ?: _uiState.value.qualityPreset)),
                         metadata = item.metadataSnapshot,
                         privacyMode = privacyMode
                     )
-                    if (savedUri != null) saved++
+                    if (result is GalleryPublication.Result.Published) saved++ else unconfirmed++
                 }
             }
-            _uiState.update { it.copy(statusMessage = "Saved $saved output cop${if (saved == 1) "y" else "ies"} to Movies/Compressor with ${privacyMode.summary}.") }
+            _uiState.update { it.copy(statusMessage = GallerySaveSummary.message(saved, unconfirmed, privacyMode.summary)) }
         }
     }
 
@@ -5245,7 +5232,7 @@ class BatchCompressorViewModel internal constructor(
                 "copySaved" to copySaved
             ) + extra
         fun saveCopy(): Boolean =
-            saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode) != null
+            saveFileToGallery(context, outputFile, item.outputName(quality), item.metadataSnapshot, privacyMode) is GalleryPublication.Result.Published
 
         if (!outputFile.exists() || outputFile.length() <= 0) {
             return@withContext ReplacementResult(false, "Replacement skipped: output file was missing or empty.",
@@ -5297,7 +5284,7 @@ class BatchCompressorViewModel internal constructor(
         }
 
         val backupMessage = if (backupBeforeReplace) {
-            val backedUp = saveSourceBackupToGallery(context, item)
+            val backedUp = saveSourceBackupToGallery(context, item, boundSourceDigest)
             if (!backedUp) {
                 val saved = saveCopy()
                 return@withContext ReplacementResult(
@@ -5559,9 +5546,11 @@ class BatchCompressorViewModel internal constructor(
             // Preserve the untouched original bytes we still hold in the recovery copy to the
             // gallery so nothing is lost, then report honestly.
             val originalPreserved = saveFileToGallery(
-                context, recoveryCopy, "ORIGINAL_${item.outputName(quality)}", item.metadataSnapshot, privacyMode
-            ) != null
-            // Only discard once the bytes exist somewhere else. If preserving them failed, this file
+                context, recoveryCopy, "ORIGINAL_${item.outputName(quality)}", item.metadataSnapshot, privacyMode,
+                expectedSha256 = transaction.stagedDigest
+            ) is GalleryPublication.Result.Published
+            // Only discard once the bytes exist somewhere else, published and read back as the staged
+            // original. A URI alone proves a row, not its bytes. If preserving them failed, this file
             // IS the user's last intact original — deleting it here would destroy it and make the
             // "don't clear the cache" advice below a lie. Keep it and say where it is. Its journal
             // entry stays with it, so the next start finds it and tries to preserve it again.
@@ -5622,15 +5611,30 @@ class BatchCompressorViewModel internal constructor(
         }
     }
 
+    /**
+     * Saves [file] as a new gallery item, and says whether it is there: [GalleryPublication] counts a
+     * save only when exactly one row was published and the item read back as the bytes written (and
+     * as [expectedSha256], when given). Callers act on [GalleryPublication.Result.Published] alone.
+     */
     private fun saveFileToGallery(
         context: Context,
         file: File,
         targetName: String,
         metadata: VideoMetadataSnapshot = VideoMetadataSnapshot(),
-        privacyMode: MetadataPrivacyMode = MetadataPrivacyMode.PRESERVE_ALL
-    ): Uri? {
-        var inserted: Uri? = null
-        return try {
+        privacyMode: MetadataPrivacyMode = MetadataPrivacyMode.PRESERVE_ALL,
+        expectedSha256: String? = null
+    ): GalleryPublication.Result =
+        saveToGallery(context, { file.inputStream() }, targetName, metadata, privacyMode, expectedSha256)
+
+    private fun saveToGallery(
+        context: Context,
+        openSource: () -> java.io.InputStream,
+        targetName: String,
+        metadata: VideoMetadataSnapshot,
+        privacyMode: MetadataPrivacyMode,
+        expectedSha256: String?
+    ): GalleryPublication.Result {
+        val result = runCatching {
             val filteredMetadata = metadata.filteredForPrivacy(privacyMode)
             val values = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, targetName)
@@ -5646,51 +5650,33 @@ class BatchCompressorViewModel internal constructor(
                     put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/Compressor")
                 }
             }
-
-            val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-            } else {
-                MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-            }
-
-            val uri = context.contentResolver.insert(collection, values) ?: return null
-            inserted = uri
-            context.contentResolver.openOutputStream(uri)?.use { out ->
-                file.inputStream().use { input -> input.copyTo(out) }
-            } ?: error("could not open the new gallery entry for writing")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                values.clear()
-                values.put(MediaStore.Video.Media.IS_PENDING, 0)
-                context.contentResolver.update(uri, values, null, null)
-            }
-            uri
-        } catch (_: Exception) {
-            // Remove the half-written entry. Left behind, it is a truncated video in the gallery,
-            // or on Q+ a pending row that never becomes visible but still holds its bytes.
-            inserted?.let { runCatching { context.contentResolver.delete(it, null, null) } }
-            null
+            GalleryPublication.save(openSource, MediaStoreGallery(context.contentResolver, values), expectedSha256)
+        }.getOrElse { GalleryPublication.Result.Failed(GalleryPublication.Stage.INSERT, it.javaClass.simpleName, cleanupFailed = false) }
+        if (result is GalleryPublication.Result.Failed) {
+            DiagLog.w(
+                "CompressorBatch",
+                "gallery save not confirmed; stage=${result.stage}; ${result.detail}; cleanupFailed=${result.cleanupFailed}"
+            )
         }
+        return result
     }
 
-    private fun saveSourceBackupToGallery(context: Context, item: BatchVideoItem): Boolean {
-        val backupDir = File(getApplication<Application>().cacheDir, "batch_compressed_videos").apply { mkdirs() }
+    /**
+     * Saves the source as it is now to the gallery, before a replacement. The backup must read back as
+     * [boundSourceDigest], the bytes the output was made from and verified against: a backup of
+     * anything else does not protect what is about to be overwritten, so it does not authorize it.
+     */
+    private fun saveSourceBackupToGallery(context: Context, item: BatchVideoItem, boundSourceDigest: String?): Boolean {
+        if (boundSourceDigest == null) return false
         val base = item.originalName.substringBeforeLast(".").ifBlank { "Video_${System.currentTimeMillis()}" }
-        val backupFile = File(backupDir, "${base}_Backup.mp4")
-        return runCatching {
-            if (backupFile.exists()) backupFile.delete()
-            context.contentResolver.openInputStream(item.sourceUri)?.use { input ->
-                backupFile.outputStream().use { output -> input.copyTo(output) }
-            } ?: return false
-            saveFileToGallery(
-                context = context,
-                file = backupFile,
-                targetName = "${base}_Backup.mp4",
-                metadata = item.metadataSnapshot,
-                privacyMode = MetadataPrivacyMode.PRESERVE_ALL
-            ) != null
-        }.getOrDefault(false).also {
-            runCatching { backupFile.delete() }
-        }
+        return saveToGallery(
+            context,
+            { context.contentResolver.openInputStream(item.sourceUri) ?: throw java.io.FileNotFoundException("source") },
+            "${base}_Backup.mp4",
+            item.metadataSnapshot,
+            MetadataPrivacyMode.PRESERVE_ALL,
+            expectedSha256 = boundSourceDigest
+        ) is GalleryPublication.Result.Published
     }
 
     private fun isLikelyCompressorOutput(name: String): Boolean {

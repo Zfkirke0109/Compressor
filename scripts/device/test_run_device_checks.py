@@ -81,8 +81,9 @@ class DeviceChecksTest(unittest.TestCase):
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
         instrument = next(call for call in calls if call.startswith("shell am instrument "))
         self.assertIn("compress.joshattic.us.FramePackingDeviceTest", instrument)
-        # The clip-free timeline localization runs with the default checks.
+        # The clip-free timeline localization and gallery publication run with the default checks.
         self.assertIn("compress.joshattic.us.EditListTimelineDeviceTest", instrument)
+        self.assertIn("compress.joshattic.us.GalleryPublicationDeviceTest", instrument)
         self.assertNotIn("logcat -c", calls)
         self.assertTrue(any("logcat -t 1794198030.123456789 " in call for call in calls))
 
@@ -94,6 +95,7 @@ class DeviceChecksTest(unittest.TestCase):
         self.assertIn("-e class compress.joshattic.us.SaferRungFallbackDeviceTest -e sourceVideo ", instrument)
         self.assertNotIn("PipelineDeviceTest", instrument)
         self.assertNotIn("EditListTimelineDeviceTest", instrument)
+        self.assertNotIn("GalleryPublicationDeviceTest", instrument)
         self.assertIn("--user 150", instrument)
         self.assertIn(f"sha256={digest}", report)
         self.assertFalse(any(call.startswith("install ") for call in calls))
@@ -139,10 +141,12 @@ class DeviceChecksTest(unittest.TestCase):
         self.assertIn("device checks incomplete", proc.stdout)
 
     def test_a_failed_run_keeps_what_the_tests_printed(self):
-        printed = "11-12 21:41:30.000  1  2 I System.out: b287-timeline edit_tail_168.mp4 stage=source_edit_list"
+        printed = ("11-12 21:41:30.000  1  2 I System.out: b287-timeline edit_tail_168.mp4 stage=source_edit_list\n"
+                   "11-12 21:41:31.000  1  2 I System.out: gallery-publication: publish0 -> PUBLISH; rowRemoved=true")
         proc, report, _, _ = self.run_checks("FAILURES!!!\nTests run: 1,  Failures: 1", logcat=printed)
         self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
         self.assertIn("b287-timeline edit_tail_168.mp4 stage=source_edit_list", report)
+        self.assertIn("gallery-publication: publish0 -> PUBLISH; rowRemoved=true", report)
         self.assertIn("device checks failed", proc.stdout)
 
     def test_an_unknown_option_is_refused_before_anything_runs(self):

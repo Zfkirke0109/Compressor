@@ -175,19 +175,72 @@ object ReplacementRecovery {
         else -> Verdict.ORIGINAL_NEEDS_RECOVERY
     }
 
+    /** What one start did with the rollback copies it found. */
+    data class StartupResult(val preserved: Int, val held: Int)
+
+    /**
+     * Settles every rollback copy in [directory] that no replacement in this process is using.
+     *
+     * A copy is deleted when the user's file is proven whole ([classify]), or once a gallery copy
+     * of it is proven: published, and read back as the bytes the copy was staged with (as the
+     * copy's own bytes when no entry says what those were). A save that is not proven leaves the
+     * copy and its entry where they are, so the next start tries again. A copy is never deleted on
+     * the strength of a save that only returned a URI: that proves a row exists, not that the
+     * original is in it.
+     *
+     * @param targetSha256 the user's file as it is now, for an entry that reached STAGED; null when unreadable.
+     * @param preserve saves a copy to the gallery, held to the digest given when there is one.
+     */
+    internal fun recoverLeftovers(
+        directory: File,
+        targetSha256: (ReplacementJournalEntry) -> String?,
+        preserve: (ReplacementLeftover, expectedSha256: String?) -> GalleryPublication.Result,
+        log: (String) -> Unit = {}
+    ): StartupResult {
+        var preserved = 0
+        var held = 0
+        for (leftover in ReplacementJournal.leftovers(directory)) {
+            val journal = leftover.journal
+            val target = journal?.takeIf { it.state == ReplacementJournalEntry.STAGED }?.let { runCatching { targetSha256(it) }.getOrNull() }
+            val verdict = classify(journal, target)
+            log("replacement recovery; job=${journal?.jobId ?: "unknown"}; verdict=${verdict.name}; copyBytes=${leftover.recoveryCopy.length()}")
+            if (!verdict.preserveCopy) {
+                ReplacementJournal.discard(leftover.recoveryCopy)
+                continue
+            }
+            val saved = runCatching { preserve(leftover, journal?.stagedSha256) }.getOrElse {
+                GalleryPublication.Result.Failed(GalleryPublication.Stage.WRITE, it.javaClass.simpleName, cleanupFailed = false)
+            }
+            when (saved) {
+                is GalleryPublication.Result.Published -> {
+                    ReplacementJournal.discard(leftover.recoveryCopy)
+                    preserved++
+                }
+                is GalleryPublication.Result.Failed -> {
+                    log(
+                        "replacement recovery; job=${journal?.jobId ?: "unknown"}; gallery copy not confirmed; stage=${saved.stage}; " +
+                            "${saved.detail}; cleanupFailed=${saved.cleanupFailed}; the rollback copy is kept"
+                    )
+                    held++
+                }
+            }
+        }
+        return StartupResult(preserved, held)
+    }
+
     /**
      * What the user is told after a start that found interrupted replacements. Null when there is
-     * nothing they need to do. [preserved] originals were saved to the gallery; [held] could not
-     * be and are still inside the app.
+     * nothing they need to do. [preserved] originals were saved to the gallery and read back whole;
+     * [held] could not be confirmed there and are still inside the app.
      */
     fun notice(preserved: Int, held: Int): String? {
         if (preserved <= 0 && held <= 0) return null
         fun files(n: Int) = if (n == 1) "1 original" else "$n originals"
         val saved = if (preserved > 0) {
-            "An intact copy of ${files(preserved)} was saved to your gallery (Movies/Compressor, named ORIGINAL_recovered_…)."
+            "An intact copy of ${files(preserved)} was saved to your gallery (Movies/Compressor, named ORIGINAL_recovered_…) and read back whole."
         } else ""
         val kept = if (held > 0) {
-            " ${files(held).replaceFirstChar { it.uppercase() }} could not be saved to your gallery and ${if (held == 1) "is" else "are"} still held " +
+            " ${files(held).replaceFirstChar { it.uppercase() }} could not be confirmed as saved to your gallery and ${if (held == 1) "is" else "are"} still held " +
                 "inside the app: free up space and reopen the app, and do not clear the app's storage."
         } else ""
         return "A replacement was interrupted the last time the app ran, and the file it was replacing may be incomplete. " +

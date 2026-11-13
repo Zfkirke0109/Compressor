@@ -136,15 +136,134 @@ class ReplacementJournalTest {
         val one = ReplacementRecovery.notice(1, 0)!!
         assertTrue(one, one.startsWith("A replacement was interrupted the last time the app ran, and the file it was replacing may be incomplete."))
         assertTrue(one, one.contains("An intact copy of 1 original was saved to your gallery"))
+        assertTrue(one, one.contains("and read back whole"))
         assertFalse(one, one.contains("still held"))
         val held = ReplacementRecovery.notice(0, 2)!!
-        assertTrue(held, held.contains("2 originals could not be saved to your gallery and are still held inside the app"))
+        assertTrue(held, held.contains("2 originals could not be confirmed as saved to your gallery and are still held inside the app"))
         assertTrue(held, held.contains("do not clear the app's storage"))
         assertFalse(held, held.contains("was saved"))
         val both = ReplacementRecovery.notice(3, 1)!!
         assertTrue(both, both.contains("An intact copy of 3 originals was saved"))
-        assertTrue(both, both.contains("1 original could not be saved to your gallery and is still held"))
+        assertTrue(both, both.contains("1 original could not be confirmed as saved to your gallery and is still held"))
         for (text in listOf(one, held, both)) assertTrue(text, text.endsWith("Please check the file in its original folder."))
+    }
+
+    /** A provider whose publishing step answers with [rows], and which keeps what was published. */
+    private class Gallery(var rows: Int = 1) : GalleryPublication.Gallery {
+        override val hasPendingRows = true
+        val published = mutableListOf<ByteArray>()
+        private val pending = java.io.ByteArrayOutputStream()
+        var deletes = 0
+        override fun insert() = "content://media/external/video/media/77".also { pending.reset() }
+        override fun openForWriting(uri: String): java.io.OutputStream = pending
+        override fun publish(uri: String) = rows.also { if (it == 1) published += pending.toByteArray() }
+        override fun openForReading(uri: String): java.io.InputStream = java.io.ByteArrayInputStream(pending.toByteArray())
+        override fun delete(uri: String) { deletes++ }
+    }
+
+    private fun sha(b: ByteArray) = java.security.MessageDigest.getInstance("SHA-256").digest(b).joinToString("") { "%02x".format(it) }
+
+    private fun startUp(dir: File, gallery: Gallery, target: String?, logs: MutableList<String> = mutableListOf()) =
+        ReplacementRecovery.recoverLeftovers(
+            dir,
+            targetSha256 = { target },
+            preserve = { leftover, expected -> GalleryPublication.save({ leftover.recoveryCopy.inputStream() }, gallery, expected) },
+            log = { logs += it }
+        )
+
+    @Test
+    fun aCopyIsKeptUntilItsGalleryCopyIsProvenThenDeletedOnce() = inTempDir { dir ->
+        val original = ByteArray(70_000) { (it % 251).toByte() }
+        val copy = ReplacementContentProof.newRecoveryFile(dir, "job_0123456789ab").apply { writeBytes(original) }
+        ReplacementJournal.write(copy, entry().copy(stagedSha256 = sha(original), boundSourceSha256 = sha(original)))
+        val gallery = Gallery(rows = 0)
+        val logs = mutableListOf<String>()
+
+        // First start: the file needs recovery, and the provider leaves the gallery copy pending.
+        assertEquals(ReplacementRecovery.StartupResult(preserved = 0, held = 1), startUp(dir, gallery, "c".repeat(64), logs))
+        assertTrue("the copy is kept", copy.exists())
+        assertTrue("and so is what it belongs to", ReplacementJournal.fileFor(copy).exists())
+        assertEquals("the unpublished row was removed", 1, gallery.deletes)
+        assertTrue(logs.joinToString("\n"), logs.any { it.contains("stage=PUBLISH") && it.contains("the rollback copy is kept") })
+        assertFalse("no path is logged", logs.any { it.contains(dir.absolutePath) })
+
+        // Second start: the save is published and reads back as the staged bytes.
+        gallery.rows = 1
+        assertEquals(ReplacementRecovery.StartupResult(preserved = 1, held = 0), startUp(dir, gallery, "c".repeat(64)))
+        assertTrue(gallery.published.single().contentEquals(original))
+        assertFalse(copy.exists())
+        assertFalse(ReplacementJournal.fileFor(copy).exists())
+
+        // Third start: nothing left to do, and nothing is saved twice.
+        assertEquals(ReplacementRecovery.StartupResult(preserved = 0, held = 0), startUp(dir, gallery, "c".repeat(64)))
+        assertEquals(1, gallery.published.size)
+    }
+
+    @Test
+    fun aCopyThatNoLongerReadsAsTheStagedOriginalIsKept() = inTempDir { dir ->
+        // Same length, one byte changed since it was staged: a gallery copy of it would not be the
+        // original, so it is neither published nor counted, and the copy is not deleted.
+        val original = ByteArray(4096) { it.toByte() }
+        val copy = ReplacementContentProof.newRecoveryFile(dir, "job_0123456789ab")
+            .apply { writeBytes(original.copyOf().also { it[100] = 0 }) }
+        ReplacementJournal.write(copy, entry().copy(stagedSha256 = sha(original)))
+        val gallery = Gallery()
+        assertEquals(ReplacementRecovery.StartupResult(preserved = 0, held = 1), startUp(dir, gallery, null))
+        assertTrue(gallery.published.isEmpty())
+        assertTrue(copy.exists())
+    }
+
+    @Test
+    fun aCopyWithNoEntryIsSavedAsItIsBeforeItIsDeleted() = inTempDir { dir ->
+        // An older build's leftover: nothing says what it was staged as, so the read-back holds the
+        // gallery copy to the bytes the copy holds.
+        val legacy = ReplacementContentProof.newRecoveryFile(dir, "job_legacy").apply { writeBytes(byteArrayOf(9, 8, 7)) }
+        val expectations = mutableListOf<String?>()
+        val gallery = Gallery()
+        val result = ReplacementRecovery.recoverLeftovers(
+            dir, targetSha256 = { null },
+            preserve = { leftover, expected ->
+                expectations += expected
+                GalleryPublication.save({ leftover.recoveryCopy.inputStream() }, gallery, expected)
+            }
+        )
+        assertEquals(ReplacementRecovery.StartupResult(preserved = 1, held = 0), result)
+        assertEquals(listOf<String?>(null), expectations)
+        assertTrue(gallery.published.single().contentEquals(byteArrayOf(9, 8, 7)))
+        assertFalse(legacy.exists())
+    }
+
+    @Test
+    fun aCopyIsDeletedWithoutASaveOnlyWhenTheUsersFileIsProvenWhole() = inTempDir { dir ->
+        for ((state, target) in listOf(
+            ReplacementJournalEntry.STAGED to staged,       // still the original
+            ReplacementJournalEntry.STAGED to output,       // the replacement completed
+            ReplacementJournalEntry.STAGING to null         // the truncating write never began
+        )) {
+            val copy = ReplacementContentProof.newRecoveryFile(dir, "job_whole").apply { writeBytes(byteArrayOf(1)) }
+            ReplacementJournal.write(copy, entry(state))
+            val saves = mutableListOf<ReplacementLeftover>()
+            val result = ReplacementRecovery.recoverLeftovers(dir, targetSha256 = { target }, preserve = { leftover, _ ->
+                saves += leftover; GalleryPublication.Result.Failed(GalleryPublication.Stage.INSERT, "unused", false)
+            })
+            assertEquals("$state/$target", ReplacementRecovery.StartupResult(0, 0), result)
+            assertTrue("$state/$target needs no gallery copy", saves.isEmpty())
+            assertFalse(copy.exists())
+        }
+    }
+
+    @Test
+    fun aSaveThatThrowsOrATargetThatCannotBeReadKeepsTheCopy() = inTempDir { dir ->
+        val copy = ReplacementContentProof.newRecoveryFile(dir, "job_0123456789ab").apply { writeBytes(byteArrayOf(5)) }
+        ReplacementJournal.write(copy, entry())
+        val result = ReplacementRecovery.recoverLeftovers(
+            dir,
+            targetSha256 = { throw SecurityException("permission revoked") },
+            preserve = { _, _ -> throw IllegalStateException("provider died") }
+        )
+        assertEquals(ReplacementRecovery.StartupResult(preserved = 0, held = 1), result)
+        assertTrue(copy.exists())
+        assertTrue(ReplacementJournal.fileFor(copy).exists())
     }
 
     @Test
