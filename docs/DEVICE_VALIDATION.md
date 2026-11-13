@@ -605,3 +605,60 @@ only learned-state update in the three batches is that attempt's.
 **Not covered.** The 168 → 166 clip is not on the phone, so there was no exact-source retest. No
 crash was recorded; the three exit records are the force-stops `am instrument` makes when it starts
 and finishes.
+
+## 11. The safe-copy harness (November 13)
+
+From here, every device check that writes to a video writes only to a disposable copy, and every
+personal original is only ever read. `scripts/device/safe-copy-harness.sh` runs in Termux on the
+phone, over the phone's own Wireless debugging connection, and keeps four roles apart:
+
+| | What it is | What may happen to it |
+|---|---|---|
+| A | a personal original, chosen by its media id from a read-only inventory | hashed (full SHA-256 and length) and copied from; never written, moved, renamed or handed to a test |
+| B | a byte-for-byte copy of A in `Documents/PLLabValidation/<run>/` (with `.nomedia`) | made once by exclusive create, verified against A, which is hashed before and after the copy; only read afterwards, by path |
+| C | disposable copies the device tests make from B, as the app's own rows in `Movies/PLLabValidation/<run>/` | written to, replaced, rolled back, interrupted and recovered, after an allowlist, owner, folder and digest check |
+| F | a synthetic fixture the harness makes with ffmpeg | the end padding repair and a full replacement batch |
+
+A and B are checked against the run's manifest before and after every case, and once at the end;
+any difference, or a hash that cannot be taken, stops the run (exit 3) with everything left in
+place. The tests are never given A's path. A run refuses to start a batch while the app holds
+unsaved outputs or an earlier replacement's rollback copies, and it deletes nothing: the run's files
+stay until the owner approves their cleanup. The private manifest, inventory and report stay in
+Termux's home folder (`~/pllab-runs/<run>/`).
+
+Each batch a harness test starts runs under a `HarnessScope`: planned from the user's learned
+state, learning into a store of its own, journalling into its own file, marked `testHarnessRun` in
+its record, and not settling the user's rollback copies when it starts. The fallback test now runs
+the same way.
+
+What runs, and what each case shows:
+
+- `SafeCopyReplacementDeviceTest`, on C copies of each B, through the app's own replacement IO
+  (`ContentResolverReplacementIo`, now shared by the app and the tests) and journal: a confirmed
+  replacement; a write that stops part way, a write of the right length but wrong bytes, and a write
+  whose size cannot be read back, each rolled back to B's bytes; a copy changed before staging,
+  never opened; a rollback that fails, whose copy is kept and then saved once by the next start; and
+  another writer after staging, overwritten as the coordinator now documents.
+- `SafeCopyProcessDeathDeviceTest`: the process is killed a third of the way into overwriting a C,
+  and the two starts after it save the rollback copy once, read back as the staged bytes, and then
+  find nothing.
+- `PaddingRepairBatchDeviceTest` on F: a smaller candidate whose copied AAC differs only in end
+  padding must be repaired, verified, certified and accepted; and a batch with Replace Originals and
+  Backup before replace on must publish and read back the backup before it replaces its C.
+- `CorpusBatchDeviceTest`: one copy-mode batch over copies of every B, recording what each item
+  ended as, with no expectation that any compresses.
+- `SaferRungFallbackDeviceTest` (`--fallback-baseline K`), on a B that selects a marginal trial.
+
+The fixture is 12 s of 1080p30 H.264 without B-frames and mono AAC whose 575,488 samples are a
+whole number of frames, written on a 48 kHz movie timescale: encoder delay 1,024 and end padding 0
+exactly, which `test_safe_copy_harness.py` reads back from the file. Media3's muxer writes such a
+track's edit on a 1/10,000 s timescale, which the platform reads as 2 samples of padding.
+
+The harness itself is tested against a fake phone (`scripts/device/test_safe_copy_harness.py`):
+staging, exclusive create, a source changing mid-copy, free space, verification, the explicit
+`--disposable-only` flag, the order of cases between checks, a case that changes a protected file,
+unsaved outputs and leftover rollback copies, a missing `run-as`, and device selection.
+
+    safe-copy-harness.sh inventory
+    safe-copy-harness.sh stage --source-id ID --dry-run
+    safe-copy-harness.sh all --source-id ID [--source-id ID ...] [--fallback-baseline K]
