@@ -641,7 +641,8 @@ What runs, and what each case shows:
   another writer after staging, overwritten as the coordinator now documents.
 - `SafeCopyProcessDeathDeviceTest`: the process is killed a third of the way into overwriting a C,
   and the two starts after it save the rollback copy once, read back as the staged bytes, and then
-  find nothing.
+  find nothing. This is the one case that passes by crashing (`crashed-as-intended`): one whose
+  process survives the write fails, and a crash in any other case fails the run.
 - `PaddingRepairBatchDeviceTest` on F: a smaller candidate whose copied AAC differs only in end
   padding must be repaired, verified, certified and accepted; and a batch with Replace Originals and
   Backup before replace on must publish and read back the backup before it replaces its C.
@@ -660,7 +661,8 @@ track's edit on a 1/10,000 s timescale, which the platform reads as 2 samples of
 The harness itself is tested against a fake phone (`scripts/device/test_safe_copy_harness.py`):
 staging, exclusive create, a source changing mid-copy, free space, verification, the explicit
 `--disposable-only` flag, the order of cases between checks, a case that changes a protected file,
-unsaved outputs and leftover rollback copies, a missing `run-as`, and device selection.
+unsaved outputs and leftover rollback copies, a missing `run-as`, device selection, and that a
+crash fails the run everywhere but the death case, which fails if its process lives.
 
     safe-copy-harness.sh inventory
     safe-copy-harness.sh stage --source-id ID --dry-run

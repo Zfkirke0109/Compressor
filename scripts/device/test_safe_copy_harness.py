@@ -107,7 +107,7 @@ FAKE_ADB = textwrap.dedent(r'''
         if tamper:
             with open(device_path(tamper), "ab") as fh:
                 fh.write(b"\0")
-        if "pllabPhase die" in cmd:
+        if "pllabPhase die" in cmd and not state.get("dieDoesNotCrash"):
             print("INSTRUMENTATION_RESULT: shortMsg=Process crashed.\nINSTRUMENTATION_CODE: 0")
         else:
             print(state.get("instrumentResult", "OK (7 tests)"))
@@ -295,8 +295,37 @@ class SafeCopyHarnessTest(unittest.TestCase):
             self.assertIn(f"{label}\tA1\tunchanged", log)
             self.assertIn(f"{label}\tB1\tunchanged", log)
         verdicts = (self.home / run / "verdicts.tsv").read_text()
-        self.assertIn("death-B1\tcrashed", verdicts)
+        self.assertIn("death-B1\tcrashed-as-intended", verdicts)
         self.assertIn("report       :", proc.stdout)
+
+    def test_a_case_that_crashes_fails_the_run_unless_it_is_the_one_meant_to(self):
+        run = self.stage()
+        self.state = json.loads((self.fake / "state.json").read_text())
+        self.state["instrumentResult"] = "INSTRUMENTATION_RESULT: shortMsg=Process crashed.\nINSTRUMENTATION_CODE: 0"; self.save()
+        proc = self.run_harness("run-replacement-tests", "--run", run, "--disposable-only")
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("replacement-B1 -> crashed", proc.stdout)
+        verdicts = dict(line.split("\t") for line in (self.home / run / "verdicts.tsv").read_text().splitlines())
+        self.assertEqual("crashed", verdicts["replacement-B1"])
+        self.assertEqual("crashed-as-intended", verdicts["death-B1"])
+        self.assertEqual("crashed", verdicts["recover-1-B1"])
+        # A copy-mode case that crashes fails too.
+        proc = self.run_harness("run-copy-tests", "--run", run, "--cases", "corpus")
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("corpus -> crashed", proc.stdout)
+
+    def test_a_death_case_whose_process_did_not_die_is_a_failure(self):
+        run = self.stage()
+        self.state = json.loads((self.fake / "state.json").read_text())
+        self.state["dieDoesNotCrash"] = True; self.save()
+        proc = self.run_harness("run-replacement-tests", "--run", run, "--disposable-only")
+        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("death-B1 -> failed", proc.stdout)
+        self.assertIn("was meant to end 'Process crashed'", proc.stderr)
+        # Its recovery runs still ran on the copy, bracketed by checks, and A and B are untouched.
+        log = (self.home / run / "protection.log").read_text()
+        self.assertIn("after-recovery-B1\tA1\tunchanged", log)
+        self.assertEqual(self.a_sha, hashlib.sha256(self.a.read_bytes()).hexdigest())
 
     def test_a_case_that_changes_a_protected_file_stops_everything_after_it(self):
         run = self.stage()

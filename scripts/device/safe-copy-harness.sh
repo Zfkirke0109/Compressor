@@ -30,7 +30,7 @@
 #
 # ID is a video's MediaStore _id from `inventory`. RUN is the run id `stage` prints. Every file
 # that names a personal path, digest or name stays in ~/pllab-runs/RUN (private); report.txt there
-# is the readable summary. Exit: 0 passed, 1 failed or error, 2 incomplete or blocked, 3 a
+# is the readable summary. Exit: 0 passed, 1 failed, crashed or error, 2 incomplete or blocked, 3 a
 # protection check failed (stop).
 set -uo pipefail
 
@@ -261,9 +261,14 @@ cmd_fixture() {
   say "fixture      : F-padding.mp4, $((bytes / 1048576)) MiB, sha256 ${sha:0:16}…, on the device and read back"
 }
 
-# instrument LABEL CLASS [-e KEY VALUE ...]: runs, keeps the output, and prints a verdict.
+# instrument [--expect-crash] LABEL CLASS [-e KEY VALUE ...]: runs, keeps the output, and prints a
+# verdict. A crash fails the run, except in the one case meant to kill its own process
+# (--expect-crash), which passes only by crashing: if it ends any other way, its process did not
+# die where it should have, and it is a failure unless it never got that far (incomplete).
 instrument() {
-  local label=$1 class=$2 out verdict
+  local expect_crash=false label class out verdict
+  if [ "$1" = --expect-crash ]; then expect_crash=true; shift; fi
+  label=$1 class=$2
   shift 2
   out="$(host_run "$RUN")/instrument-$label.txt"
   adb shell am instrument -w -r -e class "$class" "$@" "$RUNNER" 2>&1 | tr -d '\r' >"$out"
@@ -272,6 +277,12 @@ instrument() {
   elif grep -Eq '^INSTRUMENTATION_STATUS_CODE: -[34][[:space:]]*$|AssumptionViolated' "$out" ||
     ! grep -Eq '^[[:space:]]*OK \([1-9][0-9]* tests?\)[[:space:]]*$' "$out"; then verdict=incomplete
   else verdict=passed; fi
+  if $expect_crash; then
+    case "$verdict" in
+      crashed) verdict=crashed-as-intended ;;
+      passed) verdict=failed ;;
+    esac
+  fi
   printf '%s\t%s\n' "$label" "$verdict" >>"$(host_run "$RUN")/verdicts.tsv"
   say "case         : $label -> $verdict"
   LAST_VERDICT=$verdict
@@ -334,8 +345,8 @@ cmd_run_replacement_tests() {
     if $first; then
       first=false
       # A process killed a third of the way through overwriting a C, then two starts after it.
-      instrument "death-B$k" "$TEST_PACKAGE.SafeCopyProcessDeathDeviceTest" "${args[@]}" -e pllabPhase die
-      [ "$LAST_VERDICT" = crashed ] || warn "the death case was meant to end 'Process crashed'; it ended $LAST_VERDICT"
+      instrument --expect-crash "death-B$k" "$TEST_PACKAGE.SafeCopyProcessDeathDeviceTest" "${args[@]}" -e pllabPhase die
+      [ "$LAST_VERDICT" = crashed-as-intended ] || warn "the death case was meant to end 'Process crashed'; it ended $LAST_VERDICT"
       verify_protection "after-death-B$k"
       instrument "recover-1-B$k" "$TEST_PACKAGE.SafeCopyProcessDeathDeviceTest" "${args[@]}" -e pllabPhase recover-1
       instrument "recover-2-B$k" "$TEST_PACKAGE.SafeCopyProcessDeathDeviceTest" "${args[@]}" -e pllabPhase recover-2
@@ -375,10 +386,10 @@ cmd_collect() {
   say "report       : $report"
 }
 
-summary_exit() { # 3 protection, 1 failed, 2 incomplete, 0 passed
+summary_exit() { # 3 protection, 1 failed or crashed, 2 incomplete, 0 passed
   local v
   v=$(cut -f2 "$(host_run "$RUN")/verdicts.tsv" 2>/dev/null)
-  if grep -qx failed <<<"$v"; then return 1; fi
+  if grep -qxE 'failed|crashed' <<<"$v"; then return 1; fi
   if grep -qx incomplete <<<"$v"; then return 2; fi
   return 0
 }
