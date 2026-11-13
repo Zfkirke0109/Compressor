@@ -152,6 +152,7 @@ class BatchItemCardDeviceTest {
             terminalResult = BatchTerminalResult.TRANSCODED_SMALLER)
         show(ready)
         compose.onNodeWithText("Original untouched; copy ready in the app, not saved yet").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithTag(ItemCardTags.OUTCOME).assertTextEquals("Outcome: Compressed")
         evidence("copy-ready")
         show(ready.copy(galleryCopySaved = true))
         compose.onNodeWithText("Original untouched; copy saved to the gallery").assertExists()
@@ -161,12 +162,24 @@ class BatchItemCardDeviceTest {
         compose.onNodeWithTag(ItemCardTags.STATUS).assert(
             SemanticsMatcher.expectValue(SemanticsProperties.ContentDescription, listOf("Status: Not replaced"))
         )
+        compose.onNodeWithTag(ItemCardTags.OUTCOME).assertTextEquals("Outcome: Compressed, but the original was not replaced")
+        // A write that did not stand, rolled back: the original holds its bytes again, and was not left alone.
+        show(ready.copy(status = BatchItemStatus.SavedCopy, replacementOutcome = ReplacementTransaction.RESTORED_WRITE_FAILED,
+            copySaved = true, message = "In-place replacement failed, so the original was restored intact and left in place. A safe compressed copy was saved instead."))
+        compose.onNodeWithTag(ItemCardTags.ORIGINAL_STATUS).assertTextEquals("Original restored intact after a failed replacement; copy saved to the gallery")
+        compose.onNodeWithTag(ItemCardTags.STATUS).assert(
+            SemanticsMatcher.expectValue(SemanticsProperties.ContentDescription, listOf("Status: Copy saved"))
+        )
+        compose.onNodeWithTag(ItemCardTags.OUTCOME).assertTextEquals("Outcome: Compressed")
+        evidence("replacement-rolled-back")
         // As production leaves such a row: its terminal result was set before the replacement ran.
         show(ready.copy(status = BatchItemStatus.SavedCopy, replacementOutcome = ReplacementOutcome.AT_RISK_RECOVERY_RETAINED,
             copySaved = false, message = "In-place replacement failed and the original on disk may be incomplete…"))
         compose.onNodeWithTag(ItemCardTags.STATUS).assert(
             SemanticsMatcher.expectValue(SemanticsProperties.ContentDescription, listOf("Status: Original at risk"))
         )
+        // The encode's result is not left standing as the item's outcome.
+        compose.onNodeWithTag(ItemCardTags.OUTCOME).assertTextEquals("Outcome: Compressed, but replacing the original failed")
         compose.onNodeWithText("Copy saved").assertDoesNotExist()
         compose.onNodeWithText("Compressed").assertDoesNotExist()
         compose.onNodeWithTag(ItemCardTags.ORIGINAL_STATUS).performScrollTo().assertIsDisplayed()

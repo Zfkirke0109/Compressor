@@ -307,8 +307,8 @@ class BatchCompressorViewModel internal constructor(
         _uiState.update { state ->
             state.copy(
                 isCompressing = false,
-                errorMessage = state.errorMessage
-                    ?: "Batch stopped: ${throwable.message ?: throwable.javaClass.simpleName}"
+                // With the warning about the rows it finished: an original left at risk is not a failed item.
+                errorMessage = BatchEndNotice.stopped(state.items, state.errorMessage, throwable.message ?: throwable.javaClass.simpleName)
             )
         }
     }
@@ -1348,14 +1348,10 @@ class BatchCompressorViewModel internal constructor(
                 isCompressing = false,
                 batchMetrics = metrics,
                 highQualityRetryCandidates = highQualityRetryCandidatesFor(it),
-                statusMessage = "Finished ${it.doneCount} output${if (it.doneCount == 1) "" else "s"}. " +
-                    "Real compressions: ${accounting.realCompressionCount}. " +
-                    "Saved ${formatFileSize(accounting.totalBytesSaved)} by real compression.",
-                errorMessage = if (accounting.failedCount > 0) {
-                    "${accounting.failedCount} item${if (accounting.failedCount == 1) "" else "s"} failed. Tap each item for details."
-                } else {
-                    null
-                }
+                statusMessage = BatchEndNotice.finished(it.doneCount, accounting.realCompressionCount, accounting.totalBytesSaved),
+                // Every row whose badge is an alarm, not only failed encodes: a replacement that left
+                // an original at risk must not be findable only by scrolling to its row.
+                errorMessage = BatchEndNotice.warning(it.items)
             )
         }
     }
@@ -1411,7 +1407,8 @@ class BatchCompressorViewModel internal constructor(
                     backupsKept = it.backupBeforeReplace
                 ),
                 statusMessage = "Compression canceled. ${accounting.cancelledCount} item${if (accounting.cancelledCount == 1) "" else "s"} canceled.",
-                errorMessage = null
+                // What the rows finished before the cancellation still owe a warning about.
+                errorMessage = BatchEndNotice.warning(it.items)
             )
         }
     }

@@ -1245,6 +1245,7 @@ internal object ItemCardTags {
     const val ATTEMPT = "item-attempt"
     const val SIZE = "item-size"
     const val DETAIL = "item-phase-detail"
+    const val OUTCOME = "item-outcome"
     const val DETAILS_TOGGLE = "item-details-toggle"
     const val SUGGESTION_TOGGLE = "item-suggestion-toggle"
     const val APPLY_TO_BATCH = "item-apply-to-batch"
@@ -1360,12 +1361,14 @@ private fun ActiveItemBlock(item: BatchVideoItem) {
 
 @Composable
 private fun ResultBlock(item: BatchVideoItem) {
-    item.terminalResult?.let { terminal ->
+    // The encode's result, qualified when a replacement was asked for and did not happen (OutcomeLine).
+    OutcomeLine.of(item)?.let { outcome ->
         Text(
-            "Outcome: ${terminal.label}",
+            outcome.text,
             style = MaterialTheme.typography.bodyMedium,
-            color = if (terminal.isFailure) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
-            fontWeight = FontWeight.SemiBold
+            color = if (outcome.tone == OriginalStatus.Tone.WARNING) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.testTag(ItemCardTags.OUTCOME)
         )
     }
     if (item.outputSize > 0L) {

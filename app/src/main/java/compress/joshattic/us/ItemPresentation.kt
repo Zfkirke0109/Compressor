@@ -61,10 +61,15 @@ object OriginalStatus {
             Line("Original replaced by the verified copy", Tone.DONE)
         // A replacement asked for and not made. Only a proven save is "saved": copySaved is null
         // when none was attempted (the output was missing when the replacement came to run).
-        item.status == BatchItemStatus.SavedCopy -> when (item.copySaved) {
-            true -> Line("Original untouched; copy saved to the gallery", Tone.DONE)
-            false -> Line("Original untouched; saving a copy failed", Tone.WARNING)
-            null -> Line("Original untouched; no copy was saved", Tone.WARNING)
+        item.status == BatchItemStatus.SavedCopy -> {
+            // A refused replacement never opened the original. One whose write did not stand wrote the
+            // rollback copy back and read it back equal: the original's bytes, but not a file left alone.
+            val original = if (item.replacementOutcome in RESTORED) "Original restored intact after a failed replacement" else "Original untouched"
+            when (item.copySaved) {
+                true -> Line("$original; copy saved to the gallery", Tone.DONE)
+                false -> Line("$original; saving a copy failed", Tone.WARNING)
+                null -> Line("$original; no copy was saved", Tone.WARNING)
+            }
         }
         item.status == BatchItemStatus.Compressing ->
             Line(if (replaceOriginals) "Original untouched until its copy is verified" else "Original untouched; a separate copy is being made", Tone.NEUTRAL)
@@ -75,6 +80,13 @@ object OriginalStatus {
             Line(if (replaceOriginals) "Original will be replaced only after its copy is verified" else "Original stays untouched (copy mode)", Tone.NEUTRAL)
         else -> Line("Original untouched; no copy was made", Tone.NEUTRAL)
     }
+
+    /** The replacement opened the original for writing and the rollback copy was written back. */
+    private val RESTORED = setOf(
+        ReplacementTransaction.RESTORED_WRITE_FAILED,
+        ReplacementTransaction.RESTORED_READBACK_UNAVAILABLE,
+        ReplacementTransaction.RESTORED_READBACK_MISMATCH
+    )
 }
 
 /**
@@ -85,11 +97,15 @@ object OriginalStatus {
  */
 object StatusLabel {
 
+    /** The badges the batch's end notice points to, by these words. */
+    const val ORIGINAL_AT_RISK = "Original at risk"
+    const val NOT_REPLACED = "Not replaced"
+
     fun of(item: BatchVideoItem): String {
-        if (isAtRisk(item)) return "Original at risk"
+        if (isAtRisk(item)) return ORIGINAL_AT_RISK
         when (item.status) {
             BatchItemStatus.Replaced -> return "Replaced"
-            BatchItemStatus.SavedCopy -> return if (item.copySaved == true) "Copy saved" else "Not replaced"
+            BatchItemStatus.SavedCopy -> return if (item.copySaved == true) "Copy saved" else NOT_REPLACED
             else -> Unit
         }
         item.terminalResult?.let { return terminal(it) }
@@ -106,13 +122,18 @@ object StatusLabel {
     }
 
     /** Whether the badge is drawn as an error: a failure, an original at risk, or no copy where one was due. */
-    fun isAlarming(item: BatchVideoItem): Boolean =
-        isAtRisk(item) || item.terminalResult?.isFailure == true || item.status == BatchItemStatus.Failed ||
-            (item.status == BatchItemStatus.SavedCopy && item.copySaved != true)
+    fun isAlarming(item: BatchVideoItem): Boolean = isAtRisk(item) || isFailed(item) || isNotReplacedAndNotSaved(item)
 
-    private fun isAtRisk(item: BatchVideoItem): Boolean =
+    /** A replacement failed and its rollback could not be confirmed: the original may be incomplete. */
+    fun isAtRisk(item: BatchVideoItem): Boolean =
         item.replacementOutcome == ReplacementOutcome.AT_RISK_ORIGINAL_PRESERVED ||
             item.replacementOutcome == ReplacementOutcome.AT_RISK_RECOVERY_RETAINED
+
+    /** The encode itself failed. */
+    fun isFailed(item: BatchVideoItem): Boolean = item.terminalResult?.isFailure == true || item.status == BatchItemStatus.Failed
+
+    /** A replacement was asked for and not made, and the output was not saved as a copy in its place. */
+    fun isNotReplacedAndNotSaved(item: BatchVideoItem): Boolean = item.status == BatchItemStatus.SavedCopy && item.copySaved != true
 
     private fun terminal(result: BatchTerminalResult): String = when (result) {
         BatchTerminalResult.TRANSCODED_SMALLER,
@@ -129,6 +150,77 @@ object StatusLabel {
         BatchTerminalResult.ENCODER_FAILURE,
         BatchTerminalResult.UNSUPPORTED_CONTAINER,
         BatchTerminalResult.FAILED -> "Failed"
+    }
+}
+
+/**
+ * The result block's first line. A row's terminal result is the encode's, and it is settled before a
+ * replacement runs: on its own it read "Outcome: Compressed", in the colour of a success, under a
+ * badge that said the original was at risk. When a replacement was asked for and did not happen the
+ * line says so, and it is drawn as a success only on a row whose badge is not an alarm.
+ */
+object OutcomeLine {
+
+    fun of(item: BatchVideoItem): OriginalStatus.Line? {
+        val terminal = item.terminalResult ?: return null
+        val encode = "Outcome: ${terminal.label}"
+        val text = when {
+            terminal.isFailure -> encode
+            StatusLabel.isAtRisk(item) -> "$encode, but replacing the original failed"
+            StatusLabel.isNotReplacedAndNotSaved(item) -> "$encode, but the original was not replaced"
+            else -> encode
+        }
+        return OriginalStatus.Line(text, if (StatusLabel.isAlarming(item)) OriginalStatus.Tone.WARNING else OriginalStatus.Tone.DONE)
+    }
+}
+
+/**
+ * What the batch says above the list when it ends. A failed replacement is not a failed item (its
+ * encode succeeded), so a count of failures alone let a batch that put an original at risk end
+ * "Finished N outputs" with no warning: the only notice was on that item's row, wherever in the
+ * list it was. The warning counts every row whose badge is an alarm ([StatusLabel.isAlarming]),
+ * each once, the originals at risk first.
+ */
+object BatchEndNotice {
+
+    /** The total is named as the summary card names it: a size reduction, not space saved ([AcceptedReduction]). */
+    fun finished(doneCount: Int, realCompressions: Int, reductionBytes: Long): String =
+        "Finished $doneCount output${if (doneCount == 1) "" else "s"}. Real compressions: $realCompressions. " +
+            "${AcceptedReduction.LABEL}: ${formatFileSize(reductionBytes)}."
+
+    fun warning(items: List<BatchVideoItem>): String? {
+        val (atRisk, others) = items.partition(StatusLabel::isAtRisk)
+        val (failed, rest) = others.partition(StatusLabel::isFailed)
+        val notReplaced = rest.count(StatusLabel::isNotReplacedAndNotSaved)
+        val heldInApp = atRisk.count { it.replacementOutcome == ReplacementOutcome.AT_RISK_RECOVERY_RETAINED }
+        val parts = buildList {
+            if (atRisk.size == 1) {
+                add("1 original may be incomplete after a failed replacement: see the item marked \"${StatusLabel.ORIGINAL_AT_RISK}\" for where its intact copy is.")
+            } else if (atRisk.size > 1) {
+                add("${atRisk.size} originals may be incomplete after a failed replacement: see the items marked \"${StatusLabel.ORIGINAL_AT_RISK}\" for where their intact copies are.")
+            }
+            // Only the app holds these: clearing its storage would delete the last intact original.
+            if (heldInApp == 1) add("An intact copy is held inside the app, so do not clear the app's storage.")
+            else if (heldInApp > 1) add("$heldInApp intact copies are held inside the app, so do not clear the app's storage.")
+            if (failed.isNotEmpty()) add("${failed.size} item${if (failed.size == 1) "" else "s"} failed. Tap each item for details.")
+            // What became of each original is its row's to say: untouched, or restored after a failed write.
+            if (notReplaced == 1) {
+                add("1 original was not replaced and its output was not saved as a copy either: see the item marked \"${StatusLabel.NOT_REPLACED}\".")
+            } else if (notReplaced > 1) {
+                add("$notReplaced originals were not replaced and their outputs were not saved as copies either: see the items marked \"${StatusLabel.NOT_REPLACED}\".")
+            }
+        }
+        return if (parts.isEmpty()) null else parts.joinToString(" ")
+    }
+
+    /**
+     * The message of a batch stopped by an unhandled failure. It still owes the warning about the
+     * rows it finished; [existing] is a message already on screen, kept as it is.
+     */
+    fun stopped(items: List<BatchVideoItem>, existing: String?, cause: String): String {
+        val message = existing ?: "Batch stopped: $cause"
+        val warning = warning(items) ?: return message
+        return if (message.startsWith(warning)) message else "$warning $message"
     }
 }
 
