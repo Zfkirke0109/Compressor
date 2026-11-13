@@ -63,6 +63,50 @@ class ItemPresentationTest {
     }
 
     @Test
+    fun aCopyIsCalledSavedOnlyWhenItsSaveWasProven() {
+        val done = BatchTerminalResult.TRANSCODED_SMALLER
+        // A replacement that was asked for and not made: a copy was saved instead, or it was not.
+        assertEquals("Original untouched; copy saved to the gallery", line(item(BatchItemStatus.SavedCopy, copySaved = true)).text)
+        assertEquals("Original untouched; saving a copy failed", line(item(BatchItemStatus.SavedCopy, copySaved = false)).text)
+        // The output was missing at replacement time, so nothing was saved (REFUSED_OUTPUT_MISSING).
+        val missing = line(item(BatchItemStatus.SavedCopy, replacementOutcome = ReplacementOutcome.REFUSED_OUTPUT_MISSING, terminal = done))
+        assertEquals("Original untouched; no copy was saved", missing.text)
+        assertEquals(OriginalStatus.Tone.WARNING, missing.tone)
+        assertEquals("Copy saved", StatusLabel.of(item(BatchItemStatus.SavedCopy, copySaved = true, terminal = done)))
+        for (saved in listOf(false, null)) {
+            val notSaved = item(BatchItemStatus.SavedCopy, copySaved = saved, terminal = done)
+            assertEquals("Not replaced", StatusLabel.of(notSaved))
+            assertTrue(StatusLabel.isAlarming(notSaved))
+        }
+        assertFalse(StatusLabel.isAlarming(item(BatchItemStatus.SavedCopy, copySaved = true, terminal = done)))
+    }
+
+    @Test
+    fun theBadgeLeadsWithWhatHappenedToTheOriginal() {
+        val done = BatchTerminalResult.TRANSCODED_SMALLER
+        // A row's terminal result is set before its replacement runs, so the replacement's outcome
+        // has to come first: otherwise a row whose original may be incomplete reads "Compressed".
+        for (outcome in listOf(ReplacementOutcome.AT_RISK_ORIGINAL_PRESERVED, ReplacementOutcome.AT_RISK_RECOVERY_RETAINED)) {
+            for (saved in listOf(true, false, null)) {
+                val atRisk = item(BatchItemStatus.SavedCopy, replacementOutcome = outcome, copySaved = saved, terminal = done)
+                assertEquals("Original at risk", StatusLabel.of(atRisk))
+                assertTrue(StatusLabel.isAlarming(atRisk))
+            }
+        }
+        assertEquals("Replaced", StatusLabel.of(item(BatchItemStatus.Replaced, terminal = done)))
+        assertFalse(StatusLabel.isAlarming(item(BatchItemStatus.Replaced, terminal = done)))
+        // Without a replacement, the terminal result names the row as before.
+        assertEquals("Compressed", StatusLabel.of(item(BatchItemStatus.Done, terminal = done)))
+        assertEquals("Already efficient", StatusLabel.of(item(BatchItemStatus.Done, terminal = BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED)))
+        val failed = item(BatchItemStatus.Failed, terminal = BatchTerminalResult.OUTPUT_VALIDATION_FAILED)
+        assertEquals("Failed", StatusLabel.of(failed))
+        assertTrue(StatusLabel.isAlarming(failed))
+        assertFalse(StatusLabel.isAlarming(item(BatchItemStatus.Done, terminal = done)))
+        assertEquals("Ready", StatusLabel.of(item()))
+        assertEquals("Skipped", StatusLabel.of(item(BatchItemStatus.Skipped)))
+    }
+
+    @Test
     fun eachRetryCauseIsNamedAndATestsRefusalIsNotCalledAQualityFailure() {
         fun reason(cause: RetryCause) = AttemptContext.saferRungRetry(2, 2, 0.77, 0.95, cause).reason
         assertTrue(reason(RetryCause.MEASURED_BELOW_BAR).startsWith("the first candidate (0.77) did not pass the quality check"))

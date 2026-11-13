@@ -59,9 +59,13 @@ object OriginalStatus {
             Line("Original may be incomplete; an intact copy is held inside the app. Do not clear the app's storage.", Tone.WARNING)
         item.status == BatchItemStatus.Replaced ->
             Line("Original replaced by the verified copy", Tone.DONE)
-        item.status == BatchItemStatus.SavedCopy ->
-            if (item.copySaved == false) Line("Original untouched; saving a copy failed", Tone.WARNING)
-            else Line("Original untouched; copy saved to the gallery", Tone.DONE)
+        // A replacement asked for and not made. Only a proven save is "saved": copySaved is null
+        // when none was attempted (the output was missing when the replacement came to run).
+        item.status == BatchItemStatus.SavedCopy -> when (item.copySaved) {
+            true -> Line("Original untouched; copy saved to the gallery", Tone.DONE)
+            false -> Line("Original untouched; saving a copy failed", Tone.WARNING)
+            null -> Line("Original untouched; no copy was saved", Tone.WARNING)
+        }
         item.status == BatchItemStatus.Compressing ->
             Line(if (replaceOriginals) "Original untouched until its copy is verified" else "Original untouched; a separate copy is being made", Tone.NEUTRAL)
         item.status == BatchItemStatus.Done && item.outputSize > 0L && item.outputPath != null ->
@@ -70,6 +74,61 @@ object OriginalStatus {
         item.status == BatchItemStatus.Pending && !item.isAlreadyCompressed ->
             Line(if (replaceOriginals) "Original will be replaced only after its copy is verified" else "Original stays untouched (copy mode)", Tone.NEUTRAL)
         else -> Line("Original untouched; no copy was made", Tone.NEUTRAL)
+    }
+}
+
+/**
+ * The row's badge, a few words read before anything else on it. What happened to the original
+ * outranks how the encode went: a row's terminal result is set before its replacement runs, so a
+ * row whose original may now be incomplete would otherwise still read "Compressed". A copy is
+ * called saved only when its save was proven ([OriginalStatus] says the same in full).
+ */
+object StatusLabel {
+
+    fun of(item: BatchVideoItem): String {
+        if (isAtRisk(item)) return "Original at risk"
+        when (item.status) {
+            BatchItemStatus.Replaced -> return "Replaced"
+            BatchItemStatus.SavedCopy -> return if (item.copySaved == true) "Copy saved" else "Not replaced"
+            else -> Unit
+        }
+        item.terminalResult?.let { return terminal(it) }
+        return when {
+            item.status == BatchItemStatus.Skipped || item.isAlreadyCompressed -> "Skipped"
+            item.status == BatchItemStatus.Compressing ->
+                item.phaseFraction?.takeIf { item.phase.hasFraction }?.let { "${item.phase.label} ${(it * 100f).toInt()}%" }
+                    ?: item.phase.label
+            item.status == BatchItemStatus.Done -> "Copy ready"
+            item.status == BatchItemStatus.Failed -> "Failed"
+            item.status == BatchItemStatus.Cancelled -> "Cancelled"
+            else -> "Ready"
+        }
+    }
+
+    /** Whether the badge is drawn as an error: a failure, an original at risk, or no copy where one was due. */
+    fun isAlarming(item: BatchVideoItem): Boolean =
+        isAtRisk(item) || item.terminalResult?.isFailure == true || item.status == BatchItemStatus.Failed ||
+            (item.status == BatchItemStatus.SavedCopy && item.copySaved != true)
+
+    private fun isAtRisk(item: BatchVideoItem): Boolean =
+        item.replacementOutcome == ReplacementOutcome.AT_RISK_ORIGINAL_PRESERVED ||
+            item.replacementOutcome == ReplacementOutcome.AT_RISK_RECOVERY_RETAINED
+
+    private fun terminal(result: BatchTerminalResult): String = when (result) {
+        BatchTerminalResult.TRANSCODED_SMALLER,
+        BatchTerminalResult.LOSSY_SMALLER -> "Compressed"
+        BatchTerminalResult.TRANSCODED_NOT_MEANINGFULLY_SMALLER -> "No size win"
+        BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED -> "Already efficient"
+        BatchTerminalResult.REMUX_PREFERRED_BY_EVIDENCE -> "Kept (measured)"
+        BatchTerminalResult.EXPLICIT_REMUX -> "Remuxed"
+        BatchTerminalResult.UNEXPECTED_REMUX -> "Original kept"
+        BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED -> "Skipped"
+        BatchTerminalResult.SKIPPED_WOULD_DEGRADE -> "Skipped (quality)"
+        BatchTerminalResult.CANCELLED -> "Cancelled"
+        BatchTerminalResult.OUTPUT_VALIDATION_FAILED,
+        BatchTerminalResult.ENCODER_FAILURE,
+        BatchTerminalResult.UNSUPPORTED_CONTAINER,
+        BatchTerminalResult.FAILED -> "Failed"
     }
 }
 

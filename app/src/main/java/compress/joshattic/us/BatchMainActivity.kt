@@ -1284,10 +1284,8 @@ private fun ItemHeader(index: Int, item: BatchVideoItem) {
 /** The row's status as readable, non-interactive text (a disabled chip greys its label out). */
 @Composable
 private fun StatusBadge(item: BatchVideoItem) {
-    val label = item.shortStatusLabel()
-    val failed = item.terminalResult?.isFailure == true || item.status == BatchItemStatus.Failed ||
-        item.replacementOutcome == ReplacementOutcome.AT_RISK_ORIGINAL_PRESERVED ||
-        item.replacementOutcome == ReplacementOutcome.AT_RISK_RECOVERY_RETAINED
+    val label = StatusLabel.of(item)
+    val failed = StatusLabel.isAlarming(item)
     val (container, content) = when {
         failed -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
         item.status == BatchItemStatus.Compressing -> MaterialTheme.colorScheme.primaryContainer to MaterialTheme.colorScheme.onPrimaryContainer
@@ -1498,38 +1496,6 @@ private fun RecommendationSection(
                 TextButton(onClick = { confirming = false }) { Text("Cancel") }
             }
         )
-    }
-}
-
-private fun BatchVideoItem.shortStatusLabel(): String {
-    terminalResult?.let { terminal ->
-        return when (terminal) {
-            BatchTerminalResult.TRANSCODED_SMALLER,
-            BatchTerminalResult.LOSSY_SMALLER -> "Compressed"
-            BatchTerminalResult.TRANSCODED_NOT_MEANINGFULLY_SMALLER -> "No size win"
-            BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED -> "Already efficient"
-            BatchTerminalResult.REMUX_PREFERRED_BY_EVIDENCE -> "Kept (measured)"
-            BatchTerminalResult.EXPLICIT_REMUX -> "Remuxed"
-            BatchTerminalResult.UNEXPECTED_REMUX -> "Original kept"
-            BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED -> "Skipped"
-            BatchTerminalResult.SKIPPED_WOULD_DEGRADE -> "Skipped (quality)"
-            BatchTerminalResult.CANCELLED -> "Cancelled"
-            BatchTerminalResult.OUTPUT_VALIDATION_FAILED,
-            BatchTerminalResult.ENCODER_FAILURE,
-            BatchTerminalResult.UNSUPPORTED_CONTAINER,
-            BatchTerminalResult.FAILED -> "Failed"
-        }
-    }
-    return when {
-        status == BatchItemStatus.Skipped || isAlreadyCompressed -> "Skipped"
-        status == BatchItemStatus.Compressing ->
-            phaseFraction?.takeIf { phase.hasFraction }?.let { "${phase.label} ${(it * 100f).toInt()}%" } ?: phase.label
-        status == BatchItemStatus.Done -> "Copy ready"
-        status == BatchItemStatus.Replaced -> "Replaced"
-        status == BatchItemStatus.SavedCopy -> "Copy saved"
-        status == BatchItemStatus.Failed -> "Failed"
-        status == BatchItemStatus.Cancelled -> "Cancelled"
-        else -> "Ready"
     }
 }
 

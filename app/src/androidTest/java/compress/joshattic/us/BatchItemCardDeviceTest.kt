@@ -155,8 +155,20 @@ class BatchItemCardDeviceTest {
         evidence("copy-ready")
         show(ready.copy(galleryCopySaved = true))
         compose.onNodeWithText("Original untouched; copy saved to the gallery").assertExists()
-        show(item(BatchItemStatus.SavedCopy).copy(replacementOutcome = ReplacementOutcome.AT_RISK_RECOVERY_RETAINED,
-            message = "In-place replacement failed and the original on disk may be incomplete…"))
+        // A replacement refused because its output was missing: nothing was saved, and nothing says it was.
+        show(ready.copy(status = BatchItemStatus.SavedCopy, replacementOutcome = ReplacementOutcome.REFUSED_OUTPUT_MISSING))
+        compose.onNodeWithText("Original untouched; no copy was saved").assertExists()
+        compose.onNodeWithTag(ItemCardTags.STATUS).assert(
+            SemanticsMatcher.expectValue(SemanticsProperties.ContentDescription, listOf("Status: Not replaced"))
+        )
+        // As production leaves such a row: its terminal result was set before the replacement ran.
+        show(ready.copy(status = BatchItemStatus.SavedCopy, replacementOutcome = ReplacementOutcome.AT_RISK_RECOVERY_RETAINED,
+            copySaved = false, message = "In-place replacement failed and the original on disk may be incomplete…"))
+        compose.onNodeWithTag(ItemCardTags.STATUS).assert(
+            SemanticsMatcher.expectValue(SemanticsProperties.ContentDescription, listOf("Status: Original at risk"))
+        )
+        compose.onNodeWithText("Copy saved").assertDoesNotExist()
+        compose.onNodeWithText("Compressed").assertDoesNotExist()
         compose.onNodeWithTag(ItemCardTags.ORIGINAL_STATUS).performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Original may be incomplete", substring = true).assertExists()
         compose.onNodeWithText("In-place replacement failed", substring = true).assertExists()
