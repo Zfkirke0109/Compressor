@@ -193,5 +193,136 @@ def test_zip_member_identity_supplies_legacy_ids_and_rejects_conflicts():
             raise AssertionError("a record must belong to the batch in its archive member path")
 
 
+def _bundle(path, runs, root="bundle/runs/", extra=()):
+    """A device-suite bundle: run directories under bundle/runs/, each with its run-sequence place."""
+    import zipfile
+
+    with zipfile.ZipFile(path, "w") as z:
+        for batch, place, has_session in runs:
+            if has_session:
+                z.writestr(f"{root}{batch}/session.jsonl",
+                           json.dumps({"type": "session_start", "batchId": batch}) + "\n"
+                           + json.dumps({"type": "job", "batchId": batch, "nameHash": batch[-4:]}) + "\n")
+                z.writestr(f"{root}{batch}/decisions.log", "I CompressorProbe: ...\n")
+            else:
+                z.writestr(f"{root}{batch}/frames/x.jsonl.gz", b"\x1f\x8b")
+            if place is not None:
+                z.writestr(f"{root}{batch}/run-sequence", str(place))
+        z.writestr("bundle/device.txt", "model\n")
+        for name, data in extra:
+            z.writestr(name, data)
+
+
+def test_a_device_suite_bundle_reads_like_an_app_export_in_the_order_its_runs_started():
+    from session_records import session_provenance, zip_session_entries
+
+    # The shape of the v1.6.311 suite bundle: nine batch runs at places 1-4 and 6-10, and a
+    # self-check run at place 5 that records no session. Names are given out of order on purpose.
+    runs = [(f"batch_17945{i:08d}", place, True) for i, place in enumerate((3, 1, 10, 4, 2, 6, 9, 7, 8))]
+    runs.insert(4, ("selfcheck_1794540000000", 5, False))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "Compressor-suite.zip")
+        _bundle(path, runs)
+        entries = zip_session_entries(path)
+        by_place = sorted((r for r in runs if r[2]), key=lambda r: r[1], reverse=True)
+        assert entries == [f"bundle/runs/{b}/session.jsonl" for b, _, _ in by_place]
+        recs = read_records(path)
+        assert len(recs) == 18 and [r["batchId"] for r in recs[::2]] == [b for b, _, _ in by_place]
+        prov = session_provenance(path)
+        assert [p["place"] for p in prov] == [10, 9, 8, 7, 6, 4, 3, 2, 1]
+        import hashlib
+        import zipfile
+        with zipfile.ZipFile(path) as z:
+            for p in prov:
+                data = z.read(p["member"])
+                assert (p["bytes"], p["sha256"]) == (len(data), hashlib.sha256(data).hexdigest())
+
+
+def test_an_archive_that_holds_runs_under_both_roots_is_refused():
+    import zipfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "both.zip")
+        _bundle(path, [("batch_2", 2, True)], extra=[("runs/batch_1/session.jsonl", json.dumps({"type": "session_start"}) + "\n")])
+        try:
+            read_records(path)
+        except ValueError as e:
+            assert "both runs/ and bundle/runs/" in str(e)
+        else:
+            raise AssertionError("two roots are two copies, and nothing says which is the capture's")
+
+
+def test_duplicate_misplaced_and_unsafe_session_members_are_refused():
+    import warnings
+    import zipfile
+
+    cases = {
+        "duplicate": [("bundle/runs/batch_1/session.jsonl", "{}\n"), ("bundle/runs/batch_1/session.jsonl", "{}\n")],
+        "nested": [("bundle/runs/batch_1/old/session.jsonl", "{}\n")],
+        "outside": [("Compressor-suite/bundle/runs/batch_1/session.jsonl", "{}\n")],
+        "unsafe": [("bundle/runs/../session.jsonl", "{}\n")],
+        "empty id": [("bundle/runs//session.jsonl", "{}\n")],
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        for label, members in cases.items():
+            path = os.path.join(tmp, label.replace(" ", "_") + ".zip")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # zipfile warns on a duplicate name, which is the point
+                with zipfile.ZipFile(path, "w") as z:
+                    for name, data in members:
+                        z.writestr(name, data)
+            try:
+                read_records(path)
+            except ValueError:
+                continue
+            raise AssertionError(f"{label}: an archive member that cannot be placed must not be read or skipped silently")
+
+
+def test_a_record_of_another_batch_and_places_that_disagree_are_refused():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "conflict.zip")
+        _bundle(path, [("batch_1", 1, True)],
+                extra=[("bundle/runs/batch_2/session.jsonl", json.dumps({"type": "session_start", "batchId": "batch_1"}) + "\n")])
+        try:
+            read_records(path)
+        except ValueError as e:
+            assert "batch ID conflicts" in str(e)
+        else:
+            raise AssertionError("a record must belong to the batch in its archive member path")
+
+        path = os.path.join(tmp, "places.zip")
+        _bundle(path, [("batch_1", 1, True)],
+                extra=[("manifest.json", json.dumps({"files": [], "runs": [{"batchId": "batch_1", "sequence": 4}]}))])
+        try:
+            read_records(path)
+        except ValueError as e:
+            assert "different places" in str(e)
+        else:
+            raise AssertionError("the manifest and the run-sequence file must agree on a run's place")
+
+
+def test_a_bundle_of_self_checks_alone_says_it_holds_no_session_never_no_failures():
+    import subprocess
+    import sys
+
+    from session_records import describe_empty
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "selfcheck.zip")
+        _bundle(path, [("selfcheck_1794540000000", 1, False), ("selfcheck_1794540000999", 2, False)])
+        assert read_records(path) == []
+        text = describe_empty(path)
+        assert "2 run directories (selfcheck_1794540000000, selfcheck_1794540000999), none holding session.jsonl" in text
+        assert "This is not a run without failures." in text
+        here = os.path.dirname(os.path.abspath(__file__))
+        proc = subprocess.run([sys.executable, os.path.join(here, "parse_session_jsonl.py"), path],
+                              capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        assert proc.returncode != 0
+        assert "none holding session.jsonl" in proc.stderr + proc.stdout
+        empty = os.path.join(tmp, "empty.zip")
+        _bundle(empty, [])
+        assert "holds no run directories" in describe_empty(empty)
+
+
 if __name__ == "__main__":
     raise SystemExit(_main())

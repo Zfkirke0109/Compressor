@@ -71,6 +71,26 @@ class AuditTest(unittest.TestCase):
                 z.writestr('runs/batch_1/session.jsonl', '{}')
             with self.assertRaises(ValueError): load_run(paths, 'batch_1')
 
+    def test_a_device_suite_bundle_is_read_and_must_agree_with_an_export_of_the_same_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            export, bundle = Path(d) / 'export.zip', Path(d) / 'suite.zip'
+            records = [{'type': 'session_start', 'mode': 'Perceptually Lossless'}, {'type': 'session_summary'}]
+            payload = '\n'.join(map(json.dumps, records))
+            with ZipFile(export, 'w') as z:
+                z.writestr('runs/batch_1/session.jsonl', payload)
+            with ZipFile(bundle, 'w') as z:
+                z.writestr('bundle/runs/batch_1/session.jsonl', payload)
+                z.writestr('bundle/runs/batch_1/run-sequence', '1')
+            loaded, provenance = load_run([export, bundle], 'batch_1')
+            self.assertEqual(len(loaded), 2)
+            self.assertEqual([p['member'] for p in provenance], ['runs/batch_1/session.jsonl', 'bundle/runs/batch_1/session.jsonl'])
+            self.assertEqual(len({p['sessionSha256'] for p in provenance}), 1)
+            with ZipFile(bundle, 'w') as z:
+                z.writestr('bundle/runs/batch_1/session.jsonl', payload + '\n{}')
+            with self.assertRaises(ValueError): load_run([export, bundle], 'batch_1')
+            with self.assertRaises(ValueError) as missing: load_run([bundle], 'batch_2')
+            self.assertIn('batch_1', str(missing.exception))
+
     def test_missing_frame_counts_do_not_become_measurements(self):
         stage = dict(stage='probe_rung', probeMean='94', probeP5='93', probeMin='90')
         self.assertEqual(window_rows(stage), [])

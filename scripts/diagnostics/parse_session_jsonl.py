@@ -26,7 +26,7 @@ import sys
 from collections import Counter, OrderedDict
 from typing import Any
 
-from session_records import read_records, read_manifest
+from session_records import describe_empty, read_records, read_manifest, session_provenance
 
 
 def load_sessions(path: str) -> "OrderedDict[str, dict[str, Any]]":
@@ -93,7 +93,7 @@ def select_session(path: str, batch_id: str | None) -> dict[str, Any]:
     """Pick one batch out of a capture, refusing to guess when the choice is not obvious."""
     sessions = load_sessions(path)
     if not sessions:
-        raise SystemExit(f"error: no records in {path}")
+        raise SystemExit(f"error: {describe_empty(path)}")
     if batch_id is not None:
         if batch_id not in sessions:
             known = ", ".join(sessions) or "(none)"
@@ -118,6 +118,8 @@ def select_session(path: str, batch_id: str | None) -> dict[str, Any]:
 def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
     session = select_session(path, batch_id)
     start, jobs, summary = session["start"], session["jobs"], session["summary"]
+    provenance = next((p for p in session_provenance(path) if p["batchId"] == session["batchId"]), None) \
+        if path.lower().endswith(".zip") else None
     if not jobs:
         raise SystemExit(
             f"error: batch {session['batchId']} in {path} recorded no job records"
@@ -231,7 +233,7 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
         "buildTag": (start or {}).get("buildTag"),
         "v1ShadowPairs": v1_shadow_pairs(jobs),
         "probeCertDrift": probe_cert_drift(jobs, session.get("stages", [])),
-        "marginalAttempts": marginal_attempts(jobs),
+        "marginalAttempts": marginal_attempts(session),
         "budgetExhausted": budget_exhausted(jobs),
         "decisionBasis": dict(Counter(basis_kind(j.get("decisionBasis")) for j in jobs if j.get("decisionBasis")).most_common()),
         "media3Input": media3_input(jobs),
@@ -254,6 +256,8 @@ def summarize(path: str, batch_id: str | None = None) -> dict[str, Any]:
             if session.get("learnedSnapshot") else None),
         "completed": summary is not None,
         "sessionEnd": session_end(summary, session.get("terminal")),
+        # Which archive member the records came from, as read: a summary can be traced to bytes.
+        "source": provenance,
     }
 
 
@@ -636,13 +640,103 @@ def probe_cert_drift(jobs: list[dict[str, Any]], stages: list[dict[str, Any]] = 
     return out
 
 
-def marginal_attempts(jobs: list[dict[str, Any]]) -> dict[str, int]:
-    """Encodes attempted on a probe that cleared the bar but not the selection margin, and how
-    they fared. If these certify as often as ordinary passes, the margin is too strict."""
-    marginal = [j for j in jobs if "below the selection margin" in str(j.get("probeDetail") or "")]
+def _rung_identity(r: dict[str, Any]) -> tuple:
+    return (r.get("verdict"), r.get("ratio"), r.get("outputMime"), r.get("ladderRole"))
+
+
+def _resolve_rung(rungs: dict[tuple, list[dict[str, Any]]], job_id: Any, entry: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """The probe_rung record a ledger entry was planned from, or why there is none to trust.
+
+    Joined within the job by the entry's rung id and, when the entry names one, its encoder config
+    id. Records that share the id but disagree on verdict, ratio, codec or ladder role are a
+    collision: no record is picked from among them.
+    """
+    matches = rungs.get((job_id, entry.get("probeRungId")), [])
+    if not matches:
+        return None, "no probe_rung record has this rung id"
+    if entry.get("configId") is not None:
+        matches = [r for r in matches if r.get("configId") in (None, entry.get("configId"))]
+        if not matches:
+            return None, "the rung was measured with a different encoder config"
+    if len({_rung_identity(r) for r in matches}) != 1:
+        return None, f"{len(matches)} probe_rung records share this id and disagree"
+    return matches[0], None
+
+
+def marginal_attempts(session: dict[str, Any]) -> dict[str, Any] | None:
+    """Full encodes started on a probe rung that cleared the bar but not the selection margin, and
+    how each fared, joined by structure rather than read from prose.
+
+    A job's `attemptLedger` lists every full encode with the probe rung it was planned from
+    (`probeRungId`, e.g. "0.77@9408a4136ea8") and its encoder config. That rung's verdict is on the
+    job's own `probe_rung` record with the same rung and config id; "marginal" makes the encode a
+    marginal trial. A trial's outcome is its OWN ledger outcome, never the job's final
+    certification: when a rejected trial is followed by a safer rung that passes, the trial was
+    rejected and the retry accepted, and the two are counted apart.
+
+    Nothing is guessed. A ledger entry whose rung is missing, or matched by records that disagree,
+    is unresolved. A job with no ledger (a build before it) is legacy: it cannot be classified and
+    is counted as such, not as a trial. A marginal rung the size gate kept the original on is not a
+    trial either: no encode ran.
+
+    The v1.6.311 main batch holds 6 trials: 4 accepted, 2 measured below the bar and retried at
+    0.95, both of those accepted. The prose match this replaced ("below the selection margin")
+    found one job, size-gated with no encode, and reported it as an uncertified trial.
+    """
+    stages = session.get("stages", [])
+    rungs: dict[tuple, list[dict[str, Any]]] = {}
+    for r in stages:
+        if r.get("stage") == "probe_rung" and r.get("rungId"):
+            rungs.setdefault((r.get("jobId"), r.get("rungId")), []).append(r)
+    trials: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    legacy: list[Any] = []
+    for j in session.get("jobs", []):
+        jid = j.get("jobId") or j.get("id")
+        ledger = j.get("attemptLedger")
+        if not isinstance(ledger, list):
+            if _attempt_outcomes(j.get("attempts")) or j.get("pixelCertified") is not None and j.get("certificationStatus") == "ran_scored":
+                legacy.append(jid)
+            continue
+        entries = sorted((a for a in ledger if isinstance(a, dict)), key=lambda a: a.get("n") or 0)
+        for i, a in enumerate(entries):
+            if not a.get("probeRungId"):
+                continue
+            rung, why = _resolve_rung(rungs, jid, a)
+            if rung is None:
+                unresolved.append({"jobId": jid, "attempt": a.get("n"), "probeRungId": a.get("probeRungId"), "reason": why})
+                continue
+            if rung.get("verdict") != "marginal":
+                continue
+            after = entries[i + 1] if i + 1 < len(entries) else None
+            trials.append({
+                "jobId": jid, "attempt": a.get("n"), "ratio": a.get("ratio"), "probeRungId": a.get("probeRungId"),
+                "outputMime": rung.get("outputMime"), "outcome": a.get("outcome"),
+                "nextAttempt": None if after is None else {
+                    "attempt": after.get("n"), "ratio": after.get("ratio"),
+                    "probeRungId": after.get("probeRungId"), "outcome": after.get("outcome")},
+            })
+    gated = [g.get("jobId") for g in stages
+             if g.get("stage") == "size_gate" and g.get("reasonCode") == "gate_keep_original" and g.get("rungVerdict") == "marginal"]
+    if not (trials or unresolved or legacy or gated):
+        return None
+    outcomes = Counter(str(t["outcome"]) for t in trials)
+    rejected = [t for t in trials if t["outcome"] != "accepted"]
+    retried = [t for t in rejected if t["nextAttempt"] is not None]
     return {
-        "attempted": len(marginal),
-        "certified": sum(1 for j in marginal if j.get("pixelCertified")),
+        "trials": len(trials),
+        "accepted": outcomes.get("accepted", 0),
+        "measuredBelowBar": outcomes.get("measured_below_bar", 0),
+        # A test's refusal (CandidateVeto) says nothing about the rung's quality.
+        "testRejected": outcomes.get("test_rejected", 0),
+        "outcomes": dict(outcomes.most_common()),
+        "rejectedThenRetried": len(retried),
+        "retryOutcomes": dict(Counter(str(t["nextAttempt"]["outcome"]) for t in retried).most_common()),
+        "rejectedNotRetried": len(rejected) - len(retried),
+        "unresolved": unresolved,
+        "legacyJobsNotClassified": legacy,
+        "keptBySizeGateWithoutEncode": gated,
+        "trialRows": trials,
     }
 
 
@@ -797,6 +891,21 @@ def frame_count_changes(session: dict[str, Any]) -> list[dict[str, Any]]:
 
 _AUDIO_CONFIG_FIELDS = ("mime", "channels", "sampleRate", "encoderDelay", "encoderPadding", "csdSizes", "csd0Hex")
 
+# AudioPacketEvidence.SYNC_TOLERANCE_US: the largest audio-against-video skew the verifier calls the same time.
+_AUDIO_SYNC_TOLERANCE_US = 1_000
+
+
+def _audio_mismatch_kind(text: Any) -> str | None:
+    """The kind of difference a verifier reason names (AudioPacketEvidence.compare's own words)."""
+    text = str(text or "")
+    if not text:
+        return None
+    if text.startswith("presentation time differs"):
+        return "timing"
+    return {"payload differs": "payload", "packet flags differ": "flags", "packet count differs": "packet_count",
+            "decoder configuration differs": "decoder_config", "decoder configuration unknown": "config_unknown",
+            "no packets": "no_packets"}.get(text, "unknown")
+
 
 def audio_packet_differences(session: dict[str, Any]) -> list[dict[str, Any]]:
     """Verify stages whose copied audio did not compare as the source's packets, and in what.
@@ -817,6 +926,15 @@ def audio_packet_differences(session: dict[str, Any]) -> list[dict[str, Any]]:
     Taken from the record's own `differsOnlyInEndPadding` when the build wrote it, else from the
     fields: the same number of packets, no packet differing in bytes, flags or time, and the
     padding the only configuration field that differs.
+
+    `kind` is what the record shows differed, most decisive first: packet_count, payload, flags,
+    timing, padding, decoder_config, config_unknown, no_packets, or unknown. Each comes from the
+    record's own fields: the packet counts, the payload digests, the verifier's `reason` and
+    `firstMismatchKind`, and a recorded skew beyond the verifier's tolerance. Nothing is inferred
+    from the absence of another difference: v1.6.311 job_df9d097e8c72 differed in packet flags
+    alone, over 93 packets at zero skew from a zero first timestamp on both sides, and was
+    reported as "the same packets at a different time against the video". This changes the
+    report, never the verdict: the verifier refuses the copy either way.
     """
     rows = []
     for r in session.get("stages", []):
@@ -836,24 +954,42 @@ def audio_packet_differences(session: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(padding_only, bool):
             padding_only = (counts and audio["sourcePackets"] == audio["outputPackets"] and not payload_differs
                             and audio.get("firstMismatch") is None and config_fields == ["encoderPadding"])
+        reason_kind = _audio_mismatch_kind(audio.get("reason"))
+        first_kind = _audio_mismatch_kind(audio.get("firstMismatchKind"))
+        skew = audio.get("maxSkewUs")
+        skew_recorded = isinstance(skew, (int, float)) and not isinstance(skew, bool)
         if not counts:
-            explanation = "not recorded"
+            kind, explanation = "unknown", "not recorded"
+        elif reason_kind in ("config_unknown", "no_packets"):
+            kind = reason_kind
+            explanation = ("a decoder configuration could not be read, so no packet was compared" if kind == "config_unknown"
+                           else "neither side held a packet to compare")
         elif audio.get("outputLacksFirstSourcePacket") is True:
-            explanation = "the output is the source without its first packet"
+            kind, explanation = "packet_count", "the output is the source without its first packet"
         elif audio.get("outputHasExtraFirstPacket") is True:
-            explanation = "the output is the source with one extra packet in front"
+            kind, explanation = "packet_count", "the output is the source with one extra packet in front"
         elif audio["sourcePackets"] != audio["outputPackets"]:
-            explanation = "the packet counts differ and the packets are not one position apart"
+            kind, explanation = "packet_count", "the packet counts differ and the packets are not one position apart"
         elif payload_differs:
-            explanation = "the same number of packets with different bytes"
+            kind, explanation = "payload", "the same number of packets with different bytes"
+        elif first_kind == "flags":
+            kind = "flags"
+            explanation = (f"the same packets with different packet flags, first at packet {audio.get('firstMismatch')}, "
+                           + (f"at the same time against the video (max skew {skew} us)" if skew_recorded and skew <= _AUDIO_SYNC_TOLERANCE_US
+                              else f"and up to {skew} us apart against the video" if skew_recorded
+                              else "with no skew recorded"))
+        elif first_kind == "timing" or (first_kind is None and skew_recorded and skew > _AUDIO_SYNC_TOLERANCE_US):
+            kind, explanation = "timing", f"the same packets at a different time against the video (up to {skew} us)"
         elif padding_only and isinstance(source_config, dict) and isinstance(output_config, dict):
             # An absent padding is 0 to a decoder.
+            kind = "padding"
             explanation = ("the same packets; only the end padding differs "
                            f"(source {source_config.get('encoderPadding') or 0}, output {output_config.get('encoderPadding') or 0} samples)")
-        elif config_differs:
-            explanation = "the same packets under a different decoder configuration"
+        elif config_differs or reason_kind == "decoder_config":
+            kind, explanation = "decoder_config", "the same packets under a different decoder configuration"
         else:
-            explanation = "the same packets at a different time against the video"
+            kind = "unknown"
+            explanation = f"a difference this record does not classify (reason: {audio.get('reason')!r})"
         rows.append({
             "jobId": r.get("jobId"), "attemptIndex": r.get("attemptIndex"), "reason": audio.get("reason"),
             "packetsCompared": audio.get("packets"), "maxSkewUs": audio.get("maxSkewUs"), "firstMismatch": audio.get("firstMismatch"),
@@ -864,6 +1000,7 @@ def audio_packet_differences(session: dict[str, Any]) -> list[dict[str, Any]]:
             "firstMismatchKind": audio.get("firstMismatchKind"),
             "configFieldsThatDiffer": config_fields,
             "endPaddingOnly": bool(padding_only),
+            "kind": kind,
             "explanation": explanation,
         })
     return rows
@@ -979,6 +1116,8 @@ def render(s: dict[str, Any]) -> str:
                    + ". Not field evidence.")
     out += [
         f"  batch          : {s['batchId']}  build={s['buildCommit']}  mode={s['mode']}",
+        *([f"  read from      : {s['source']['member']}  {s['source']['bytes']:,} bytes  sha256={s['source']['sha256']}"
+           + (f"  place {s['source']['place']}" if s['source'].get('place') else "")] if s.get("source") else []),
         f"  jobs           : {s['jobs']}",
         f"  source bytes   : {s['sourceBytes']:,}",
         f"  REAL compress. : {s['realCompressions']}   savedBytes={s['savedBytes']:,}",
@@ -1021,9 +1160,25 @@ def render(s: dict[str, Any]) -> str:
                 out.append(f"      {name:<4}  median {d['median']:+.2f}   p10 {d['p10']:+.2f}   worst {d['worst']:+.2f}")
         for e in (drift.get("excluded") or [])[:6]:
             out.append(f"      excluded {e['jobId']}: {e['reason']}")
-    marginal = s.get("marginalAttempts") or {}
-    if marginal.get("attempted"):
-        out.append(f"  marginal passes: {marginal['attempted']} attempted, {marginal['certified']} certified")
+    marginal = s.get("marginalAttempts")
+    if marginal:
+        others = {k: v for k, v in marginal["outcomes"].items() if k not in ("accepted", "measured_below_bar", "test_rejected")}
+        out.append(
+            f"  marginal trials: {marginal['trials']} full encode(s) on a rung that cleared the bar but not the selection margin;"
+            f" {marginal['accepted']} accepted, {marginal['measuredBelowBar']} measured below the bar"
+            + (f", {marginal['testRejected']} refused by a test" if marginal["testRejected"] else "")
+            + (f", other {others}" if others else ""))
+        if marginal["rejectedThenRetried"] or marginal["rejectedNotRetried"]:
+            out.append(f"      rejected then retried at a safer rung: {marginal['rejectedThenRetried']} {marginal['retryOutcomes'] or ''};"
+                       f" not retried: {marginal['rejectedNotRetried']} (a retry's outcome is its own, not the trial's)")
+        if marginal["unresolved"]:
+            out.append(f"      unresolved rung references (not counted): {len(marginal['unresolved'])}")
+            for u in marginal["unresolved"][:6]:
+                out.append(f"        {u['jobId']} attempt {u['attempt']} {u['probeRungId']}: {u['reason']}")
+        if marginal["legacyJobsNotClassified"]:
+            out.append(f"      jobs with no attempt ledger, not classified: {len(marginal['legacyJobsNotClassified'])}")
+        if marginal["keptBySizeGateWithoutEncode"]:
+            out.append(f"      marginal rungs the size gate kept the original on (no encode, not trials): {len(marginal['keptBySizeGateWithoutEncode'])}")
     budget = s.get("budgetExhausted") or {}
     if budget.get("ladders"):
         out.append(f"  budget exhausted: {budget['ladders']} ladder(s), {budget['encodedThenFailed']} then encoded and failed certification")

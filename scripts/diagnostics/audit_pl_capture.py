@@ -22,22 +22,31 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from zipfile import ZipFile
 
+from session_records import describe_empty, run_root, zip_session_entries
+
 GATES = {'mean': 95.5, 'p5': 91.0, 'min': 84.0}
 
 
 def load_run(paths, batch):
-    name = f'runs/{batch}/session.jsonl'
+    """The named run's records from one or more archives, each an app export (runs/<id>/) or a
+    device-suite bundle (bundle/runs/<id>/). Every archive that holds the run must hold the same
+    bytes; which member each copy came from is kept with its digest."""
     payload = None
     provenance = []
     for path in paths:
         with ZipFile(path) as archive:
-            if name not in archive.namelist(): continue
+            names = archive.namelist()
+            root = run_root(names)
+            name = f'{root}{batch}/session.jsonl' if root else None
+            if name is None or name not in names: continue
             data = archive.read(name)
             if payload is not None and data != payload:
                 raise ValueError(f'conflicting copies of {batch}: {path}')
             payload = data
-            provenance.append({'archive': Path(path).name, 'sessionSha256': hashlib.sha256(data).hexdigest()})
-    if payload is None: raise ValueError(f'no such batch: {batch}')
+            provenance.append({'archive': Path(path).name, 'member': name, 'sessionSha256': hashlib.sha256(data).hexdigest()})
+    if payload is None:
+        raise ValueError(f'no such batch: {batch} (' + '; '.join(
+            ', '.join(sorted({e.split('/')[-2] for e in zip_session_entries(p)})) or describe_empty(p) for p in paths) + ')')
     records = [json.loads(line) for line in payload.splitlines() if line.strip()]
     starts = [r for r in records if r.get('type') == 'session_start']
     if len(starts) != 1 or starts[0].get('mode') != 'Perceptually Lossless':

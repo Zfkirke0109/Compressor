@@ -90,8 +90,13 @@ clears the bar but not the margin is *marginal*: the ladder tries the next, safe
 clears the margin, the highest marginal rung is still attempted, labelled "by only X, below the
 selection margin; certification decides", and certification judges the real output against the
 unchanged bar. The margin changes which encode is attempted, never what is accepted. The session
-summariser prints the drift and the marginal attempts of every capture (`probe->cert`,
-`marginal passes`), so the margin is re-measured each run rather than trusted.
+summariser prints the drift and the marginal trials of every capture (`probe->cert`,
+`marginal trials`), so the margin is re-measured each run rather than trusted. A marginal trial is
+a full encode whose attempt-ledger entry names a probe rung that the job's own `probe_rung` record
+(same rung and config id) calls marginal; its outcome is that attempt's own, and a safer retry that
+passes afterwards is counted as the retry's. Prose such as "below the selection margin" is not
+evidence of an encode: in the v1.6.311 batch it matched one size-gated job that never encoded, while
+the ledger holds six trials (four accepted, two measured below the bar and then accepted at 0.95).
 
 A ladder that runs past its time budget skips the rungs in between and still measures the safest
 one, so a file is never re-encoded at the default ratio on no evidence after its lower rungs

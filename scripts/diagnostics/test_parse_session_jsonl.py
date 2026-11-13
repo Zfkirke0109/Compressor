@@ -202,7 +202,10 @@ def test_probe_to_certification_drift_and_marginal_attempts_are_reported():
     assert s["probeCertDrift"]["windows"] == 3
     assert abs(s["probeCertDrift"]["mean"]["worst"] - (-0.8)) < 1e-9
     assert abs(s["probeCertDrift"]["p5"]["worst"] - (-1.2)) < 1e-9
-    assert s["marginalAttempts"] == {"attempted": 1, "certified": 0}
+    # Neither record has an attempt ledger, so neither can be classified as a marginal trial, the
+    # one whose prose says "below the selection margin" included: prose is not evidence of an encode.
+    assert s["marginalAttempts"]["trials"] == 0
+    assert len(s["marginalAttempts"]["legacyJobsNotClassified"]) == 2
     assert s["decisionBasis"] == {"cannot be measured": 1, "learned": 1}
 
 
@@ -879,7 +882,11 @@ def test_an_audio_packet_difference_says_what_differed_or_that_it_was_not_record
     assert rows["padding_flag"]["endPaddingOnly"] is True
     assert rows["padding_flag"]["explanation"] == "the same packets; only the end padding differs (source 0, output 3 samples)"
     assert rows["padding_and_time"]["endPaddingOnly"] is False
-    assert rows["padding_and_time"]["explanation"] == "the same packets under a different decoder configuration"
+    # Its padding differs too, but the recorded skew is far beyond the verifier's tolerance.
+    assert rows["padding_and_time"]["kind"] == "timing"
+    assert rows["padding_and_time"]["explanation"] == "the same packets at a different time against the video (up to 97488 us)"
+    assert [rows[j]["kind"] for j in ("old", "late", "config", "padding", "padding_flag")] == \
+        ["unknown", "packet_count", "decoder_config", "padding", "padding"]
     from parse_session_jsonl import render
     text = render(s)
     assert "old decoder configuration differs over 342 compared packet(s), max skew 21334 us; this build recorded neither" in text
@@ -930,6 +937,215 @@ def test_a_batch_the_app_ran_carries_no_test_marker():
     assert s["saferRungRetries"]["afterTestRejection"] == 0
     from parse_session_jsonl import render
     assert "TEST CAPTURE" not in render(s) and "test's refusal" not in render(s)
+
+
+# The six marginal trials of the v1.6.311 main batch (58 items, S26 normal profile), and the one
+# marginal rung the size gate kept the original on, as the batch recorded them. Reduced to the
+# fields the join reads: job and config ids, rung ids, ratios, verdicts and outcomes. No names,
+# sizes, digests or scores. Independently: 6 trials, 4 accepted directly, 2 measured below the bar
+# and then accepted at 0.95.
+B311_MARGINAL = """
+{"type":"stage","jobId":"job_89baf1b00ad3","stage":"probe_rung","reasonCode":"rung_measured","attempt":18,"rungId":"0.95@20f77a5a9ad8","configId":"20f77a5a9ad8","ratio":0.95,"verdict":"passed","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_89baf1b00ad3","stage":"probe_rung","reasonCode":"rung_measured","attempt":18,"rungId":"0.77@9408a4136ea8","configId":"9408a4136ea8","ratio":0.77,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_89baf1b00ad3","stage":"size_gate","reasonCode":"gate_encode","attempt":18,"assessedRungId":"0.77@9408a4136ea8","rungVerdict":"marginal","disposition":"predicted_smaller","outputMime":"video/hevc"}
+{"type":"stage","jobId":"job_89baf1b00ad3","stage":"certify","reasonCode":"cert_measured_failure","attempt":18,"probeRungId":"0.77@9408a4136ea8","configId":"9408a4136ea8","usedRatio":0.77,"accepted":false,"pixelCertified":false}
+{"type":"stage","jobId":"job_89baf1b00ad3","stage":"retry","reasonCode":"retry_allowed","attempt":18,"usedRatio":0.77,"saferRatio":0.95,"trigger":"measured_below_bar"}
+{"type":"stage","jobId":"job_89baf1b00ad3","stage":"certify","reasonCode":"cert_passed","attempt":19,"probeRungId":"0.95@20f77a5a9ad8","configId":"20f77a5a9ad8","usedRatio":0.95,"accepted":true,"pixelCertified":true}
+{"type":"job","jobId":"job_89baf1b00ad3","terminal":"TRANSCODED_SMALLER","pixelCertified":true,"probeRungId":"0.95@20f77a5a9ad8","probeDetail":"windows passed at 0.77 (marginal refinement; certification decides); safer-rung retry at 0.95 after certification measured_below_bar at 0.77","attemptsStarted":2,"attemptLedger":[{"n":1,"token":18,"ratio":0.77,"probeRungId":"0.77@9408a4136ea8","configId":"9408a4136ea8","outcome":"measured_below_bar"},{"n":2,"token":19,"ratio":0.95,"probeRungId":"0.95@20f77a5a9ad8","configId":"20f77a5a9ad8","outcome":"accepted"}]}
+{"type":"stage","jobId":"job_1ecc4136ae36","stage":"probe_rung","reasonCode":"rung_measured","attempt":20,"rungId":"0.95@49a93b63170a","configId":"49a93b63170a","ratio":0.95,"verdict":"passed","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_1ecc4136ae36","stage":"probe_rung","reasonCode":"rung_measured","attempt":20,"rungId":"0.77@eedf2405c3e1","configId":"eedf2405c3e1","ratio":0.77,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_1ecc4136ae36","stage":"size_gate","reasonCode":"gate_encode","attempt":20,"assessedRungId":"0.77@eedf2405c3e1","rungVerdict":"marginal","disposition":"predicted_smaller","outputMime":"video/hevc"}
+{"type":"stage","jobId":"job_1ecc4136ae36","stage":"certify","reasonCode":"cert_measured_failure","attempt":20,"probeRungId":"0.77@eedf2405c3e1","configId":"eedf2405c3e1","usedRatio":0.77,"accepted":false,"pixelCertified":false}
+{"type":"stage","jobId":"job_1ecc4136ae36","stage":"retry","reasonCode":"retry_allowed","attempt":20,"usedRatio":0.77,"saferRatio":0.95,"trigger":"measured_below_bar"}
+{"type":"stage","jobId":"job_1ecc4136ae36","stage":"certify","reasonCode":"cert_passed","attempt":21,"probeRungId":"0.95@49a93b63170a","configId":"49a93b63170a","usedRatio":0.95,"accepted":true,"pixelCertified":true}
+{"type":"job","jobId":"job_1ecc4136ae36","terminal":"TRANSCODED_SMALLER","pixelCertified":true,"probeRungId":"0.95@49a93b63170a","probeDetail":"windows passed at 0.77 (marginal refinement; certification decides); safer-rung retry at 0.95 after certification measured_below_bar at 0.77","attemptsStarted":2,"attemptLedger":[{"n":1,"token":20,"ratio":0.77,"probeRungId":"0.77@eedf2405c3e1","configId":"eedf2405c3e1","outcome":"measured_below_bar"},{"n":2,"token":21,"ratio":0.95,"probeRungId":"0.95@49a93b63170a","configId":"49a93b63170a","outcome":"accepted"}]}
+{"type":"stage","jobId":"job_1c02059b9ca2","stage":"probe_rung","reasonCode":"rung_measured","attempt":22,"rungId":"0.80@fd504fdcad9c","configId":"fd504fdcad9c","ratio":0.8,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_1c02059b9ca2","stage":"size_gate","reasonCode":"gate_encode","attempt":22,"assessedRungId":"0.80@fd504fdcad9c","rungVerdict":"marginal","disposition":"predicted_smaller","outputMime":"video/hevc"}
+{"type":"stage","jobId":"job_1c02059b9ca2","stage":"certify","reasonCode":"cert_passed","attempt":22,"probeRungId":"0.80@fd504fdcad9c","configId":"fd504fdcad9c","usedRatio":0.8,"accepted":true,"pixelCertified":true}
+{"type":"job","jobId":"job_1c02059b9ca2","terminal":"TRANSCODED_SMALLER","pixelCertified":true,"probeRungId":"0.80@fd504fdcad9c","probeDetail":"windows passed at 0.80 (marginal refinement; certification decides)","attemptsStarted":1,"attemptLedger":[{"n":1,"token":22,"ratio":0.8,"probeRungId":"0.80@fd504fdcad9c","configId":"fd504fdcad9c","outcome":"accepted"}]}
+{"type":"stage","jobId":"job_2142a16a7282","stage":"probe_rung","reasonCode":"rung_measured","attempt":23,"rungId":"0.77@73dc56f9b489","configId":"73dc56f9b489","ratio":0.77,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_2142a16a7282","stage":"size_gate","reasonCode":"gate_encode","attempt":23,"assessedRungId":"0.77@73dc56f9b489","rungVerdict":"marginal","disposition":"predicted_smaller","outputMime":"video/hevc"}
+{"type":"stage","jobId":"job_2142a16a7282","stage":"certify","reasonCode":"cert_passed","attempt":23,"probeRungId":"0.77@73dc56f9b489","configId":"73dc56f9b489","usedRatio":0.77,"accepted":true,"pixelCertified":true}
+{"type":"job","jobId":"job_2142a16a7282","terminal":"TRANSCODED_SMALLER","pixelCertified":true,"probeRungId":"0.77@73dc56f9b489","probeDetail":"windows passed at 0.77 (marginal refinement; certification decides)","attemptsStarted":1,"attemptLedger":[{"n":1,"token":23,"ratio":0.77,"probeRungId":"0.77@73dc56f9b489","configId":"73dc56f9b489","outcome":"accepted"}]}
+{"type":"stage","jobId":"job_b0edd46ad770","stage":"probe_rung","reasonCode":"rung_measured","attempt":24,"rungId":"0.77@4837d50108b9","configId":"4837d50108b9","ratio":0.77,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_b0edd46ad770","stage":"size_gate","reasonCode":"gate_encode","attempt":24,"assessedRungId":"0.77@4837d50108b9","rungVerdict":"marginal","disposition":"predicted_smaller","outputMime":"video/hevc"}
+{"type":"stage","jobId":"job_b0edd46ad770","stage":"certify","reasonCode":"cert_passed","attempt":24,"probeRungId":"0.77@4837d50108b9","configId":"4837d50108b9","usedRatio":0.77,"accepted":true,"pixelCertified":true}
+{"type":"job","jobId":"job_b0edd46ad770","terminal":"TRANSCODED_SMALLER","pixelCertified":true,"probeRungId":"0.77@4837d50108b9","probeDetail":"windows passed at 0.77 (marginal refinement; certification decides)","attemptsStarted":1,"attemptLedger":[{"n":1,"token":24,"ratio":0.77,"probeRungId":"0.77@4837d50108b9","configId":"4837d50108b9","outcome":"accepted"}]}
+{"type":"stage","jobId":"job_a26e9d113c47","stage":"probe_rung","reasonCode":"rung_measured","attempt":58,"rungId":"0.75@17d521372fb7","configId":"17d521372fb7","ratio":0.75,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_a26e9d113c47","stage":"size_gate","reasonCode":"gate_encode","attempt":58,"assessedRungId":"0.75@17d521372fb7","rungVerdict":"marginal","disposition":"predicted_smaller","outputMime":"video/hevc"}
+{"type":"stage","jobId":"job_a26e9d113c47","stage":"certify","reasonCode":"cert_passed","attempt":58,"probeRungId":"0.75@17d521372fb7","configId":"17d521372fb7","usedRatio":0.75,"accepted":true,"pixelCertified":true}
+{"type":"job","jobId":"job_a26e9d113c47","terminal":"TRANSCODED_SMALLER","pixelCertified":true,"probeRungId":"0.75@17d521372fb7","probeDetail":"windows passed at 0.75 (marginal refinement; certification decides)","attemptsStarted":1,"attemptLedger":[{"n":1,"token":58,"ratio":0.75,"probeRungId":"0.75@17d521372fb7","configId":"17d521372fb7","outcome":"accepted"}]}
+{"type":"stage","jobId":"job_e78a13f84734","stage":"probe_rung","reasonCode":"rung_measured","attempt":53,"rungId":"0.97@233b0a0f5040","configId":"233b0a0f5040","ratio":0.97,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_e78a13f84734","stage":"size_gate","reasonCode":"gate_keep_original","attempt":53,"assessedRungId":"0.97@233b0a0f5040","rungVerdict":"marginal","disposition":"predicted_not_smaller","outputMime":"video/hevc"}
+{"type":"job","jobId":"job_e78a13f84734","terminal":"ALREADY_HIGHLY_OPTIMIZED","pixelCertified":false,"probeRungId":"0.97@233b0a0f5040","probeDetail":"windows passed at 0.97 by only 0.14, below the selection margin (0.5/1.25/1.0); certification decides"}
+"""
+
+
+def b311_session(*extra):
+    recs = [json.loads(line) for line in B311_MARGINAL.strip().splitlines()]
+    return write([start(batchId="b311")] + [dict(r, batchId="b311") for r in recs] + list(extra)
+                 + [{"type": "session_summary", "batchId": "b311"}])
+
+
+def test_the_v1_6_311_marginal_trials_are_counted_from_their_own_ledgers():
+    m = summarize(b311_session())["marginalAttempts"]
+    assert (m["trials"], m["accepted"], m["measuredBelowBar"], m["testRejected"]) == (6, 4, 2, 0)
+    assert (m["rejectedThenRetried"], m["retryOutcomes"], m["rejectedNotRetried"]) == (2, {"accepted": 2}, 0)
+    assert m["unresolved"] == [] and m["legacyJobsNotClassified"] == []
+    # The job the prose match used to count: size-gated, no full encode, so not a trial.
+    assert m["keptBySizeGateWithoutEncode"] == ["job_e78a13f84734"]
+    assert "job_e78a13f84734" not in {t["jobId"] for t in m["trialRows"]}
+    from parse_session_jsonl import render
+    text = render(summarize(b311_session()))
+    assert "marginal trials: 6 full encode(s)" in text and "4 accepted, 2 measured below the bar" in text
+    assert "rejected then retried at a safer rung: 2 {'accepted': 2}" in text
+    assert "marginal passes" not in text
+
+
+def test_a_retry_that_passes_does_not_certify_the_trial_it_replaced():
+    m = summarize(b311_session())["marginalAttempts"]
+    retried = {t["jobId"]: t for t in m["trialRows"] if t["nextAttempt"]}
+    assert set(retried) == {"job_89baf1b00ad3", "job_1ecc4136ae36"}
+    for t in retried.values():
+        # Each job ended certified, by its second attempt at 0.95. The 0.77 trial was rejected.
+        assert (t["ratio"], t["outcome"]) == (0.77, "measured_below_bar")
+        assert (t["nextAttempt"]["ratio"], t["nextAttempt"]["outcome"]) == (0.95, "accepted")
+
+
+def _trial_job(jid, ledger, rungs):
+    return [{"type": "stage", "jobId": jid, "stage": "probe_rung", "rungId": rid, "configId": rid.split("@")[1],
+             "ratio": float(rid.split("@")[0]), "verdict": verdict, "outputMime": mime, "ladderRole": role}
+            for rid, verdict, mime, role in rungs] + [
+        {"type": "job", "jobId": jid, "terminal": "KEPT_ORIGINAL", "attemptLedger": [
+            {"n": n, "ratio": float(rid.split("@")[0]) if rid else None, "probeRungId": rid,
+             "configId": cfg if cfg is not None else (rid.split("@")[1] if rid else None), "outcome": outcome}
+            for n, (rid, outcome, cfg) in enumerate(ledger, 1)]}]
+
+
+def _marginal(*records):
+    return summarize(write([start()] + [dict(r, batchId="b1") for r in records] + [{"type": "session_summary", "batchId": "b1"}]))["marginalAttempts"]
+
+
+def test_both_attempts_refused_and_a_tests_refusal_are_told_apart():
+    m = _marginal(
+        *_trial_job("job_both", [("0.77@aaaaaaaaaaaa", "measured_below_bar", None), ("0.95@bbbbbbbbbbbb", "measured_below_bar", None)],
+                    [("0.77@aaaaaaaaaaaa", "marginal", "video/hevc", "primary"), ("0.95@bbbbbbbbbbbb", "passed", "video/hevc", "primary")]),
+        *_trial_job("job_veto", [("0.75@cccccccccccc", "test_rejected", None), ("0.80@dddddddddddd", "accepted", None)],
+                    [("0.75@cccccccccccc", "marginal", "video/hevc", "primary"), ("0.80@dddddddddddd", "passed", "video/hevc", "primary")]),
+        *_trial_job("job_alone", [("0.70@eeeeeeeeeeee", "structural_failed", None)],
+                    [("0.70@eeeeeeeeeeee", "marginal", "video/avc", "primary")]),
+    )
+    assert (m["trials"], m["accepted"], m["measuredBelowBar"], m["testRejected"]) == (3, 0, 1, 1)
+    assert m["outcomes"] == {"measured_below_bar": 1, "test_rejected": 1, "structural_failed": 1}
+    assert (m["rejectedThenRetried"], m["rejectedNotRetried"]) == (2, 1)
+    assert m["retryOutcomes"] == {"measured_below_bar": 1, "accepted": 1}
+
+
+def test_an_encode_on_a_passing_rung_or_on_no_rung_is_not_a_marginal_trial():
+    m = _marginal(
+        *_trial_job("job_pass", [("0.60@aaaaaaaaaaaa", "accepted", None)], [("0.60@aaaaaaaaaaaa", "passed", "video/hevc", "primary")]),
+        *_trial_job("job_preset", [(None, "accepted", None)], []),
+    )
+    assert m is None
+
+
+def test_rung_ids_are_joined_within_the_job_by_config_never_by_ratio_alone():
+    m = _marginal(
+        # Same ratio, two codecs: the HEVC rung was marginal, the AVC one passed. The encode used AVC.
+        *_trial_job("job_codec", [("0.77@bbbbbbbbbbbb", "accepted", None)],
+                    [("0.77@aaaaaaaaaaaa", "marginal", "video/hevc", "primary"), ("0.77@bbbbbbbbbbbb", "passed", "video/avc", "alternate")]),
+        # Another job measured the same rung id as marginal; it says nothing about this one.
+        *_trial_job("job_other", [("0.80@cccccccccccc", "accepted", None)], [("0.80@cccccccccccc", "passed", "video/hevc", "primary")]),
+        *_trial_job("job_else", [], [("0.80@cccccccccccc", "marginal", "video/hevc", "primary")]),
+    )
+    assert m is None
+
+
+def test_a_rung_that_is_missing_contradicted_or_measured_with_another_config_is_unresolved():
+    m = _marginal(
+        *_trial_job("job_missing", [("0.77@aaaaaaaaaaaa", "accepted", None)], []),
+        # A ladder id collision: two records of one rung id that disagree. Neither is picked.
+        *_trial_job("job_collide", [("0.80@bbbbbbbbbbbb", "measured_below_bar", None)],
+                    [("0.80@bbbbbbbbbbbb", "marginal", "video/hevc", "primary"), ("0.80@bbbbbbbbbbbb", "passed", "video/hevc", "alternate")]),
+        *_trial_job("job_config", [("0.75@cccccccccccc", "accepted", "ffffffffffff")], [("0.75@cccccccccccc", "marginal", "video/hevc", "primary")]),
+    )
+    assert m["trials"] == 0
+    reasons = {u["jobId"]: u["reason"] for u in m["unresolved"]}
+    assert reasons == {
+        "job_missing": "no probe_rung record has this rung id",
+        "job_collide": "2 probe_rung records share this id and disagree",
+        "job_config": "the rung was measured with a different encoder config",
+    }
+
+
+def test_two_records_of_one_rung_that_agree_are_one_rung():
+    m = _marginal(*_trial_job("job_twice", [("0.77@aaaaaaaaaaaa", "accepted", None)],
+                              [("0.77@aaaaaaaaaaaa", "marginal", "video/hevc", "primary")] * 2))
+    assert (m["trials"], m["accepted"], m["unresolved"]) == (1, 1, [])
+
+
+def test_a_job_with_no_attempt_ledger_is_counted_as_unclassified_not_as_a_trial():
+    m = _marginal(job("old", jobId="job_old", attempts="0.90:measured_below_bar:cand=1:encodeMs=2",
+                      probeDetail="windows passed at 0.90 by only 0.20, below the selection margin (0.5/1.25/1.0); certification decides"))
+    assert (m["trials"], m["legacyJobsNotClassified"]) == (0, ["job_old"])
+
+
+def test_each_audio_difference_is_named_from_the_record_never_inferred_as_timing():
+    aac = {"mime": "audio/mp4a-latm", "channels": 2, "sampleRate": 48000, "encoderDelay": None, "encoderPadding": None,
+           "csdSizes": [2, None, None], "csd0Hex": "1190"}
+    same = dict(sourceConfigSha256="aa", outputConfigSha256="aa", sourcePayloadSha256="cc", outputPayloadSha256="cc",
+                sourceConfig=aac, outputConfig=aac, outputLacksFirstSourcePacket=False, outputHasExtraFirstPacket=False)
+
+    def ev(job_id, **kw):
+        return _audio(job_id, **dict(same, **kw))
+
+    path = write([
+        start(),
+        # v1.6.311 job_df9d097e8c72 as recorded: 93 packets, equal bytes and configuration, both
+        # first timestamps 0, zero skew, and the flags of packet 1 differ.
+        ev("flags", packets=93, sourcePackets=93, outputPackets=93, sourceFirstPtsUs=0, outputFirstPtsUs=0, maxSkewUs=0,
+           firstMismatch=1, firstMismatchKind="packet flags differ", reason="packet flags differ", differsOnlyInEndPadding=False),
+        ev("shift", packets=93, sourcePackets=93, outputPackets=93, sourceFirstPtsUs=0, outputFirstPtsUs=21333, maxSkewUs=21333,
+           firstMismatch=0, firstMismatchKind="presentation time differs against video by 21333us",
+           reason="presentation time differs against video by 21333us"),
+        ev("payload", packets=93, sourcePackets=93, outputPackets=93, outputPayloadSha256="dd", maxSkewUs=0,
+           firstMismatch=7, firstMismatchKind="payload differs", reason="payload differs"),
+        ev("absent", packets=92, sourcePackets=93, outputPackets=92, maxSkewUs=0, firstMismatch=92,
+           firstMismatchKind="packet count differs", reason="packet count differs"),
+        ev("extra", packets=93, sourcePackets=93, outputPackets=94, outputPayloadSha256="ee", maxSkewUs=21333, firstMismatch=0,
+           firstMismatchKind="payload differs", reason="payload differs", outputHasExtraFirstPacket=True),
+        ev("padding", packets=93, sourcePackets=93, outputPackets=93, maxSkewUs=0, firstMismatch=None, outputConfigSha256="bb",
+           reason="decoder configuration differs", differsOnlyInEndPadding=True,
+           sourceConfig=dict(aac, encoderPadding=0), outputConfig=dict(aac, encoderPadding=2)),
+        ev("unknown_config", packets=0, sourcePackets=0, outputPackets=0, maxSkewUs=0, firstMismatch=None,
+           reason="decoder configuration unknown", sourceConfigSha256=None, sourceConfig=None),
+        # A reason no build of this verifier writes: said so, not turned into a timing claim.
+        ev("unclassified", packets=93, sourcePackets=93, outputPackets=93, maxSkewUs=0, firstMismatch=None, reason="something new"),
+        # Legacy: one reason and no counts.
+        _audio("legacy", reason="packet flags differ", maxSkewUs=0),
+        *[job(j, batchId="b1", jobId=j) for j in ("flags", "shift", "payload", "absent", "extra", "padding", "unknown_config", "unclassified", "legacy")],
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    rows = {d["jobId"]: d for d in s["audioPacketDifferences"]}
+    assert {j: r["kind"] for j, r in rows.items()} == {
+        "flags": "flags", "shift": "timing", "payload": "payload", "absent": "packet_count", "extra": "packet_count",
+        "padding": "padding", "unknown_config": "config_unknown", "unclassified": "unknown", "legacy": "unknown"}
+    assert rows["flags"]["explanation"] == \
+        "the same packets with different packet flags, first at packet 1, at the same time against the video (max skew 0 us)"
+    assert "different time" not in rows["flags"]["explanation"]
+    assert rows["shift"]["explanation"] == "the same packets at a different time against the video (up to 21333 us)"
+    assert rows["absent"]["explanation"] == "the packet counts differ and the packets are not one position apart"
+    assert rows["extra"]["explanation"] == "the output is the source with one extra packet in front"
+    assert rows["unknown_config"]["explanation"] == "a decoder configuration could not be read, so no packet was compared"
+    assert rows["unclassified"]["explanation"] == "a difference this record does not classify (reason: 'something new')"
+    assert rows["legacy"]["explanation"] == "not recorded"
+    for r in rows.values():
+        if r["kind"] != "timing":
+            assert "different time" not in r["explanation"], r
+    from parse_session_jsonl import render
+    assert "flags packet flags differ over 93 compared packet(s), max skew 0 us; source 93 / output 93 packets, first at 0 / 0 us;" \
+           " the same packets with different packet flags, first at packet 1" in render(s)
 
 
 if __name__ == "__main__":
