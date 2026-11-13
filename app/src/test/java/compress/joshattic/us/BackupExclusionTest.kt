@@ -32,7 +32,10 @@ class BackupExclusionTest {
 
     private val staysOnThisPhone = listOf(
         "file" to "replace_recovery", "file" to "diagnostics",
-        "file" to "learning", "sharedpref" to "smart_perceptual_profiles_v4.xml"
+        "file" to "learning", "sharedpref" to "smart_perceptual_profiles_v4.xml",
+        // A device-harness run's folder: rollback copies of a disposable copy of a user's video
+        // while a replacement case runs, and the run's own learning journal.
+        "file" to "pllab"
     )
 
     private fun assertExcludesAll(where: String, xml: String) {

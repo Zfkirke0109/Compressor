@@ -18,5 +18,7 @@
          data_extraction_rules.xml. -->
     <exclude domain="file" path="diagnostics" />
     <exclude domain="file" path="learning" />
+    <!-- A device-harness run's files, which can hold rollback copies of a copy of a user's video. -->
+    <exclude domain="file" path="pllab" />
     <exclude domain="sharedpref" path="smart_perceptual_profiles_v4.xml" />
 </full-backup-content>

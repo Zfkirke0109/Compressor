@@ -16,16 +16,21 @@
          encoder and stays with it, the journal carries source fingerprints, and the two are only
          consistent with each other. A new phone starts from its model's defaults and measures for
          itself; every Perceptually Lossless output is measured whatever was learned. -->
+    <!-- What a device-harness run keeps in the app (HarnessCopies, HarnessScope): its allowlist,
+         results, rendered states, its own learning journal and, while a replacement case runs or
+         after one that stopped, rollback copies of a disposable copy of a user's video. -->
     <cloud-backup>
         <exclude domain="file" path="replace_recovery" />
         <exclude domain="file" path="diagnostics" />
         <exclude domain="file" path="learning" />
+        <exclude domain="file" path="pllab" />
         <exclude domain="sharedpref" path="smart_perceptual_profiles_v4.xml" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="file" path="replace_recovery" />
         <exclude domain="file" path="diagnostics" />
         <exclude domain="file" path="learning" />
+        <exclude domain="file" path="pllab" />
         <exclude domain="sharedpref" path="smart_perceptual_profiles_v4.xml" />
     </device-transfer>
 </data-extraction-rules>
