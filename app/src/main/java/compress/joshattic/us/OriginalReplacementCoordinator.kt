@@ -235,10 +235,14 @@ object OriginalReplacementCoordinator {
      *     from the staged copy, and a restore that cannot be confirmed is reported at risk with
      *     the staged bytes kept.
      *
-     * Between step 3 and the open in step 5 another writer could still change the file. No digest
-     * or size check can close that through a content provider; what this guarantees is that such
-     * a change is never lost silently: the staged copy holds the verified original, and the write
-     * is confirmed against the output afterwards.
+     * What this does not protect: a change another writer makes between step 3 and the open in
+     * step 5. That change is overwritten and is not kept anywhere. The staged copy holds the bytes
+     * verified in step 3, not the newer ones, and the read-back in step 5 confirms the output, which
+     * says nothing about what the write replaced. A content provider offers no compare-and-swap, so
+     * no digest or size check here can close that window; step 3 only keeps it short (it opens after
+     * certification and closes at the truncating open). Replacement is for files nothing else is
+     * writing, and nothing here is atomic against a concurrent writer
+     * (OriginalReplacementCoordinatorTest.aWriteByAnotherAppAfterStagingIsOverwrittenAndNotKept).
      */
     fun replace(io: OriginalReplacementIo, request: ReplacementRequest, journal: ReplacementJournalSink = ReplacementJournalSink.NONE): ReplacementTransaction =
         run(io, request.expectedOutputBytes, request.expectedSourceBytes, requireBoundSource = true, request.boundSourceDigest, journal)

@@ -240,6 +240,8 @@ class OriginalReplacementCoordinatorTest {
         var file: ByteArray,
         val output: ByteArray,
         val swapBeforeStaging: ByteArray? = null,
+        /** Another app's write after the rollback copy was staged and before the truncating open. */
+        val swapAfterStaging: ByteArray? = null,
         val corruptWrittenByte: Boolean = false,
         val sizeUnknownAfterWrite: Boolean = false,
         val contentUnreadableAfterWrite: Boolean = false,
@@ -259,6 +261,7 @@ class OriginalReplacementCoordinatorTest {
         }
         override fun stagedSourceDigest(): String? = recovery?.let(::sha)
         override fun writeOutputOverOriginal() {
+            swapAfterStaging?.let { file = it.copyOf() }
             opensForWriting++
             file = ByteArray(0) // the truncating open
             if (writeThrowsAfterTruncating) throw java.io.IOException("provider died mid-write")
@@ -319,6 +322,24 @@ class OriginalReplacementCoordinatorTest {
         // The digest is compared as text, whatever its case.
         val upper = ProviderIo(verifiedSource.copyOf(), smallerOutput)
         assertEquals(ReplacementAttempt.Replaced, OriginalReplacementCoordinator.replace(upper, request(digest(verifiedSource).uppercase())).attempt)
+    }
+
+    @Test fun aWriteByAnotherAppAfterStagingIsOverwrittenAndNotKept() {
+        // The limit of what a replacement through a content provider can promise. Another app
+        // writes the file after the rollback copy was staged and checked, and before the truncating
+        // open. Nothing in the transaction can see it: the staged copy matched, the write lands,
+        // and the read-back confirms the output. The other app's bytes are gone, and the staged
+        // copy, which is discarded once the write is confirmed, held the earlier original anyway.
+        val newer = verifiedSource.copyOf().also { it[100] = (it[100] + 1).toByte() }
+        val io = ProviderIo(verifiedSource.copyOf(), smallerOutput, swapAfterStaging = newer)
+        val tx = OriginalReplacementCoordinator.replace(io, request())
+
+        assertEquals(ReplacementAttempt.Replaced, tx.attempt)
+        assertEquals(ReadBack.CONFIRMED, tx.writeReadBack)
+        assertTrue(io.file.contentEquals(smallerOutput))
+        assertEquals("what was staged is the verified original, not the newer write", digest(verifiedSource), tx.stagedDigest)
+        assertFalse(digest(newer) == tx.stagedDigest)
+        assertTrue("and it is discarded once the write is confirmed", io.discarded)
     }
 
     @Test fun aSourceWithNoBoundDigestIsNeverStagedOrOpened() {
