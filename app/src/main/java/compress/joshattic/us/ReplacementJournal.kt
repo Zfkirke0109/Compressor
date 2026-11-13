@@ -114,6 +114,16 @@ object ReplacementJournal {
         fileFor(recoveryCopy).takeIf { it.isFile }?.readText(Charsets.UTF_8)?.let(ReplacementJournalEntry::decode)
     }.getOrNull()
 
+    /**
+     * The journal a replacement writes for [recoveryCopy]: [entry] as STAGING before the copy is
+     * made, then STAGED with the copy's digest before the truncating open.
+     */
+    fun sink(recoveryCopy: File, entry: ReplacementJournalEntry): ReplacementJournalSink = object : ReplacementJournalSink {
+        override fun staging(): Boolean = write(recoveryCopy, entry)
+        override fun staged(stagedDigest: String?, stagedBytes: Long): Boolean =
+            write(recoveryCopy, entry.copy(state = ReplacementJournalEntry.STAGED, stagedSha256 = stagedDigest))
+    }
+
     /** Deletes a rollback copy that is no longer needed, and its entry with it. */
     fun discard(recoveryCopy: File) {
         runCatching { recoveryCopy.delete() }

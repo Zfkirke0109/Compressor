@@ -149,10 +149,21 @@ class CandidateVetoTest {
     fun theFactoryConstructorIsStillPublic() {
         val constructor = BatchCompressorViewModel::class.java.getConstructor(Application::class.java)
         assertTrue(Modifier.isPublic(constructor.modifiers))
-        // The only other constructor is the one that takes a veto.
+        // The only other constructor is the internal one that takes a veto and a harness scope.
         assertEquals(
-            setOf(listOf(Application::class.java), listOf(Application::class.java, CandidateVeto::class.java)),
+            setOf(listOf(Application::class.java), listOf(Application::class.java, CandidateVeto::class.java, HarnessScope::class.java)),
             BatchCompressorViewModel::class.java.declaredConstructors.filterNot { it.isSynthetic }.map { it.parameterTypes.toList() }.toSet()
         )
+    }
+
+    @Test
+    fun theAppNeverRunsItsBatchesUnderAHarnessScope() {
+        // Only an instrumented test makes a scope: the app's batches learn into the user's store and
+        // settle the user's rollback copies at start. The factory constructor leaves it null.
+        assertEquals(emptyList<String>(), occurrences(Regex("""(?<!class )\bHarnessScope\s*\(""")))
+        assertEquals(emptyList<String>(), occurrences(Regex("""(?<!class )\bOverlayProfileStore\s*\(""")))
+        val viewModel = mainSources().single { it.name == "BatchCompressorViewModel.kt" }.readText()
+        assertEquals(1, Regex("""private val harness: HarnessScope\? = null""").findAll(viewModel).count())
+        assertEquals(1, Regex("""if \(harness == null\) recoverInterruptedReplacements\(\)""").findAll(viewModel).count())
     }
 }

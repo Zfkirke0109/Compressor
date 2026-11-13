@@ -258,10 +258,13 @@ data class BatchCompressorUiState(
 class BatchCompressorViewModel internal constructor(
     application: Application,
     // Refuses nothing in the app (CandidateVeto.NONE). Only an instrumented test supplies another.
-    private val candidateVeto: CandidateVeto
+    private val candidateVeto: CandidateVeto,
+    // Null in the app. A device-harness batch learns into its own store and leaves the user's
+    // rollback copies alone (HarnessScope).
+    private val harness: HarnessScope? = null
 ) : AndroidViewModel(application) {
 
-    /** The constructor the app's ViewModel factory uses: no candidate veto. */
+    /** The constructor the app's ViewModel factory uses: no candidate veto, no harness. */
     constructor(application: Application) : this(application, CandidateVeto.NONE)
 
     private val _uiState = MutableStateFlow(BatchCompressorUiState())
@@ -322,13 +325,19 @@ class BatchCompressorViewModel internal constructor(
     // Local-only encode calibration; recommends Perceptually Lossless targets but never bypasses
     // verification. Stored in app SharedPreferences, nothing leaves the device.
     private val learningEngine by lazy {
+        val filesDir = getApplication<Application>().filesDir
         SmartPerceptualProfileEngine(
             // Every learned-state write goes to the running batch's capture, in order, so the
             // batch-start snapshot plus these updates reconstructs the state at any point.
             LearningEvidenceStore(
-                RecordingProfileStore(SmartPerceptualProfileEngine.SharedPreferencesProfileStore(getApplication())) { key, before, after ->
+                RecordingProfileStore(
+                    harness?.learningStore ?: SmartPerceptualProfileEngine.SharedPreferencesProfileStore(getApplication())
+                ) { key, before, after ->
                     activeDiagnostics?.learnedStateUpdate(key, before, after)
-                }, File(getApplication<Application>().filesDir, "learning/evidence-v1.jsonl")
+                },
+                // A harness batch journals beside its own store, never into the user's journal.
+                harness?.let { File(filesDir, "pllab/${it.runLabel}/learning-evidence-v1.jsonl") }
+                    ?: File(filesDir, "learning/evidence-v1.jsonl")
             ) { fields -> activeDiagnostics?.record("learning_evidence",
                 activeDiagnostics?.learningContext?.let { activeDiagnostics?.jobId(it.sourceKey) }, fields) }
         )
@@ -349,7 +358,8 @@ class BatchCompressorViewModel internal constructor(
     private val qualityProber by lazy { PerceptualQualityProber(getApplication()) }
 
     init {
-        recoverInterruptedReplacements()
+        // A harness view model is a test's: settling the user's rollback copies is the app's job.
+        if (harness == null) recoverInterruptedReplacements()
     }
 
     /**
@@ -1180,6 +1190,8 @@ class BatchCompressorViewModel internal constructor(
                 // An instrumented test's batch: attempts may be refused by the test, not by a
                 // measurement. Absent from every batch the app itself runs.
                 if (candidateVeto !== CandidateVeto.NONE) it["testCandidateVeto"] = true
+                // A device-harness batch: its learning is kept apart from the user's (HarnessScope).
+                harness?.let { scope -> it["testHarnessRun"] = scope.runLabel }
             }
         }
         _uiState.value.items.filter { it.isAlreadyCompressed }.forEach { skippedItem ->
@@ -5266,7 +5278,8 @@ class BatchCompressorViewModel internal constructor(
         // The evidence every exit carries: what was asked, on which bytes (by role, redacted), and
         // how far the transaction got. No path, name or URI.
         var outputDigest: String? = null
-        var postWriteDigest: String? = null
+        // The provider IO, once the replacement has one: its last read-back digest goes in the record.
+        var replacementIoForEvidence: ContentResolverReplacementIo? = null
         fun evidence(tx: ReplacementTransaction? = null, copySaved: Boolean? = null, extra: Map<String, Any?> = emptyMap()): Map<String, Any?> =
             linkedMapOf<String, Any?>(
                 "backupRequested" to backupBeforeReplace,
@@ -5276,7 +5289,7 @@ class BatchCompressorViewModel internal constructor(
                 "sourceBeforeDigest" to ReplacementOutcome.redact(boundSourceDigest),
                 "stagedDigest" to ReplacementOutcome.redact(tx?.stagedDigest),
                 "outputDigest" to ReplacementOutcome.redact(outputDigest),
-                "postWriteDigest" to ReplacementOutcome.redact(postWriteDigest),
+                "postWriteDigest" to ReplacementOutcome.redact(replacementIoForEvidence?.postWriteDigest),
                 "stagedBytes" to tx?.stagedBytes,
                 "stagedMatchesSourceBefore" to tx?.stagedMatchesBoundSource,
                 "originalOpenedForWriting" to (tx?.originalWasOpenedForWriting ?: false),
@@ -5401,72 +5414,8 @@ class BatchCompressorViewModel internal constructor(
         try {
         // What the write is confirmed against, and what a later start compares the file with.
         outputDigest = runCatching { outputFile.inputStream().use { ReplacementContentProof.sha256(it) } }.getOrNull()
-        var stagedDigest: String? = null
-        val replacementIo = object : OriginalReplacementIo {
-            // One pass: the bytes are digested as they are copied, so the digest is of exactly
-            // what the recovery file holds and costs no second read of the original.
-            override fun stageRecoveryCopy(): Long {
-                val md = java.security.MessageDigest.getInstance("SHA-256")
-                val opened = context.contentResolver.openInputStream(item.sourceUri)?.use { input ->
-                    recoveryCopy.outputStream().use { output ->
-                        java.security.DigestInputStream(input, md).copyTo(output)
-                        output.fd.sync() // Recovery must be durable before the destructive open.
-                    }
-                }
-                if (opened == null) return -1L
-                stagedDigest = md.digest().joinToString("") { "%02x".format(it) }
-                return recoveryCopy.length()
-            }
-
-            override fun stagedSourceDigest(): String? = stagedDigest
-
-            override fun writeOutputOverOriginal() {
-                context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
-                    outputFile.inputStream().use { input -> input.copyTo(out) }
-                    // Best-effort durability so the size read-back reflects committed bytes.
-                    runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
-                } ?: error("Could not open original for writing")
-            }
-
-            override fun readBackOriginalSize(): Long =
-                context.contentResolver.openFileDescriptor(item.sourceUri, "r")?.use { it.statSize } ?: -1L
-
-            override fun restoreOriginalFromRecovery() {
-                context.contentResolver.openOutputStream(item.sourceUri, "rwt")?.use { out ->
-                    recoveryCopy.inputStream().use { input -> input.copyTo(out) }
-                    runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
-                } ?: error("Could not reopen original to restore it")
-            }
-
-            override fun recoveryCopyLength(): Long = recoveryCopy.length()
-
-            override fun discardRecoveryCopy() = ReplacementJournal.discard(recoveryCopy)
-
-            // Content proof: the original read back through the provider, digested and compared
-            // with the file it should now hold. A size match cannot catch equal-length corruption.
-            private fun sourceDigest(): String? = runCatching {
-                context.contentResolver.openInputStream(item.sourceUri)?.use { ReplacementContentProof.sha256(it) }
-            }.getOrNull()
-
-            private fun proof(expected: String?, actual: String?) = when {
-                expected == null || actual == null -> ContentProof.UNAVAILABLE
-                expected == actual -> ContentProof.MATCH
-                else -> ContentProof.MISMATCH
-            }
-
-            override fun writtenOutputProof(): ContentProof {
-                val readBack = sourceDigest()
-                postWriteDigest = readBack
-                return proof(outputDigest, readBack)
-            }
-
-            override fun restoredOriginalProof(): ContentProof =
-                proof(runCatching { recoveryCopy.inputStream().use { ReplacementContentProof.sha256(it) } }.getOrNull(), sourceDigest())
-
-            override fun writtenOutputMatches(): Boolean = writtenOutputProof() == ContentProof.MATCH
-
-            override fun restoredOriginalMatches(): Boolean = restoredOriginalProof() == ContentProof.MATCH
-        }
+        val replacementIo = ContentResolverReplacementIo(context.contentResolver, item.sourceUri, outputFile, recoveryCopy, outputDigest)
+        replacementIoForEvidence = replacementIo
 
         val expectedLength = outputFile.length()
         // Beside the recovery copy, durably, before the original is opened: which file the copy
@@ -5477,11 +5426,7 @@ class BatchCompressorViewModel internal constructor(
             sourceBytes = item.originalSize, boundSourceSha256 = boundSourceDigest, stagedSha256 = null,
             outputBytes = expectedLength, outputSha256 = outputDigest, createdAtMs = System.currentTimeMillis()
         )
-        val journal = object : ReplacementJournalSink {
-            override fun staging(): Boolean = ReplacementJournal.write(recoveryCopy, journalEntry)
-            override fun staged(stagedDigest: String?, stagedBytes: Long): Boolean =
-                ReplacementJournal.write(recoveryCopy, journalEntry.copy(state = ReplacementJournalEntry.STAGED, stagedSha256 = stagedDigest))
-        }
+        val journal = ReplacementJournal.sink(recoveryCopy, journalEntry)
         // The recovery copy must hold the whole original (item.originalSize, as indexed) and equal
         // the digest bound when the item began, before the truncating write may begin.
         val transaction = OriginalReplacementCoordinator.replace(

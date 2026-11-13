@@ -48,10 +48,11 @@ import java.security.MessageDigest
  *
  * What it changes on the device, and puts back: the opt-in safer-rung retry switch. It reads a
  * copy of the clip in the app's cache; Replace Originals must be off and is asserted off. Each
- * batch writes its usual diagnostics session, marked `testCandidateVeto`, and the real second
- * encode's result reaches the learned profile exactly as it would in the app. The refused attempt
- * writes nothing there. Starting a batch clears the app's cached outputs, as it does in the app:
- * run it when no results are waiting to be saved.
+ * batch writes its usual diagnostics session, marked `testCandidateVeto` and `testHarnessRun`. It
+ * plans from the user's learned state and learns into a store of its own (HarnessScope): the real
+ * second encode's result is recorded and learned there, exactly as the app would learn it, and the
+ * user's profile is never written. The refused attempt writes nothing. Starting a batch clears
+ * the app's cached outputs, as it does in the app: run it when no results are waiting to be saved.
  *
  *   scripts/device/run-device-checks.sh --fallback CLIP.mp4 [ANDROID_USER]
  */
@@ -108,7 +109,6 @@ class SaferRungFallbackDeviceTest {
         return source
     }
 
-    /** One finished batch over [source]: its session records and what it left behind. */
     /**
      * The row says which attempt ran and why, in the item's own numbering (the batch-wide token of
      * the retry is higher), and that a test, not a measurement, refused the first candidate.
@@ -120,6 +120,7 @@ class SaferRungFallbackDeviceTest {
         println("b287-fallback row: ${context!!.label}: ${context.reason}; status=${batch.row.status} terminal=${batch.row.terminalResult}")
     }
 
+    /** One finished batch over [source]: its session records and what it left behind. */
     private class Batch(
         val records: List<JSONObject>, val job: JSONObject, val stages: List<JSONObject>,
         val refused: List<Pair<Int, Double>>, val leftovers: List<File>,
@@ -175,7 +176,11 @@ class SaferRungFallbackDeviceTest {
             } else null
         }
         val startedAt = System.currentTimeMillis()
-        val vm = BatchCompressorViewModel(context.applicationContext as Application, veto).also { running = it }
+        // The batch plans from the user's learned state and learns into a store of its own: a test's
+        // encodes never change what the user's next batch is planned from (HarnessScope).
+        val app = context.applicationContext as Application
+        val scope = HarnessScope("fallback-$startedAt", OverlayProfileStore(SmartPerceptualProfileEngine.SharedPreferencesProfileStore(app)))
+        val vm = BatchCompressorViewModel(app, veto, scope).also { running = it }
         instrumentation.runOnMainSync {
             vm.setQuality("Perceptually Lossless")
             vm.setExhaustivePerceptualLossless(true)
@@ -348,7 +353,7 @@ class SaferRungFallbackDeviceTest {
             assertTrue("the accepted output is not smaller than its source", outputSize in 1 until batch.job.getLong("sourceSize"))
             // One file remains, the accepted output: the refused candidate is gone.
             assertEquals(listOf(outputSize), batch.leftovers.map { it.length() })
-            // The real result, and only it, reached the learned profile.
+            // The real result, and only it, reached the (test's own) learned state.
             assertTrue(batch.learnedUpdates.any { it.optInt("attemptIndex", -1) == 2 })
         } else {
             // A real rejection of the second encode, by whichever production rule made it: nothing

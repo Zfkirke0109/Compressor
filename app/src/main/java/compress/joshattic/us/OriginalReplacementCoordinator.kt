@@ -386,3 +386,92 @@ object ReplacementContentProof {
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
 }
+
+/**
+ * The device's replacement IO: the target written through its content provider, a private rollback
+ * copy on the app's own storage, and SHA-256 content proofs read back through the provider. The
+ * coordinator decides; this only moves bytes. The app's replacement and the device harness, which
+ * runs it on disposable copies only, use the same class.
+ *
+ * @param outputDigest SHA-256 of [outputFile]; null when it could not be read, and then no write
+ *   can be confirmed.
+ */
+internal class ContentResolverReplacementIo(
+    private val resolver: android.content.ContentResolver,
+    private val target: android.net.Uri,
+    private val outputFile: java.io.File,
+    private val recoveryCopy: java.io.File,
+    private val outputDigest: String?
+) : OriginalReplacementIo {
+    /** The rollback copy's digest, taken while it was copied; null before staging or when it failed. */
+    var stagedDigest: String? = null
+        private set
+
+    /** The target's digest as last read back after a write; for the record. */
+    var postWriteDigest: String? = null
+        private set
+
+    // One pass: the bytes are digested as they are copied, so the digest is of exactly what the
+    // recovery file holds and costs no second read of the original.
+    override fun stageRecoveryCopy(): Long {
+        val md = java.security.MessageDigest.getInstance("SHA-256")
+        val opened = resolver.openInputStream(target)?.use { input ->
+            recoveryCopy.outputStream().use { output ->
+                java.security.DigestInputStream(input, md).copyTo(output)
+                output.fd.sync() // Recovery must be durable before the destructive open.
+            }
+        }
+        if (opened == null) return -1L
+        stagedDigest = md.digest().joinToString("") { "%02x".format(it) }
+        return recoveryCopy.length()
+    }
+
+    override fun stagedSourceDigest(): String? = stagedDigest
+
+    override fun writeOutputOverOriginal() {
+        resolver.openOutputStream(target, "rwt")?.use { out ->
+            outputFile.inputStream().use { input -> input.copyTo(out) }
+            // Best-effort durability so the size read-back reflects committed bytes.
+            runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
+        } ?: error("Could not open original for writing")
+    }
+
+    override fun readBackOriginalSize(): Long =
+        resolver.openFileDescriptor(target, "r")?.use { it.statSize } ?: -1L
+
+    override fun restoreOriginalFromRecovery() {
+        resolver.openOutputStream(target, "rwt")?.use { out ->
+            recoveryCopy.inputStream().use { input -> input.copyTo(out) }
+            runCatching { (out as? java.io.FileOutputStream)?.fd?.sync() }
+        } ?: error("Could not reopen original to restore it")
+    }
+
+    override fun recoveryCopyLength(): Long = recoveryCopy.length()
+
+    override fun discardRecoveryCopy() = ReplacementJournal.discard(recoveryCopy)
+
+    // Content proof: the target read back through the provider, digested and compared with the
+    // file it should now hold. A size match cannot catch equal-length corruption.
+    private fun targetDigest(): String? = runCatching {
+        resolver.openInputStream(target)?.use { ReplacementContentProof.sha256(it) }
+    }.getOrNull()
+
+    private fun proof(expected: String?, actual: String?) = when {
+        expected == null || actual == null -> ContentProof.UNAVAILABLE
+        expected == actual -> ContentProof.MATCH
+        else -> ContentProof.MISMATCH
+    }
+
+    override fun writtenOutputProof(): ContentProof {
+        val readBack = targetDigest()
+        postWriteDigest = readBack
+        return proof(outputDigest, readBack)
+    }
+
+    override fun restoredOriginalProof(): ContentProof =
+        proof(runCatching { recoveryCopy.inputStream().use { ReplacementContentProof.sha256(it) } }.getOrNull(), targetDigest())
+
+    override fun writtenOutputMatches(): Boolean = writtenOutputProof() == ContentProof.MATCH
+
+    override fun restoredOriginalMatches(): Boolean = restoredOriginalProof() == ContentProof.MATCH
+}
