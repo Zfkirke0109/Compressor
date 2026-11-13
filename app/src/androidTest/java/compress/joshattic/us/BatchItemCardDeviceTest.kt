@@ -18,7 +18,10 @@ import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.graphics.asAndroidBitmap
+import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
@@ -83,6 +86,17 @@ class BatchItemCardDeviceTest {
         compose.waitForIdle()
     }
 
+    /**
+     * The rendered row as a PNG in files/pllab/ui-evidence/, for the harness to collect: what the
+     * states look like at this width and text size. Synthetic rows only.
+     */
+    private fun evidence(name: String) {
+        val dir = java.io.File(androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().targetContext.filesDir, "pllab/ui-evidence")
+        dir.mkdirs()
+        val bitmap = compose.onRoot().captureToImage().asAndroidBitmap()
+        java.io.File(dir, "$name.png").outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+    }
+
     @Composable
     private fun Narrow(fontScale: Float, widthDp: Int, content: @Composable () -> Unit) {
         val density = LocalDensity.current
@@ -106,6 +120,7 @@ class BatchItemCardDeviceTest {
         compose.onNodeWithTag(ItemCardTags.PHASE).performScrollTo().assertIsDisplayed().assertTextEquals("Verifying output")
         compose.onNodeWithText("Finalizing: writing the source's metadata into the output…").assertDoesNotExist()
         compose.onNodeWithTag(ItemCardTags.DETAIL).assertDoesNotExist()
+        evidence("verifying-after-finalizing")
     }
 
     @Test
@@ -127,6 +142,7 @@ class BatchItemCardDeviceTest {
             compose.onNodeWithTag(ItemCardTags.STATUS).assert(
                 SemanticsMatcher.expectValue(SemanticsProperties.ContentDescription, listOf("Status: Encoding 3%"))
             )
+            evidence("retry-encoding-300dp-text${(scale * 100).toInt()}")
         }
     }
 
@@ -136,6 +152,7 @@ class BatchItemCardDeviceTest {
             terminalResult = BatchTerminalResult.TRANSCODED_SMALLER)
         show(ready)
         compose.onNodeWithText("Original untouched; copy ready in the app, not saved yet").performScrollTo().assertIsDisplayed()
+        evidence("copy-ready")
         show(ready.copy(galleryCopySaved = true))
         compose.onNodeWithText("Original untouched; copy saved to the gallery").assertExists()
         show(item(BatchItemStatus.SavedCopy).copy(replacementOutcome = ReplacementOutcome.AT_RISK_RECOVERY_RETAINED,
@@ -143,6 +160,7 @@ class BatchItemCardDeviceTest {
         compose.onNodeWithTag(ItemCardTags.ORIGINAL_STATUS).performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Original may be incomplete", substring = true).assertExists()
         compose.onNodeWithText("In-place replacement failed", substring = true).assertExists()
+        evidence("replacement-left-original-incomplete")
     }
 
     private fun lossyRecommendation() = CompressionRecommendation(
@@ -162,6 +180,7 @@ class BatchItemCardDeviceTest {
         compose.onNodeWithText("not measured", substring = true).assertExists()
         compose.onNodeWithText("Applies to the whole batch, not only this file:").assertExists()
         compose.onNodeWithText("• Quality: Perceptually Lossless → High Quality (lossy)").assertExists()
+        evidence("suggestion-open")
         compose.onNodeWithTag(ItemCardTags.APPLY_TO_BATCH).performScrollTo().performClick()
         compose.onNodeWithText("Change the whole batch?").assertIsDisplayed()
         compose.onNodeWithText("Cancel").performClick()

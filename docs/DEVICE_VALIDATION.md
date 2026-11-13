@@ -648,6 +648,9 @@ What runs, and what each case shows:
 - `CorpusBatchDeviceTest`: one copy-mode batch over copies of every B, recording what each item
   ended as, with no expectation that any compresses.
 - `SaferRungFallbackDeviceTest` (`--fallback-baseline K`), on a B that selects a marginal trial.
+- `app-checks`, needing no media: `GalleryPublicationDeviceTest` (a save counts only when one row
+  is published and reads back whole; a refused save leaves no row) and `BatchItemCardDeviceTest`
+  (the row's states at 300 dp and 100-200 % text, saved as PNGs of synthetic rows for the report).
 
 The fixture is 12 s of 1080p30 H.264 without B-frames and mono AAC whose 575,488 samples are a
 whole number of frames, written on a 48 kHz movie timescale: encoder delay 1,024 and end padding 0

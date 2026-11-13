@@ -23,7 +23,7 @@
 #   safe-copy-harness.sh [--serial S] stage --source-id ID [--source-id ID ...] [--dry-run]
 #   safe-copy-harness.sh [--serial S] verify-protection --run RUN [--final]
 #   safe-copy-harness.sh [--serial S] fixture --run RUN
-#   safe-copy-harness.sh [--serial S] run-copy-tests --run RUN --cases padding-repair,batch-replace,corpus[,fallback] [--fallback-baseline K]
+#   safe-copy-harness.sh [--serial S] run-copy-tests --run RUN --cases app-checks,padding-repair,batch-replace,corpus[,fallback] [--fallback-baseline K]
 #   safe-copy-harness.sh [--serial S] run-replacement-tests --run RUN --disposable-only
 #   safe-copy-harness.sh [--serial S] collect --run RUN
 #   safe-copy-harness.sh [--serial S] all --source-id ID [...] [--fallback-baseline K]
@@ -310,7 +310,11 @@ cmd_run_copy_tests() {
         [ -n "$fpath" ] || die "no B in this run" 2
         instrument "$case" "$TEST_PACKAGE.CorpusBatchDeviceTest" -e pllabRunId "$RUN" -e pllabBaselines "$fpath"
         ;;
-      *) die "unknown case: $case (padding-repair, batch-replace, fallback, corpus)" 64 ;;
+      app-checks)
+        # Needs no media: gallery publication with test-made bytes, and the batch row's states.
+        instrument "$case" "$TEST_PACKAGE.GalleryPublicationDeviceTest,$TEST_PACKAGE.BatchItemCardDeviceTest"
+        ;;
+      *) die "unknown case: $case (app-checks, padding-repair, batch-replace, corpus, fallback)" 64 ;;
     esac
     verify_protection "after-$case"
   done
@@ -346,7 +350,13 @@ cmd_collect() {
   local host report
   host=$(host_run "$RUN"); report="$host/report.txt"
   adb exec-out run-as "$PKG" cat "files/pllab/$RUN/results.jsonl" >"$host/results.jsonl" 2>/dev/null || true
-  adb logcat -d -s System.out:I 2>/dev/null | tr -d '\r' | grep -E 'pllab-(result|batch)|b287-fallback' >"$host/printed.txt" || true
+  adb logcat -d -s System.out:I 2>/dev/null | tr -d '\r' | grep -E 'pllab-(result|batch)|b287-fallback|gallery-publication' >"$host/printed.txt" || true
+  # The rendered row states (synthetic rows only), as PNGs.
+  local png
+  mkdir -p "$host/ui-evidence"
+  for png in $(dsh run-as "$PKG" ls -1 files/pllab/ui-evidence | grep -E '^[A-Za-z0-9_-]+\.png$'); do
+    adb exec-out run-as "$PKG" cat "files/pllab/ui-evidence/$png" >"$host/ui-evidence/$png" 2>/dev/null || true
+  done
   {
     say "safe-copy harness run $RUN on $MODEL (API $SDK), app $APP_VERSION"
     say ""
@@ -408,7 +418,7 @@ case "$COMMAND" in
     cmd_stage
     verify_protection initial
     cmd_fixture
-    CASES="padding-repair,batch-replace,corpus${FALLBACK_K:+,fallback}"
+    CASES="app-checks,padding-repair,batch-replace,corpus${FALLBACK_K:+,fallback}"
     cmd_run_copy_tests
     DISPOSABLE_ONLY=true
     cmd_run_replacement_tests

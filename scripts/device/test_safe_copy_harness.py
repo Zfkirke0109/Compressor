@@ -134,6 +134,8 @@ class SafeCopyHarnessTest(unittest.TestCase):
         (self.fake / "device" / "DCIM" / "Camera").mkdir(parents=True)
         (self.fake / "app" / "cache" / "batch_compressed_videos").mkdir(parents=True)
         (self.fake / "app" / "files" / "replace_recovery").mkdir(parents=True)
+        (self.fake / "app" / "files" / "pllab" / "ui-evidence").mkdir(parents=True)
+        (self.fake / "app" / "files" / "pllab" / "ui-evidence" / "retry.png").write_bytes(b"\x89PNG fake")
         self.bin = self.tmp / "bin"; self.bin.mkdir()
         adb = self.bin / "adb"; adb.write_text(FAKE_ADB); adb.chmod(0o755)
         self.home = self.tmp / "home"
@@ -389,14 +391,16 @@ class SafeCopyHarnessTest(unittest.TestCase):
         proc = self.run_harness("all", "--source-id", "41")
         self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
         order = [line.split(":", 1)[1].strip() for line in proc.stdout.splitlines() if line.startswith(("case ", "protected ", "fixture ", "staged "))]
-        labels = [o.split(" ")[0] if o.startswith(("padding", "batch", "corpus", "replacement", "death", "recover")) else o for o in order]
+        labels = [o.split(" ")[0] if o.startswith(("app-checks", "padding", "batch", "corpus", "replacement", "death", "recover")) else o for o in order]
         self.assertTrue(labels[0].startswith("A1 -> B1"), labels)
         self.assertIn("every A and B unchanged (initial)", labels[1])
         self.assertTrue(labels[2].startswith("F-padding.mp4"), labels)
-        names = ("padding-repair", "batch-replace", "corpus", "replacement-B1", "death-B1", "recover-1-B1", "recover-2-B1")
+        names = ("app-checks", "padding-repair", "batch-replace", "corpus", "replacement-B1", "death-B1", "recover-1-B1", "recover-2-B1")
         cases = [l for l in labels if l in names]
         self.assertEqual(list(names), cases)
         self.assertIn("every A and B unchanged (final)", labels[-1])
+        # The rendered states the card test saved are collected beside the report.
+        self.assertEqual(["retry.png"], sorted(p.name for p in (self.home / proc.stdout.split("run          : ")[1].split()[0] / "ui-evidence").iterdir()))
         self.assertEqual(self.a_sha, hashlib.sha256(self.a.read_bytes()).hexdigest())
 
 
