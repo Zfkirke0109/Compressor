@@ -438,9 +438,11 @@ source's padding. So:
   it still differs, the original is kept, as before.
 - The first timestamp repair, which required identical audio before it started, also starts from
   a copy that differs only in end padding: the one rewrite puts both right.
-- Neither is tried on a file the platform's muxer has already written (a source with a location,
-  whose metadata remux ran). Its padding is what that muxer writes, and writing it again changes
-  nothing.
+- A padding difference is a starting point only on Media3's own file. When the platform's muxer
+  has already written the candidate (a source with a location, whose metadata remux ran), its
+  padding is what that muxer writes, and writing it again changes nothing: such a candidate is
+  judged as it is. The first timestamp repair still runs on such a file when its audio is
+  identical, as it always did.
 - The record says what was done: a `finalize` stage with operation `restore_audio_end_padding`,
   or `restoredAudioEndPadding` on the first timestamp repair's, each with the padding before the
   rewrite and the source's. A copy the verifier still refuses reads "end padding differs (source
