@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """The device scoring controls come out in profiles a phone decodes, and check themselves."""
 import hashlib
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 import make_scoring_controls as controls
 
@@ -41,6 +45,34 @@ class RulesTest(unittest.TestCase):
         self.assertIn('libx265', controls.LOSSLESS)
         self.assertNotIn('libx264', controls.LOSSLESS)
         self.assertIn('yuv420p', controls.LOSSLESS)
+
+    def test_a_tool_that_finishes_returns_what_it_printed(self):
+        self.assertEqual('ok\n', controls.run(sys.executable, '-c', 'print("ok")'))
+        with self.assertRaises(subprocess.CalledProcessError): controls.run(sys.executable, '-c', 'raise SystemExit(3)')
+
+    def test_a_tool_that_never_finishes_is_stopped_and_named(self):
+        # Android CI #309: a control job sat for ten minutes with one ffmpeg process that never
+        # exited, until the run was cancelled. No command here had a time limit. A stuck tool now
+        # fails the run by name, and is not left running behind it.
+        stuck = "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); time.sleep(600)"
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_file = Path(tmp) / 'pid'
+            started = time.monotonic()
+            with mock.patch.object(controls, 'TOOL_TIMEOUT_S', 2), \
+                    self.assertRaisesRegex(TimeoutError, r'did not finish within 2 s: .* -c import os') as raised:
+                controls.run(sys.executable, '-c', stuck, pid_file)
+            self.assertLess(time.monotonic() - started, 60)
+            self.assertIn(sys.executable, str(raised.exception))
+            # run() comes back only once the tool has been killed and reaped.
+            with self.assertRaises(ProcessLookupError): os.kill(int(pid_file.read_text()), 0)
+
+    def test_every_command_the_generator_runs_has_the_time_limit(self):
+        # The generator reaches its tools only through run(): a direct subprocess call would be unbounded again.
+        source = Path(controls.__file__).read_text()
+        self.assertEqual(1, source.count('subprocess.run('))
+        for unbounded in ('subprocess.check_output(', 'subprocess.Popen(', 'subprocess.call(', 'subprocess.check_call(', 'os.system('):
+            self.assertNotIn(unbounded, source)
+        self.assertIn('timeout=TOOL_TIMEOUT_S', source)
 
 
 @unittest.skipUnless(HAVE_ENCODERS, 'requires ffmpeg and ffprobe with libx264 and libx265')

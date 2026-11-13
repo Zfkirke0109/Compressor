@@ -181,6 +181,10 @@ jobs:
 
   offline-scoring-controls:
     runs-on: ubuntu-latest
+    # About 45 seconds when it works. In run #309 one of these sat for ten minutes on an ffmpeg
+    # process that never exited, with nothing to stop it short of GitHub's six-hour default. The
+    # scripts now stop a stuck tool themselves; this is the bound for whatever they do not cover.
+    timeout-minutes: 15
     strategy:
       matrix:
         include:

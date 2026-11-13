@@ -11,7 +11,7 @@ import tempfile
 import unittest
 import scoring_parity as parity
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'device'))
-from make_scoring_controls import make
+from make_scoring_controls import make, TOOL_TIMEOUT_S
 
 
 @unittest.skipUnless(os.environ.get('COMPRESSOR_VMAF_BIN'),'requires pinned libvmaf; not an Android parity result')
@@ -22,8 +22,10 @@ class RealParityControls(unittest.TestCase):
         make(cls.root)
         pts,fmt,(w,h),_=parity.inspect_video(cls.root/'source.mp4')
         chosen=[max(i for i,p in enumerate(pts) if p<1000000)]+[i for i,p in enumerate(pts) if 1000000<=p<5000000]
-        raw=subprocess.check_output(['ffmpeg','-v','error','-i',str(cls.root/'source.mp4'),'-vf',parity.select_filter(chosen),
-            '-vsync','0','-pix_fmt',fmt,'-f','rawvideo','pipe:1'])
+        # Bounded like the generator's own commands: a decode of the six-second source that has not
+        # finished in that time never will, and without a limit it holds the job until it is cancelled.
+        raw=subprocess.check_output(['ffmpeg','-nostdin','-v','error','-i',str(cls.root/'source.mp4'),'-vf',parity.select_filter(chosen),
+            '-vsync','0','-pix_fmt',fmt,'-f','rawvideo','pipe:1'],stdin=subprocess.DEVNULL,timeout=TOOL_TIMEOUT_S)
         size=w*h*3//2
         cls.header=dict(type='header',schemaVersion=1,model='vmaf_v0.6.1',modelJsonSha256=parity.sha_file(os.environ['COMPRESSOR_VMAF_MODEL']),
             phoneTransform=False,width=w,height=h,p5Method='sorted[floor((n-1)*0.05)]',meanGate=95.5,p5Gate=91.,minGate=84.,minFrames=12,
@@ -54,7 +56,8 @@ class RealParityControls(unittest.TestCase):
         binary=os.environ['COMPRESSOR_VMAF_BIN']
         return parity.compare(argparse.Namespace(trace=cls.root/'trace.jsonl',reference=cls.root/'source.mp4',candidate=cls.root/candidate,
             model=os.environ['COMPRESSOR_VMAF_MODEL'],model_sha256=cls.header['modelJsonSha256'],vmaf_bin=binary,
-            lib_version=os.environ['COMPRESSOR_VMAF_VERSION'],tool_version=subprocess.check_output([binary,'--version'],text=True,stderr=subprocess.STDOUT).strip(),
+            lib_version=os.environ['COMPRESSOR_VMAF_VERSION'],tool_version=subprocess.check_output([binary,'--version'],text=True,stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,timeout=TOOL_TIMEOUT_S).strip(),
             out=cls.root/out,reference_pts_offset_us=0,candidate_pts_offset_us=0,pts_tolerance_us=1,score_tolerance=.0001))
 
     def setUp(self): self.write_trace()

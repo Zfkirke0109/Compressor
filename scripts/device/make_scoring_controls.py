@@ -25,10 +25,20 @@ import subprocess
 DECODABLE_PROFILES = {('h264', 'Constrained Baseline'), ('h264', 'Main'), ('h264', 'High'), ('hevc', 'Main')}
 LOSSLESS = ['-c:v', 'libx265', '-x265-params', 'lossless=1:log-level=error', '-pix_fmt', 'yuv420p', '-tag:v', 'hvc1']
 DELETED_FRAME = 90
+# Every command here finishes in about a second: the source is 192x128 and six seconds long. A
+# tool still running after this long is not going to finish, and a caller that waits for it holds
+# its CI job until someone cancels the run.
+TOOL_TIMEOUT_S = 120
 
 
 def run(tool, *args):
-    return subprocess.run([tool, *map(str, args)], check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True).stdout
+    command = [tool, *map(str, args)]
+    try:
+        return subprocess.run(command, check=True, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=TOOL_TIMEOUT_S).stdout
+    except subprocess.TimeoutExpired:
+        # subprocess.run has killed and reaped the tool. Name the command: the log is all a CI run leaves.
+        raise TimeoutError('%s did not finish within %g s: %s' % (tool, TOOL_TIMEOUT_S, ' '.join(command))) from None
 
 
 def video_stream(path):
