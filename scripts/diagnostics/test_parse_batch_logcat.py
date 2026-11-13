@@ -153,6 +153,55 @@ class ParseBatchLogcatTest(unittest.TestCase):
         self.assertEqual("TRANSCODED_SMALLER", jobs[0]["terminal"])
         self.assertEqual(1, aggregate["real_compression_count"])
 
+    def test_certification_fields_survive_ingestion_so_a_measurement_is_not_read_as_not_run(self):
+        # research/perceptual_calibration's label basis reads these three fields off the parsed
+        # jobs. They used to be dropped here, so a measured pass and a measured failure both came
+        # out as "not_run".
+        def job(job_id, terminal, **fields):
+            return "I CompressorDiag: " + json.dumps({
+                "batchId": "bc", "type": "job", "timestampMs": 2, "id": job_id, "nameHash": job_id[-6:], "ext": "mp4",
+                "sourceMime": "video/avc", "requestedMode": "Perceptually Lossless",
+                "effectiveMode": "Perceptually Lossless", "plannedOutputMime": "video/hevc",
+                "sourceSize": 100, "outputSize": 80, "terminal": terminal, "countsAsRealCompression": terminal == "TRANSCODED_SMALLER",
+                **fields,
+            })
+        records = [
+            'I CompressorDiag: {"batchId":"bc","type":"session_start","schema":1,"timestampMs":1,"selectedCount":4}',
+            job("job_aaaaaaaaaaaa", "TRANSCODED_SMALLER", certificationDecision="passed", certificationStatus="ran_scored",
+                structuralVerified=True, verified=True),
+            job("job_bbbbbbbbbbbb", "SKIPPED_WOULD_DEGRADE", certificationDecision="measured_below_bar",
+                certificationStatus="ran_scored", structuralVerified=True, verified=False),
+            job("job_cccccccccccc", "UNEXPECTED_REMUX", certificationDecision="unavailable", certificationStatus="ran_unavailable",
+                structuralVerified=True, verified=False),
+            job("job_dddddddddddd", "UNEXPECTED_REMUX", certificationStatus="skipped_hdr_not_pixel_validated", verified=False),
+            'I CompressorDiag: {"batchId":"bc","type":"session_summary","timestampMs":3,"processed":4,"realCompressions":1}',
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            log = root / "logcat.txt"
+            out = root / "out"
+            log.write_text("\n".join(records), encoding="utf-8")
+            subprocess.run([sys.executable, str(SCRIPT), str(log), "--out", str(out)], check=True, capture_output=True, text=True)
+            jobs = {j["id"]: j for j in map(json.loads, (out / "jobs.jsonl").read_text(encoding="utf-8").splitlines())}
+            aggregate = json.loads((out / "aggregate.json").read_text(encoding="utf-8"))
+        self.assertEqual("passed", jobs["job_aaaaaaaaaaaa"]["certificationDecision"])
+        self.assertEqual("ran_scored", jobs["job_bbbbbbbbbbbb"]["certificationStatus"])
+        self.assertIs(True, jobs["job_bbbbbbbbbbbb"]["structuralVerified"])
+        self.assertEqual(0, aggregate["structured_ignored_field_count"])
+        # The consumer's reading of the parsed rows.
+        basis_path = SCRIPT.resolve().parents[2] / "research" / "perceptual_calibration" / "scripts" / "label_basis.py"
+        spec = importlib.util.spec_from_file_location("label_basis_under_test", basis_path)
+        basis = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(basis)
+        self.assertEqual(
+            {"job_aaaaaaaaaaaa": "adequate", "job_bbbbbbbbbbbb": "adequate", "job_cccccccccccc": "unavailable",
+             "job_dddddddddddd": "not_run"},
+            {job_id: basis.measurement_status(row) for job_id, row in jobs.items()},
+        )
+        # A structurally verified candidate that was rejected is not a structural failure.
+        self.assertEqual("passed", basis.structural_status(jobs["job_bbbbbbbbbbbb"]))
+        self.assertEqual("failed", basis.structural_status(jobs["job_dddddddddddd"]))
+
     def test_disallowed_structured_fields_are_dropped_and_counted(self):
         # Privacy: a structured record carrying sensitive keys must have them dropped from every
         # derived artifact AND reported as ignored so silent truncation is visible.

@@ -1,0 +1,71 @@
+{
+  "schema": "compressor_experiment_manifest/1",
+  "experimentId": "b177-pilot-1",
+  "purpose": "One-factor-at-a-time encoder operating-point pilot under the FROZEN production gate. Measures accepted bytes; changes no threshold.",
+  "frozenGate": {
+    "verdictModel": "vmaf_v0.6.1",
+    "phoneModel": false,
+    "windowMeanMin": 95.5,
+    "windowP5Min": 91.0,
+    "windowMinMin": 84.0,
+    "probeSelectionMargins": {"mean": 0.5, "p5": 1.25, "min": 1.0},
+    "minComparedFramesPerWindow": 12
+  },
+  "baselineEvidence": {
+    "note": "Observational only: both runs are logs of the same 226 sources with different learned states; not a controlled A/B.",
+    "runs": [
+      {"label": "b177_PL-A", "batchId": "batch_1790443993165", "buildTag": "pr44-b177", "buildCommit": "2b4a2cf",
+       "learnedSnapshotSha256": "f61924791f19e724dcc72955ac8e2f6332e4fb5e684226bbecd8d09f4f8846d4",
+       "settings": {"saferRungRetry": false, "shadowV1": "always (pre-b177 behaviour)", "maxBFrames": 2, "longGop": false}},
+      {"label": "b177_PL-B", "batchId": "batch_1790453977026", "buildTag": "pr44-b177", "buildCommit": "2b4a2cf",
+       "learnedSnapshotSha256": "d6193bd0b54405ce3eb14eaf5af9d068ed94df665ff4a48707e22ef3fe3a244b",
+       "settings": {"saferRungRetry": true, "shadowV1": "always (pre-b177 behaviour)", "maxBFrames": 2, "longGop": false}}
+    ]
+  },
+  "identity": {
+    "sourceMatching": "jobId (URI hash) and nameHash identify NAMES. Before a pilot run, compute full SHA-256 of each local original with `run_experiment.py hash`; the app's job records carry sourceFingerprint (sampled) from this build. Private paths never enter this file.",
+    "requiredBuildTagPrefix": "pr44-",
+    "learnedState": "Record the learned_state_snapshot sha256 at each arm's start. Do not clear app data. Experimental arms learn under their own key suffix (EncoderExperiments.learningKeySuffix), so they neither read nor write the baseline's ratios."
+  },
+  "sources": [
+    {"jobId": "job_9ee0e75ebc4f", "nameHash": "0691d6433187", "sourceBytes": 2350327019, "geometry": "1920x1080", "fps": 30, "role": "largest_rejected", "b177": "probe_rejected margin -1.354"},
+    {"jobId": "job_755b7431c321", "nameHash": "4c4a46139747", "sourceBytes": 1507552582, "geometry": "1920x1080", "fps": 30, "role": "largest_rejected", "b177": "probe_rejected margin -1.198"},
+    {"jobId": "job_9f72a32ccfd1", "nameHash": "a311cb8a224a", "sourceBytes": 1239822684, "geometry": "1920x1080", "fps": 30, "role": "largest_rejected", "b177": "probe_rejected margin -3.232"},
+    {"jobId": "job_add6b83edcab", "nameHash": "aa286d43ec84", "sourceBytes": 1087435878, "geometry": "1080x1350", "fps": 30, "role": "largest_rejected", "b177": "probe_rejected margin -1.860"},
+    {"jobId": "job_675cfc7a183b", "nameHash": "b7ee7dc0f011", "sourceBytes": 686750123, "geometry": "1920x1080", "fps": 60, "role": "high_fps_rejected_control", "b177": "probe_rejected margin -4.448"},
+    {"jobId": "job_83e666c8f930", "nameHash": "6b9c0b7ee064", "sourceBytes": 691692511, "geometry": "1920x1080", "fps": 30, "role": "near_bar_control", "b177": "probe_rejected margin -0.194"},
+    {"jobId": "job_f729253151a6", "nameHash": "db9f5e44909a", "sourceBytes": 742856372, "geometry": "1920x1080", "fps": 30, "role": "winner_regression_control", "b177": "accepted"},
+    {"jobId": "job_a15a8b28f36b", "nameHash": "4c9ef9bffcf6", "sourceBytes": 206433345, "geometry": "1080x1920", "fps": 30, "role": "winner_regression_control", "b177": "accepted"},
+    {"jobId": "job_458aa0663c3e", "nameHash": "d0631e6e5b58", "sourceBytes": 73612248, "geometry": "2160x3840", "fps": 30, "role": "long_scoring_timing_case", "b177": "accepted; 203,049 ms in PL-A, 1,430,434 ms in PL-B"},
+    {"jobId": "job_478c2fa19100", "nameHash": "4bf7f7e2b133", "sourceBytes": 16753345, "geometry": "1356x760", "fps": 10, "role": "retry_case", "b177": "accepted after the .90 retry in PL-B"}
+  ],
+  "hdrTrack": {
+    "status": "separate; not part of this pilot",
+    "sources": ["job_95ab2107feeb", "job_52fa956a2a48"],
+    "prerequisite": "research/hdr_measurement_basis harness fixed in b177 (F7). Needs the two originals and the HQ outputs; PQ/HLG and dynamic metadata identified first. No PL promotion from size or a single DeltaE threshold."
+  },
+  "arms": [
+    {"id": "A0", "label": "baseline", "changes": {}, "settings": {"maxBFrames": 2, "longGop": false, "saferRungRetry": true, "shadowCalibration": false},
+     "status": "not run: needs the S23 Ultra, user 150, and the originals"},
+    {"id": "A1", "label": "long_gop_x2", "changes": {"longGop": true}, "settings": {"maxBFrames": 2, "longGop": true, "saferRungRetry": true, "shadowCalibration": false},
+     "status": "not run: needs the device"},
+    {"id": "A2", "label": "b_frames_off", "changes": {"maxBFrames": 0}, "settings": {"maxBFrames": 0, "longGop": false, "saferRungRetry": true, "shadowCalibration": false},
+     "status": "not run: needs the device"},
+    {"id": "A3", "label": "shadow_calibration_on", "changes": {"shadowCalibration": true}, "settings": {"maxBFrames": 2, "longGop": false, "saferRungRetry": true, "shadowCalibration": true},
+     "purpose": "timing only: acceptance must equal A0's on every source (v1 is never read by the gate)",
+     "status": "not run: needs the device"},
+    {"id": "A0_REPEAT", "label": "baseline_repeat", "repeatOf": "A0", "changes": {}, "settings": {"maxBFrames": 2, "longGop": false, "saferRungRetry": true, "shadowCalibration": false},
+     "status": "not run: repeatability measurement needs the device"}
+  ],
+  "blockedArms": [
+    {"label": "encoder_complexity", "reason": "Media3 1.11 Transformer exposes no KEY_COMPLEXITY request; needs a custom Codec.EncoderFactory. The run_identity encoder inventory will show whether c2.qti.hevc.encoder advertises a complexity range at all."},
+    {"label": "cq_rate_control", "reason": "CQ needs its own quality search (KEY_QUALITY points) and an empirical size model; not implemented. The encoder inventory will show whether CQ is advertised."},
+    {"label": "alternate_device_encoder", "reason": "Only after the encoder inventory enumerates another compatible video encoder."},
+    {"label": "salvage_0.98_0.99", "reason": "Nine near-bar rejects total 3,289,602,779 source bytes; a nominal 2% of that is 65.8 MB. Kept as a later, bounded salvage run."},
+    {"label": "desktop_x265_svt_av1", "reason": "Optional offline route; separately measured, never merged into an on-device claim."}
+  ],
+  "order": ["A0", "A1", "A2", "A3", "A0_REPEAT"],
+  "orderNote": "Same source order in every arm; baseline repeated last to measure repeatability. Device on charge, comparable starting thermal state, screen recording and Perfetto trace on job_458aa0663c3e in the first A0.",
+  "measures": ["acceptedSavedBytes", "incrementalBytesVsBaseline", "sourceBytes", "outputBytes", "measuredFailures", "unavailableEvidence", "attemptsStarted", "retriesStarted", "audioFindings", "wallMs", "peakCandidateBytes"],
+  "stopping": "Extend beyond the pilot only if an arm keeps all regression controls accepted and improves accepted bytes on matched sources. Report the tested frontier if no arm does."
+}

@@ -26,7 +26,7 @@ Real Android devices — especially Samsung phones — produce a lot of log nois
 ## Standard commands
 
 ```
-adb logcat -v time -s CompressorBatch CompressorEncoderPlan CompressorVerification CompressorLearning Transformer MediaCodec
+adb logcat -v time -s CompressorBatch CompressorEncoderPlan CompressorVerification CompressorLearning CompressorProbe CompressorDiag VmafPairScorer Transformer MediaCodec
 adb logcat -v time -s NotificationService OptimizationWorkerNotification WorkForegroundNotificationHelper
 adb shell dumpsys media.codec
 adb shell dumpsys media.metrics
@@ -36,6 +36,32 @@ adb shell getprop ro.build.version.release
 ```
 
 Adjust the `-s` tag filter to match whatever component is actually in question — these are the common ones for Compressor (video pipeline) and AppBooster (foreground service / notifications), not an exhaustive list.
+
+## The app's own evidence comes first
+
+Logcat is a ring buffer and has lost whole rounds of evidence. The app keeps its own record:
+`files/diagnostics/<batchId>/session.jsonl` (structured, schema-versioned, hashed ids) and
+`decisions.log` (the "why" lines), exported in-app as one ZIP (Diagnostics → Export, scope
+"Everything"), which also carries crash reports, process-exit records and logcat. Ask for that ZIP
+before raw logcat, and analyse it with the `pl-batch-capture-analysis` skill.
+
+## Secure Folder / user 150
+
+The user's batches run in a secondary profile (Secure Folder, Android user 150). Commands that
+install, launch or read app data must target it: `adb install --user 150 …`,
+`adb shell am instrument --user 150 …`, `adb shell pm list packages --user 150`. The app's files
+dir is not reachable from `adb shell` there, which is why the in-app export exists.
+
+## Real-device checks that ship with the repo
+
+- `scripts/device/run-device-checks.sh CLIP.mp4 150` builds and installs the debug and test APKs
+  for user 150 and runs `PipelineDeviceTest` (real Media3 export, native VMAF scorer, phase
+  transitions, source bytes unchanged after a discarded candidate). Without a clip every test is
+  skipped, which is not a pass.
+- `python3 scripts/device/map_targets.py /path/to/originals` finds the target files locally by name
+  hash (names never leave the machine).
+- `docs/DEVICE_VALIDATION.md` lists what only the phone can confirm and the target-batch procedure.
+  Report each item as observed, not observed, or not run; never infer a device result from a JVM test.
 
 ## Workflow
 

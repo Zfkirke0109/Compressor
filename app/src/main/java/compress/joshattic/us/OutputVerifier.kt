@@ -68,7 +68,16 @@ object OutputVerifier {
         // certification of the final output remains mandatory for such encodes (enforced in
         // the batch pipeline); this field only stops the structural floor from rejecting an
         // encode the pixels already justified. Null = classic behavior, byte-identical.
-        val pixelProvenVideoBitrateFloor: Int? = null
+        val pixelProvenVideoBitrateFloor: Int? = null,
+        // True only when AudioTrackIdentity proved the output's audio packets byte-identical to
+        // the source's. Proof of a pass-through copy, which no bitrate label can give.
+        val audioPacketsIdentical: Boolean = false,
+        // How many packets that proof compared (0 when it was not made).
+        val audioPacketsCompared: Int = 0,
+        // True when the packet comparison or its decoder-configuration or timing proof differs.
+        val audioPacketsDiffer: Boolean = false,
+        val videoTimeline: MediaTimelineEvidence.Result? = null,
+        val audioEvidence: AudioTrackIdentity.Outcome? = null
     )
 
     fun verify(
@@ -78,7 +87,21 @@ object OutputVerifier {
         modeLabel: String,
         privacyMode: MetadataPrivacyMode,
         pixelProvenVideoBitrateFloor: Int? = null
-    ): OutputVerificationReport {
+    ): OutputVerificationReport = verify(
+        captureInput(context, source, outputFile, modeLabel, privacyMode, pixelProvenVideoBitrateFloor)
+    )
+
+    /** Immutable evidence for one finalized candidate; never reuse after either file changes. */
+    internal fun captureInput(
+        context: Context,
+        source: BatchVideoItem,
+        outputFile: File,
+        modeLabel: String,
+        privacyMode: MetadataPrivacyMode,
+        pixelProvenVideoBitrateFloor: Int? = null,
+        cancellationCheck: () -> Unit = {}
+    ): VerificationInput {
+        cancellationCheck()
         val rawOutputProbe = readFileProbe(outputFile)
         val sourceTracks = probeTracks(context, source.sourceUri)
         val outputTracks = readTrackProbe(outputFile.absolutePath)
@@ -92,6 +115,20 @@ object OutputVerifier {
         val outputMetadata = runCatching {
             VideoMetadataPreserver.capture(context, Uri.fromFile(outputFile))
         }.getOrDefault(VideoMetadataSnapshot())
+        // Compared in every re-encoding mode, not only Perceptually Lossless: a lossy mode that
+        // requested an audio copy is otherwise described by its mode name instead of by what its
+        // output holds (b177 F5). A measurement only; it adds proof and removes no check.
+        val pl = BatchQualityMode.fromLabel(modeLabel) == BatchQualityMode.PERCEPTUAL_LOSSLESS
+        val timeline = if (pl) MediaTimelineEvidence.inspect(context, source.sourceUri, outputFile, cancellationCheck) else null
+        val audioIdentity = if (BatchQualityMode.fromLabel(modeLabel) != BatchQualityMode.REMUX_ONLY &&
+            sourceTracks.audioCodec != null && sourceTracks.audioCodec == outputTracks.audioCodec
+        ) {
+            AudioTrackIdentity.compare(context, source.sourceUri, outputFile,
+                timeline?.sourceOriginUs, timeline?.outputOriginUs, requirePresentationProof = pl,
+                cancellationCheck = cancellationCheck)
+        } else {
+            null
+        }
         val sourceInfo = VideoSourceInfo(
             width = source.originalWidth,
             height = source.originalHeight,
@@ -112,21 +149,24 @@ object OutputVerifier {
             mediaStoreDatePresent = source.metadataSnapshot.dateSource?.startsWith("MediaStore") == true,
             mp4DatePresent = source.metadataSnapshot.rawDateTag != null
         )
-        return verify(
-            VerificationInput(
-                mode = BatchQualityMode.fromLabel(modeLabel),
-                source = sourceInfo,
-                outputFileProbe = outputProbe,
-                sourceTrackProbe = sourceTracks,
-                outputTrackProbe = outputTracks,
-                sourceMetadata = source.metadataSnapshot,
-                outputMetadata = outputMetadata,
-                sourceSize = source.originalSize,
-                outputSize = outputFile.length(),
-                privacyMode = privacyMode,
-                sourceFrameCount = readSourceFrameCount(context, source.sourceUri),
-                pixelProvenVideoBitrateFloor = pixelProvenVideoBitrateFloor
-            )
+        return VerificationInput(
+            mode = BatchQualityMode.fromLabel(modeLabel),
+            source = sourceInfo,
+            outputFileProbe = outputProbe,
+            sourceTrackProbe = sourceTracks,
+            outputTrackProbe = outputTracks,
+            sourceMetadata = source.metadataSnapshot,
+            outputMetadata = outputMetadata,
+            sourceSize = source.originalSize,
+            outputSize = outputFile.length(),
+            privacyMode = privacyMode,
+            sourceFrameCount = readSourceFrameCount(context, source.sourceUri),
+            pixelProvenVideoBitrateFloor = pixelProvenVideoBitrateFloor,
+            // A matching audio codec makes packet-copy proof possible in any encode mode.
+            audioPacketsIdentical = audioIdentity?.result == AudioTrackIdentity.Result.IDENTICAL,
+            audioPacketsCompared = audioIdentity?.packets ?: 0,
+            audioPacketsDiffer = audioIdentity?.result == AudioTrackIdentity.Result.DIFFERENT,
+            videoTimeline = timeline, audioEvidence = audioIdentity
         )
     }
 
@@ -185,10 +225,13 @@ object OutputVerifier {
 
         // Frame-count parity (when the platform exposes it on both files) catches dropped or
         // duplicated frames that metadata-level FPS tolerance cannot see.
-        val frameCountMatches = input.sourceFrameCount <= 0 ||
+        val reportedFrameCountMatches = input.sourceFrameCount <= 0 ||
             input.outputFileProbe.frameCount <= 0 ||
             abs(input.outputFileProbe.frameCount - input.sourceFrameCount) <=
             maxOf(2, (input.sourceFrameCount * 0.01).toInt())
+
+        val frameCountMatches = reportedFrameCountMatches &&
+            (input.mode != BatchQualityMode.PERCEPTUAL_LOSSLESS || input.videoTimeline?.matches == true)
 
         val rotationMatches = sameDisplayOrientation(
             mode = input.mode,
@@ -247,15 +290,20 @@ object OutputVerifier {
             0
         }
 
-        // Audio in Perceptually Lossless and Remux Only is stream-copied, never re-encoded; when
-        // the copied track's bitrate is not exposed but the codec/channels/sample-rate all match
-        // the source exactly, the source bitrate is the truthful value for the copied packets.
-        val audioLooksStreamCopied = input.outputTrackProbe.audioBitrate <= 0 &&
-            audioCodecMatches &&
+        // A stream-copied track carries the source packets verbatim. Two ways to recognise one:
+        //  - the copied track's bitrate is not exposed but codec/channels/sample-rate all match,
+        //    so the source bitrate is the truthful value for the copied packets; or
+        //  - AudioTrackIdentity compared the packets and found them byte-identical. That is the
+        //    stronger proof, and the one that works when the muxer DOES expose a bitrate. Without
+        //    it, a 128 kbps pass-through copy met the PL re-encode rule below (>= 256 kbps less
+        //    10%) and failed, which discarded 13 encodes in batch_1790263711162.
+        val audioLooksStreamCopied = audioCodecMatches &&
+            !input.audioPacketsDiffer &&
             input.sourceTrackProbe.audioCodec != null &&
             audioShapeMatches &&
             input.outputTrackProbe.audioChannelCount != null &&
-            input.outputTrackProbe.audioSampleRate != null
+            input.outputTrackProbe.audioSampleRate != null &&
+            (input.outputTrackProbe.audioBitrate <= 0 || input.audioPacketsIdentical)
         val effectiveOutputAudioBitrate = when {
             input.outputTrackProbe.audioBitrate > 0 -> input.outputTrackProbe.audioBitrate
             audioLooksStreamCopied -> input.sourceTrackProbe.audioBitrate
@@ -287,14 +335,14 @@ object OutputVerifier {
             else -> true
         }
         val audioBitratePass = when {
-            input.sourceTrackProbe.audioCodec == null -> input.outputTrackProbe.audioCodec == null || input.mode != BatchQualityMode.REMUX_ONLY
+            input.sourceTrackProbe.audioCodec == null -> input.outputTrackProbe.audioCodec == null || (input.mode != BatchQualityMode.REMUX_ONLY && input.mode != BatchQualityMode.PERCEPTUAL_LOSSLESS)
+            // No audio-transparency calibration exists. Neither a high bitrate nor absent
+            // bitrate metadata proves a second lossy generation is transparent.
+            input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS ->
+                input.audioPacketsIdentical && !input.audioPacketsDiffer && audioCodecMatches && audioShapeMatches
             // A stream-copied track carries the source packets verbatim, so bitrate parity holds
             // even when neither container exposes a numeric value.
             audioLooksStreamCopied -> true
-            input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS -> {
-                val floor = maxOf(input.source.audioBitrate, 256_000)
-                effectiveOutputAudioBitrate > 0 && effectiveOutputAudioBitrate >= floor * 0.9
-            }
             input.mode == BatchQualityMode.REMUX_ONLY -> {
                 if (input.sourceTrackProbe.audioBitrate <= 0) {
                     // Bitrate parity is unknowable when the source hides it; codec/shape/size
@@ -370,15 +418,16 @@ object OutputVerifier {
         val remuxVerified = checks.passes(VerificationChecks.Scope.REMUX)
 
         // The failing predicates for the mode actually being judged, straight from the same
-        // structure that produced the verdict above. Null for modes with no verification scope:
-        // those verdicts are not derived from VerificationChecks, so claiming "nothing failed"
-        // would assert something this function never evaluated.
-        val failedChecks: List<String>? = when (input.mode) {
-            BatchQualityMode.REMUX_ONLY -> checks.failures(VerificationChecks.Scope.REMUX)
-            BatchQualityMode.PERCEPTUAL_LOSSLESS ->
-                checks.failures(VerificationChecks.Scope.PERCEPTUAL_LOSSLESS)
-            else -> null
+        // structure that produced the verdict above. A lossy mode is judged on LOSSY: what it
+        // changes by design (codec, a portrait source's coded orientation) is a difference
+        // outside its scope, reported apart, and never a failed check.
+        val scope = when (input.mode) {
+            BatchQualityMode.REMUX_ONLY -> VerificationChecks.Scope.REMUX
+            BatchQualityMode.PERCEPTUAL_LOSSLESS -> VerificationChecks.Scope.PERCEPTUAL_LOSSLESS
+            else -> VerificationChecks.Scope.LOSSY
         }
+        val failedChecks: List<String> = checks.failures(scope)
+        val lossyVerified = checks.passes(VerificationChecks.Scope.LOSSY)
 
         val outputWithinTolerance = input.sourceSize <= 0L ||
             input.outputSize <= (input.sourceSize * (1.0 + BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_SIZE_TOLERANCE)).toLong()
@@ -392,13 +441,18 @@ object OutputVerifier {
         val replacementSafe = when (input.mode) {
             BatchQualityMode.REMUX_ONLY -> remuxVerified
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance && strictlySmaller
-            else -> playable
+            // A lossy mode promises nothing about sameness, but the output must still be the WHOLE
+            // video before it may overwrite its source. One that plays and stops early is also
+            // much smaller, so it read as a real compression and as replaceable; the block reason
+            // below already named the duration while this flag stayed true. The lossy verdict
+            // itself is unchanged: this decides only what may replace an original.
+            else -> lossyVerified && durationMatches
         }
 
         val blockReason = when {
             !playable -> "output did not pass playability verification"
             !durationMatches -> "output duration differs from the source (possible truncation)"
-            !frameCountMatches -> "output video frame count differs from the source"
+            !frameCountMatches -> "complete video timeline not verified: ${input.videoTimeline?.reason ?: "frame count or timeline evidence unavailable"}"
             input.mode == BatchQualityMode.REMUX_ONLY && !criticalFieldsComplete -> "stream-copy verification was incomplete"
             input.mode == BatchQualityMode.REMUX_ONLY && !videoMatches -> "remux output changed resolution"
             input.mode == BatchQualityMode.REMUX_ONLY && !rotationMatches -> "remux output changed display orientation"
@@ -412,7 +466,7 @@ object OutputVerifier {
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !rotationMatches -> "perceptually lossless output changed display orientation"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && fpsComparison != VerificationTransitionStatus.MATCH -> "perceptually lossless output changed FPS"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !bitratePass -> "perceptually lossless output bitrate fell below the verified safety threshold"
-            input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !audioBitratePass -> "perceptually lossless output audio bitrate fell below the verified safety threshold"
+            input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !audioBitratePass -> "audio packet, decoder configuration or A/V timing identity was not proven"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !(hdrMatches && standardMatches && rangeMatches) -> "perceptually lossless output lost HDR/color metadata"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !outputWithinTolerance -> "perceptually lossless output exceeded the allowed size growth tolerance"
             input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS && !strictlySmaller -> "perceptually lossless output is not smaller than the source, so replacing the original is blocked"
@@ -447,14 +501,27 @@ object OutputVerifier {
             videoCodec = "${codecLabel(input.sourceTrackProbe.videoCodec)} -> ${codecLabel(input.outputTrackProbe.videoCodec)} ${statusSuffix(videoCodecMatches)}",
             audioCodec = "${codecLabel(input.sourceTrackProbe.audioCodec)} -> ${codecLabel(input.outputTrackProbe.audioCodec)} ${statusSuffix(audioCodecMatches)}",
             audioDetails = "${sampleRateLabel(input.sourceTrackProbe.audioSampleRate)}/${channelLabel(input.sourceTrackProbe.audioChannelCount)} -> ${sampleRateLabel(input.outputTrackProbe.audioSampleRate)}/${channelLabel(input.outputTrackProbe.audioChannelCount)} ${statusSuffix(audioShapeMatches)}",
-            audioBitrate = "${bitrateLabel(input.sourceTrackProbe.audioBitrate)} -> ${bitrateLabel(effectiveOutputAudioBitrate)}${if (audioLooksStreamCopied) " (stream copied)" else ""} ${statusSuffix(audioBitratePass)}",
+            // In PL only the packet comparison proves a copy (October 1 review), so an inferred copy
+            // is not labelled one beside the failing check it causes.
+            audioBitrate = "${bitrateLabel(input.sourceTrackProbe.audioBitrate)} -> ${bitrateLabel(effectiveOutputAudioBitrate)}${if (audioLooksStreamCopied && (input.mode != BatchQualityMode.PERCEPTUAL_LOSSLESS || input.audioPacketsIdentical)) " (stream copied)" else ""} ${statusSuffix(audioBitratePass)}",
+            audioBasis = AudioPreservation.describe(
+                mode = input.mode,
+                sourceHasAudio = input.sourceTrackProbe.audioCodec != null,
+                packetsIdentical = input.audioPacketsIdentical,
+                packetsCompared = input.audioPacketsCompared,
+                inferredStreamCopy = audioLooksStreamCopied && !input.audioPacketsIdentical,
+                packetsDiffer = input.audioPacketsDiffer,
+                identityFailure = input.audioEvidence?.failureReason
+            ),
             hdr = "${input.sourceTrackProbe.hdrLabel} -> ${input.outputTrackProbe.hdrLabel}" +
                 if (colorComparison.basis == ColorMatchBasis.MEDIA3_ASSUMED_SDR) {
                     " (Media3 assumed SDR default) ${statusSuffix(hdrMatches)}"
                 } else {
                     " ${statusSuffix(hdrMatches)}"
                 },
-            colorStandard = "${colorStandardLabel(input.sourceTrackProbe.colorStandard)} -> ${colorStandardLabel(input.outputTrackProbe.colorStandard)} ${statusSuffix(standardMatches)}",
+            colorStandard = "${colorStandardLabel(input.sourceTrackProbe.colorStandard)} -> ${colorStandardLabel(input.outputTrackProbe.colorStandard)}" +
+                (if (colorComparison.standardIsBt601Variant) " (both BT.601: same matrix, NTSC/PAL tag only)" else "") +
+                " ${statusSuffix(standardMatches)}",
             colorRange = "${colorRangeLabel(input.sourceTrackProbe.colorRange)} -> ${colorRangeLabel(input.outputTrackProbe.colorRange)} ${statusSuffix(rangeMatches)}",
             // Reports the predicate that is actually judged, not a stricter one the verdict never
             // used: a label saying "unverified" beside a passing check is how a real failure went
@@ -476,10 +543,29 @@ object OutputVerifier {
             replacementBlockReason = blockReason,
             criticalFieldsComplete = criticalFieldsComplete,
             failedChecks = failedChecks,
+            unjudgedDifferences = checks.differencesOutside(scope),
+            structuralEvidence = mapOf("videoTimeline" to input.videoTimeline?.let { t -> mapOf(
+                "matches" to t.matches, "sourceFrames" to t.sourceFrames, "outputFrames" to t.outputFrames,
+                "sourceOriginUs" to t.sourceOriginUs, "outputOriginUs" to t.outputOriginUs,
+                "maxSkewUs" to t.maxSkewUs, "firstMismatch" to t.firstMismatch, "reason" to t.reason) },
+                "audioPacketEvidence" to input.audioEvidence?.let { a -> mapOf(
+                    "result" to a.result.name, "packets" to a.packets, "bytes" to a.evidence?.bytes,
+                    "sourceConfigSha256" to a.sourceConfigHash, "outputConfigSha256" to a.outputConfigHash,
+                    "sourcePayloadSha256" to a.evidence?.sourceHash, "outputPayloadSha256" to a.evidence?.outputHash,
+                    "maxSkewUs" to a.evidence?.maxSkewUs, "firstMismatch" to a.evidence?.firstMismatch,
+                    "reason" to a.evidence?.reason,
+                    "sourcePackets" to a.evidence?.sourcePackets, "outputPackets" to a.evidence?.outputPackets,
+                    "sourceFirstPtsUs" to a.evidence?.sourceFirstPtsUs, "outputFirstPtsUs" to a.evidence?.outputFirstPtsUs,
+                    "firstMismatchKind" to a.evidence?.firstMismatchKind,
+                    "outputLacksFirstSourcePacket" to a.evidence?.outputLacksFirstSourcePacket,
+                    "outputHasExtraFirstPacket" to a.evidence?.outputHasExtraFirstPacket,
+                    // The one difference a rewrite of the container puts right (CandidateContainerRepair).
+                    "differsOnlyInEndPadding" to a.differsOnlyInEndPadding,
+                    "sourceConfig" to a.sourceConfig, "outputConfig" to a.outputConfig) }),
             verified = when (input.mode) {
                 BatchQualityMode.REMUX_ONLY -> remuxVerified
                 BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance
-                else -> playable
+                else -> lossyVerified
             },
             failedOnlyOnVideoBitrateFloor = input.mode == BatchQualityMode.PERCEPTUAL_LOSSLESS &&
                 !bitratePass &&
@@ -676,9 +762,16 @@ object OutputVerifier {
         MISMATCH
     }
 
+    private val BT601_STANDARDS = setOf(
+        MediaFormat.COLOR_STANDARD_BT601_NTSC,
+        MediaFormat.COLOR_STANDARD_BT601_PAL
+    )
+
     internal data class ColorTransitionComparison(
         val transferMatches: Boolean,
         val standardMatches: Boolean,
+        // True when standardMatches holds only through the BT.601 NTSC <-> PAL equivalence.
+        val standardIsBt601Variant: Boolean = false,
         val rangeMatches: Boolean,
         val hdrMetadataMatches: Boolean,
         val bitDepthMatches: Boolean,
@@ -711,12 +804,21 @@ object OutputVerifier {
             MediaFormat.COLOR_TRANSFER_SDR_VIDEO,
             allowMedia3SdrDefault
         )
-        val standard = compareColorField(
+        val exactOrDefaultStandard = compareColorField(
             source.colorStandard,
             output.colorStandard,
             MediaFormat.COLOR_STANDARD_BT709,
             allowMedia3SdrDefault
         )
+        // Media3 collapses the BT.601 tags, but NTSC/PAL have distinct primaries. Record
+        // this transition and reject it until a separate decoded-color proof exists.
+        val bt601Variant = !exactOrDefaultStandard.first &&
+            mode == BatchQualityMode.PERCEPTUAL_LOSSLESS &&
+            source.colorStandard in BT601_STANDARDS &&
+            output.colorStandard in BT601_STANDARDS
+        // NTSC/PAL primaries differ. Media3's abstraction losing that distinction is not
+        // decoded-color proof. Keep the diagnostic, but fail the metadata comparison.
+        val standard = exactOrDefaultStandard
         val range = compareColorField(
             source.colorRange,
             output.colorRange,
@@ -748,6 +850,7 @@ object OutputVerifier {
         return ColorTransitionComparison(
             transferMatches = transfer.first,
             standardMatches = standard.first,
+            standardIsBt601Variant = bt601Variant,
             rangeMatches = range.first,
             hdrMetadataMatches = hdrMetadataMatches,
             bitDepthMatches = bitDepthMatches,

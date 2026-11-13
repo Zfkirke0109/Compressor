@@ -5,22 +5,27 @@ package compress.joshattic.us.quality
  *
  * Both streams are normalized to window-relative time (ref: pts − windowStart; dist:
  * pts − distStart). Two head frames may be scored as a pair only when their normalized
- * timestamps sit within [TOLERANCE_FLOOR_US] — a FIXED tolerance that does not vary with
- * frame rate.
+ * timestamps sit within [TOLERANCE_FLOOR_US] — a maximum tolerance, narrowed when adjacent frames could be confused.
  *
  * Why fixed, and why 4 ms specifically. A correctly aligned pair's skew is bounded by how the
  * two streams were ADDRESSED, not by how far apart their frames are. The probe path is the
  * widest case: [VmafPairScorer] is handed `ScoreWindow(startUs, endUs, distStartUs = 0)` while
- * `PerceptualQualityProber.exportClip` cuts the clip with `setStartPositionMs(startUs / 1000)`,
- * so the clip really begins at `startUs − (startUs % 1000)`. A source frame at pts P therefore
- * normalizes to `P − startUs` on the ref side and `P − (startUs − startUs % 1000)` on the dist
- * side, leaving a CONSTANT skew of `−(startUs % 1000)` — at most 999 µs, at any frame rate.
+ * `PerceptualQualityProber.exportClip` now cuts the clip with `setStartPositionUs(startUs)` —
+ * the same microseconds the scorer normalizes by — so that term is zero by construction. It was
+ * not always: the clip was previously requested with `setStartPositionMs(startUs / 1000)`, which
+ * began it at `startUs − (startUs % 1000)` and left a CONSTANT skew of `−(startUs % 1000)`, at
+ * most 999 µs at any frame rate. Device captures show exactly that signature — a clip whose
+ * window starts ended in 200/500/800 µs produced windows at 0.2/0.5/0.8 ms skew. The floor is
+ * kept at 4 ms rather than tightened to match: the residual that appears when the trimmed clip
+ * lands on a different FRAME than the requested instant is a separate, larger mechanism, and
+ * narrowing the floor to the newly-smaller term needs its own calibration round, not an
+ * inference.
  * Certification is tighter still (both streams share one timeline; only muxer timescale rounding
  * separates them). 4 ms is ~4× that 999 µs bound: wide enough to absorb legitimate addressing
  * noise, narrow enough that a one-frame offset — ≥ 8.3 ms even at 120 fps — is never mistaken
  * for alignment.
  *
- * This is deliberately NOT adaptive. A superseded rule widened the tolerance to half the smallest
+ * This tolerance never widens with frame rate. A superseded rule widened the tolerance to half the smallest
  * observed frame interval, which grew it exactly where frames are furthest apart (20.0 ms at
  * 25 fps, 16.7 ms at 30 fps) and so scored frames up to half a frame out of step as if they were
  * aligned. Measured on device across 368 probe windows in five 219-file batches: every window
@@ -34,11 +39,14 @@ package compress.joshattic.us.quality
  *    observed) are still scored. Narrowing the floor to reach them would trade the 4× margin
  *    above for ~1.5×, on a passing-window corpus of only three distinct clips; that needs a
  *    broader corpus first, not a guess.
- *  - When the frame interval is itself at or below the floor (> 250 fps, or VFR frames closer
- *    than 4 ms), a one-frame offset can still land inside the tolerance. The superseded rule
- *    behaved identically there — `max(4 ms, minGap/2)` is exactly 4 ms whenever minGap ≤ 8 ms —
- *    so this is pre-existing and unchanged, not a regression. [smallestFrameIntervalUs] records
- *    the observation a future calibration round would need to close it honestly.
+ *  - Closed in the October 1 review: when the frame interval was at or below the floor (> 250
+ *    fps, or VFR frames closer than 4 ms), a one-frame offset could land inside the tolerance.
+ *    The tolerance is now also capped at half the smallest frame interval observed on either
+ *    stream ([toleranceUs]). The cap only ever narrows it; at 120 fps and below it stays 4 ms.
+ *
+ * A repeated or reversed timestamp after a scored pair fails the window as well: a frame that does
+ * not advance the timeline is not a fresh frame, and scoring it again would count one picture
+ * twice (October 1 review).
  *
  * Drop-based repair is allowed ONLY at the window's leading boundary — before the first
  * scored pair (measured on device: the Transformer probe clip and the reference window
@@ -66,6 +74,8 @@ class PtsAligner(
     private var minRefGapUs = Long.MAX_VALUE
     private var minDistGapUs = Long.MAX_VALUE
     private var pairedAtLeastOnce = false
+    private var lastPairedRefUs = Long.MIN_VALUE
+    private var lastPairedDistUs = Long.MIN_VALUE
 
     var refDropped = 0
         private set
@@ -95,17 +105,17 @@ class PtsAligner(
     }
 
     /**
-     * The pairing tolerance: fixed at [toleranceFloorUs], independent of frame rate. See the
-     * class KDoc for why a correctly aligned pair's skew is bounded by stream addressing
-     * (≤ 999 µs) rather than by the frame interval.
+     * The pairing tolerance: [toleranceFloorUs], independent of frame rate, except that it never
+     * exceeds half the smallest frame interval observed on either stream. See the class KDoc for
+     * why a correctly aligned pair's skew is bounded by stream addressing (≤ 999 µs) rather than by
+     * the frame interval; the cap keeps a one-frame offset outside the tolerance when frames are
+     * closer together than the floor.
      */
-    fun toleranceUs(): Long = toleranceFloorUs
+    fun toleranceUs(): Long = smallestFrameIntervalUs()?.let { minOf(toleranceFloorUs, (it - 1) / 2) } ?: toleranceFloorUs
 
     /**
      * Smallest frame interval observed on either stream so far, or null until two frames of one
-     * stream have been seen. Diagnostic only — no decision reads it. Recorded because the fixed
-     * tolerance's one known blind spot is content whose frame interval is at or below the floor,
-     * and closing that honestly needs this observation from real high-frame-rate content.
+     * stream have been seen. Also caps tolerance so adjacent VFR frames remain distinguishable.
      */
     fun smallestFrameIntervalUs(): Long? =
         minOf(minRefGapUs, minDistGapUs).takeIf { it != Long.MAX_VALUE }
@@ -114,17 +124,35 @@ class PtsAligner(
     fun decide(refNormUs: Long, distNormUs: Long): Action {
         val skew = refNormUs - distNormUs
         if (kotlin.math.abs(skew) <= toleranceUs()) {
+            // Within tolerance, but a head that does not advance past the last scored one is the
+            // same picture again (or an earlier one), not a fresh frame. An out-of-tolerance pair
+            // falls through to the misalignment path below, which reports its skew.
+            if (pairedAtLeastOnce && (refNormUs <= lastPairedRefUs || distNormUs <= lastPairedDistUs)) {
+                failureReason = "repeated or reversed presentation time after a scored pair" +
+                    " (ref ${lastPairedRefUs}->${refNormUs}us, dist ${lastPairedDistUs}->${distNormUs}us)"
+                return Action.FAIL
+            }
             pairedAtLeastOnce = true
+            lastPairedRefUs = refNormUs
+            lastPairedDistUs = distNormUs
             return Action.PAIR
         }
         if (pairedAtLeastOnce) {
             // Misalignment AFTER a scored pair = a frame is missing or retimed INSIDE the
             // window. Dropping around it would hide real temporal degradation; fail closed.
-            failureReason = "internal frame misalignment after ${refDropped + distDropped} leading drops (frame loss or retiming inside the window)"
+            failureReason = "internal frame misalignment after ${refDropped + distDropped} leading drops" +
+                " (frame loss or retiming inside the window; skew ${skew / 1000}ms)"
             return Action.FAIL
         }
         if (refDropped + distDropped >= maxDrops) {
-            failureReason = "leading offset not aligned within $maxDrops drops"
+            // The magnitude and SIGN of the unclosed offset are the diagnosis, and naming only
+            // the failure withheld both. 12 of the 13 misaligned ladders in batch_1788257645030
+            // ended here, and the capture could not say whether the clip began a hair late (a
+            // rounding residue worth widening the budget for) or seconds early (a clip cut at a
+            // different instant than requested, which no number of drops can repair). A positive
+            // skew means the CLIP is ahead of the source window; negative means it lags.
+            failureReason = "leading offset not aligned within $maxDrops drops" +
+                " (unclosed skew ${skew / 1000}ms, ref dropped $refDropped, dist dropped $distDropped)"
             return Action.FAIL
         }
         return if (skew > 0) {

@@ -216,6 +216,41 @@ object BatchQualityBitratePolicy {
         }
     }
 
+    /**
+     * Whether the source audio track should be copied through bit-exactly instead of re-encoded.
+     *
+     * Re-encoding AAC can only lose information: every AAC encode is a new lossy generation, and a
+     * HIGHER target bitrate cannot restore what the first generation discarded. The previous
+     * policy nevertheless re-encoded audio in every mode, and pushed it UP — a 128 kbps source
+     * became 192 kbps in High Quality and 256 kbps in Perceptually Lossless — so outputs got a
+     * second audio generation AND a larger audio track, for no possible gain.
+     *
+     * It was also the stage that wedged. The 2026-09-01 DebugTraceUtil capture of the High
+     * Quality stall shows every pipeline stage stopping at ~11.5 s while AudioGraph.ProducedOutput
+     * kept firing 17,922 times to 131,592 ms; the muxer received 3,623 of 6,322 offered samples.
+     * A passed-through audio track never enters the AudioGraph at all.
+     *
+     * Pass-through applies when the source is already AAC (the output container's audio codec)
+     * and the mode would not LOWER the bitrate. Storage Saver deliberately lowers audio, a
+     * labelled lossy trade, so it still re-encodes; with an unknown source bitrate it re-encodes
+     * too, because "lower" cannot be established. Every other mode passes through.
+     */
+    fun shouldPassThroughAudio(
+        sourceAudioMime: String?,
+        sourceAudioBitrate: Int,
+        mode: BatchQualityMode
+    ): Boolean {
+        if (sourceAudioMime == null || !sourceAudioMime.equals("audio/mp4a-latm", ignoreCase = true)) {
+            return false
+        }
+        if (mode == BatchQualityMode.STORAGE_SAVER) {
+            if (sourceAudioBitrate <= 0) return false
+            val target = calculateAudioBitrate(VideoSourceInfo(audioBitrate = sourceAudioBitrate), mode)
+            return target >= sourceAudioBitrate
+        }
+        return true
+    }
+
     // Resolution classing must be orientation-agnostic: a portrait 1440x2560 clip is QHD-class,
     // not 4K-class, even though its raw height exceeds 2160. Long/short edge, not width/height.
     private fun longEdge(source: VideoSourceInfo): Int = maxOf(source.width, source.height)

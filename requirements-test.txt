@@ -8,3 +8,10 @@
 #   measurement basis works on per-pixel arrays in PQ/ICtCp space; those transforms are not
 #   something to reimplement by hand when correctness is the entire point of the module.
 numpy>=1.24
+#
+# pandas, scikit-learn - research/perceptual_calibration/scripts (run_study_v2, prepare_dataset_v2).
+#   test_label_basis.py drives the study's own selection and CLI to prove a threshold candidate is
+#   judged on human labels, never on the opposite policy labels; the study is written in pandas
+#   and uses scikit-learn's GroupKFold for source-grouped holdout.
+pandas>=2.0
+scikit-learn>=1.3

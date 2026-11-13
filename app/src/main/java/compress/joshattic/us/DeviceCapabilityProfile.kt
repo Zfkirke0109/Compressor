@@ -14,8 +14,16 @@ data class DeviceCapabilityProfile(
     val preferHevcForDefaultCompression: Boolean,
     val avoidAv1EncodingByDefault: Boolean,
     val recommendedBatchParallelism: Int,
-    val notes: List<String> = emptyList()
+    val notes: List<String> = emptyList(),
+    val isGalaxyS26Ultra: Boolean = false
 ) {
+    val presetFamily: String
+        get() = when {
+            isGalaxyS26Ultra -> "S26 Ultra"
+            isGalaxyS23Ultra -> "S23 Ultra"
+            else -> "Device"
+        }
+
     fun chooseDefaultVideoCodec(supportedCodecs: List<String>): String {
         return when {
             preferHevcForDefaultCompression && supportedCodecs.contains(MimeTypes.VIDEO_H265) -> MimeTypes.VIDEO_H265
@@ -38,13 +46,28 @@ data class DeviceCapabilityProfile(
 }
 
 object DeviceCapabilityProfiles {
-    fun current(): DeviceCapabilityProfile {
-        val manufacturer = Build.MANUFACTURER.orEmpty()
-        val model = Build.MODEL.orEmpty()
-        val device = Build.DEVICE.orEmpty()
-        val product = Build.PRODUCT.orEmpty()
+    fun current(): DeviceCapabilityProfile = forDevice(
+        Build.MANUFACTURER.orEmpty(), Build.MODEL.orEmpty(), Build.DEVICE.orEmpty(), Build.PRODUCT.orEmpty()
+    )
 
+    /** Model identity changes defaults only; actual encoder support is always queried at runtime. */
+    fun forDevice(manufacturer: String, model: String, device: String = "", product: String = ""): DeviceCapabilityProfile {
         val isSamsung = manufacturer.equals("samsung", ignoreCase = true)
+        if (isSamsung && model.startsWith("SM-S948", ignoreCase = true)) {
+            return DeviceCapabilityProfile(
+                name = "Samsung Galaxy S26 Ultra",
+                isGalaxyS23Ultra = false,
+                isGalaxyS26Ultra = true,
+                preferHevcForDefaultCompression = true,
+                avoidAv1EncodingByDefault = true,
+                recommendedBatchParallelism = 1,
+                notes = listOf(
+                    "Probe the installed hardware encoders; do not inherit S23 Ultra rate-control assumptions.",
+                    "Keep batch encodes sequential for sustained thermal and memory stability.",
+                    "AV1 remains opt-in until its actual geometry and quality have been measured."
+                )
+            )
+        }
         val isS23Ultra = isSamsung && (
             model.startsWith("SM-S918", ignoreCase = true) ||
                 device.equals("dm3q", ignoreCase = true) ||
