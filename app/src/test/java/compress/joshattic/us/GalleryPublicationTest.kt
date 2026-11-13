@@ -257,6 +257,19 @@ class GalleryPublicationTest {
     }
 
     @Test
+    fun everyGalleryPublishInTheAppIsRowCountedAndReadBack() {
+        // The only places that clear IS_PENDING: MediaStoreGallery, whose publish GalleryPublication
+        // holds to one row and a read-back, and the diagnostics export, which
+        // DiagnosticsPublication holds to one row. A new save that clears it elsewhere bypasses both.
+        val root = listOf("src/main/java", "app/src/main/java").map { java.io.File(it) }.first { it.isDirectory }
+        val clears = root.walkTopDown().filter { it.isFile && it.extension == "kt" }
+            .filter { Regex("""IS_PENDING,\s*0\b""").containsMatchIn(it.readText()) }.map { it.name }.toSet()
+        assertEquals(setOf("GalleryPublication.kt", "DiagnosticsExporter.kt"), clears)
+        val exporter = root.walkTopDown().single { it.name == "DiagnosticsExporter.kt" }.readText()
+        assertEquals(2, Regex("""DiagnosticsPublication\.writeAndPublish\(""").findAll(exporter).count())
+    }
+
+    @Test
     fun theUserIsToldOnlyAboutCopiesProvenInTheGallery() {
         assertEquals("Saved 1 output copy to Movies/Compressor with all metadata.", GallerySaveSummary.message(1, 0, "all metadata"))
         assertEquals("Saved 3 output copies to Movies/Compressor with all metadata.", GallerySaveSummary.message(3, 0, "all metadata"))

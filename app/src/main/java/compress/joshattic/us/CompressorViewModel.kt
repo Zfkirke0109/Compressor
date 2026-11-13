@@ -1207,30 +1207,19 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     }
                 }
 
-                val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                } else {
-                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                }
-
-                val itemUri = context.contentResolver.insert(collection, values)
-                
-                if (itemUri != null) {
-                    context.contentResolver.openOutputStream(itemUri).use { out ->
-                        file.inputStream().use { input ->
-                            input.copyTo(out!!)
-                        }
+                // Saved only when exactly one row was published and it reads back as the file:
+                // a row, or a publishing update that changed nothing, is not a saved copy.
+                when (val saved = GalleryPublication.save({ file.inputStream() }, MediaStoreGallery(context.contentResolver, values))) {
+                    is GalleryPublication.Result.Published -> _uiState.update { it.copy(saveSuccess = true) }
+                    is GalleryPublication.Result.Failed -> _uiState.update {
+                        it.copy(error = if (saved.stage == GalleryPublication.Stage.INSERT) {
+                            getApplication<Application>().getString(R.string.error_gallery_entry)
+                        } else {
+                            getApplication<Application>().getString(
+                                R.string.error_save_failed, "the gallery copy could not be confirmed (${saved.stage.name.lowercase()})"
+                            )
+                        })
                     }
-                    
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        values.clear()
-                        values.put(MediaStore.Video.Media.IS_PENDING, 0)
-                        context.contentResolver.update(itemUri, values, null, null)
-                    }
-                    
-                    _uiState.update { it.copy(saveSuccess = true) }
-                } else {
-                     _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_gallery_entry)) }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
