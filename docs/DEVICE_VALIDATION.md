@@ -677,3 +677,74 @@ crash fails the run everywhere but the death case, which fails if its process li
     safe-copy-harness.sh inventory
     safe-copy-harness.sh stage --source-id ID --dry-run
     safe-copy-harness.sh all --source-id ID [--source-id ID ...] [--fallback-baseline K]
+
+## 12. The safe-copy harness on the S26 (v1.6.322, November 13, 22:16 UTC)
+
+The owner ran `safe-copy-harness.sh all --fallback-baseline 1` in Termux on the S26 (SM-S948U,
+Android 17, normal profile) with the matched v1.6.322 APKs from `bfa0cf9`, over ADB to the phone
+itself, on three of the phone's videos chosen from the read-only inventory: the 55 s 1080 × 1920
+clip of the fallback check (first, so the fallback ran on it), a 720 × 1280 clip, and a
+2160 × 3840 clip. File names, paths, media ids and sizes stay in the run's private manifest.
+
+**Protection.** Each original (A) was copied to its baseline (B) by exclusive create and hashed
+before and after the copy. All 13 cases passed, the process-death case by crashing as intended.
+Every A and B was checked against the manifest at 20 points (before and after each case, and at
+the start and end): 120 checks, all unchanged. No original was written, moved or renamed.
+
+**Gallery publication (R1) on the real MediaStore.** `GalleryPublicationDeviceTest`, 5 of 5: a
+save counts only when one row is published and reads back whole; a publish that changes no row, a
+write that stops part way, a read-back that differs and bytes other than the expected ones each
+leave no row behind. `BatchItemCardDeviceTest`, 5 of 5, rendered the row's states (below).
+
+**The end padding repair, in a batch, on a smaller candidate.** On the synthetic fixture
+(12 s 1080p30, AAC delay 1,024 and end padding 0) Perceptually Lossless accepted the 0.60 rung:
+certified on three windows (means 98.66, 99.89 and 99.58) and passed structural verification.
+Media3's copy of the audio read 2 samples of end padding against the source's 0; the batch
+rewrote the file once (`restore_audio_end_padding`) and the audio then compared bit-identical
+with the source (563 packets). The output was 13,035,031 bytes from 21,180,786. This is the first
+batch on a phone that needed the repair; the fixture is synthetic, so a real camera file needing
+it is still unobserved.
+
+**A replacement batch with a proven backup.** The same fixture, through a disposable copy with
+Replace Originals and Backup before replace on: the backup was published and read back as the
+fixture before the copy was replaced (`replace_committed`), and the copy then held the accepted
+output.
+
+**The corpus, copy mode.** One Perceptually Lossless batch over copies of the three baselines,
+under `HarnessScope`: the 1080 × 1920 clip compressed at 0.75, 23.6 % smaller, the same size to
+the byte as in the v1.6.311 batch; the 720 × 1280 clip was kept (`SKIPPED_WOULD_DEGRADE`); the
+2160 × 3840 clip was already efficient (a verified stream copy, not counted as compression).
+
+**The fallback, again, under `HarnessScope`.** 3 of 3, with the clip's ladder as before (0.70
+failed, 0.80 passed, 0.75 marginal). The test's veto refused the 0.75 encode; production retried
+at 0.80, which certified with the same window means as on November 13 (96.37, 97.54, 96.54) and
+the same output size, and was accepted. The row said, to the end: "Attempt 2 of 2: an
+instrumented test refused the first candidate (0.75); not a quality measurement, so it was
+discarded; encoding again at the safer measured ratio 0.80, which is larger". Without the retry
+experiment the original was kept after one encode; with both refused, no third encode started.
+The safer-rung retry switch read on before the case and after it, and `TestOwnedSettingsDeviceTest`
+found nothing to put back.
+
+**Replacement on disposable copies**, `SafeCopyReplacementDeviceTest` 7 of 7 on a copy of each of
+the three baselines: a replacement committed and confirmed by content; a write that stopped part
+way, a write of the right length but wrong bytes and a write whose size could not be read back,
+each restored to the baseline's bytes; a copy changed before staging refused and never opened; a
+rollback that failed left the copy at risk, and the next start preserved it once, the start after
+that finding nothing; another writer after staging overwritten and not kept, the documented
+limitation.
+
+**Process death.** The process was killed a third of the way into overwriting a copy of the first
+baseline. The next start preserved the rollback copy once (published, read back as the staged
+bytes, deleted); the start after it found nothing.
+
+**The row's rendered states.** Seven images of synthetic rows: verifying after finalizing, the
+retry at 300 dp and 100, 130 and 200 % text, a copy ready, an open suggestion, and a replacement
+that left the original incomplete. The last showed a defect: a row named by its status read
+"Copy saved" over a line saying the intact copy was held inside the app, and a production row,
+whose terminal result is set before its replacement runs, read "Compressed". Fixed in `01b4605`
+(the badge reads "Original at risk", "Replaced", "Copy saved" only for a proven save, otherwise
+"Not replaced"). At 200 % text the row is taller than the test's window, so that image is cut at
+the bottom; in the app the row scrolls.
+
+Not covered: an exact-source retest of the 168 to 166 case (the original is not on the phone),
+a real camera file needing the end padding repair, and the S23.
