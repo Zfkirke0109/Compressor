@@ -453,9 +453,9 @@ muxer and the app's comparison calls its copy of the tail file's track different
 padding and nothing else, and its copy of the control's track identical. `AudioEndPaddingTest`
 holds what counts as only the end padding and when a rewrite is tried, and
 `ScientificEvidenceSafetyTest` that the verifier still refuses such a copy. **The repair itself
-has not run on a phone.** The S26 run above shows the padding restored by the metadata remux,
-which is the same muxer; the default device checks now print what the repair's own rewrite gives
-(`b287-timeline … endPaddingRepair …`).
+had not run on a phone** at this build. The S26 run above shows the padding restored by the
+metadata remux, which is the same muxer; the default device checks now print what the repair's own
+rewrite gives (`b287-timeline … endPaddingRepair …`), and on v1.6.311 it gave identical audio (§9).
 
 **The fallback check** (`--fallback`, the same phone and build, a clip from the normal profile).
 All three batches made a real first full encode (encoded, finalized and structurally verified)
@@ -467,4 +467,79 @@ one rung, 0.75, and it passed, so there was no marginal trial and no measured sa
 retry was recorded after the refusal. One passing rung is what the short ladder gives a source above
 1920 × 1088; the report did not say the clip's size, because the script dropped the tests' printed
 lines from a run it judged incomplete. It now keeps them for every outcome. The encode that follows
-a refused trial at the safer measured ratio has still not run on a device.
+a refused trial at the safer measured ratio has still not run on a device under the test; §9 has
+production making it twice after a real certification failure.
+
+## 9. v1.6.311 on the S26, normal profile (November 12)
+
+The matched v1.6.311 app and test APKs from Android CI #311 (`e284cb5`) were installed over ADB on
+the SM-S948U (Android 17) as updates, in the normal profile.
+
+**Default checks.** All 12 tests passed, in 72 s. The real Perceptually Lossless batch that the
+production-evidence test runs over the supplied clip, a 4K one this time, accepted a smaller
+pixel-certified output on its first attempt, at 0.75, with the audio a bit-identical copy of the
+source's (342 packets compared). The edit-list timeline test counted what it counted on v1.6.299
+(§8) at every stage, and the first timestamp repair again gave back the control file's timeline
+(first sample at 97,500 µs against the source's 97,488 µs) with identical audio.
+
+The same test made the audio end padding repair's rewrite on a phone for the first time. With the
+video's own start left out of the comparison, Media3's copy of the tail file's audio differed from
+the source's in nothing but the end padding the platform reads, 2 samples against 0, so the repair
+was proposed; after the rewrite through the platform's muxer, made as a batch makes it, the same
+comparison found the audio identical (329 packets, 0 µs apart). The control file's copy was
+identical to begin with, and no rewrite was proposed. In a batch the tail file still keeps its
+original, because its video lost two samples (168 → 166). This was the synthetic source inside a
+test; no batch has needed the rewrite yet (below).
+
+**The fallback check, run a second time,** on a 25.5 s clip of 0.7 Mbit/s. In all three batches
+every rung failed on both ladders (HEVC 0.90, 0.95 and 0.97; AVC 0.85, 0.95 and 0.97), so no batch
+reached a full encode, there was nothing to refuse, and all three tests were skipped (`attempt 1
+never reached certification (terminal SKIPPED_WOULD_DEGRADE): nothing to refuse`). The encode at
+the safer measured ratio after a refused trial has still not run under the test.
+
+**A batch over the phone's videos.** The owner then ran v1.6.311 in Perceptually Lossless over the
+phone's videos, in the normal profile with Replace Originals off: 58 items from 54 distinct
+sources, in 35.5 minutes. Read with the audit tool (§7):
+
+| Outcome | Items |
+|---|---|
+| Smaller pixel-certified output, accepted | 13, saving 673,227,786 bytes (4.7 % of the 14.19 GB read) |
+| Original kept: every measured rung missed the bar | 35 (the mean was the limiting gate in 27, p5 in 8) |
+| Original kept as already highly optimized | 5 |
+| Original kept: the only output was a copy that bought nothing (`UNEXPECTED_REMUX`) | 5, each 2 s long |
+
+Every original's SHA-256 was unchanged after the run (58 of 58), and no replacement was requested
+(13 of 13 `replace_not_requested`).
+
+- **The retry at the safer measured ratio, in production, twice.** `job_89baf1b00ad3` and
+  `job_1ecc4136ae36`, 15 and 18 minutes long, each selected the 0.77 marginal trial under a
+  passing 0.95. Each full encode at 0.77 passed structural verification and then failed
+  certification on its measured scores (`cert_measured_failure`); the retry was allowed, and the
+  full encode at 0.95 passed verification and certification on its own and was accepted, saving
+  25,811,833 and 29,292,688 bytes. Each ledger holds two attempts, 0.77 `measured_below_bar` and
+  0.95 `accepted`. This is the path `SaferRungFallbackDeviceTest` drives with a refusal, taken
+  here after a real certification failure. Whether the first candidates' files were removed is not
+  in the record. Four more items certified the marginal trial they selected on the first attempt:
+  `job_a26e9d113c47` at 0.75 under 0.80, `job_1c02059b9ca2` at 0.80 under 0.85, and
+  `job_2142a16a7282` and `job_b0edd46ad770` at 0.77 under 0.95.
+- **The first timestamp repair, on a real file.** For `job_7ecd37d63ba4`, a 17.5 s 4K source, the
+  repair restored the first video timestamp by 3,600 µs (`restore_first_video_timestamp`, no
+  padding restored), and the repaired file passed verification and certification and was accepted.
+- **The end padding repair had nothing to do.** Three items, each a 2 s clip, failed the audio
+  check with "end padding differs" and nothing else (`differsOnlyInEndPadding`), but their
+  candidates were 3.1, 3.1 and 6.0 times the size of their sources. The repair rewrites only a
+  candidate smaller than its source, so it was rightly not tried, and the originals were kept.
+- **What the AVC search cost.** It ran on 34 of the 58 items, all 34 then kept as
+  `SKIPPED_WOULD_DEGRADE`, measured 102 rungs and found none usable: all 102 failed, with a median
+  worst margin of −4.5 points, 1 ladder within half a point of every gate and 7 within one. It took
+  148.6 s, 8.0 % of the batch's item time and 55.5 % of those 34 items' time; in 27 of them the
+  HEVC ladder had stopped below the ratio the AVC ladder reached. With the Secure Folder run of §7,
+  55 AVC searches on this phone have found no usable rung. No default was changed: that waits for
+  a matched benchmark and the owner's decision.
+- **The 4K items** that made a full encode (4) took 4.19 s per second of media, 85.2 % of it pixel
+  scoring. They are not the sources of §7, so the two are not a comparison.
+- **The one crash record** in the export, about five hours before the batch and just after the
+  install, was the test instrumentation's process: when ADB dropped in the middle of a test run,
+  androidx.test's runner failed on UiAutomation's `DeadObjectException`, and no frame of the app's
+  code was in it. The other 20 records are exits (11 other, 7 user requested, 1 package updated,
+  1 low memory), all before the batch.
