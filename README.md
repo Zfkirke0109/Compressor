@@ -5,7 +5,7 @@
 
 On-device Android batch video compression with sampled quality checks, original-file recovery and separate profiles for the Galaxy S26 Ultra and S23 Ultra.
 
-[Download the latest signed APK](https://github.com/Zfkirke0109/Compressor/releases/latest) · [Changelog](CHANGELOG.md) · [Android CI](https://github.com/Zfkirke0109/Compressor/actions/workflows/android-ci.yml?query=branch%3Amain)
+[Download v1.6.335 (APK)](https://github.com/Zfkirke0109/Compressor/releases/download/ci-1.6.335/Galaxy-Compressor-v1.6.335-ci-arm64.apk) · [All releases](https://github.com/Zfkirke0109/Compressor/releases) · [Changelog](CHANGELOG.md) · [Android CI](https://github.com/Zfkirke0109/Compressor/actions/workflows/android-ci.yml?query=branch%3Amain)
 
 ![Kotlin](https://img.shields.io/badge/Kotlin-7F52FF?logo=kotlin&logoColor=white)
 ![Android](https://img.shields.io/badge/Android-3DDC84?logo=android&logoColor=white)
@@ -17,7 +17,7 @@ On-device Android batch video compression with sampled quality checks, original-
 
 ## Install
 
-The fork installs as `io.github.zfkirke0109.galaxycompressor` on 64-bit ARM devices running Android 7.0 or later. For a new installation or an update to a release-signed copy, install the APK from GitHub Releases. If you already use a PR or Android CI debug build, use the `debug/app-debug.apk` from a successful `main` CI run to update in place and retain your settings and learned profile. Android requires the same signing certificate for an in-place update.
+Galaxy Compressor runs on 64-bit ARM devices with Android 7.0 or later. The current GitHub pre-release contains a debug APK signed with this fork’s stable CI certificate. It installs fresh and can update an existing PR #44 or Android CI build in place, preserving settings and learned profiles. The package is `io.github.zfkirke0109.galaxycompressor`. Android requires a matching signing certificate for an in-place update.
 
 ## Compressing a batch
 
@@ -27,7 +27,7 @@ The fork installs as `io.github.zfkirke0109.galaxycompressor` on 64-bit ARM devi
 
 You can adjust codec, frame rate and thermal pacing, and choose whether to preserve recording dates and location. Optional Shizuku support provides another route for authorized file operations.
 
-## What changed in v1.6.334
+## What changed in v1.6.335
 
 The S26 Ultra and S23 Ultra use separate encoder profiles. Exhaustive mode can try a lower measured bitrate, use a bounded hardware AVC search on eligible inputs and retry a safer measured bitrate when needed. Device-specific learning, native frame preparation and targeted MP4/AAC repairs support that search. Gallery saves now require a successful publish and a byte-for-byte read-back before Compressor reports success. [Release notes](CHANGELOG.md) · [Quality criteria](docs/PERCEPTUALLY_LOSSLESS.md) · [Device validation](docs/DEVICE_VALIDATION.md)
 

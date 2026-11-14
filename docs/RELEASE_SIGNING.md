@@ -57,6 +57,10 @@ Settings → Secrets and variables → Actions → New repository secret:
 | `RELEASE_KEY_PASSWORD` | the key password (same as the store password unless you set a different one) |
 | `RELEASE_SIGNER_SHA256` | fingerprint from step 2 |
 
+## Public builds
+
+The first public fork build is a CI-signed pre-release. It comes from Android CI on the tagged commit and uses the stable debug certificate. Its `ci-*` tag identifies this distribution. A production APK uses the separate release certificate and `v*` workflow described below. [GitHub Releases](https://github.com/Zfkirke0109/Compressor/releases)
+
 ## Building
 
 - **On a same-repository pull request:** a signed release APK is built and uploaded as an artifact, so you

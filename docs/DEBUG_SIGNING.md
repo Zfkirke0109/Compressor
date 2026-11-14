@@ -33,4 +33,4 @@ The workflow reads `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PAS
 
 ## Important install note
 
-Android requires a matching certificate for an in-place update. To retain settings and learned profiles on a stable-debug install, continue with the app APK from Android CI. Use the release-signed APK for fresh installs and existing release-signed installations. [GitHub Releases](https://github.com/Zfkirke0109/Compressor/releases/latest)
+Android requires a matching certificate for an in-place update. To retain settings and learned profiles on a stable-debug install, continue with the app APK from Android CI. A CI-signed pre-release also installs fresh. When production-signed APKs are available, those update existing installations signed with the production certificate. [GitHub Releases](https://github.com/Zfkirke0109/Compressor/releases)

@@ -74,7 +74,7 @@ val buildTag: String = if (buildNumber > 0) "$buildLabel-b$buildNumber" else bui
 //                Android refuses a downgrade. Build time only ever increases. Local builds keep
 //                the historical 26 so a developer install never outranks a CI one.
 val baseVersion = "1.6"
-val basePatch = 334
+val basePatch = 335
 val isTaggedRelease: Boolean = buildTag == "release"
 val versionNameComputed: String = when {
     isTaggedRelease -> "$baseVersion.$basePatch"
