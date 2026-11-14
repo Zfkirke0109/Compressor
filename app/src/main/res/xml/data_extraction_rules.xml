@@ -4,16 +4,33 @@
    for details.
 -->
 <data-extraction-rules>
+    <!-- Rollback copies of a user's original video and the journal naming the file each belongs
+         to (ReplacementJournal). They mean something only on this device, while a replacement is
+         in flight or being recovered, and must not travel to a backup or another device. -->
+    <!-- Each run's diagnostics (DiagnosticsRecorder, DiagLog): session records with full source
+         SHA-256s and source fingerprints, frame traces, and, when the experiment that keeps them is
+         on, encoded copies of the user's videos. They describe runs on this device; exporting them
+         is the user's own act, and a backup or a new phone must not carry them. -->
+    <!-- What the app has learned (SmartPerceptualProfileEngine) and the journal of evidence it
+         learned from (LearningEvidenceStore), together. Learning is measured on this phone's
+         encoder and stays with it, the journal carries source fingerprints, and the two are only
+         consistent with each other. A new phone starts from its model's defaults and measures for
+         itself; every Perceptually Lossless output is measured whatever was learned. -->
+    <!-- What a device-harness run keeps in the app (HarnessCopies, HarnessScope): its allowlist,
+         results, rendered states, its own learning journal and, while a replacement case runs or
+         after one that stopped, rollback copies of a disposable copy of a user's video. -->
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="file" path="replace_recovery" />
+        <exclude domain="file" path="diagnostics" />
+        <exclude domain="file" path="learning" />
+        <exclude domain="file" path="pllab" />
+        <exclude domain="sharedpref" path="smart_perceptual_profiles_v4.xml" />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="file" path="replace_recovery" />
+        <exclude domain="file" path="diagnostics" />
+        <exclude domain="file" path="learning" />
+        <exclude domain="file" path="pllab" />
+        <exclude domain="sharedpref" path="smart_perceptual_profiles_v4.xml" />
     </device-transfer>
-    -->
 </data-extraction-rules>

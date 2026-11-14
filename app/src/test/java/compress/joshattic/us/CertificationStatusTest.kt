@@ -67,14 +67,14 @@ class CertificationStatusTest {
         )
         assertEquals(
             CertificationStatus.MISALIGNED,
-            CertificationStatus.forOutcome(PairScoreOutcome.MisalignmentRejected)
+            CertificationStatus.forOutcome(PairScoreOutcome.MisalignmentRejected(null))
         )
         // The three must stay distinguishable: "measured and misaligned" is evidence AGAINST,
         // while "unavailable" is merely absent evidence, and they drive different decisions.
         val all = setOf(
             CertificationStatus.forOutcome(scored),
             CertificationStatus.forOutcome(PairScoreOutcome.Unavailable),
-            CertificationStatus.forOutcome(PairScoreOutcome.MisalignmentRejected)
+            CertificationStatus.forOutcome(PairScoreOutcome.MisalignmentRejected(null))
         )
         assertEquals(3, all.size)
     }

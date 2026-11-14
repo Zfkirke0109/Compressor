@@ -23,6 +23,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -155,7 +159,7 @@ private fun BatchCompressorScreen(
                     colors = CardDefaults.outlinedCardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
                 ) {
                     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        Text("Samsung Galaxy S23 Ultra optimized", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Text(state.deviceProfile, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                         Text(
                             "Default is Perceptually Lossless: keep 4K as 4K, keep source FPS/audio, and fall back to Remux Only if safety cannot be verified.",
                             style = MaterialTheme.typography.bodyMedium,
@@ -180,7 +184,16 @@ private fun BatchCompressorScreen(
             }
 
             item { BatchSettingsCard(state, viewModel, context, requestOriginalMediaAccess) }
-            item { DiagnosticsExportCard(context) }
+            item {
+                DiagnosticsExportCard(
+                    context,
+                    state.isCompressing,
+                    state.items.any { !it.isAlreadyCompressed },
+                    state.isSelfChecking,
+                    viewModel::runScorerSelfCheck,
+                    viewModel::resetLearnedProfiles
+                )
+            }
             if (state.items.isNotEmpty()) {
                 item { BatchSummaryCard(state) }
                 item { PreservationReportCard(state) }
@@ -253,7 +266,10 @@ private fun BatchCompressorScreen(
                     BatchItemCard(
                         index = index + 1,
                         item = item,
-                        recommendationEnabled = !state.isCompressing,
+                        batchRunning = state.isCompressing,
+                        replaceOriginals = state.replaceOriginals,
+                        settings = BatchSettingsView(state.qualityPreset, state.codecOption, state.frameRateOption),
+                        queuedCount = state.items.count { it.status == BatchItemStatus.Pending && !it.isAlreadyCompressed },
                         onApplyRecommendation = { viewModel.applyRecommendation(item.sourceUri) }
                     )
                 }
@@ -319,13 +335,53 @@ private fun HighQualityRetryCard(count: Int, onRetry: () -> Unit) {
  * every state.
  */
 @Composable
-private fun DiagnosticsExportCard(context: Context) {
+private fun DiagnosticsExportCard(
+    context: Context,
+    isCompressing: Boolean,
+    hasSelection: Boolean,
+    isSelfChecking: Boolean,
+    onRunScorerSelfCheck: (Context) -> Unit,
+    onResetLearnedProfiles: ((Result<String>) -> Unit) -> Unit
+) {
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     var isError by remember { mutableStateOf(false) }
     val clipboard = LocalClipboardManager.current
     val termuxAvailability = remember { DiagnosticsExporter.termuxAvailability(context) }
+
+    fun readLearnedState() = runCatching {
+        SmartPerceptualProfileEngine(
+            SmartPerceptualProfileEngine.SharedPreferencesProfileStore(context.applicationContext)
+        ).learnedStateIdentity()
+    }.getOrNull()
+
+    var learnedState by remember { mutableStateOf<String?>(null) }
+
+    // Re-read learned profiles on first show and whenever a batch finishes, since the engine
+    // mutates them during a run. Done in an effect on the IO dispatcher: this used to read
+    // SharedPreferences and write state during composition itself, on the main thread.
+    LaunchedEffect(isCompressing) {
+        if (!isCompressing) learnedState = withContext(Dispatchers.IO) { readLearnedState() }
+    }
+
+    // The reset is irreversible, so the button asks first (the AlertDialog below).
+    var confirmReset by remember { mutableStateOf(false) }
+
+    fun resetLearnedProfiles() {
+        busy = true
+        onResetLearnedProfiles { result ->
+            busy = false
+            result.onSuccess {
+                learnedState = it
+                isError = false
+                message = "Learned profiles and measurement history reset. The next batch starts from the default targets."
+            }.onFailure {
+                isError = true
+                message = "Could not reset learned profiles: ${it.message ?: "unknown error"}"
+            }
+        }
+    }
 
     fun report(result: DiagnosticsExporter.ExportResult) {
         when (result) {
@@ -368,26 +424,308 @@ private fun DiagnosticsExportCard(context: Context) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
+            var scope by remember { mutableStateOf(DiagnosticsArchivePlan.Scope.CURRENT_RUN) }
+            Text("What to include", style = MaterialTheme.typography.labelLarge)
+            @OptIn(ExperimentalLayoutApi::class)
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                DiagnosticsArchivePlan.Scope.entries.forEach { option ->
+                    FilterChip(
+                        selected = scope == option,
+                        onClick = { scope = option },
+                        label = { Text(option.label) },
+                        enabled = !busy
+                    )
+                }
+            }
             Button(
-                onClick = { runExport { DiagnosticsExporter.exportSessions(context) } },
+                onClick = { runExport { DiagnosticsExporter.exportArchive(context, scope) } },
                 modifier = Modifier.fillMaxWidth(),
                 enabled = !busy
-            ) { Text("Save batch records to Downloads") }
+            ) { Text("Save diagnostics ZIP to Downloads") }
+            OutlinedButton(
+                onClick = { runExport { DiagnosticsExporter.exportArchive(context, scope, includeEvidenceFiles = false) } },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !busy
+            ) { Text("Save log-only ZIP to Downloads") }
             Text(
-                "The structured per-job records (session.jsonl) for every batch this app has run.",
+                "Log-only keeps the records, decisions and crash reports for the selected scope. " +
+                    "Everything also includes the learned profiles and learning history. " +
+                    "Retained videos and per-frame traces stay on the device.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                when (scope) {
+                    DiagnosticsArchivePlan.Scope.CURRENT_RUN ->
+                        "The newest batch: its records and decision log, any scorer self-check run " +
+                            "just before or after it, any crash or process-exit report written since it " +
+                            "started, and the device log buffer."
+                    DiagnosticsArchivePlan.Scope.PREVIOUS_RUN ->
+                        "The batch before the newest one, with its self-checks and the crash reports from its time."
+                    DiagnosticsArchivePlan.Scope.ALL_RUNS ->
+                        "Every retained run (the newest ${DiagnosticsRetention.MAX_RUNS}), every crash report, and the device log buffer."
+                    DiagnosticsArchivePlan.Scope.EVERYTHING ->
+                        "All runs, all crash reports, the device log buffer and the learned profiles. " +
+                            "The file is named Compressor-v<version>-<time>-Everything.zip."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                "One archive with a manifest.json; each run keeps its raw session.jsonl and " +
+                    "decisions.log under runs/<batchId>/. Export soon after a batch: the device log " +
+                    "buffer is small and overwrites itself, though the app's own records do not.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            OutlinedButton(
-                onClick = { runExport { DiagnosticsExporter.exportLogcat(context) } },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !busy
-            ) { Text("Save log to Downloads") }
+            HorizontalDivider()
+
+            Text("Scorer self-check", style = MaterialTheme.typography.labelLarge)
             Text(
-                "This app's own log lines only — including the per-check verification detail that " +
-                    "the batch records do not carry. Export soon after a batch: the system log " +
-                    "buffer is small and overwrites itself.",
+                "Control tests on the first selected video check that the source and a stream copy " +
+                    "decode to identical frames. A 2x-bitrate encode of one window shows what this " +
+                    "encoder can achieve on the clip. The result appears " +
+                    "in the status line and in the next diagnostics ZIP.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            OutlinedButton(
+                onClick = { onRunScorerSelfCheck(context) },
+                modifier = Modifier.fillMaxWidth(),
+                // One self-check at a time; starting a batch stops a running one.
+                enabled = !busy && !isCompressing && hasSelection && !isSelfChecking
+            ) { Text(if (isSelfChecking) "Scorer self-check running…" else "Run scorer self-check") }
+
+            HorizontalDivider()
+
+            val traceState by ExportDebugTracing.state.collectAsState()
+            Text("Media3 export trace", style = MaterialTheme.typography.labelLarge)
+            Text(
+                when (traceState) {
+                    ExportDebugTracing.State.ARMED -> "Trace armed for the next batch. The summary appears in export failure messages."
+                    ExportDebugTracing.State.ACTIVE -> "Recording per-stage pipeline events for this batch."
+                    ExportDebugTracing.State.IDLE -> "Arm only for a targeted diagnostic batch. Long or high-frame-rate exports can accumulate substantial trace data."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (traceState == ExportDebugTracing.State.IDLE) {
+                OutlinedButton(
+                    onClick = ExportDebugTracing::armNextBatch,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !isCompressing
+                ) { Text("Arm trace for next batch") }
+            }
+
+            HorizontalDivider()
+
+            val operationRunning by ExportDebugTracing.isOperationRunning.collectAsState()
+            val canChangeExperiments = !isCompressing && !operationRunning
+            var bFrames by remember { mutableStateOf(EncoderExperiments.isBFramesEnabled(context)) }
+            Text("Encoder experiment: B-frames", style = MaterialTheme.typography.labelLarge)
+            Text(
+                "Off by default. When on, probes and encodes ask the HEVC encoder for " +
+                    "${EncoderExperiments.B_FRAMES_WHEN_ENABLED} B-frames (max-bframes). The same gates judge " +
+                    "the result, and encodeResult lines carry bframes= so runs can be compared. Whether " +
+                    "this device's encoder honours the request is not yet known.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = bFrames,
+                    onCheckedChange = { on ->
+                        if (EncoderExperiments.setBFramesEnabled(context, on)) bFrames = on
+                    },
+                    enabled = canChangeExperiments
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (bFrames) "B-frames requested for the next batch" else "B-frames off",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            HorizontalDivider()
+
+            var saferRetry by remember { mutableStateOf(EncoderExperiments.isSaferRungRetryEnabled(context)) }
+            Text("Experiment: safer-rung retry", style = MaterialTheme.typography.labelLarge)
+            Text(
+                "Off by default. When a full encode fails pixel certification on measured windows, and the " +
+                    "probes had also passed a higher (safer) ratio for the same file, encode once more at that " +
+                    "ratio. The retry must pass every check again, including the unchanged pixel bar; if it " +
+                    "fails, the original is kept. At most one retry per file. Whether it recovers anything is " +
+                    "not yet measured on this device.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = saferRetry,
+                    onCheckedChange = { on ->
+                        if (EncoderExperiments.setSaferRungRetryEnabled(context, on)) saferRetry = on
+                    },
+                    enabled = canChangeExperiments
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (saferRetry) "Safer-rung retry on for the next batch" else "Safer-rung retry off",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            HorizontalDivider()
+
+            var longGop by remember { mutableStateOf(EncoderExperiments.isLongGopEnabled(context)) }
+            Text("Experiment: longer keyframe interval", style = MaterialTheme.typography.labelLarge)
+            Text(
+                "Off by default. Probes and encodes request twice the source's keyframe interval (at most " +
+                    "${EncoderExperiments.LONG_GOP_MAX_SECONDS.toInt()} s). Every quality check is unchanged, and this " +
+                    "setting learns separately, so it never uses or changes the ratios learned without it.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = longGop,
+                    onCheckedChange = { on ->
+                        if (EncoderExperiments.setLongGopEnabled(context, on)) longGop = on
+                    },
+                    enabled = canChangeExperiments
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (longGop) "Longer keyframe interval on for the next batch" else "Longer keyframe interval off",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            HorizontalDivider()
+
+            var shadowCalibration by remember { mutableStateOf(EncoderExperiments.isShadowCalibrationEnabled(context)) }
+            Text("Experiment: VMAF v1 shadow calibration", style = MaterialTheme.typography.labelLarge)
+            Text(
+                "Off by default. Also scores certification windows with the newer VMAF v1 model, for " +
+                    "calibration only: no decision reads it, and pass/fail stays on the v0.6.1 bar. It is slow " +
+                    "(up to minutes per 4K window), so it runs on at most ${compress.joshattic.us.quality.ShadowCalibration.MAX_WINDOWS_PER_BATCH} " +
+                    "windows per batch and never above 1080p.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = shadowCalibration,
+                    onCheckedChange = { on ->
+                        if (EncoderExperiments.setShadowCalibrationEnabled(context, on)) shadowCalibration = on
+                    },
+                    enabled = canChangeExperiments
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (shadowCalibration) "Shadow calibration on for the next batch" else "Shadow calibration off",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            HorizontalDivider()
+
+            var frameTrace by remember { mutableStateOf(EncoderExperiments.isFrameTraceEnabled(context)) }
+            Text("Research: per-frame evidence", style = MaterialTheme.typography.labelLarge)
+            Text("Records frame hashes, timestamps and scores for every probe, certification and self-check window. " +
+                "Adds CPU and storage work. No decoded images are saved. Export the diagnostics ZIP after a focused test.",
+                style = MaterialTheme.typography.bodySmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(checked = frameTrace, enabled = canChangeExperiments, onCheckedChange = { on ->
+                    if (EncoderExperiments.setFrameTraceEnabled(context, on)) frameTrace = on
+                })
+                Spacer(Modifier.width(8.dp))
+                Text(if (frameTrace) "Per-frame evidence on" else "Per-frame evidence off", style = MaterialTheme.typography.bodySmall)
+            }
+            var retainCandidates by remember { mutableStateOf(EncoderExperiments.isRetainCandidatesEnabled(context)) }
+            Text("Research: include encoded probe clips", style = MaterialTheme.typography.labelLarge)
+            Text("Includes the actual short videos in the exported ZIP for offline scoring. The archive will contain video content " +
+                "and can be large (512 MiB of clips per run). Use with per-frame evidence on a small selected test.", style = MaterialTheme.typography.bodySmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(checked = retainCandidates, enabled = canChangeExperiments, onCheckedChange = { on ->
+                    if (EncoderExperiments.setRetainCandidatesEnabled(context, on)) retainCandidates = on
+                })
+                Spacer(Modifier.width(8.dp))
+                Text(if (retainCandidates) "Include encoded clips" else "Exclude encoded clips", style = MaterialTheme.typography.bodySmall)
+            }
+            HorizontalDivider()
+
+            var fullSourceHash by remember { mutableStateOf(EncoderExperiments.isFullSourceHashEnabled(context)) }
+            Text("Pilot: full source hash", style = MaterialTheme.typography.labelLarge)
+            Text(
+                "Off by default. Reads every selected original in full before and after its job and " +
+                    "records its SHA-256 in the diagnostics, to prove the pilot arms used identical files " +
+                    "and that no original changed. It never modifies a file and records no names or paths, " +
+                    "but it reads each original twice, so leave it off for normal batches.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(
+                    checked = fullSourceHash,
+                    onCheckedChange = { on ->
+                        if (EncoderExperiments.setFullSourceHashEnabled(context, on)) fullSourceHash = on
+                    },
+                    enabled = canChangeExperiments
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    if (fullSourceHash) "Full source hash on for the next batch" else "Full source hash off",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            HorizontalDivider()
+            // Which build is actually running. Checking this used to mean exporting a capture and
+            // diffing a log string against the source; on 2026-09-01 a whole calibration round was
+            // spent on an APK that predated the instrumentation it was meant to exercise. The
+            // build number is monotonic, so "is this newer than the one I ran?" is answerable here.
+            Text(
+                "Build ${BuildConfig.BUILD_TAG} (${BuildConfig.GIT_COMMIT}) • v${BuildConfig.VERSION_NAME}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                learnedState?.let {
+                    if (it == "empty") "No learned profiles — the next batch starts from the defaults."
+                    else "Learned state: $it. Learned targets, and in Fast search the probe skips, " +
+                        "carry over between runs, so a comparison against another run is not controlled."
+                } ?: "Learned state unavailable.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            if (confirmReset) {
+                AlertDialog(
+                    onDismissRequest = { confirmReset = false },
+                    title = { Text("Reset learned profiles?") },
+                    text = {
+                        Text(
+                            "This erases every learned target and probe skip on this device and resets " +
+                                "which measurements may train again. It cannot be undone; the next batch " +
+                                "starts from the default targets."
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { confirmReset = false; resetLearnedProfiles() }) { Text("Reset") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { confirmReset = false }) { Text("Cancel") }
+                    }
+                )
+            }
+            OutlinedButton(
+                onClick = { confirmReset = true },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !busy && !isCompressing
+            ) { Text("Reset learned profiles") }
+            Text(
+                "Do this before an A/B run. The adb broadcast cannot reach a Secure Folder install " +
+                    "(it is a separate Android user), so in there this button is the only way.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -462,15 +800,11 @@ private fun BatchSettingsCard(
             val remuxOnly = state.qualityPreset == "Remux Only"
             Text("Batch settings", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
 
-            Text("S23 Ultra presets", style = MaterialTheme.typography.labelLarge)
+            val deviceProfile = remember { DeviceCapabilityProfiles.current() }
+            Text("${deviceProfile.presetFamily} presets", style = MaterialTheme.typography.labelLarge)
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf(
-                    "S23 Ultra Best Quality",
-                    "S23 Ultra Storage Saver",
-                    "Social Upload",
-                    "Archive Mode",
-                    "HDR Safe Mode"
-                ).forEach { label ->
+                BatchPresetOption.forDevice(deviceProfile).forEach { preset ->
+                    val label = preset.label
                     FilterChip(
                         selected = state.selectedPreset == label,
                         onClick = { viewModel.applyPreset(label) },
@@ -574,6 +908,36 @@ private fun BatchSettingsCard(
                     perceptuallyLossless -> "Disabled in Perceptually Lossless because source FPS/motion (including 120fps) is always preserved. Choose High Quality or Storage Saver to cap FPS."
                     else -> "Original/source FPS is preserved by default, including 120fps. 120/60/30/24 caps are applied only when you explicitly choose them."
                 },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Text("Perceptually Lossless search", style = MaterialTheme.typography.labelLarge)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Switch(
+                    checked = state.exhaustivePerceptualLossless,
+                    onCheckedChange = { viewModel.setExhaustivePerceptualLossless(it) },
+                    enabled = !state.isCompressing
+                )
+                Text(
+                    if (state.exhaustivePerceptualLossless) "Exhaustive: measure every file" else "Fast: skip likely failures",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+            Text(
+                if (state.exhaustivePerceptualLossless)
+                    "SDR videos up to 4K get a real VMAF test before being kept as-is (a shorter test " +
+                        "above 1080p), and any verified saving is kept, however small. Same quality bar: " +
+                        "a file is only replaced when the test proves no visible loss. Slower and uses " +
+                        "more battery, most of all on 4K. Never tested: HDR (no validated HDR quality " +
+                        "model), 8K, clips under 2 seconds, and files already in a more efficient codec " +
+                        "than the phone can encode (such as AV1)."
+                else
+                    "Skips the VMAF test for files that look already compressed, or whose type " +
+                        "failed recently. Faster, but some compressible files are never tried.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
@@ -729,22 +1093,23 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
             if (state.isCompressing) {
                 state.activeItem?.let { active ->
                     Text(
-                        "Active: ${active.currentOutputDisplaySize} / est ${active.targetOutputDisplaySize} • ${active.progressPercent}%",
+                        "Active: ${ItemProgressModel.describe(active)} • ${active.activeSizeLine()}",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.primary,
                         fontWeight = FontWeight.SemiBold
                     )
                 }
-                if (state.totalTargetOutputBytes > 0L) {
-                    Text(
-                        "Batch written: ${state.formattedTotalCurrentOutput} / est ${state.formattedTotalTargetOutput}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
+                Text(
+                    "Finished: ${state.items.count { ItemProgressModel.isTerminal(it) }} of ${state.items.size} items",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
             if (state.totalOutputBytes > 0) {
-                Text("Outputs: ${state.formattedTotalOutput} • Saved by real compression: ${state.formattedTotalSaved}")
+                Text("Outputs: ${state.formattedTotalOutput} • ${AcceptedReduction.LABEL}: ${state.formattedTotalSaved}")
+                AcceptedReduction.storageNote(state.realCompressionCount, state.originalsReplacedCount, state.backupBeforeReplace)?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
     }
@@ -807,11 +1172,22 @@ private fun PreservationReportCard(state: BatchCompressorUiState) {
     }
 }
 
+/** The batch settings a recommendation is compared with. */
+internal data class BatchSettingsView(val quality: String, val codec: String, val frameRate: String)
+
+/**
+ * One row of the batch. Identity first (a stable name area, the status below it when the window or
+ * the font is narrow), then what is happening to the original and the copy, then the active phase
+ * or the result. Durable warnings stay visible; the full verification evidence folds away.
+ */
 @Composable
-private fun BatchItemCard(
+internal fun BatchItemCard(
     index: Int,
     item: BatchVideoItem,
-    recommendationEnabled: Boolean,
+    batchRunning: Boolean,
+    replaceOriginals: Boolean,
+    settings: BatchSettingsView,
+    queuedCount: Int,
     onApplyRecommendation: () -> Unit
 ) {
     val skipped = item.status == BatchItemStatus.Skipped || item.isAlreadyCompressed
@@ -824,169 +1200,331 @@ private fun BatchItemCard(
         colors = cardColors
     ) {
         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.Top,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        "$index. ${item.originalName}",
-                        style = MaterialTheme.typography.bodyLarge,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        "Original: ${item.originalWidth}x${item.originalHeight} • ${item.originalFps.toInt()}fps • ${item.displaySize}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                Spacer(modifier = Modifier.width(10.dp))
-                AssistChip(
-                    onClick = {},
-                    enabled = false,
-                    label = { Text(item.shortStatusLabel()) }
-                )
-            }
-
+            ItemHeader(index, item)
             Text(
-                item.preservationSummary(),
+                "Original: ${item.originalWidth}x${item.originalHeight} • ${item.originalFps.toInt()}fps • ${item.displaySize}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            val original = OriginalStatus.describe(item, replaceOriginals)
+            Text(
+                original.text,
+                style = MaterialTheme.typography.bodySmall,
+                fontWeight = if (original.tone == OriginalStatus.Tone.NEUTRAL) FontWeight.Normal else FontWeight.SemiBold,
+                color = when (original.tone) {
+                    OriginalStatus.Tone.WARNING -> MaterialTheme.colorScheme.error
+                    OriginalStatus.Tone.DONE -> MaterialTheme.colorScheme.primary
+                    OriginalStatus.Tone.NEUTRAL -> MaterialTheme.colorScheme.onSurfaceVariant
+                },
+                modifier = Modifier.testTag(ItemCardTags.ORIGINAL_STATUS)
+            )
+            Text(
+                item.metadataSummary(),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            item.recommendation?.takeIf { item.status == BatchItemStatus.Pending }?.let { recommendation ->
-                HorizontalDivider()
-                Text(
-                    recommendation.summary,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Text(
-                    recommendation.reason,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                OutlinedButton(onClick = onApplyRecommendation, enabled = recommendationEnabled) {
-                    Text("Apply recommendation")
-                }
-            }
-
             if (item.status == BatchItemStatus.Compressing) {
-                Text(
-                    "Output: ${item.currentOutputDisplaySize} / est ${item.targetOutputDisplaySize} • ${item.progressPercent}%",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold
-                )
-                LinearProgressIndicator(progress = { item.progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                ActiveItemBlock(item)
+            } else {
+                ResultBlock(item)
             }
 
-            if (item.outputSize > 0L) {
-                HorizontalDivider()
-                Text(
-                    item.beforeAfterSummary(),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-
-            item.terminalResult?.let { terminal ->
-                Text(
-                    "Outcome: ${terminal.label}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (terminal.isFailure) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-
-            item.verificationReport?.let { report ->
-                HorizontalDivider()
-                Text("Verification", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
-                report.summaryLines.forEach { line ->
-                    Text(
-                        line,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-                report.replacementBlockReason?.let { reason ->
-                    Text(
-                        "Replacement blocked: $reason",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.error
-                    )
-                }
-            }
-
-            item.metrics?.let { metrics ->
-                Text(
-                    metrics.summary,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-
-            item.message?.let {
-                Text(
-                    it,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (item.status == BatchItemStatus.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
-                )
+            item.recommendation?.takeIf { item.status == BatchItemStatus.Pending && !batchRunning }?.let { recommendation ->
+                RecommendationSection(item, recommendation, settings, queuedCount, onApplyRecommendation)
             }
         }
     }
 }
 
-private fun BatchVideoItem.shortStatusLabel(): String {
-    terminalResult?.let { terminal ->
-        return when (terminal) {
-            BatchTerminalResult.TRANSCODED_SMALLER,
-            BatchTerminalResult.LOSSY_SMALLER -> "Compressed"
-            BatchTerminalResult.TRANSCODED_NOT_MEANINGFULLY_SMALLER -> "No size win"
-            BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED -> "Already efficient"
-            BatchTerminalResult.REMUX_PREFERRED_BY_EVIDENCE -> "Kept (measured)"
-            BatchTerminalResult.EXPLICIT_REMUX -> "Remuxed"
-            BatchTerminalResult.UNEXPECTED_REMUX -> "Original kept"
-            BatchTerminalResult.SKIPPED_ALREADY_COMPRESSED -> "Skipped"
-            BatchTerminalResult.SKIPPED_WOULD_DEGRADE -> "Skipped (quality)"
-            BatchTerminalResult.CANCELLED -> "Cancelled"
-            BatchTerminalResult.OUTPUT_VALIDATION_FAILED,
-            BatchTerminalResult.ENCODER_FAILURE,
-            BatchTerminalResult.UNSUPPORTED_CONTAINER,
-            BatchTerminalResult.FAILED -> "Failed"
+/** Test tags for the parts of a row whose presence or absence a test checks. */
+internal object ItemCardTags {
+    const val STATUS = "item-status"
+    const val ORIGINAL_STATUS = "item-original-status"
+    const val PHASE = "item-phase"
+    const val ATTEMPT = "item-attempt"
+    const val SIZE = "item-size"
+    const val DETAIL = "item-phase-detail"
+    const val OUTCOME = "item-outcome"
+    const val DETAILS_TOGGLE = "item-details-toggle"
+    const val SUGGESTION_TOGGLE = "item-suggestion-toggle"
+    const val APPLY_TO_BATCH = "item-apply-to-batch"
+}
+
+@Composable
+private fun ItemHeader(index: Int, item: BatchVideoItem) {
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        // A long name and a long status cannot share a narrow row: the status goes below it, so the
+        // name keeps a stable area. Large text narrows the row as much as a small window does.
+        val narrow = maxWidth < 360.dp || androidx.compose.ui.platform.LocalDensity.current.fontScale >= 1.3f
+        val name = @Composable { modifier: Modifier ->
+            Text(
+                "$index. ${item.originalName}",
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = modifier
+            )
         }
+        if (narrow) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                name(Modifier)
+                StatusBadge(item)
+            }
+        } else {
+            Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                name(Modifier.weight(1f))
+                Spacer(modifier = Modifier.width(10.dp))
+                StatusBadge(item)
+            }
+        }
+    }
+}
+
+/** The row's status as readable, non-interactive text (a disabled chip greys its label out). */
+@Composable
+private fun StatusBadge(item: BatchVideoItem) {
+    val label = StatusLabel.of(item)
+    val failed = StatusLabel.isAlarming(item)
+    val (container, content) = when {
+        failed -> MaterialTheme.colorScheme.errorContainer to MaterialTheme.colorScheme.onErrorContainer
+        item.status == BatchItemStatus.Compressing -> MaterialTheme.colorScheme.primaryContainer to MaterialTheme.colorScheme.onPrimaryContainer
+        item.status == BatchItemStatus.Pending -> MaterialTheme.colorScheme.surfaceVariant to MaterialTheme.colorScheme.onSurfaceVariant
+        else -> MaterialTheme.colorScheme.secondaryContainer to MaterialTheme.colorScheme.onSecondaryContainer
+    }
+    Surface(
+        color = container,
+        contentColor = content,
+        shape = MaterialTheme.shapes.small,
+        modifier = Modifier
+            .testTag(ItemCardTags.STATUS)
+            .semantics(mergeDescendants = true) { contentDescription = "Status: $label" }
+    ) {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+        )
+    }
+}
+
+@Composable
+private fun ActiveItemBlock(item: BatchVideoItem) {
+    // The phase and its own measured fraction (ItemProgressModel), never an encoder's 100 %
+    // presented as the item's: finalizing, verification and certification follow.
+    Text(
+        ItemProgressModel.describe(item),
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.primary,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.testTag(ItemCardTags.PHASE)
+    )
+    // Why the work restarted and why the estimate grew: kept for the whole retry (R4).
+    item.attemptContext?.let { attempt ->
+        Text(
+            "${attempt.label}: ${attempt.reason}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.tertiary,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.testTag(ItemCardTags.ATTEMPT)
+        )
+    }
+    Text(
+        item.activeSizeLine(),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.testTag(ItemCardTags.SIZE)
+    )
+    val fraction = item.phaseFraction
+    if (fraction != null) {
+        LinearProgressIndicator(progress = { fraction.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+    } else {
+        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+    }
+    // Only the current phase's own detail: text a finished phase wrote is obsolete (R3).
+    item.detail?.takeIf { it.phase == item.phase }?.let { detail ->
+        Text(
+            detail.text,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.testTag(ItemCardTags.DETAIL)
+        )
+    }
+    // Durable text written while the row is active (a warning) stays visible beside the phase.
+    item.message?.let {
+        Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+@Composable
+private fun ResultBlock(item: BatchVideoItem) {
+    // The encode's result, qualified when a replacement was asked for and did not happen (OutcomeLine).
+    OutcomeLine.of(item)?.let { outcome ->
+        Text(
+            outcome.text,
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (outcome.tone == OriginalStatus.Tone.WARNING) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.testTag(ItemCardTags.OUTCOME)
+        )
+    }
+    if (item.outputSize > 0L) {
+        Text(
+            item.beforeAfterSummary(),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+    }
+    item.attemptContext?.let { attempt ->
+        Text(
+            "${attempt.label}: ${attempt.reason}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.tertiary,
+            modifier = Modifier.testTag(ItemCardTags.ATTEMPT)
+        )
+    }
+    // Warnings are never folded away.
+    item.verificationReport?.replacementBlockReason?.let { reason ->
+        Text(
+            "Replacement blocked: $reason",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error
+        )
+    }
+    // An outcome, a failure or a replacement's account is shown; the long technical completion
+    // line of a verified output goes with the verification details.
+    val messageUpFront = item.status == BatchItemStatus.Failed || item.replacementOutcome != null || item.verificationReport == null
+    if (messageUpFront) {
+        item.message?.let {
+            Text(
+                it,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (item.status == BatchItemStatus.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+    val report = item.verificationReport
+    if (report != null || item.metrics != null || (!messageUpFront && item.message != null)) {
+        var expanded by rememberSaveable(item.sourceUri.toString()) { mutableStateOf(false) }
+        TextButton(
+            onClick = { expanded = !expanded },
+            modifier = Modifier.testTag(ItemCardTags.DETAILS_TOGGLE)
+        ) {
+            Text(if (expanded) "Hide verification details" else "Show verification details")
+        }
+        if (expanded) {
+            HorizontalDivider()
+            report?.summaryLines?.forEach { line ->
+                Text(line, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            item.metrics?.let { metrics ->
+                Text(metrics.summary, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (!messageUpFront) {
+                item.message?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            }
+        }
+    }
+}
+
+/**
+ * A recommendation is a rule of thumb about the kind of clip, and applying it changes the WHOLE
+ * batch's settings, not this file's. It is folded by default, says what it would change and
+ * whether that leaves Perceptually Lossless, and asks before applying (R5). Hidden while a batch runs.
+ */
+@Composable
+private fun RecommendationSection(
+    item: BatchVideoItem,
+    recommendation: CompressionRecommendation,
+    settings: BatchSettingsView,
+    queuedCount: Int,
+    onApply: () -> Unit
+) {
+    val preview = RecommendationPreview.of(recommendation, settings.quality, settings.codec, settings.frameRate)
+    var open by rememberSaveable("suggestion-" + item.sourceUri.toString()) { mutableStateOf(false) }
+    var confirming by remember { mutableStateOf(false) }
+    HorizontalDivider()
+    Text(
+        "Suggestion: ${recommendation.title}" +
+            when {
+                !preview.changesAnything -> " (the batch already uses it)"
+                preview.leavesPerceptuallyLossless -> " (would leave Perceptually Lossless)"
+                else -> ""
+            },
+        style = MaterialTheme.typography.bodySmall,
+        color = if (preview.leavesPerceptuallyLossless) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+        fontWeight = FontWeight.SemiBold
+    )
+    TextButton(onClick = { open = !open }, modifier = Modifier.testTag(ItemCardTags.SUGGESTION_TOGGLE)) {
+        Text(if (open) "Hide suggestion" else "Show suggestion")
+    }
+    if (open) {
+        Text(RecommendationPreview.estimateLine(recommendation), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(recommendation.reason, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        if (preview.changesAnything) {
+            Text("Applies to the whole batch, not only this file:", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.SemiBold)
+            preview.changes.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
+            if (preview.leavesPerceptuallyLossless) {
+                Text(
+                    "Every output would be lossy, and the measured Perceptually Lossless checks would not apply.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+            OutlinedButton(onClick = { confirming = true }, modifier = Modifier.testTag(ItemCardTags.APPLY_TO_BATCH)) {
+                Text("Apply to entire batch…")
+            }
+        }
+    }
+    if (confirming) {
+        AlertDialog(
+            onDismissRequest = { confirming = false },
+            title = { Text("Change the whole batch?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("These settings apply to all $queuedCount queued file${if (queuedCount == 1) "" else "s"}:")
+                    preview.changes.forEach { Text("• $it") }
+                    if (preview.leavesPerceptuallyLossless) {
+                        Text("Outputs would be lossy: Perceptually Lossless would be off.", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { confirming = false; onApply() }) { Text("Apply to batch") }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirming = false }) { Text("Cancel") }
+            }
+        )
+    }
+}
+
+/**
+ * Sizes for an active row, each named for what it is: the live file while the muxer writes (a
+ * temporary footprint that can shrink when the file is closed), the finalized candidate (not yet
+ * accepted), and the estimate, marked provisional until the probes have chosen a ratio.
+ */
+private fun BatchVideoItem.activeSizeLine(): String {
+    val estimate = if (targetOutputSize > 0L) {
+        "est ${formatCardBytes(targetOutputSize)}${if (estimateIsProvisional) " (provisional)" else ""}"
+    } else {
+        "no estimate"
     }
     return when {
-        status == BatchItemStatus.Skipped || isAlreadyCompressed -> "Skipped"
-        status == BatchItemStatus.Compressing -> "${progressPercent}%"
-        status == BatchItemStatus.Done -> "Done"
-        status == BatchItemStatus.Replaced -> "Replaced"
-        status == BatchItemStatus.SavedCopy -> "Saved"
-        status == BatchItemStatus.Failed -> "Failed"
-        status == BatchItemStatus.Cancelled -> "Cancelled"
-        else -> "Ready"
+        candidateOutputSize > 0L -> "Candidate ${formatCardBytes(candidateOutputSize)} (not yet accepted) • $estimate"
+        currentOutputSize > 0L -> "Writing ${formatCardBytes(currentOutputSize)} (temporary) • $estimate"
+        else -> estimate
     }
 }
 
-private fun BatchVideoItem.preservationSummary(): String {
+/** What the source carries; what happens to the original and the copy is OriginalStatus's line. */
+private fun BatchVideoItem.metadataSummary(): String {
     val date = if (metadataSnapshot.hasDate) "${metadataSnapshot.dateDiagnosticLabel} ✓" else "date —"
     val location = if (metadataSnapshot.hasLocation) "location ✓" else "location —"
-    val replacement = when (status) {
-        BatchItemStatus.Replaced -> "original replaced"
-        BatchItemStatus.SavedCopy -> "safe copy saved"
-        BatchItemStatus.Done -> "copy ready"
-        BatchItemStatus.Skipped -> "skipped"
-        BatchItemStatus.Failed -> "failed"
-        BatchItemStatus.Cancelled -> "cancelled"
-        BatchItemStatus.Compressing -> "compressing"
-        else -> "ready"
-    }
-    return "Metadata: $date • $location • $replacement"
+    return "Metadata: $date • $location"
 }
 
 private fun BatchVideoItem.beforeAfterSummary(): String {
@@ -995,7 +1533,8 @@ private fun BatchVideoItem.beforeAfterSummary(): String {
     val savedPercent = if (originalSize > 0L) ((savedBytes * 100.0) / originalSize).toInt() else 0
     val similarSize = originalSize > 0L && kotlin.math.abs(outputSize - originalSize).toDouble() / originalSize.toDouble() < 0.03
     if (terminalResult?.countsAsRealCompression == true) {
-        return "Before/after: ${formatCardBytes(originalSize)} → ${formatCardBytes(outputSize)} • saved ${formatCardBytes(savedBytes)} ($savedPercent%)"
+        // A size reduction, not freed space: the original may still sit beside this output.
+        return "Before/after: ${formatCardBytes(originalSize)} → ${formatCardBytes(outputSize)} • ${formatCardBytes(savedBytes)} smaller ($savedPercent%)"
     }
     val rawDelta = outputSize - originalSize
     val deltaLabel = when {
@@ -1014,9 +1553,9 @@ private fun formatCardBytes(bytes: Long): String {
     val mb = kb * 1024.0
     val gb = mb * 1024.0
     return when {
-        safe >= gb -> String.format(java.util.Locale.US, "%.2f GB", safe / gb)
-        safe >= mb -> String.format(java.util.Locale.US, "%.1f MB", safe / mb)
-        safe >= kb -> String.format(java.util.Locale.US, "%.1f KB", safe / kb)
+        safe >= gb -> String.format(java.util.Locale.US, "%.2f GiB", safe / gb)
+        safe >= mb -> String.format(java.util.Locale.US, "%.1f MiB", safe / mb)
+        safe >= kb -> String.format(java.util.Locale.US, "%.1f KiB", safe / kb)
         else -> "${bytes.coerceAtLeast(0L)} B"
     }
 }

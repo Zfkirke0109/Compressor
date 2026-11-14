@@ -10,4 +10,15 @@
    <include domain="sharedpref" path="."/>
    <exclude domain="sharedpref" path="device.xml"/>
 -->
+    <!-- Rollback copies of a user's original video and the journal naming the file each belongs
+         to (ReplacementJournal). They mean something only on this device, while a replacement is
+         in flight or being recovered, and must not travel to a backup or another device. -->
+    <exclude domain="file" path="replace_recovery" />
+    <!-- Each run's diagnostics, and the learned profiles with their journal: see
+         data_extraction_rules.xml. -->
+    <exclude domain="file" path="diagnostics" />
+    <exclude domain="file" path="learning" />
+    <!-- A device-harness run's files, which can hold rollback copies of a copy of a user's video. -->
+    <exclude domain="file" path="pllab" />
+    <exclude domain="sharedpref" path="smart_perceptual_profiles_v4.xml" />
 </full-backup-content>

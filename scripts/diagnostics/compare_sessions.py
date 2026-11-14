@@ -15,7 +15,9 @@ It is deliberately hard to use for marketing:
   * A "win" requires a genuinely smaller output, not merely a changed terminal state.
 
 Usage:
-    python3 compare_sessions.py BASELINE.jsonl CANDIDATE.jsonl [--json out.json]
+    python3 compare_sessions.py BASELINE CANDIDATE [--baseline-batch ID] [--candidate-batch ID] [--json out.json]
+
+Choose a batch explicitly for each capture that contains multiple runs.
 
 Exit codes: 0 comparison produced, 2 unusable input, 3 no overlapping files.
 """
@@ -25,10 +27,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import zipfile
 from collections import Counter
 from typing import Any
 
-from session_records import read_records
+from parse_session_jsonl import load_sessions
 
 # Terminal states in which no output file is produced, so no byte saving is possible.
 NON_PRODUCING = {
@@ -39,17 +42,20 @@ NON_PRODUCING = {
 }
 
 
-def load_jobs(path: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Accepts both capture transports; see session_records.decode_record."""
-    start: dict[str, Any] = {}
-    jobs: list[dict[str, Any]] = []
-    for rec in read_records(path):
-        kind = rec.get("type") or rec.get("eventType")
-        if kind == "session_start":
-            start = rec
-        elif kind == "job":
-            jobs.append(rec)
-    return start, jobs
+def load_jobs(path: str, batch_id: str | None = None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Read one batch from JSONL, logcat or a diagnostics ZIP."""
+    sessions = load_sessions(path)
+    if not sessions:
+        return {}, []
+    if batch_id is None:
+        if len(sessions) != 1:
+            raise ValueError(f"{path} contains multiple batches: {', '.join(sessions)}")
+        session = next(iter(sessions.values()))
+    else:
+        if batch_id not in sessions:
+            raise ValueError(f"{path} has no batch {batch_id}; available: {', '.join(sessions)}")
+        session = sessions[batch_id]
+    return session["start"] or {}, session["jobs"]
 
 
 def saved_bytes(job: dict[str, Any]) -> int:
@@ -156,11 +162,16 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("baseline")
     ap.add_argument("candidate")
+    ap.add_argument("--baseline-batch", help="batch ID from a baseline with multiple runs")
+    ap.add_argument("--candidate-batch", help="batch ID from a candidate with multiple runs")
     ap.add_argument("--json")
     args = ap.parse_args()
 
-    start_a, jobs_a = load_jobs(args.baseline)
-    start_b, jobs_b = load_jobs(args.candidate)
+    try:
+        start_a, jobs_a = load_jobs(args.baseline, args.baseline_batch)
+        start_b, jobs_b = load_jobs(args.candidate, args.candidate_batch)
+    except (OSError, ValueError, zipfile.BadZipFile) as e:
+        ap.error(str(e))
     if not jobs_a or not jobs_b:
         print("error: one or both captures contain no job records", file=sys.stderr)
         return 2
@@ -174,6 +185,8 @@ def main() -> int:
     result["uncontrolled"] = missing
     result["baselineBuild"] = start_a.get("buildCommit")
     result["candidateBuild"] = start_b.get("buildCommit")
+    result["baselineBatchId"] = start_a.get("batchId") or args.baseline_batch
+    result["candidateBatchId"] = start_b.get("batchId") or args.candidate_batch
 
     print(render(result, missing,
                  str(start_a.get("buildCommit")), str(start_b.get("buildCommit"))))

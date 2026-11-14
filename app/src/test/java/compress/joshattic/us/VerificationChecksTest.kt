@@ -56,6 +56,47 @@ class VerificationChecksTest {
     }
 
     @Test
+    fun aLossyVerdictIsJudgedOnPlayabilityAndEverythingElseIsADifference() {
+        // H.264 to HEVC, and a portrait source coded as landscape: what High Quality changes by design.
+        val c = allPassing().copy(videoCodecMatches = false, rotationMatches = false)
+        assertTrue(c.passes(VerificationChecks.Scope.LOSSY))
+        assertEquals(emptyList<String>(), c.failures(VerificationChecks.Scope.LOSSY))
+        assertEquals(listOf("rotationMatches", "videoCodecMatches"), c.differencesOutside(VerificationChecks.Scope.LOSSY))
+        // The same output judged as a stream copy fails on both, and has no difference left outside.
+        assertEquals(listOf("rotationMatches", "videoCodecMatches"), c.failures(VerificationChecks.Scope.REMUX))
+        assertEquals(emptyList<String>(), c.differencesOutside(VerificationChecks.Scope.REMUX))
+        // A Perceptually Lossless transcode changes the codec too: outside its scope, not a failure.
+        val pl = allPassing().copy(videoCodecMatches = false)
+        assertTrue(pl.passes(VerificationChecks.Scope.PERCEPTUAL_LOSSLESS))
+        assertEquals(listOf("videoCodecMatches"), pl.differencesOutside(VerificationChecks.Scope.PERCEPTUAL_LOSSLESS))
+        assertEquals(listOf("playable"), allPassing().copy(playable = false).failures(VerificationChecks.Scope.LOSSY))
+    }
+
+    @Test
+    fun failuresAndOutsideDifferencesTogetherAreEveryPredicateThatDoesNotHold() {
+        val rng = Random(20261111)
+        repeat(500) {
+            fun b() = rng.nextInt(4) != 0
+            val c = VerificationChecks(
+                playable = b(), criticalFieldsComplete = b(), durationMatches = b(),
+                frameCountMatches = b(), videoMatches = b(), fpsMatches = b(),
+                videoCodecMatches = b(), audioCodecMatches = b(), audioShapeMatches = b(),
+                audioBitratePass = b(), hdrMatches = b(), standardMatches = b(),
+                rangeMatches = b(), rotationMatches = b(), locationMatches = b(),
+                mediaStoreDateMatches = b(), mp4DateMatches = b(), videoBitratePass = b()
+            )
+            val notHolding = c.toString().removePrefix("VerificationChecks(").removeSuffix(")").split(", ")
+                .filter { it.endsWith("=false") }.map { it.substringBefore('=') }.toSet()
+            VerificationChecks.Scope.entries.forEach { scope ->
+                val failed = c.failures(scope)
+                val outside = c.differencesOutside(scope)
+                assertTrue("$scope", failed.intersect(outside.toSet()).isEmpty())
+                assertEquals("$scope on $c", notHolding, (failed + outside).toSet())
+            }
+        }
+    }
+
+    @Test
     fun theSevenInvisiblePredicatesAreEachNamed() {
         // These are precisely the ones that rendered no "warn" and so were undiagnosable.
         val cases = mapOf(

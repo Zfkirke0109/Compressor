@@ -11,7 +11,7 @@ import json
 import os
 import tempfile
 
-from parse_session_jsonl import summarize
+from parse_session_jsonl import load_sessions, summarize
 
 
 def write(records) -> str:
@@ -34,6 +34,68 @@ def start(**kw):
     d = {"type": "session_start", "batchId": "b1", "buildCommit": "abc1234", "mode": "PL"}
     d.update(kw)
     return d
+
+
+def test_a_capture_holding_several_builds_is_never_merged_into_one_total():
+    # The in-app export writes EVERY session the recorder holds, newest first, so one file
+    # routinely spans several builds. Merging them and labelling the total with whichever
+    # session_start happened to be parsed last attributes one build's jobs to another -- the
+    # 2026-09-01 capture would have read as 387 jobs of the OLDEST batch when the batch under
+    # test contributed 36.
+    path = write([
+        start(batchId="new", buildCommit="d72cfee"),
+        job("a", batchId="new", terminal="ALREADY_HIGHLY_OPTIMIZED", verified=True, failedChecks=[]),
+        {"type": "session_summary", "batchId": "new", "elapsedMs": 10},
+        start(batchId="old", buildCommit="457edfe"),
+        job("b", batchId="old"),
+        job("c", batchId="old"),
+        {"type": "session_summary", "batchId": "old", "elapsedMs": 20},
+    ])
+    sessions = load_sessions(path)
+    assert list(sessions) == ["new", "old"]
+    assert len(sessions["new"]["jobs"]) == 1
+    assert len(sessions["old"]["jobs"]) == 2
+
+    # Default is the newest session, reported under ITS OWN build -- not a merged 3-job total.
+    s = summarize(path)
+    assert s["batchId"] == "new"
+    assert s["buildCommit"] == "d72cfee"
+    assert s["jobs"] == 1
+
+    # And an older batch stays addressable rather than being lost.
+    old = summarize(path, "old")
+    assert old["batchId"] == "old" and old["buildCommit"] == "457edfe" and old["jobs"] == 2
+
+
+def test_records_without_their_own_batch_id_follow_the_session_they_come_after():
+    # Older captures stamp batchId only on session_start and rely on block order. Those must
+    # still land in the right session rather than collapsing into one "None" bucket.
+    path = write([start(batchId="b1"), job("a"), start(batchId="b2"), job("b"), job("c")])
+    sessions = load_sessions(path)
+    assert [len(v["jobs"]) for v in sessions.values()] == [1, 2]
+    assert list(sessions) == ["b1", "b2"]
+
+
+def test_a_batch_that_recorded_no_summary_is_flagged_as_unfinished():
+    # A batch killed mid-run still has job records. Reporting its totals as if the run completed
+    # would understate the corpus and hide the fact that it stopped.
+    from parse_session_jsonl import render
+    path = write([start(batchId="b1"), job("a")])
+    s = summarize(path)
+    assert s["completed"] is False
+    assert "did not finish" in render(s)
+
+
+def test_v1_shadow_scores_are_paired_with_the_verdict_scores_window_by_window():
+    s = summarize(write([
+        start(),
+        job("a", certWindowScores="99.0/98.0/97.0;90.0/85.0/80.0",
+            certV1Scores="98.0/97.0/96.5;88.0/82.0/75.0"),
+        job("b", certWindowScores="99.0/98.0/97.0", certV1Scores=None),
+        # Mismatched window counts are dropped, never guessed into alignment.
+        job("c", certWindowScores="99.0/98.0/97.0;90.0/85.0/80.0", certV1Scores="98.0/97.0/96.0"),
+    ]))
+    assert s["v1ShadowPairs"] == [(97.0, 96.5), (80.0, 75.0)]
 
 
 def test_failing_predicates_are_counted_and_shared_against_verified_jobs_only():
@@ -81,6 +143,34 @@ def test_learned_state_identity_is_surfaced_for_run_comparability():
     assert summarize(write([start(), job("a")]))["learnedStateIdentity"] is None
 
 
+def test_a_ladder_that_measured_nothing_is_separated_from_one_that_measured_and_failed():
+    # Both report the same terminal, and before the fix both reported the same probeDetail.
+    # Only the presence of window scores tells them apart, which is why the summariser checks it.
+    s = summarize(write([
+        start(),
+        job("a", probedRatios="0.90,0.95", probeWindowScores="97.0/93.0/88.0",
+            probeDetail="no candidate ratio passed"),
+        job("b", probedRatios="0.90,0.95", probeWindowScores=None,
+            probeDetail="no candidate ratio passed"),
+        job("c", probedRatios=None, probeWindowScores=None),
+    ]))
+    assert s["laddersRun"] == 2
+    assert s["laddersWithNoMeasurement"] == 1
+    assert s["laddersMislabelledAsMeasured"] == 1
+
+
+def test_the_corrected_wording_is_not_counted_as_mislabelled():
+    # After the fix the ladder says so itself, so it is no longer a silent misreport.
+    s = summarize(write([
+        start(),
+        job("b", probedRatios="0.90,0.95", probeWindowScores=None,
+            probeDetail="no probe rung could be measured (2 not time-alignable, 0 unmeasurable)"
+                        " — nothing was scored, so this is NOT evidence the clip resists re-encoding"),
+    ]))
+    assert s["laddersWithNoMeasurement"] == 1
+    assert s["laddersMislabelledAsMeasured"] == 0
+
+
 def _main():
     fails = 0
     for name, fn in sorted(globals().items()):
@@ -91,6 +181,971 @@ def _main():
                 fails += 1; print(f"FAIL {name}: {e!r}")
     print(f"\n{'FAILED' if fails else 'OK'} ({fails} failure(s))")
     return 1 if fails else 0
+
+
+def test_probe_to_certification_drift_and_marginal_attempts_are_reported():
+    path = write([
+        {"type": "session_start", "batchId": "b1"},
+        job("a", certificationStatus="ran_scored", pixelCertified=True,
+            probeWindowScores="97.0/93.0/88.0;96.0/92.0/86.0", certWindowScores="96.5/92.0/87.5;96.0/91.0/85.0",
+            probeDetail="windows passed at 0.70", plannedTargetRatio=0.70),
+        # b177: a legacy pair is joined only when the probe rung is the encoded ratio.
+        job("b", certificationStatus="ran_scored", pixelCertified=False,
+            probeWindowScores="95.8/91.2/84.3", certWindowScores="95.0/90.0/83.0",
+            probeDetail="windows passed at 0.90 by only 0.20, below the selection margin (0.5/1.25/1.0); certification decides",
+            plannedTargetRatio=0.90),
+        job("c", decisionBasis="Basis: heuristic. This file cannot be pixel-measured on this device: its resolution is above the 4K scoring limit."),
+        job("d", decisionBasis="Basis: earlier measured failures for this device and content class (learned), not a measurement of this file."),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["probeCertDrift"]["windows"] == 3
+    assert abs(s["probeCertDrift"]["mean"]["worst"] - (-0.8)) < 1e-9
+    assert abs(s["probeCertDrift"]["p5"]["worst"] - (-1.2)) < 1e-9
+    # Neither record has an attempt ledger, so neither can be classified as a marginal trial, the
+    # one whose prose says "below the selection margin" included: prose is not evidence of an encode.
+    assert s["marginalAttempts"]["trials"] == 0
+    assert len(s["marginalAttempts"]["legacyJobsNotClassified"]) == 2
+    assert s["decisionBasis"] == {"cannot be measured": 1, "learned": 1}
+
+
+def test_ladders_that_ran_out_of_budget_are_counted_with_their_blind_encodes():
+    path = write([
+        {"type": "session_start", "batchId": "b1"},
+        job("a", probeDetail="probe budget exhausted", certificationStatus="ran_scored", pixelCertified=False),
+        job("b", probeDetail="probe budget exhausted"),
+        job("c", probeDetail="windows passed at 0.90", certificationStatus="ran_scored", pixelCertified=True),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    assert summarize(path)["budgetExhausted"] == {"ladders": 2, "encodedThenFailed": 1}
+
+
+def test_a_cancelled_batch_is_reported_as_cancelled_not_as_unfinished():
+    # b167's 14-second batch was cancelled by the user and wrote session_cancelled; the summary
+    # called it an unexplained stop. The terminal record says which it was, so the report must too.
+    from parse_session_jsonl import render
+    path = write([
+        start(batchId="b1"),
+        job("a", terminal="CANCELLED"),
+        {"type": "session_cancelled", "batchId": "b1", "reason": "user_cancelled",
+         "totalElapsedMs": 14800, "cancelled": 1},
+    ])
+    s = summarize(path)
+    assert s["completed"] is False
+    assert s["sessionEnd"] == {"kind": "cancelled", "reason": "user_cancelled", "elapsedMs": 14800, "cancelledJobs": 1}
+    text = render(s)
+    assert "CANCELLED after 14.8 s" in text
+    assert "did not finish" not in text
+
+
+def test_current_batch_duration_uses_the_recorded_total_elapsed_field():
+    path = write([start(batchId="b1"), job("a"),
+                  {"type": "session_summary", "batchId": "b1", "totalElapsedMs": 691973}])
+    assert summarize(path)["elapsedMs"] == 691973
+    legacy = write([start(batchId="b1"), job("a"),
+                    {"type": "session_summary", "batchId": "b1", "elapsedMs": 10}])
+    assert summarize(legacy)["elapsedMs"] == 10
+
+
+def test_a_failed_batch_names_its_failure():
+    from parse_session_jsonl import render
+    path = write([
+        start(batchId="b1"),
+        job("a"),
+        {"type": "session_failed", "batchId": "b1", "reason": "IllegalStateException", "elapsedMs": 5000},
+    ])
+    text = render(summarize(path))
+    assert "FAILED after 5.0 s (reason=IllegalStateException)" in text
+
+
+def test_files_media3_could_not_parse_are_grouped_by_what_the_copy_did():
+    path = write([
+        start(batchId="b1"),
+        job("a", terminal="TRANSCODED_SMALLER", media3Input="platform-normalised copy; copy=1432.4MB in 21000ms"),
+        job("b", terminal="UNEXPECTED_REMUX", media3Input="normalisation failed: platform copy ended early"),
+        job("c", terminal="UNEXPECTED_REMUX", media3Input="platform-normalised copy also unreadable by Media3 (x)"),
+        job("d", terminal="UNEXPECTED_REMUX", media3Input="not normalised: HDR source"),
+        job("e", terminal="TRANSCODED_SMALLER"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    m = summarize(path)["media3Input"]
+    assert m["normalised"] == {"files": 1, "terminals": {"TRANSCODED_SMALLER": 1}}
+    assert m["normalisation failed"]["files"] == 1
+    assert m["copy also unreadable"]["files"] == 1
+    assert m["not normalised"]["files"] == 1
+    assert sum(e["files"] for e in m.values()) == 4
+
+
+def test_overshoot_prediction_error_is_measured_at_the_proven_rung_only():
+    # Rung 0.90 is the proven one: its two windows predict 1.26 on average and the encode came out
+    # at 1.235. The 0.80 rung's numbers must not enter the comparison.
+    path = write([
+        start(batchId="b1"),
+        job("a", pixelProvenRatio=0.9,
+            probeRateDiag="0.80=rate[req=1kbps,win=1kbps,I=1x1kB,P=1x1kB,steady=1kbps,x1.500];"
+                          "0.90=rate[req=1kbps,win=1kbps,I=1x1kB,P=1x1kB,steady=1kbps,x1.250]|"
+                          "rate[req=1kbps,win=1kbps,I=1x1kB,P=1x1kB,steady=1kbps,x1.270]",
+            encoderConfig="mime=video/avc->video/hevc;vbr=1->1;ratio=1.235;mode=VBR"),
+        job("b", pixelProvenRatio=0.9,
+            probeRateDiag="0.90=rate[req=1kbps,win=1kbps,I=1x1kB,P=1x1kB,steady=1kbps,x1.100]",
+            encoderConfig="ratio=1.000;mode=VBR"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    o = summarize(path)["overshootPrediction"]
+    # job b has one window only, below MeasuredOvershoot.MIN_WINDOWS, so it is left out.
+    assert o["encodes"] == 1
+    assert abs(o["meanError"] - (1.235 - 1.26)) < 1e-9
+    assert o["beyondMargin"] == 0
+
+
+def test_a_size_gated_keep_original_is_its_own_basis_kind():
+    from parse_session_jsonl import basis_kind
+    assert basis_kind("Basis: pixel probes passed at 0.90; the size prediction decided. At that rate ...") == \
+        "probe passed, size predicted"
+    assert basis_kind("Basis: heuristic. Probes at 0.95 produced no measurement that could decide it.") == "probed, undecided"
+
+
+def test_damaged_sources_and_frame_limited_ladders_are_counted_apart():
+    path = write([
+        start(batchId="b1"),
+        job("a", terminal="UNEXPECTED_REMUX", media3Input="not normalised: the source is damaged: 100.0 % of the 64 KiB around byte 5 are zero bytes"),
+        job("b", terminal="UNEXPECTED_REMUX", media3Input="normalisation failed: platform copy holds only 12.4 % of the source's bytes: most of its sample data is empty or unreadable, so the file itself is damaged"),
+        job("c", terminal="ALREADY_HIGHLY_OPTIMIZED", probeDetail="no candidate ratio passed; 4 rung(s) undecided: a window held fewer than 12 frames, which is not a quality measurement"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["media3Input"]["damaged (zero-filled)"]["files"] == 1
+    assert s["media3Input"]["damaged (copy too small)"]["files"] == 1
+    assert s["framesUndecided"] == 1
+
+
+
+def test_a_discarded_candidate_claiming_a_verified_replaceable_output_is_flagged_not_counted():
+    # b169 job_478c2fa19100: SKIPPED_WOULD_DEGRADE, outputSize=0, yet verdict/verified/replacementSafe
+    # carried the structural pass. It must be flagged, and never counted as an accepted output.
+    path = write([
+        start(batchId="b1"),
+        job("a", schemaVersion=2, terminal="SKIPPED_WOULD_DEGRADE", outputSize=0, sourceSize=16753345,
+            verified=True, replacementSafe=True, failedChecks=[], pixelCertified=False,
+            verdict="Perceptually Lossless Verified",
+            fallbackReason="pixel certification failed (sampled VMAF below thresholds)"),
+        job("b", terminal="TRANSCODED_SMALLER", outputSize=246118100, sourceSize=322388270,
+            countsAsRealCompression=True, verified=True, replacementSafe=True, failedChecks=[]),
+        # Schema v3 writes the same rejection truthfully: nothing to flag.
+        job("c", schemaVersion=3, terminal="SKIPPED_WOULD_DEGRADE", outputSize=0, verified=False,
+            replacementSafe=False, failedChecks=[], finalAccepted=False, structuralVerified=True,
+            verdict="Rejected — Skipped — compression would visibly lose quality",
+            fallbackReason="pixel certification failed (sampled VMAF below thresholds)",
+            certificationDecision="measured_below_bar", candidateBytes=15123456),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["acceptanceContradictions"]["count"] == 1
+    assert s["acceptanceContradictions"]["jobs"][0]["schemaVersion"] == 2
+    assert s["realCompressions"] == 1
+    assert s["savedBytes"] == 322388270 - 246118100
+    # An explained rejection is not a silent one.
+    assert s["silentRejections"] == 0
+    assert s["certificationDecisions"] == {"measured_below_bar": 1}
+    from parse_session_jsonl import render
+    assert "contradictory acceptance: 1 record(s)" in render(s)
+
+
+def test_safer_rung_retries_are_counted_with_their_attempts():
+    path = write([
+        start(batchId="b1"),
+        job("a", terminal="TRANSCODED_SMALLER", countsAsRealCompression=True, outputSize=15000000, sourceSize=16753345,
+            attempts="0.85:measured_below_bar:cand=15123456:encodeMs=9000;0.90:accepted:cand=15600000:encodeMs=9400"),
+        job("b", terminal="SKIPPED_WOULD_DEGRADE", outputSize=0,
+            attempts="0.97:measured_below_bar:cand=270000000:encodeMs=60000"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["saferRungRetries"]["retried"] == 1
+    assert s["saferRungRetries"]["certifiedAfterRetry"] == 1
+
+
+
+def test_a_v3_capture_reports_its_learned_snapshot_and_stage_events():
+    path = write([
+        start(batchId="b1"),
+        {"type": "learned_state_snapshot", "batchId": "b1", "sha256": "ab" * 32, "profileCount": 27},
+        {"type": "learned_state_update", "batchId": "b1", "profileKey": "k", "before": None, "after": "x"},
+        {"type": "stage", "batchId": "b1", "stage": "certify", "reasonCode": "cert_passed"},
+        {"type": "stage", "batchId": "b1", "stage": "certify", "reasonCode": "cert_passed"},
+        job("a", terminal="TRANSCODED_SMALLER", countsAsRealCompression=True, outputSize=5, sourceSize=9),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["learnedSnapshot"] == {"sha256": "ab" * 32, "profiles": 27, "updates": 1}
+    assert s["stageReasons"] == {"certify:cert_passed": 2}
+    from parse_session_jsonl import render
+    assert "snapshot sha256=abababababababab" in render(s)
+
+
+
+
+
+# ---- b177: evidence joins by identity, every attempt counted, audio request vs observation ----
+
+def _cert_job(h, **kw):
+    d = {"type": "job", "batchId": "b1", "nameHash": h, "id": f"job_{h}", "jobId": f"job_{h}",
+         "terminal": "TRANSCODED_SMALLER", "countsAsRealCompression": True, "sourceSize": 1000,
+         "outputSize": 900, "verified": True, "certificationStatus": "ran_scored",
+         "plannedTargetRatio": 0.85, "probeDetail": "windows passed at 0.85",
+         "probeWindowScores": "99.000/97.000/97.000;98.000/96.000/96.000",
+         "certWindowScores": "98.500/96.500/96.500;97.500/95.500/95.500"}
+    d.update(kw)
+    return d
+
+
+def test_a_legacy_retry_record_is_excluded_from_drift_not_paired_across_rungs():
+    # b177 PL-B job_478c2fa19100: .90 encode and certification, .85 probe windows on the record.
+    path = write([
+        start(),
+        _cert_job("ok"),
+        _cert_job("retry", plannedTargetRatio=0.9,
+                  probeDetail="windows passed at 0.85 (refined); safer-rung retry at 0.90 after a measured certification failure at 0.85",
+                  attempts="0.85:measured_below_bar:cand=1:encodeMs=1;0.90:accepted:cand=2:encodeMs=2"),
+        {"type": "session_summary", "batchId": "b1", "elapsedMs": 1},
+    ])
+    drift = summarize(path)["probeCertDrift"]
+    assert drift["windows"] == 2
+    assert drift["joinBasis"] == {"legacy_same_rung_position": 2}
+    assert drift["excluded"] == [{"jobId": "job_retry", "reason": "retry: the record's probe windows belong to another rung"}]
+
+
+def test_a_legacy_record_whose_probe_rung_differs_from_the_encoded_ratio_is_excluded():
+    path = write([start(), _cert_job("x", plannedTargetRatio=0.9), {"type": "session_summary", "batchId": "b1"}])
+    drift = summarize(path)["probeCertDrift"]
+    assert drift["windows"] == 0
+    assert drift["excluded"][0]["reason"] == "probe rung 0.85 differs from the encoded ratio 0.9"
+
+
+def test_identity_join_uses_stage_events_window_ids_and_full_precision():
+    rung = "0.90@cfgA"
+    path = write([
+        start(),
+        {"type": "stage", "batchId": "b1", "jobId": "job_n", "stage": "probe_rung", "reasonCode": "rung_measured",
+         "rungId": rung, "probeMean": "99.10000001;97.0", "probeP5": "97.0;95.0", "probeMin": "96.9;94.9",
+         "probeWindowIds": "1-2;3-4"},
+        {"type": "stage", "batchId": "b1", "jobId": "job_n", "stage": "certify", "reasonCode": "cert_passed",
+         "accepted": True, "certMean": "98.10000001;96.5;95.0", "certP5": "96.0;94.5;93.0",
+         "certMin": "95.9;94.4;92.9", "certWindowIds": "1-2;3-4;5-6"},
+        _cert_job("n", plannedTargetRatio=0.9, probeRungId=rung, encodeConfigId="cfgA"),
+        _cert_job("m", plannedTargetRatio=0.9, probeRungId="0.90@cfgA", encodeConfigId="cfgB"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    drift = summarize(path)["probeCertDrift"]
+    assert drift["joinBasis"] == {"identity_window_id": 2}
+    assert drift["unjoinedWindows"] == 1  # window 5-6 was certified but never probed
+    # Deltas (-1.0, -0.5) from the full-precision event values; q() takes the lower middle.
+    assert abs(drift["mean"]["median"] - (-1.0)) < 1e-9
+    assert abs(drift["mean"]["worst"] - (-1.0)) < 1e-9
+    assert {"jobId": "job_m", "reason": "probe config cfgA differs from the encode config cfgB"} in drift["excluded"]
+
+
+def test_retries_count_every_started_attempt_including_those_without_a_candidate():
+    path = write([
+        start(),
+        _cert_job("a", terminal="UNEXPECTED_REMUX", countsAsRealCompression=False, outputSize=1000,
+                  attemptsStarted=2,
+                  attempts="0.85:measured_below_bar:cand=1:encodeMs=1:n=1:token=5;0.90:export_failed:cand=0:encodeMs=3:n=2:token=6"),
+        {"type": "stage", "batchId": "b1", "jobId": "job_c", "stage": "encode", "reasonCode": "encode_cancelled",
+         "attemptIndex": 2, "attemptsStarted": 2, "attempts": "0.85:measured_below_bar:cand=1:encodeMs=1:n=1:token=7;0.90:cancelled:cand=0:encodeMs=0:n=2:token=8"},
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    r = summarize(path)["saferRungRetries"]
+    assert r["retried"] == 2
+    assert r["secondAttemptOutcomes"] == {"export_failed": 1, "cancelled": 1}
+    assert r["certifiedAfterRetry"] == 0
+
+
+def test_a_requested_audio_copy_recorded_as_reencoded_is_flagged():
+    path = write([
+        start(),
+        job("hq", batchId="b1", terminal="LOSSY_SMALLER", encodePlan="outputMime=video/hevc; audio=copy(source=256000bps)",
+            audioPreservation="re-encoded (lossy mode)"),
+        job("new", batchId="b1", terminal="LOSSY_SMALLER", audioRequested="copy",
+            audioPreservation="bit-identical copy of the source's compressed audio (6000 packets compared)"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    audio = summarize(path)["audioClaims"]
+    assert audio["requestedCopyObservedOther"] == [{"jobId": None, "nameHash": "hq", "observed": "re-encoded (lossy mode)", "legacyModeLabel": True}]
+    assert audio["verifiedCopies"] == 1
+
+
+def test_replay_coverage_names_missing_stages_and_unlinked_learning():
+    path = write([
+        start(),
+        {"type": "stage", "batchId": "b1", "stage": "plan", "reasonCode": "plan_resolved"},
+        {"type": "learned_state_update", "batchId": "b1", "jobId": None, "profileKey": "k", "after": "v"},
+        job("a", batchId="b1"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    cov = summarize(path)["replayCoverage"]
+    assert cov["label"] == "PARTIAL_OBSERVATIONAL_REPLAY"
+    assert set(cov["missingStages"]) >= {"probe_rung", "size_gate", "encode", "verify"}
+    assert cov["learnedUpdatesLinked"] == 0 and cov["learnedUpdates"] == 1
+
+
+def test_replay_coverage_requires_each_jobs_stages_and_real_update_links():
+    from parse_session_jsonl import replay_coverage, _REPLAY_STAGES
+    stages = [{"stage": stage, "jobId": "a"} for stage in _REPLAY_STAGES]
+    session = {"jobs": [{"jobId": "a", "terminal": "TRANSCODED_SMALLER", "attemptsStarted": 1},
+                        {"jobId": "b", "terminal": "TRANSCODED_SMALLER", "attemptsStarted": 1}],
+               "stages": stages, "learnedSnapshot": {"sha256": "snapshot"}, "identity": {"scoring": {}},
+               "learnedUpdates": 1, "learnedUpdatesLinked": 1,
+               "updates": [{"jobId": "ghost", "attemptIndex": 1, "updateIndex": 0,
+                            "snapshotSha256": "snapshot"}]}
+    cov = replay_coverage(session)
+    assert cov["label"] == "PARTIAL_OBSERVATIONAL_REPLAY"
+    assert "accept" in cov["missingJobStages"]["b"]
+    assert cov["invalidLearningUpdates"] == 1
+
+
+def test_replay_coverage_recognizes_valid_per_job_stages_and_update_chain():
+    from parse_session_jsonl import replay_coverage, _REPLAY_STAGES
+    session = {"jobs": [{"jobId": "a", "terminal": "TRANSCODED_SMALLER", "attemptsStarted": 1}],
+               "stages": [{"stage": stage, "jobId": "a"} for stage in _REPLAY_STAGES],
+               "learnedSnapshot": {"sha256": "snapshot"}, "identity": {"scoring": {}},
+               "learnedUpdates": 1, "learnedUpdatesLinked": 1,
+               "updates": [{"jobId": "a", "attemptIndex": 1, "updateIndex": 0,
+                            "snapshotSha256": "snapshot"}]}
+    assert replay_coverage(session)["label"] == "REPLAYABLE_RECORD"
+    session["updates"][0]["snapshotSha256"] = "other"
+    assert replay_coverage(session)["label"] == "PARTIAL_OBSERVATIONAL_REPLAY"
+
+
+def test_replay_coverage_matches_what_each_terminal_path_emits():
+    """The app side of per-job coverage: which stages each terminal path writes (b82d465 contract).
+
+    A probe skip ends in planning with its rungs and a terminal `accept`; a stream-copy remux writes
+    a `finalize` for its candidate; a failed floor recovery writes a `certify` (scope floor_recovery)
+    for its `ran_floor_recovery_*` status. Before, only the finalize path wrote `accept` and only an
+    encode wrote `finalize`, so every realistic PL batch read as partial.
+    """
+    from parse_session_jsonl import replay_coverage
+
+    def ev(job, stage, **fields):
+        return {"jobId": job, "stage": stage, "attemptIndex": fields.pop("attemptIndex", 0), **fields}
+
+    jobs = [
+        {"jobId": "skip", "terminal": "SKIPPED_WOULD_DEGRADE", "probedRatios": "0.85,0.90", "attemptsStarted": None},
+        {"jobId": "remux", "terminal": "ALREADY_HIGHLY_OPTIMIZED", "candidateBytes": 10_000},
+        {"jobId": "enc", "terminal": "TRANSCODED_SMALLER", "attemptsStarted": 1, "probedRatios": "0.90",
+         "probeRungId": "0.90@abc", "pixelProvenRatio": 0.9, "candidateBytes": 9_000,
+         "certificationDecision": "passed", "certificationStatus": "ran_scored"},
+        {"jobId": "rec", "terminal": "REMUX_PREFERRED_BY_EVIDENCE", "attemptsStarted": 1, "candidateBytes": 8_000,
+         "certificationStatus": "ran_floor_recovery_scored_below_bar"},
+    ]
+    stages = [
+        ev("skip", "probe_rung"), ev("skip", "probe_rung"), ev("skip", "accept", reasonCode="rejected"),
+        ev("remux", "finalize", operation="remux"), ev("remux", "verify"), ev("remux", "accept"),
+        ev("enc", "probe_rung"), ev("enc", "size_gate"), ev("enc", "plan"), ev("enc", "encode", attemptIndex=1),
+        ev("enc", "finalize", attemptIndex=1), ev("enc", "verify", attemptIndex=1),
+        ev("enc", "certify", attemptIndex=1, accepted=True), ev("enc", "accept", attemptIndex=1),
+        ev("rec", "plan"), ev("rec", "encode", attemptIndex=1), ev("rec", "finalize", attemptIndex=1),
+        ev("rec", "certify", attemptIndex=1, scope="floor_recovery", accepted=False),
+        ev("rec", "verify", attemptIndex=1), ev("rec", "accept", attemptIndex=1),
+    ]
+    session = {"jobs": jobs, "stages": stages, "learnedSnapshot": {"sha256": "snap"},
+               "identity": {"scoring": {}}, "learnedUpdates": 1,
+               "updates": [{"jobId": "enc", "attemptIndex": 1, "updateIndex": 0, "snapshotSha256": "snap"}]}
+    cov = replay_coverage(session)
+    assert cov["label"] == "REPLAYABLE_RECORD", cov
+    assert cov["missingJobStages"] == {} and cov["orphanStages"] == 0
+
+    # The pre-fix emissions: no terminal event off the finalize path, no finalize for a remux,
+    # no certify for a failed floor recovery.
+    before = dict(session, stages=[s for s in stages if not (
+        (s["jobId"] == "skip" and s["stage"] == "accept")
+        or (s["jobId"] == "remux" and s["stage"] == "finalize")
+        or (s["jobId"] == "rec" and s["stage"] == "certify"))])
+    cov = replay_coverage(before)
+    assert cov["label"] == "PARTIAL_OBSERVATIONAL_REPLAY"
+    assert cov["missingJobStages"] == {"skip": ["accept"], "remux": ["finalize"], "rec": ["certify"]}
+
+def test_replay_coverage_judges_each_job_not_stages_no_job_reached():
+    """b182: a batch where every source was probe-rejected, and an undecided keep-original."""
+    from parse_session_jsonl import replay_coverage
+
+    def session(jobs, stages):
+        return {"jobs": jobs, "stages": stages, "learnedSnapshot": {"sha256": "s"}, "identity": {"scoring": {}},
+                "learnedUpdates": 0, "updates": []}
+
+    # batch_1790560725342: 12 sources, all SKIPPED_WOULD_DEGRADE. Nothing was encoded, so no job
+    # needed plan/size_gate/encode/finalize/verify/certify; the record is complete.
+    skipped = [{"jobId": f"j{i}", "terminal": "SKIPPED_WOULD_DEGRADE", "probedRatios": "0.95", "probeRungId": "0.95@c"}
+               for i in range(3)]
+    stages = [{"jobId": f"j{i}", "stage": st, "verdict": "failed" if st == "probe_rung" else None}
+              for i in range(3) for st in ("probe_rung", "accept")]
+    cov = replay_coverage(session(skipped, stages))
+    assert cov["label"] == "REPLAYABLE_RECORD", cov
+    assert "encode" in cov["missingStages"]          # still reported, no longer a gap
+
+    # job_641d0183abbb: both rungs undecided (too few frames), kept as the original. It names the
+    # last measured rung, but no ratio was proven, so the size gate never ran and is not required.
+    undecided = {"jobId": "u", "terminal": "ALREADY_HIGHLY_OPTIMIZED", "probedRatios": "0.90,0.95",
+                 "probeRungId": "0.95@edb0627715d8", "pixelProvenRatio": None}
+    ustages = [{"jobId": "u", "stage": "probe_rung", "verdict": "insufficient"},
+               {"jobId": "u", "stage": "probe_rung", "verdict": "insufficient"},
+               {"jobId": "u", "stage": "accept"}]
+    assert replay_coverage(session([undecided], ustages))["label"] == "REPLAYABLE_RECORD"
+
+    # A proven rung the size gate then kept as the original: the gate's event is required.
+    kept = {"jobId": "k", "terminal": "ALREADY_HIGHLY_OPTIMIZED", "probedRatios": "0.90", "probeRungId": "0.90@a"}
+    kstages = [{"jobId": "k", "stage": "probe_rung", "verdict": "passed"}, {"jobId": "k", "stage": "accept"}]
+    cov = replay_coverage(session([kept], kstages))
+    assert cov["missingJobStages"] == {"k": ["size_gate"]}
+    kstages.append({"jobId": "k", "stage": "size_gate"})
+    assert replay_coverage(session([kept], kstages))["label"] == "REPLAYABLE_RECORD"
+
+
+def _gate(job_id, reason, rung_id, attempt, **kw):
+    d = {"type": "stage", "batchId": "b1", "jobId": job_id, "stage": "size_gate", "reasonCode": reason,
+         "attempt": attempt, "outputMime": "video/hevc", "provenRatio": None, "probeRungId": rung_id}
+    d.update(kw)
+    return d
+
+
+def _rung(job_id, rung_id, attempt, ratio, verdict, planned, scored, mime="video/hevc"):
+    return {"type": "stage", "batchId": "b1", "jobId": job_id, "stage": "probe_rung", "reasonCode": "rung_measured",
+            "attempt": attempt, "outputMime": mime, "rungId": rung_id, "ratio": ratio, "verdict": verdict,
+            "plannedWindowIds": ";".join(f"{i}-{i + 1}" for i in range(planned)), "probeWindows": scored}
+
+
+def test_a_size_gate_is_counted_by_how_its_assessed_rung_stood():
+    # b287 regular job_8227cd6d6a43: 0.75 failed, 0.95 and 0.97 marginal on the one planned window,
+    # kept on predicted size, and worded "pixel probes passed at 0.97". b287 Secure Folder
+    # job_31e5faeaf665: a clean 0.90 pass on three of three windows, also kept on predicted size.
+    # Neither build recorded the rung's verdict on the gate: it is joined by attempt, codec and id.
+    worded = ("Basis: pixel probes passed at {}; the size prediction decided. At that rate the re-encode is "
+              "predicted ... The quality was measured; the size was predicted.")
+    path = write([
+        start(),
+        _rung("m", "0.75@9aade12672e7", 7, 0.75, "failed", 1, 1),
+        _rung("m", "0.95@1eec1b05b828", 7, 0.95, "marginal", 1, 1),
+        _rung("m", "0.97@ed624713bee1", 7, 0.97, "marginal", 1, 1),
+        _gate("m", "gate_keep_original", "0.97@ed624713bee1", 7, predictedBytes=114912600, sourceBytes=102508481),
+        job("m", batchId="b1", jobId="m", terminal="ALREADY_HIGHLY_OPTIMIZED", verified=True, outputSize=0,
+            materializationMode="REUSED_SOURCE", decisionBasis=worded.format("0.97")),
+        _rung("c", "0.90@e929b108d9e5", 3, 0.90, "passed", 3, 3),
+        _gate("c", "gate_keep_original", "0.90@e929b108d9e5", 3, predictedBytes=126265012, sourceBytes=123783185),
+        job("c", batchId="b1", jobId="c", terminal="ALREADY_HIGHLY_OPTIMIZED", verified=True, outputSize=0,
+            materializationMode="REUSED_SOURCE", decisionBasis=worded.format("0.90")),
+        # An AVC rung with the same id in the same attempt must not answer for the HEVC gate.
+        _rung("x", "0.97@samehash", 9, 0.97, "passed", 3, 3, mime="video/avc"),
+        _gate("x", "gate_encode", "0.97@samehash", 9),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    gates = summarize(path)["sizeGates"]
+    assert gates["keepOriginal"] == {"marginal": 1, "passed": 1}, gates
+    assert gates["encode"] == {"unknown": 1}, gates
+    assert gates["wordedAsPassedButNot"] == ["m"], gates
+    marginal = next(g for g in gates["gates"] if g["jobId"] == "m")
+    assert (marginal["assessedRatio"], marginal["measuredWindows"], marginal["plannedWindows"]) == (0.97, 1, 1), marginal
+    assert marginal["rungVerdictSource"] == "joined to the probe rung by id"
+    assert (marginal["predictedBytes"], marginal["sourceBytes"]) == (114912600, 102508481)
+    clean = next(g for g in gates["gates"] if g["jobId"] == "c")
+    assert (clean["rungVerdict"], clean["measuredWindows"], clean["plannedWindows"], clean["wordedAsPassed"]) == ("passed", 3, 3, False)
+    unknown = next(g for g in gates["gates"] if g["jobId"] == "x")
+    assert unknown["rungVerdictSource"] == "not recorded" and unknown["rungVerdict"] == "unknown", unknown
+
+
+def test_a_size_gate_that_records_its_evidence_is_read_from_the_gate_itself():
+    path = write([
+        start(),
+        _gate("n", "gate_keep_original", "0.97@ed624713bee1", 7, assessedRatio=0.97, assessedRungId="0.97@ed624713bee1",
+              rungVerdict="marginal", clearedSelectionMargin=False, measuredWindows=1, plannedWindows=1, scope="complete",
+              sizeBasis="predicted", disposition="predicted_not_smaller", predictedBytes=114912600, sourceBytes=102508481),
+        job("n", batchId="b1", jobId="n", terminal="ALREADY_HIGHLY_OPTIMIZED", verified=True, outputSize=0,
+            materializationMode="REUSED_SOURCE",
+            decisionBasis="Basis: the 0.97 probe cleared the Perceptually Lossless bar on 1 of 1 planned window but not the "
+                          "selection margin (marginal), so no ratio was selected on quality; the size prediction decided. ..."),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    gate = s["sizeGates"]["gates"][0]
+    assert gate["rungVerdictSource"] == "recorded on the size gate" and gate["rungVerdict"] == "marginal", gate
+    assert s["sizeGates"]["wordedAsPassedButNot"] == []
+    assert s["decisionBasis"] == {"probe marginal, size predicted": 1}, s["decisionBasis"]
+    from parse_session_jsonl import basis_kind
+    assert basis_kind("Basis: the 0.90 probe was the rung assessed, and its verdict was not recorded; "
+                      "the size prediction decided. ...") == "probe verdict unknown, size predicted"
+    # No encode ran for either size keep: no attempt, no certificate, no saving, and no output bytes.
+    assert s["realCompressions"] == 0 and s["savedBytes"] == 0 and s["pixelCertified"] == 0
+    assert s["generatedOutputBytes"] == 0
+    assert s["dispositions"]["output"] == {"original_retained": 1}
+
+
+def test_a_difference_on_a_verified_output_is_not_a_failed_check():
+    # b287 HQ job_31e5faeaf665: verified=true beside failedChecks=[videoCodec, rotation] (a text
+    # scan of what High Quality changes by design). A later build records [] and names the two
+    # under unjudgedDifferences. Neither is a failure; a rejected output's named check still is.
+    path = write([
+        start(mode="High Quality"),
+        job("old", batchId="b1", jobId="old", terminal="TRANSCODED_NOT_MEANINGFULLY_SMALLER", verified=True,
+            failedChecks=["videoCodec", "rotation"], sourceSize=123783185, outputSize=122130776,
+            materializationMode="GENERATED_FILE", finalAccepted=True, candidateBytes=122130776, replacementSafe=False),
+        job("new", batchId="b1", jobId="new", terminal="TRANSCODED_NOT_MEANINGFULLY_SMALLER", verified=True,
+            failedChecks=[], unjudgedDifferences=["rotationMatches", "videoCodecMatches"],
+            sourceSize=123783185, outputSize=122130776, materializationMode="GENERATED_FILE",
+            disposition={"candidateGenerated": True, "structurallyVerified": True, "pixelCertified": False,
+                         "output": "kept_for_copy", "candidateRejected": False, "qualifyingSavings": False,
+                         "replacementEligible": False}),
+        job("bad", batchId="b1", jobId="bad", failedChecks=["playable"], materializationMode="GENERATED_FILE", outputSize=0,
+            candidateBytes=5),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["failedCheckCounts"] == {"playable": 1}, s["failedCheckCounts"]
+    assert s["differencesOnVerifiedOutputs"] == {"videoCodec": 1, "rotation": 1, "rotationMatches": 1, "videoCodecMatches": 1}
+    d = s["dispositions"]
+    assert d["basis"] == {"derived": 2, "recorded": 1}, d
+    assert d["output"] == {"kept_for_copy": 2, "none": 1}, d
+    assert d["keptForCopyNotCounted"] == ["old", "new"], d
+    assert d["generatedThenRejected"] == ["bad"], d
+    assert d["qualifyingSavings"] == 0
+    assert s["realCompressions"] == 0
+
+
+def test_an_older_record_that_cannot_settle_a_state_leaves_it_unknown():
+    from parse_session_jsonl import dispositions
+    # Before materializationMode and candidateBytes existed: a kept size says nothing about where
+    # the bytes came from.
+    d = dispositions([{"id": "legacy", "terminal": "TRANSCODED_SMALLER", "outputSize": 900, "sourceSize": 1000,
+                       "countsAsRealCompression": True, "verified": True}])
+    assert d["output"] == {"None": 1}, d
+    assert d["generatedThenRejected"] == [] and d["keptForCopyNotCounted"] == []
+    # A retained original is never a generated output, and a failure leaves nothing.
+    d = dispositions([
+        {"id": "kept", "terminal": "ALREADY_HIGHLY_OPTIMIZED", "materializationMode": "REUSED_SOURCE", "verified": True, "outputSize": 0},
+        {"id": "gone", "terminal": "OUTPUT_VALIDATION_FAILED", "materializationMode": "REUSED_SOURCE", "verified": False, "outputSize": 0},
+        {"id": "discarded", "terminal": "ALREADY_HIGHLY_OPTIMIZED", "materializationMode": "REUSED_SOURCE", "verified": True,
+         "outputSize": 0, "candidateBytes": 79552584},
+    ])
+    assert d["output"] == {"original_retained": 2, "none": 1}, d
+    assert d["generatedThenRejected"] == ["discarded"], d
+
+
+def _replace(job_id, reason, **kw):
+    d = {"type": "stage", "batchId": "b1", "jobId": job_id, "stage": "replace", "reasonCode": reason, "attempt": 1}
+    d.update(kw)
+    return d
+
+
+def test_a_capture_without_replacement_records_says_so_instead_of_reading_as_none():
+    # v1.6.287 and earlier: no `replace` stage and no batch settings. An untouched original may
+    # mean replacement was off, refused or simply unrecorded; the summary must not pick one.
+    path = write([start(), job("a", batchId="b1", jobId="a", terminal="TRANSCODED_SMALLER", verified=True),
+                  {"type": "run_identity", "batchId": "b1", "scoring": {}},
+                  {"type": "session_summary", "batchId": "b1"}])
+    s = summarize(path)
+    assert s["replacements"] == {"recorded": False}, s["replacements"]
+    from parse_session_jsonl import render
+    assert "replacements   : not recorded by this build" in render(s)
+
+
+def test_replacement_requests_are_counted_by_how_each_one_ended():
+    path = write([
+        start(),
+        {"type": "run_identity", "batchId": "b1", "scoring": {},
+         "batchSettings": {"replaceOriginals": True, "backupBeforeReplace": False, "useShizukuFallback": False}},
+        _replace("ok", "replace_committed", originalOpenedForWriting=True, stagedMatchesSourceBefore=True,
+                 writeReadBack="confirmed", sourceBeforeDigest="aaaaaaaaaaaa", stagedDigest="aaaaaaaaaaaa",
+                 outputDigest="bbbbbbbbbbbb", postWriteDigest="bbbbbbbbbbbb"),
+        _replace("changed", "replace_refused_source_changed", originalOpenedForWriting=False,
+                 stagedMatchesSourceBefore=False, sourceBeforeDigest="aaaaaaaaaaaa", stagedDigest="cccccccccccc"),
+        _replace("blind", "replace_restored_readback_unavailable", originalOpenedForWriting=True, writeReadBack="size_unavailable",
+                 restoreReadBack="confirmed"),
+        _replace("bad", "replace_restored_readback_mismatch", originalOpenedForWriting=True, writeReadBack="content_mismatch"),
+        _replace("risk", "replace_at_risk_recovery_retained", originalOpenedForWriting=True),
+        _replace("off", "replace_not_requested"),
+        *[job(j, batchId="b1", jobId=j, terminal="TRANSCODED_SMALLER", verified=True) for j in ("ok", "changed", "blind", "bad", "risk", "off")],
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    r = s["replacements"]
+    assert r["recorded"] and r["replaceOriginalsAtStart"] is True and r["backupBeforeReplaceAtStart"] is False, r
+    assert (r["requested"], r["committed"], r["refused"], r["restored"]) == (5, 1, 1, 2), r
+    assert r["originalOpenedForWriting"] == 4, r
+    assert r["atRisk"] == ["risk"] and r["sourceChanged"] == ["changed"] and r["readBackUnavailable"] == ["blind"], r
+    assert r["outcomes"]["replace_not_requested"] == 1
+    from parse_session_jsonl import render, replay_coverage, load_sessions
+    text = render(s)
+    assert "left an original possibly incomplete: risk" in text
+    assert "changed after being read for compression and were not overwritten: changed" in text
+    # A replace event belongs to its job: it is not an orphan and asks nothing more of the record.
+    assert replay_coverage(load_sessions(path)["b1"])["orphanStages"] == 0
+
+
+def _verify(job_id, source, output, **kw):
+    d = {"type": "stage", "batchId": "b1", "jobId": job_id, "stage": "verify", "reasonCode": "structural_failed", "attemptIndex": 1,
+         "structuralEvidence": {"videoTimeline": {"matches": source == output, "sourceFrames": source, "outputFrames": output,
+                                                  "sourceOriginUs": 97488, "outputOriginUs": 0}}}
+    d.update(kw)
+    return d
+
+
+def test_a_frame_count_change_is_reported_with_the_stage_it_was_localized_to():
+    path = write([
+        start(),
+        # b287 regular job_782a717d3217: one measurement after the remux and nothing else.
+        _verify("old", 168, 166),
+        # A build that records per-stage counts, on a source whose edit list presents 166 of 168.
+        _verify("new", 168, 166, timelineLocalization={
+            "firstChangedStage": "source_edit_list",
+            "reason": "the source's edit list presents 166 of the 168 samples in its table, and the first stage that "
+                      "reported a count had 166: Media3 read what the edit list presents",
+            "sourceEdit": {"tableSamples": 168, "presentedSamples": 166, "samplesAfterEditEnd": 2, "initialEmptyEditUs": 97488},
+            "media3VideoFrameCount": 166, "remuxVideoSamplesRead": 166, "remuxVideoSamplesWritten": 166}),
+        # The app's own remux lost them: the same counts, a different stage.
+        _verify("remux", 168, 166, timelineLocalization={"firstChangedStage": "metadata_remux",
+                                                         "reason": "the metadata remux read 168 video samples and wrote 166",
+                                                         "media3VideoFrameCount": 168, "remuxVideoSamplesRead": 168}),
+        _verify("same", 842, 842),
+        *[job(j, batchId="b1", jobId=j, terminal="UNEXPECTED_REMUX", verified=True, outputSize=0, materializationMode="REUSED_SOURCE")
+          for j in ("old", "new", "remux", "same")],
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    changes = {c["jobId"]: c for c in s["frameCountChanges"]}
+    assert set(changes) == {"old", "new", "remux"}, changes
+    assert changes["old"]["firstChangedStage"] == "not localized" and changes["old"]["sourcePresentedSamples"] is None
+    assert (changes["new"]["firstChangedStage"], changes["new"]["sourcePresentedSamples"], changes["new"]["sourceSamplesAfterEditEnd"],
+            changes["new"]["media3VideoFrameCount"]) == ("source_edit_list", 166, 2, 166)
+    assert changes["remux"]["firstChangedStage"] == "metadata_remux"
+    from parse_session_jsonl import render
+    text = render(s)
+    assert "old 168 -> 166 video samples (source first timestamp 97488 us); first changed at: not localized" in text
+    assert "first changed at: source_edit_list" in text and "first changed at: metadata_remux" in text
+
+def _audio(job_id, **audio):
+    d = {"result": "DIFFERENT", "packets": 342, "sourceConfigSha256": "aa", "outputConfigSha256": "bb",
+         "sourcePayloadSha256": "cc", "outputPayloadSha256": "dd", "maxSkewUs": 21334, "firstMismatch": 0,
+         "reason": "decoder configuration differs"}
+    d.update(audio)
+    return {"type": "stage", "batchId": "b1", "jobId": job_id, "stage": "verify", "reasonCode": "structural_failed", "attemptIndex": 1,
+            "structuralEvidence": {"audioPacketEvidence": d}}
+
+
+def test_an_audio_packet_difference_says_what_differed_or_that_it_was_not_recorded():
+    aac = {"mime": "audio/mp4a-latm", "channels": 2, "sampleRate": 48000, "encoderDelay": None, "encoderPadding": None,
+           "csdSizes": [2, None, None], "csd0Hex": "1190"}
+    path = write([
+        start(),
+        # b213 job_6d1173f4c0f9 as captured: one reason, no counts, no configuration fields.
+        _audio("old"),
+        # The same numbers from a build that records the rest: the output starts one packet late.
+        _audio("late", packets=341, sourcePackets=342, outputPackets=341, sourceFirstPtsUs=0, outputFirstPtsUs=21333,
+               firstMismatchKind="payload differs", outputLacksFirstSourcePacket=True, outputHasExtraFirstPacket=False,
+               sourceConfig=dict(aac, encoderDelay=2112), outputConfig=aac),
+        # Identical packets, only the configuration differs.
+        _audio("config", sourcePayloadSha256="cc", outputPayloadSha256="cc", maxSkewUs=0, firstMismatch=None,
+               sourcePackets=342, outputPackets=342, sourceFirstPtsUs=0, outputFirstPtsUs=0,
+               outputLacksFirstSourcePacket=False, outputHasExtraFirstPacket=False,
+               sourceConfig=aac, outputConfig=dict(aac, csd0Hex="1210", sampleRate=44100)),
+        # What the S26 read for Media3's copy: the same packets, 2 samples of end padding where the
+        # source has 0. A build before the classification was recorded, and one that records it.
+        _audio("padding", sourcePayloadSha256="cc", outputPayloadSha256="cc", maxSkewUs=0, firstMismatch=None, packets=329,
+               sourcePackets=329, outputPackets=329, sourceFirstPtsUs=-21333, outputFirstPtsUs=-21333,
+               outputLacksFirstSourcePacket=False, outputHasExtraFirstPacket=False,
+               sourceConfig=dict(aac, encoderDelay=1024, encoderPadding=0), outputConfig=dict(aac, encoderDelay=1024, encoderPadding=2)),
+        _audio("padding_flag", sourcePayloadSha256="cc", outputPayloadSha256="cc", maxSkewUs=0, firstMismatch=None, packets=329,
+               sourcePackets=329, outputPackets=329, sourceFirstPtsUs=-21333, outputFirstPtsUs=-21333,
+               differsOnlyInEndPadding=True,
+               sourceConfig=dict(aac, encoderPadding=None), outputConfig=dict(aac, encoderPadding=3)),
+        # The padding differs and the audio also sits elsewhere against the video: not only the padding.
+        _audio("padding_and_time", sourcePayloadSha256="cc", outputPayloadSha256="cc", maxSkewUs=97488, firstMismatch=0, packets=329,
+               sourcePackets=329, outputPackets=329, sourceFirstPtsUs=-21333, outputFirstPtsUs=-21333,
+               differsOnlyInEndPadding=False,
+               sourceConfig=dict(aac, encoderPadding=0), outputConfig=dict(aac, encoderPadding=2)),
+        # A matching copy is not a difference.
+        _audio("same", result="IDENTICAL", outputConfigSha256="aa", outputPayloadSha256="cc", reason=None),
+        *[job(j, batchId="b1", jobId=j) for j in ("old", "late", "config", "padding", "padding_flag", "padding_and_time", "same")],
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    rows = {d["jobId"]: d for d in s["audioPacketDifferences"]}
+    assert set(rows) == {"old", "late", "config", "padding", "padding_flag", "padding_and_time"}, rows
+    assert rows["old"]["countsRecorded"] is False and rows["old"]["explanation"] == "not recorded"
+    assert rows["old"]["configFieldsThatDiffer"] is None and rows["old"]["configDiffers"] and rows["old"]["payloadDiffers"]
+    assert rows["late"]["explanation"] == "the output is the source without its first packet"
+    assert rows["late"]["configFieldsThatDiffer"] == ["encoderDelay"], rows["late"]
+    assert (rows["late"]["sourcePackets"], rows["late"]["outputPackets"], rows["late"]["outputFirstPtsUs"]) == (342, 341, 21333)
+    assert rows["config"]["explanation"] == "the same packets under a different decoder configuration"
+    assert rows["config"]["configFieldsThatDiffer"] == ["sampleRate", "csd0Hex"] and not rows["config"]["payloadDiffers"]
+    assert rows["config"]["endPaddingOnly"] is False and rows["late"]["endPaddingOnly"] is False and rows["old"]["endPaddingOnly"] is False
+    assert rows["padding"]["endPaddingOnly"] is True and rows["padding"]["configFieldsThatDiffer"] == ["encoderPadding"]
+    assert rows["padding"]["explanation"] == "the same packets; only the end padding differs (source 0, output 2 samples)"
+    assert rows["padding_flag"]["endPaddingOnly"] is True
+    assert rows["padding_flag"]["explanation"] == "the same packets; only the end padding differs (source 0, output 3 samples)"
+    assert rows["padding_and_time"]["endPaddingOnly"] is False
+    # Its padding differs too, but the recorded skew is far beyond the verifier's tolerance.
+    assert rows["padding_and_time"]["kind"] == "timing"
+    assert rows["padding_and_time"]["explanation"] == "the same packets at a different time against the video (up to 97488 us)"
+    assert [rows[j]["kind"] for j in ("old", "late", "config", "padding", "padding_flag")] == \
+        ["unknown", "packet_count", "decoder_config", "padding", "padding"]
+    from parse_session_jsonl import render
+    text = render(s)
+    assert "old decoder configuration differs over 342 compared packet(s), max skew 21334 us; this build recorded neither" in text
+    assert "source 342 / output 341 packets, first at 0 / 21333 us; the output is the source without its first packet; " \
+           "configuration differs in encoderDelay" in text
+    assert "configuration differs in sampleRate, csd0Hex" in text and "audio packets: same" not in text
+    assert "the same packets; only the end padding differs (source 0, output 2 samples); configuration differs in encoderPadding" in text
+
+
+def test_a_capture_from_the_candidate_veto_test_is_marked_and_its_retry_is_not_a_recovered_failure():
+    path = write([
+        start(),
+        {"type": "run_identity", "batchId": "b1", "batchSettings": {"replaceOriginals": False, "testCandidateVeto": True}},
+        {"type": "stage", "batchId": "b1", "jobId": "j", "stage": "certify", "reasonCode": "cert_test_rejected", "attemptIndex": 1,
+         "usedRatio": 0.75, "accepted": False, "pixelCertified": False, "injectedRejection": "first full encode refused"},
+        {"type": "stage", "batchId": "b1", "jobId": "j", "stage": "retry", "reasonCode": "retry_allowed", "attemptIndex": 1,
+         "usedRatio": 0.75, "saferRatio": 0.8, "trigger": "test_rejected"},
+        {"type": "stage", "batchId": "b1", "jobId": "j", "stage": "certify", "reasonCode": "cert_passed", "attemptIndex": 2,
+         "usedRatio": 0.8, "accepted": True, "pixelCertified": True},
+        job("j", batchId="b1", jobId="j", terminal="TRANSCODED_SMALLER", countsAsRealCompression=True, verified=True,
+            outputSize=800, sourceSize=1000, attemptsStarted=2,
+            attempts="0.75:test_rejected:cand=760:encodeMs=9000:n=1:token=1;0.80:accepted:cand=800:encodeMs=9400:n=2:token=2"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["testInjection"] == {"vetoInstalled": True, "refusedAttempts": [
+        {"jobId": "j", "attemptIndex": 1, "usedRatio": 0.75, "reason": "first full encode refused"}]}, s["testInjection"]
+    assert s["saferRungRetries"]["retried"] == 1 and s["saferRungRetries"]["afterTestRejection"] == 1
+    from parse_session_jsonl import render
+    text = render(s)
+    assert text.startswith("  !! TEST CAPTURE : an instrumented test's candidate veto was installed; 1 attempt(s) were refused by the test"), text[:200]
+    assert "j attempt 1 at 0.75. Not field evidence." in text
+    assert "1 followed a test's refusal, not a measured failure" in text
+
+
+def test_a_batch_the_app_ran_carries_no_test_marker():
+    path = write([
+        start(),
+        {"type": "run_identity", "batchId": "b1", "batchSettings": {"replaceOriginals": False}},
+        {"type": "stage", "batchId": "b1", "jobId": "j", "stage": "certify", "reasonCode": "cert_unavailable", "attemptIndex": 1},
+        job("j", batchId="b1", jobId="j", terminal="TRANSCODED_SMALLER", countsAsRealCompression=True, verified=True,
+            outputSize=800, sourceSize=1000, attemptsStarted=2,
+            attempts="0.85:measured_below_bar:cand=760:encodeMs=9000;0.90:accepted:cand=800:encodeMs=9400"),
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    assert s["testInjection"] is None
+    assert s["saferRungRetries"]["afterTestRejection"] == 0
+    from parse_session_jsonl import render
+    assert "TEST CAPTURE" not in render(s) and "test's refusal" not in render(s)
+
+
+# The six marginal trials of the v1.6.311 main batch (58 items, S26 normal profile), and the one
+# marginal rung the size gate kept the original on, as the batch recorded them. Reduced to the
+# fields the join reads: job and config ids, rung ids, ratios, verdicts and outcomes. No names,
+# sizes, digests or scores. Independently: 6 trials, 4 accepted directly, 2 measured below the bar
+# and then accepted at 0.95.
+B311_MARGINAL = """
+{"type":"stage","jobId":"job_89baf1b00ad3","stage":"probe_rung","reasonCode":"rung_measured","attempt":18,"rungId":"0.95@20f77a5a9ad8","configId":"20f77a5a9ad8","ratio":0.95,"verdict":"passed","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_89baf1b00ad3","stage":"probe_rung","reasonCode":"rung_measured","attempt":18,"rungId":"0.77@9408a4136ea8","configId":"9408a4136ea8","ratio":0.77,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_89baf1b00ad3","stage":"size_gate","reasonCode":"gate_encode","attempt":18,"assessedRungId":"0.77@9408a4136ea8","rungVerdict":"marginal","disposition":"predicted_smaller","outputMime":"video/hevc"}
+{"type":"stage","jobId":"job_89baf1b00ad3","stage":"certify","reasonCode":"cert_measured_failure","attempt":18,"probeRungId":"0.77@9408a4136ea8","configId":"9408a4136ea8","usedRatio":0.77,"accepted":false,"pixelCertified":false}
+{"type":"stage","jobId":"job_89baf1b00ad3","stage":"retry","reasonCode":"retry_allowed","attempt":18,"usedRatio":0.77,"saferRatio":0.95,"trigger":"measured_below_bar"}
+{"type":"stage","jobId":"job_89baf1b00ad3","stage":"certify","reasonCode":"cert_passed","attempt":19,"probeRungId":"0.95@20f77a5a9ad8","configId":"20f77a5a9ad8","usedRatio":0.95,"accepted":true,"pixelCertified":true}
+{"type":"job","jobId":"job_89baf1b00ad3","terminal":"TRANSCODED_SMALLER","pixelCertified":true,"probeRungId":"0.95@20f77a5a9ad8","probeDetail":"windows passed at 0.77 (marginal refinement; certification decides); safer-rung retry at 0.95 after certification measured_below_bar at 0.77","attemptsStarted":2,"attemptLedger":[{"n":1,"token":18,"ratio":0.77,"probeRungId":"0.77@9408a4136ea8","configId":"9408a4136ea8","outcome":"measured_below_bar"},{"n":2,"token":19,"ratio":0.95,"probeRungId":"0.95@20f77a5a9ad8","configId":"20f77a5a9ad8","outcome":"accepted"}]}
+{"type":"stage","jobId":"job_1ecc4136ae36","stage":"probe_rung","reasonCode":"rung_measured","attempt":20,"rungId":"0.95@49a93b63170a","configId":"49a93b63170a","ratio":0.95,"verdict":"passed","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_1ecc4136ae36","stage":"probe_rung","reasonCode":"rung_measured","attempt":20,"rungId":"0.77@eedf2405c3e1","configId":"eedf2405c3e1","ratio":0.77,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_1ecc4136ae36","stage":"size_gate","reasonCode":"gate_encode","attempt":20,"assessedRungId":"0.77@eedf2405c3e1","rungVerdict":"marginal","disposition":"predicted_smaller","outputMime":"video/hevc"}
+{"type":"stage","jobId":"job_1ecc4136ae36","stage":"certify","reasonCode":"cert_measured_failure","attempt":20,"probeRungId":"0.77@eedf2405c3e1","configId":"eedf2405c3e1","usedRatio":0.77,"accepted":false,"pixelCertified":false}
+{"type":"stage","jobId":"job_1ecc4136ae36","stage":"retry","reasonCode":"retry_allowed","attempt":20,"usedRatio":0.77,"saferRatio":0.95,"trigger":"measured_below_bar"}
+{"type":"stage","jobId":"job_1ecc4136ae36","stage":"certify","reasonCode":"cert_passed","attempt":21,"probeRungId":"0.95@49a93b63170a","configId":"49a93b63170a","usedRatio":0.95,"accepted":true,"pixelCertified":true}
+{"type":"job","jobId":"job_1ecc4136ae36","terminal":"TRANSCODED_SMALLER","pixelCertified":true,"probeRungId":"0.95@49a93b63170a","probeDetail":"windows passed at 0.77 (marginal refinement; certification decides); safer-rung retry at 0.95 after certification measured_below_bar at 0.77","attemptsStarted":2,"attemptLedger":[{"n":1,"token":20,"ratio":0.77,"probeRungId":"0.77@eedf2405c3e1","configId":"eedf2405c3e1","outcome":"measured_below_bar"},{"n":2,"token":21,"ratio":0.95,"probeRungId":"0.95@49a93b63170a","configId":"49a93b63170a","outcome":"accepted"}]}
+{"type":"stage","jobId":"job_1c02059b9ca2","stage":"probe_rung","reasonCode":"rung_measured","attempt":22,"rungId":"0.80@fd504fdcad9c","configId":"fd504fdcad9c","ratio":0.8,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_1c02059b9ca2","stage":"size_gate","reasonCode":"gate_encode","attempt":22,"assessedRungId":"0.80@fd504fdcad9c","rungVerdict":"marginal","disposition":"predicted_smaller","outputMime":"video/hevc"}
+{"type":"stage","jobId":"job_1c02059b9ca2","stage":"certify","reasonCode":"cert_passed","attempt":22,"probeRungId":"0.80@fd504fdcad9c","configId":"fd504fdcad9c","usedRatio":0.8,"accepted":true,"pixelCertified":true}
+{"type":"job","jobId":"job_1c02059b9ca2","terminal":"TRANSCODED_SMALLER","pixelCertified":true,"probeRungId":"0.80@fd504fdcad9c","probeDetail":"windows passed at 0.80 (marginal refinement; certification decides)","attemptsStarted":1,"attemptLedger":[{"n":1,"token":22,"ratio":0.8,"probeRungId":"0.80@fd504fdcad9c","configId":"fd504fdcad9c","outcome":"accepted"}]}
+{"type":"stage","jobId":"job_2142a16a7282","stage":"probe_rung","reasonCode":"rung_measured","attempt":23,"rungId":"0.77@73dc56f9b489","configId":"73dc56f9b489","ratio":0.77,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_2142a16a7282","stage":"size_gate","reasonCode":"gate_encode","attempt":23,"assessedRungId":"0.77@73dc56f9b489","rungVerdict":"marginal","disposition":"predicted_smaller","outputMime":"video/hevc"}
+{"type":"stage","jobId":"job_2142a16a7282","stage":"certify","reasonCode":"cert_passed","attempt":23,"probeRungId":"0.77@73dc56f9b489","configId":"73dc56f9b489","usedRatio":0.77,"accepted":true,"pixelCertified":true}
+{"type":"job","jobId":"job_2142a16a7282","terminal":"TRANSCODED_SMALLER","pixelCertified":true,"probeRungId":"0.77@73dc56f9b489","probeDetail":"windows passed at 0.77 (marginal refinement; certification decides)","attemptsStarted":1,"attemptLedger":[{"n":1,"token":23,"ratio":0.77,"probeRungId":"0.77@73dc56f9b489","configId":"73dc56f9b489","outcome":"accepted"}]}
+{"type":"stage","jobId":"job_b0edd46ad770","stage":"probe_rung","reasonCode":"rung_measured","attempt":24,"rungId":"0.77@4837d50108b9","configId":"4837d50108b9","ratio":0.77,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_b0edd46ad770","stage":"size_gate","reasonCode":"gate_encode","attempt":24,"assessedRungId":"0.77@4837d50108b9","rungVerdict":"marginal","disposition":"predicted_smaller","outputMime":"video/hevc"}
+{"type":"stage","jobId":"job_b0edd46ad770","stage":"certify","reasonCode":"cert_passed","attempt":24,"probeRungId":"0.77@4837d50108b9","configId":"4837d50108b9","usedRatio":0.77,"accepted":true,"pixelCertified":true}
+{"type":"job","jobId":"job_b0edd46ad770","terminal":"TRANSCODED_SMALLER","pixelCertified":true,"probeRungId":"0.77@4837d50108b9","probeDetail":"windows passed at 0.77 (marginal refinement; certification decides)","attemptsStarted":1,"attemptLedger":[{"n":1,"token":24,"ratio":0.77,"probeRungId":"0.77@4837d50108b9","configId":"4837d50108b9","outcome":"accepted"}]}
+{"type":"stage","jobId":"job_a26e9d113c47","stage":"probe_rung","reasonCode":"rung_measured","attempt":58,"rungId":"0.75@17d521372fb7","configId":"17d521372fb7","ratio":0.75,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_a26e9d113c47","stage":"size_gate","reasonCode":"gate_encode","attempt":58,"assessedRungId":"0.75@17d521372fb7","rungVerdict":"marginal","disposition":"predicted_smaller","outputMime":"video/hevc"}
+{"type":"stage","jobId":"job_a26e9d113c47","stage":"certify","reasonCode":"cert_passed","attempt":58,"probeRungId":"0.75@17d521372fb7","configId":"17d521372fb7","usedRatio":0.75,"accepted":true,"pixelCertified":true}
+{"type":"job","jobId":"job_a26e9d113c47","terminal":"TRANSCODED_SMALLER","pixelCertified":true,"probeRungId":"0.75@17d521372fb7","probeDetail":"windows passed at 0.75 (marginal refinement; certification decides)","attemptsStarted":1,"attemptLedger":[{"n":1,"token":58,"ratio":0.75,"probeRungId":"0.75@17d521372fb7","configId":"17d521372fb7","outcome":"accepted"}]}
+{"type":"stage","jobId":"job_e78a13f84734","stage":"probe_rung","reasonCode":"rung_measured","attempt":53,"rungId":"0.97@233b0a0f5040","configId":"233b0a0f5040","ratio":0.97,"verdict":"marginal","outputMime":"video/hevc","ladderRole":"primary"}
+{"type":"stage","jobId":"job_e78a13f84734","stage":"size_gate","reasonCode":"gate_keep_original","attempt":53,"assessedRungId":"0.97@233b0a0f5040","rungVerdict":"marginal","disposition":"predicted_not_smaller","outputMime":"video/hevc"}
+{"type":"job","jobId":"job_e78a13f84734","terminal":"ALREADY_HIGHLY_OPTIMIZED","pixelCertified":false,"probeRungId":"0.97@233b0a0f5040","probeDetail":"windows passed at 0.97 by only 0.14, below the selection margin (0.5/1.25/1.0); certification decides"}
+"""
+
+
+def b311_session(*extra):
+    recs = [json.loads(line) for line in B311_MARGINAL.strip().splitlines()]
+    return write([start(batchId="b311")] + [dict(r, batchId="b311") for r in recs] + list(extra)
+                 + [{"type": "session_summary", "batchId": "b311"}])
+
+
+def test_the_v1_6_311_marginal_trials_are_counted_from_their_own_ledgers():
+    m = summarize(b311_session())["marginalAttempts"]
+    assert (m["trials"], m["accepted"], m["measuredBelowBar"], m["testRejected"]) == (6, 4, 2, 0)
+    assert (m["rejectedThenRetried"], m["retryOutcomes"], m["rejectedNotRetried"]) == (2, {"accepted": 2}, 0)
+    assert m["unresolved"] == [] and m["legacyJobsNotClassified"] == []
+    # The job the prose match used to count: size-gated, no full encode, so not a trial.
+    assert m["keptBySizeGateWithoutEncode"] == ["job_e78a13f84734"]
+    assert "job_e78a13f84734" not in {t["jobId"] for t in m["trialRows"]}
+    from parse_session_jsonl import render
+    text = render(summarize(b311_session()))
+    assert "marginal trials: 6 full encode(s)" in text and "4 accepted, 2 measured below the bar" in text
+    assert "rejected then retried at a safer rung: 2 {'accepted': 2}" in text
+    assert "marginal passes" not in text
+
+
+def test_a_retry_that_passes_does_not_certify_the_trial_it_replaced():
+    m = summarize(b311_session())["marginalAttempts"]
+    retried = {t["jobId"]: t for t in m["trialRows"] if t["nextAttempt"]}
+    assert set(retried) == {"job_89baf1b00ad3", "job_1ecc4136ae36"}
+    for t in retried.values():
+        # Each job ended certified, by its second attempt at 0.95. The 0.77 trial was rejected.
+        assert (t["ratio"], t["outcome"]) == (0.77, "measured_below_bar")
+        assert (t["nextAttempt"]["ratio"], t["nextAttempt"]["outcome"]) == (0.95, "accepted")
+
+
+def _trial_job(jid, ledger, rungs):
+    return [{"type": "stage", "jobId": jid, "stage": "probe_rung", "rungId": rid, "configId": rid.split("@")[1],
+             "ratio": float(rid.split("@")[0]), "verdict": verdict, "outputMime": mime, "ladderRole": role}
+            for rid, verdict, mime, role in rungs] + [
+        {"type": "job", "jobId": jid, "terminal": "KEPT_ORIGINAL", "attemptLedger": [
+            {"n": n, "ratio": float(rid.split("@")[0]) if rid else None, "probeRungId": rid,
+             "configId": cfg if cfg is not None else (rid.split("@")[1] if rid else None), "outcome": outcome}
+            for n, (rid, outcome, cfg) in enumerate(ledger, 1)]}]
+
+
+def _marginal(*records):
+    return summarize(write([start()] + [dict(r, batchId="b1") for r in records] + [{"type": "session_summary", "batchId": "b1"}]))["marginalAttempts"]
+
+
+def test_both_attempts_refused_and_a_tests_refusal_are_told_apart():
+    m = _marginal(
+        *_trial_job("job_both", [("0.77@aaaaaaaaaaaa", "measured_below_bar", None), ("0.95@bbbbbbbbbbbb", "measured_below_bar", None)],
+                    [("0.77@aaaaaaaaaaaa", "marginal", "video/hevc", "primary"), ("0.95@bbbbbbbbbbbb", "passed", "video/hevc", "primary")]),
+        *_trial_job("job_veto", [("0.75@cccccccccccc", "test_rejected", None), ("0.80@dddddddddddd", "accepted", None)],
+                    [("0.75@cccccccccccc", "marginal", "video/hevc", "primary"), ("0.80@dddddddddddd", "passed", "video/hevc", "primary")]),
+        *_trial_job("job_alone", [("0.70@eeeeeeeeeeee", "structural_failed", None)],
+                    [("0.70@eeeeeeeeeeee", "marginal", "video/avc", "primary")]),
+    )
+    assert (m["trials"], m["accepted"], m["measuredBelowBar"], m["testRejected"]) == (3, 0, 1, 1)
+    assert m["outcomes"] == {"measured_below_bar": 1, "test_rejected": 1, "structural_failed": 1}
+    assert (m["rejectedThenRetried"], m["rejectedNotRetried"]) == (2, 1)
+    assert m["retryOutcomes"] == {"measured_below_bar": 1, "accepted": 1}
+
+
+def test_an_encode_on_a_passing_rung_or_on_no_rung_is_not_a_marginal_trial():
+    m = _marginal(
+        *_trial_job("job_pass", [("0.60@aaaaaaaaaaaa", "accepted", None)], [("0.60@aaaaaaaaaaaa", "passed", "video/hevc", "primary")]),
+        *_trial_job("job_preset", [(None, "accepted", None)], []),
+    )
+    assert m is None
+
+
+def test_rung_ids_are_joined_within_the_job_by_config_never_by_ratio_alone():
+    m = _marginal(
+        # Same ratio, two codecs: the HEVC rung was marginal, the AVC one passed. The encode used AVC.
+        *_trial_job("job_codec", [("0.77@bbbbbbbbbbbb", "accepted", None)],
+                    [("0.77@aaaaaaaaaaaa", "marginal", "video/hevc", "primary"), ("0.77@bbbbbbbbbbbb", "passed", "video/avc", "alternate")]),
+        # Another job measured the same rung id as marginal; it says nothing about this one.
+        *_trial_job("job_other", [("0.80@cccccccccccc", "accepted", None)], [("0.80@cccccccccccc", "passed", "video/hevc", "primary")]),
+        *_trial_job("job_else", [], [("0.80@cccccccccccc", "marginal", "video/hevc", "primary")]),
+    )
+    assert m is None
+
+
+def test_a_rung_that_is_missing_contradicted_or_measured_with_another_config_is_unresolved():
+    m = _marginal(
+        *_trial_job("job_missing", [("0.77@aaaaaaaaaaaa", "accepted", None)], []),
+        # A ladder id collision: two records of one rung id that disagree. Neither is picked.
+        *_trial_job("job_collide", [("0.80@bbbbbbbbbbbb", "measured_below_bar", None)],
+                    [("0.80@bbbbbbbbbbbb", "marginal", "video/hevc", "primary"), ("0.80@bbbbbbbbbbbb", "passed", "video/hevc", "alternate")]),
+        *_trial_job("job_config", [("0.75@cccccccccccc", "accepted", "ffffffffffff")], [("0.75@cccccccccccc", "marginal", "video/hevc", "primary")]),
+    )
+    assert m["trials"] == 0
+    reasons = {u["jobId"]: u["reason"] for u in m["unresolved"]}
+    assert reasons == {
+        "job_missing": "no probe_rung record has this rung id",
+        "job_collide": "2 probe_rung records share this id and disagree",
+        "job_config": "the rung was measured with a different encoder config",
+    }
+
+
+def test_two_records_of_one_rung_that_agree_are_one_rung():
+    m = _marginal(*_trial_job("job_twice", [("0.77@aaaaaaaaaaaa", "accepted", None)],
+                              [("0.77@aaaaaaaaaaaa", "marginal", "video/hevc", "primary")] * 2))
+    assert (m["trials"], m["accepted"], m["unresolved"]) == (1, 1, [])
+
+
+def test_a_job_with_no_attempt_ledger_is_counted_as_unclassified_not_as_a_trial():
+    m = _marginal(job("old", jobId="job_old", attempts="0.90:measured_below_bar:cand=1:encodeMs=2",
+                      probeDetail="windows passed at 0.90 by only 0.20, below the selection margin (0.5/1.25/1.0); certification decides"))
+    assert (m["trials"], m["legacyJobsNotClassified"]) == (0, ["job_old"])
+
+
+def test_each_audio_difference_is_named_from_the_record_never_inferred_as_timing():
+    aac = {"mime": "audio/mp4a-latm", "channels": 2, "sampleRate": 48000, "encoderDelay": None, "encoderPadding": None,
+           "csdSizes": [2, None, None], "csd0Hex": "1190"}
+    same = dict(sourceConfigSha256="aa", outputConfigSha256="aa", sourcePayloadSha256="cc", outputPayloadSha256="cc",
+                sourceConfig=aac, outputConfig=aac, outputLacksFirstSourcePacket=False, outputHasExtraFirstPacket=False)
+
+    def ev(job_id, **kw):
+        return _audio(job_id, **dict(same, **kw))
+
+    path = write([
+        start(),
+        # v1.6.311 job_df9d097e8c72 as recorded: 93 packets, equal bytes and configuration, both
+        # first timestamps 0, zero skew, and the flags of packet 1 differ.
+        ev("flags", packets=93, sourcePackets=93, outputPackets=93, sourceFirstPtsUs=0, outputFirstPtsUs=0, maxSkewUs=0,
+           firstMismatch=1, firstMismatchKind="packet flags differ", reason="packet flags differ", differsOnlyInEndPadding=False),
+        ev("shift", packets=93, sourcePackets=93, outputPackets=93, sourceFirstPtsUs=0, outputFirstPtsUs=21333, maxSkewUs=21333,
+           firstMismatch=0, firstMismatchKind="presentation time differs against video by 21333us",
+           reason="presentation time differs against video by 21333us"),
+        ev("payload", packets=93, sourcePackets=93, outputPackets=93, outputPayloadSha256="dd", maxSkewUs=0,
+           firstMismatch=7, firstMismatchKind="payload differs", reason="payload differs"),
+        ev("absent", packets=92, sourcePackets=93, outputPackets=92, maxSkewUs=0, firstMismatch=92,
+           firstMismatchKind="packet count differs", reason="packet count differs"),
+        ev("extra", packets=93, sourcePackets=93, outputPackets=94, outputPayloadSha256="ee", maxSkewUs=21333, firstMismatch=0,
+           firstMismatchKind="payload differs", reason="payload differs", outputHasExtraFirstPacket=True),
+        ev("padding", packets=93, sourcePackets=93, outputPackets=93, maxSkewUs=0, firstMismatch=None, outputConfigSha256="bb",
+           reason="decoder configuration differs", differsOnlyInEndPadding=True,
+           sourceConfig=dict(aac, encoderPadding=0), outputConfig=dict(aac, encoderPadding=2)),
+        ev("unknown_config", packets=0, sourcePackets=0, outputPackets=0, maxSkewUs=0, firstMismatch=None,
+           reason="decoder configuration unknown", sourceConfigSha256=None, sourceConfig=None),
+        # A reason no build of this verifier writes: said so, not turned into a timing claim.
+        ev("unclassified", packets=93, sourcePackets=93, outputPackets=93, maxSkewUs=0, firstMismatch=None, reason="something new"),
+        # Legacy: one reason and no counts.
+        _audio("legacy", reason="packet flags differ", maxSkewUs=0),
+        *[job(j, batchId="b1", jobId=j) for j in ("flags", "shift", "payload", "absent", "extra", "padding", "unknown_config", "unclassified", "legacy")],
+        {"type": "session_summary", "batchId": "b1"},
+    ])
+    s = summarize(path)
+    rows = {d["jobId"]: d for d in s["audioPacketDifferences"]}
+    assert {j: r["kind"] for j, r in rows.items()} == {
+        "flags": "flags", "shift": "timing", "payload": "payload", "absent": "packet_count", "extra": "packet_count",
+        "padding": "padding", "unknown_config": "config_unknown", "unclassified": "unknown", "legacy": "unknown"}
+    assert rows["flags"]["explanation"] == \
+        "the same packets with different packet flags, first at packet 1, at the same time against the video (max skew 0 us)"
+    assert "different time" not in rows["flags"]["explanation"]
+    assert rows["shift"]["explanation"] == "the same packets at a different time against the video (up to 21333 us)"
+    assert rows["absent"]["explanation"] == "the packet counts differ and the packets are not one position apart"
+    assert rows["extra"]["explanation"] == "the output is the source with one extra packet in front"
+    assert rows["unknown_config"]["explanation"] == "a decoder configuration could not be read, so no packet was compared"
+    assert rows["unclassified"]["explanation"] == "a difference this record does not classify (reason: 'something new')"
+    assert rows["legacy"]["explanation"] == "not recorded"
+    for r in rows.values():
+        if r["kind"] != "timing":
+            assert "different time" not in r["explanation"], r
+    from parse_session_jsonl import render
+    assert "flags packet flags differ over 93 compared packet(s), max skew 0 us; source 93 / output 93 packets, first at 0 / 0 us;" \
+           " the same packets with different packet flags, first at packet 1" in render(s)
 
 
 if __name__ == "__main__":

@@ -320,13 +320,15 @@ data class CompressorUiState(
     }
 }
 
+// Binary units, labelled as such: the value was always divided by 1024², and "MB" beside it made
+// 246,118,100 bytes read as 234.7 "MB" while the diagnostics said 246 MB. Locale-pinned.
 fun formatFileSize(size: Long): String {
-    if (size <= 0) return "0 MB"
-    val mb = size / (1024.0 * 1024.0)
-    if (mb >= 1000) {
-        return String.format("%.1f GB", mb / 1024)
+    if (size <= 0) return "0 MiB"
+    val mib = size / (1024.0 * 1024.0)
+    if (mib >= 1000) {
+        return String.format(java.util.Locale.US, "%.1f GiB", mib / 1024)
     }
-    return String.format("%.1f MB", mb)
+    return String.format(java.util.Locale.US, "%.1f MiB", mib)
 }
 
 @OptIn(UnstableApi::class)
@@ -389,8 +391,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
 
     private fun hasEncoder(mimeType: String): Boolean {
         try {
-            val list = MediaCodecList(MediaCodecList.ALL_CODECS)
-            for (info in list.codecInfos) {
+            for (info in DeviceCodecCatalog.codecInfos) {
                 if (!info.isEncoder) continue
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -772,21 +773,30 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
             )
             .build()
             
+        // Media3 1.9+ threads a platform-diagnostics LogSessionId through the encoder factory.
+        // It is @Nullable on every overload we call, and Transformer supplies whatever it has —
+        // forwarded verbatim so the CBR/VBR delegates keep whatever session Transformer opened.
         val encoderFactory = object : androidx.media3.transformer.Codec.EncoderFactory {
-            override fun createForAudioEncoding(format: androidx.media3.common.Format): androidx.media3.transformer.Codec {
-                return cbrEncoderFactory.createForAudioEncoding(format)
+            override fun createForAudioEncoding(
+                format: androidx.media3.common.Format,
+                logSessionId: android.media.metrics.LogSessionId?
+            ): androidx.media3.transformer.Codec {
+                return cbrEncoderFactory.createForAudioEncoding(format, logSessionId)
             }
 
-            override fun createForVideoEncoding(format: androidx.media3.common.Format): androidx.media3.transformer.Codec {
+            override fun createForVideoEncoding(
+                format: androidx.media3.common.Format,
+                logSessionId: android.media.metrics.LogSessionId?
+            ): androidx.media3.transformer.Codec {
                 var modifiedFormat = format
                 if (format.colorInfo == null || !androidx.media3.common.ColorInfo.isTransferHdr(format.colorInfo)) {
                      modifiedFormat = format.buildUpon().setColorInfo(null).build()
                 }
 
                 return try {
-                    cbrEncoderFactory.createForVideoEncoding(modifiedFormat)
+                    cbrEncoderFactory.createForVideoEncoding(modifiedFormat, logSessionId)
                 } catch (e: Exception) {
-                    vbrEncoderFactory.createForVideoEncoding(modifiedFormat)
+                    vbrEncoderFactory.createForVideoEncoding(modifiedFormat, logSessionId)
                 }
             }
 
@@ -795,9 +805,11 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
         
         val transformerBuilder = Transformer.Builder(context)
+            // See ExportWatchdogPolicy.
+            .setMaxDelayBetweenMuxerSamplesMs(ExportWatchdogPolicy.MAX_DELAY_BETWEEN_MUXER_SAMPLES_MS)
             .setVideoMimeType(videoMimeType)
             .setAudioMimeType(MimeTypes.AUDIO_AAC)
-            .setAssetLoaderFactory(androidx.media3.transformer.DefaultAssetLoaderFactory(context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT))
+            .setAssetLoaderFactory(androidx.media3.transformer.DefaultAssetLoaderFactory(context, decoderFactory, androidx.media3.common.util.Clock.DEFAULT, null))
             .setEncoderFactory(encoderFactory)
             .addListener(object : Transformer.Listener {
                 override fun onCompleted(composition: Composition, exportResult: ExportResult) {
@@ -902,7 +914,7 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         }
 
         val composition = Composition.Builder(
-            listOf(EditedMediaItemSequence(editedMediaItem))
+            listOf(EditedMediaItemSequence.Builder(editedMediaItem).build())
         )
         .setHdrMode(hdrMode)
         .build()
@@ -1095,9 +1107,8 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
         encoder: Boolean
     ): Boolean {
         return try {
-            val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
             val safeFps = kotlin.math.ceil(if (fps > 0f) fps.toDouble() else 30.0)
-            codecList.codecInfos
+            DeviceCodecCatalog.codecInfos
                 .asSequence()
                 .filter { it.isEncoder == encoder }
                 .filter { info -> info.supportedTypes.any { it.equals(mimeType, ignoreCase = true) } }
@@ -1196,30 +1207,19 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                     }
                 }
 
-                val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-                } else {
-                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-                }
-
-                val itemUri = context.contentResolver.insert(collection, values)
-                
-                if (itemUri != null) {
-                    context.contentResolver.openOutputStream(itemUri).use { out ->
-                        file.inputStream().use { input ->
-                            input.copyTo(out!!)
-                        }
+                // Saved only when exactly one row was published and it reads back as the file:
+                // a row, or a publishing update that changed nothing, is not a saved copy.
+                when (val saved = GalleryPublication.save({ file.inputStream() }, MediaStoreGallery(context.contentResolver, values))) {
+                    is GalleryPublication.Result.Published -> _uiState.update { it.copy(saveSuccess = true) }
+                    is GalleryPublication.Result.Failed -> _uiState.update {
+                        it.copy(error = if (saved.stage == GalleryPublication.Stage.INSERT) {
+                            getApplication<Application>().getString(R.string.error_gallery_entry)
+                        } else {
+                            getApplication<Application>().getString(
+                                R.string.error_save_failed, "the gallery copy could not be confirmed (${saved.stage.name.lowercase()})"
+                            )
+                        })
                     }
-                    
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                        values.clear()
-                        values.put(MediaStore.Video.Media.IS_PENDING, 0)
-                        context.contentResolver.update(itemUri, values, null, null)
-                    }
-                    
-                    _uiState.update { it.copy(saveSuccess = true) }
-                } else {
-                     _uiState.update { it.copy(error = getApplication<Application>().getString(R.string.error_gallery_entry)) }
                 }
             } catch (e: Exception) {
                 e.printStackTrace()

@@ -15,7 +15,15 @@ data class Mp4MetadataRemuxResult(
     val outputFile: File,
     val didRemux: Boolean,
     val locationWritten: Boolean,
-    val message: String
+    val message: String,
+    // When a metadata remux ran: the video samples it read from the closed Media3 file and the ones
+    // it wrote, with the first and last presentation times it read. The remux reads every sample
+    // anyway, so this is the one free look at Media3's output before it is replaced; it lets a
+    // timeline failure say whether a frame went missing before the remux, in it, or not at all.
+    val videoSamplesRead: Int? = null,
+    val videoSamplesWritten: Int? = null,
+    val firstVideoPtsUs: Long? = null,
+    val lastVideoPtsUs: Long? = null
 )
 
 object Mp4MetadataRemuxer {
@@ -27,7 +35,14 @@ object Mp4MetadataRemuxer {
         sourceUri: Uri,
         outputFile: File,
         snapshot: VideoMetadataSnapshot,
-        onProgress: (copiedBytes: Long, outputBytes: Long) -> Unit = { _, _ -> }
+        onProgress: (copiedBytes: Long, outputBytes: Long) -> Unit = { _, _ -> },
+        // Called between samples; throw (e.g. ensureActive) to stop. Media3InputNormalizer uses it
+        // so a cancelled batch does not finish copying a multi-gigabyte file.
+        cancellationCheck: () -> Unit = {},
+        restoreFirstVideoPtsUs: Long? = null,
+        // Every video sample written, by presentation time, so a caller can tell a complete copy
+        // from one the extractor ended early (readSampleData < 0 ends the loop silently).
+        onVideoSample: (presentationTimeUs: Long) -> Unit = {}
     ): Mp4MetadataRemuxResult {
         if (outputFile.exists()) outputFile.delete()
         outputFile.parentFile?.mkdirs()
@@ -78,8 +93,12 @@ object Mp4MetadataRemuxer {
             val buffer = ByteBuffer.allocateDirect(maxBufferSize)
             val bufferInfo = MediaCodec.BufferInfo()
             var copiedBytes = 0L
+            val videoTrack = videoTracks.single()
+            var samples = 0L
+            var restored = false
 
             while (true) {
+                if (samples++ % 256L == 0L) cancellationCheck()
                 val inputTrackIndex = extractor.sampleTrackIndex
                 if (inputTrackIndex < 0) break
 
@@ -98,14 +117,22 @@ object Mp4MetadataRemuxer {
                 val sampleSize = extractor.readSampleData(buffer, 0)
                 if (sampleSize < 0) break
 
-                bufferInfo.set(0, sampleSize, extractor.sampleTime, flags)
+                val pts = extractor.sampleTime
+                val restoredPts = restoreFirstVideoPtsUs?.takeIf { inputTrackIndex == videoTrack && !restored }
+                if (restoredPts != null) {
+                    check(pts == 0L && restoredPts > 0L) { "unexpected first video timestamp" }
+                    restored = true
+                }
+                bufferInfo.set(0, sampleSize, restoredPts ?: pts, flags)
                 muxer.writeSampleData(outputTrackIndex, buffer, bufferInfo)
                 copiedBytes += sampleSize
+                if (inputTrackIndex == videoTrack) onVideoSample(bufferInfo.presentationTimeUs)
                 onProgress(copiedBytes, outputFile.length())
                 extractor.advance()
             }
 
-            runCatching { muxer.stop() }
+            check(restoreFirstVideoPtsUs == null || restored) { "first video timestamp is missing" }
+            muxer.stop()
             muxerStarted = false
             muxer.release()
             muxer = null
@@ -186,12 +213,18 @@ object Mp4MetadataRemuxer {
 
             val trackMap = mutableMapOf<Int, Int>()
             var maxBufferSize = DEFAULT_BUFFER_SIZE
+            val videoTracks = mutableSetOf<Int>()
+            var videoRead = 0
+            var videoWritten = 0
+            var firstVideoPts = Long.MAX_VALUE
+            var lastVideoPts = Long.MIN_VALUE
 
             for (trackIndex in 0 until extractor.trackCount) {
                 val format = extractor.getTrackFormat(trackIndex)
                 val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
 
                 if (!mime.startsWith("video/") && !mime.startsWith("audio/")) continue
+                if (mime.startsWith("video/")) videoTracks += trackIndex
 
                 if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
                     maxBufferSize = maxOf(
@@ -249,11 +282,18 @@ object Mp4MetadataRemuxer {
                     extractor.sampleFlags
                 )
 
+                val isVideo = inputTrackIndex in videoTracks
+                if (isVideo) {
+                    videoRead++
+                    firstVideoPts = minOf(firstVideoPts, bufferInfo.presentationTimeUs)
+                    lastVideoPts = maxOf(lastVideoPts, bufferInfo.presentationTimeUs)
+                }
                 muxer.writeSampleData(outputTrackIndex, buffer, bufferInfo)
+                if (isVideo) videoWritten++
                 extractor.advance()
             }
 
-            runCatching { muxer.stop() }
+            muxer.stop()
             muxerStarted = false
             muxer.release()
             muxer = null
@@ -270,7 +310,11 @@ object Mp4MetadataRemuxer {
                         "metadata remux complete: source location written"
                     } else {
                         "metadata remux complete"
-                    }
+                    },
+                    videoSamplesRead = videoRead,
+                    videoSamplesWritten = videoWritten,
+                    firstVideoPtsUs = firstVideoPts.takeIf { videoRead > 0 },
+                    lastVideoPtsUs = lastVideoPts.takeIf { videoRead > 0 }
                 )
             } else {
                 Mp4MetadataRemuxResult(

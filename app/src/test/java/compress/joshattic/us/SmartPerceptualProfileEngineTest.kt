@@ -5,6 +5,7 @@ import androidx.media3.common.MimeTypes
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -302,6 +303,21 @@ class SmartPerceptualProfileEngineTest {
         assertEquals(1.0, e.expectedOvershootFactor(keyFor(hdr1080pHevc, MimeTypes.VIDEO_H265)), 1e-9)
     }
 
+    @Test fun s23OvershootMeasurementsDoNotSeedTheS26OrOtherEncoders() {
+        val e = engine()
+        for ((manufacturer, model) in listOf("samsung" to "SM-S948U", "other" to "SM-S918B")) {
+            val k = SmartPerceptualProfileEngine.profileKeyFor(hdr4k60Source(), MimeTypes.VIDEO_H265,
+                manufacturer, model, 37)
+            assertEquals(1.0, e.expectedOvershootFactor(k), 1e-9)
+        }
+        val s23 = SmartPerceptualProfileEngine.profileKeyFor(hdr4k60Source(), MimeTypes.VIDEO_H265,
+            "samsung", "SM-S918U1", 37)
+        val s26 = s23.copy(model = "SM-S948U")
+        e.recordVerifiedSuccess(s23, 0.95, 0.90, 0.80, measuredOvershootFactor = 1.5)
+        assertEquals(1.0, e.expectedOvershootFactor(s26), 1e-9)
+        assertNotEquals(s23.asKey(), s26.asKey())
+    }
+
     @Test
     fun probeSkipLatchIsDecayingAndEvidenceOnly() {
         val e = engine()
@@ -418,5 +434,37 @@ class SmartPerceptualProfileEngineTest {
             learnedTargetRatio = learnedRatio
         )
         assertTrue(target >= BatchQualityBitratePolicy.perceptualLosslessBitrateFloor(source))
+    }
+
+    @Test
+    fun learnedOvershootDoesNotDependOnTheOrderOfEncodes() {
+        // b167's 4K H.264 bucket: 458a verified at 1.003, then 732f failed for size at 1.235. The
+        // old (stored + new) / 2 gave the last encode half the weight, so order changed the value.
+        val measurements = listOf(1.003, 1.235, 1.010, 0.998)
+        val values = listOf(measurements, measurements.reversed(), listOf(1.235, 1.003, 0.998, 1.010)).map { order ->
+            val e = engine()
+            order.forEachIndexed { i, m ->
+                if (i % 2 == 0) e.recordVerifiedSuccess(key(), 0.90, 0.9, floorRatio = 0.80, measuredOvershootFactor = m)
+                else e.recordFailure(key(), 0.90, "size", floorRatio = 0.80, measuredOvershootFactor = m, stepUp = false)
+            }
+            e.expectedOvershootFactor(key())
+        }
+        // Stored factors are clamped at 1.0 (no undershoot is ever assumed), so 0.998 counts as 1.0.
+        values.forEach { assertEquals(measurements.map { maxOf(it, 1.0) }.average(), it, 1e-9) }
+    }
+
+    @Test
+    fun aStoredFactorWithoutACountIsTreatedAsOneMeasurement() {
+        val store = SmartPerceptualProfileEngine.InMemoryProfileStore()
+        val e = SmartPerceptualProfileEngine(store)
+        e.recordVerifiedSuccess(key(), 0.90, 0.9, floorRatio = 0.80, measuredOvershootFactor = 1.10)
+        // Simulate a store written before overshootN existed.
+        val raw = SmartPerceptualProfileEngine.LearnedEncodeProfile.decode(
+            e.profile(key()).encode().replace(Regex("overshootN=\\d+"), "")
+        )!!
+        assertEquals(0, raw.overshootSamples)
+        val legacy = SmartPerceptualProfileEngine(SmartPerceptualProfileEngine.InMemoryProfileStore().apply { write(key().asKey(), raw.encode()) })
+        legacy.recordVerifiedSuccess(key(), 0.90, 0.9, floorRatio = 0.80, measuredOvershootFactor = 1.00)
+        assertEquals(1.05, legacy.expectedOvershootFactor(key()), 1e-9)
     }
 }

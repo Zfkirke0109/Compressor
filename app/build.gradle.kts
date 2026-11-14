@@ -42,6 +42,52 @@ val buildGitCommit: String = try {
     "unknown"
 }
 
+// Monotonic build identity, so a capture can be matched to the APK it came from at a glance.
+//
+// This exists because it has already cost a round. The 2026-09-01 08:08 batch ran on an APK
+// built before the instrumentation it was meant to exercise, and nothing in the capture said so
+// directly — it took diffing a log wording against the source to establish which commit the
+// build carried. `GIT_COMMIT` alone cannot settle it: PR builds check out `refs/pull/N/merge`,
+// whose SHA is a merge commit GitHub recomputes (so it changes even when the tree does not), and
+// it is not ordered, so two of them cannot be compared for "which is newer".
+//
+// COMPRESSOR_BUILD_NUMBER is the CI run number: monotonic per workflow, and printable. The label
+// says which line it came from ("pr44", "main"). Absent both — a local build — the label is
+// "local" and the number is 0, which is honest rather than pretending to an identity CI assigns.
+val buildNumber: Int = (System.getenv("COMPRESSOR_BUILD_NUMBER")?.toIntOrNull() ?: 0)
+val buildLabel: String = (System.getenv("COMPRESSOR_BUILD_LABEL") ?: "local")
+    .replace(Regex("[^A-Za-z0-9._-]"), "-")
+    .ifBlank { "local" }
+
+/** e.g. "pr44-b123" or "local". Recorded in every session_start; usually also in versionName. */
+val buildTag: String = if (buildNumber > 0) "$buildLabel-b$buildNumber" else buildLabel
+
+// The version itself climbs with every CI build, so Android — not just a label — sees each new
+// APK as newer, and "which build is this?" is readable straight off Settings > Apps.
+//
+//   versionName  1.6.<run>  e.g. 1.6.155 for run 155; a local build stays 1.6.1-local, and a
+//                tagged release keeps its clean base version.
+//   versionCode  minutes since 2026-01-01 UTC, offset by 100 000. It must be monotonic across
+//                EVERY workflow that produces an installable APK, and run numbers are not: the
+//                PR-debug, CI and release workflows each count separately, so a run-number code
+//                could go backwards when the user installs from a different workflow, and
+//                Android refuses a downgrade. Build time only ever increases. Local builds keep
+//                the historical 26 so a developer install never outranks a CI one.
+val baseVersion = "1.6"
+val basePatch = 1
+val isTaggedRelease: Boolean = buildTag == "release"
+val versionNameComputed: String = when {
+    isTaggedRelease -> "$baseVersion.$basePatch"
+    buildNumber > 0 -> "$baseVersion.$buildNumber"
+    else -> "$baseVersion.$basePatch-local"
+}
+val versionCodeComputed: Int = if (buildNumber > 0 || isTaggedRelease) {
+    val epoch2026 = 1_767_225_600_000L // 2026-01-01T00:00:00Z
+    (100_000 + (System.currentTimeMillis() - epoch2026) / 60_000L).toInt()
+} else {
+    26
+}
+
 android {
     namespace = "compress.joshattic.us"
     compileSdk = 36
@@ -51,12 +97,15 @@ android {
         applicationId = "io.github.zfkirke0109.galaxycompressor"
         minSdk = 24
         targetSdk = 36
-        versionCode = 26
-        versionName = "1.6.1"
+        versionCode = versionCodeComputed
+        // See versionNameComputed: 1.6.<ci run number>, climbing with every build.
+        versionName = versionNameComputed
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         buildConfigField("String", "GIT_COMMIT", "\"$buildGitCommit\"")
+        buildConfigField("String", "BUILD_TAG", "\"$buildTag\"")
+        buildConfigField("int", "BUILD_NUMBER", "$buildNumber")
 
         // On-device VMAF is arm64-only (libvmaf NEON build). Other ABIs simply run without
         // pixel scoring: VmafNative.isAvailable is false and every caller falls back to the

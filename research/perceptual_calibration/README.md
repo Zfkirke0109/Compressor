@@ -44,8 +44,15 @@ each across a bits-per-pixel ladder (emphasizing the disputed [0.03, 0.069) band
 and codec mix, producing controlled SOURCE clips. Its `label` phase re-encodes
 each clip perceptually-lossless-style and scores it with the repo's authoritative
 VMAF harness ([`measure_quality.py`](../../scripts/diagnostics/measure_quality.py))
-to attach a ground-truth "compressible?" label — treating any encoder/measurement
+to attach a production-policy "compressible?" label, not a human visibility judgment — treating any encoder/measurement
 failure as *unlabeled*, never as a quality-negative.
+
+`prepare_dataset_v2.py` preserves `policy_label`, `measurement_status`,
+`structural_status`, `label_source`, and an empty `human_visibility_label` separately.
+The study remains policy-only unless every row has a valid 0/1 human judgment and
+`label_source=human`; when present, selection, holdout, references, chronological check,
+and bootstrap all use the human column. Filling human placeholders with policy labels
+does not provide independent perceptual evidence.
 
 ```
 python scripts/build_corpus.py plan  --masters <dir>              # dry-run size/spread estimate

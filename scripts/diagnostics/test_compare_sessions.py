@@ -2,7 +2,12 @@
 """Tests for the paired session comparison."""
 from __future__ import annotations
 
-from compare_sessions import compare, controls_present, saved_bytes
+import json
+import tempfile
+import zipfile
+from pathlib import Path
+
+from compare_sessions import compare, controls_present, load_jobs, saved_bytes
 
 
 def job(h, terminal="ALREADY_HIGHLY_OPTIMIZED", src=1000, out=0, real=False, **kw):
@@ -19,6 +24,38 @@ def test_saved_bytes_requires_both_a_claim_and_a_smaller_output():
     assert saved_bytes(job("a", src=1000, out=1200, real=True)) == 0
     assert saved_bytes(job("a", src=1000, out=1000, real=True)) == 0
     assert saved_bytes(job("a", src=1000, out=0, real=True)) == 0
+
+
+def test_retained_archive_requires_a_batch_and_uses_only_its_jobs():
+    with tempfile.TemporaryDirectory() as tmp:
+        capture = Path(tmp) / "everything.zip"
+        with zipfile.ZipFile(capture, "w") as z:
+            for batch, build, out in (("batch_200", "new", 970), ("batch_100", "old", 990)):
+                records = [
+                    {"type": "session_start", "batchId": batch, "buildCommit": build},
+                    job("same-file", out=out, real=True, type="job", batchId=batch),
+                ]
+                z.writestr(f"runs/{batch}/session.jsonl", "\n".join(map(json.dumps, records)))
+        try:
+            load_jobs(str(capture))
+        except ValueError as e:
+            assert "batch_200" in str(e) and "batch_100" in str(e)
+        else:
+            raise AssertionError("an archive with two batches must require selection")
+        newer, new_jobs = load_jobs(str(capture), "batch_200")
+        older, old_jobs = load_jobs(str(capture), "batch_100")
+        assert newer["buildCommit"] == "new" and older["buildCommit"] == "old"
+        assert len(new_jobs) == len(old_jobs) == 1
+        assert compare(old_jobs, new_jobs)["pairedCandidateSavedBytes"] == 30
+
+
+def test_single_legacy_session_still_uses_its_start_and_jobs():
+    with tempfile.TemporaryDirectory() as tmp:
+        capture = Path(tmp) / "legacy.jsonl"
+        start = {"type": "session_start", "batchId": "batch_100", "buildCommit": "old"}
+        outcome = job("same-file", out=990, real=True, type="job")
+        capture.write_text("\n".join(map(json.dumps, [start, outcome])))
+        assert load_jobs(str(capture)) == (start, [outcome])
 
 
 def test_only_shared_files_are_paired():
