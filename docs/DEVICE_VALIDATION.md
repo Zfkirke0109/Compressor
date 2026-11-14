@@ -784,7 +784,24 @@ colour of a success. The code behind it had the same blind spot at the end of a 
 
 These are tested on the JVM (each of the eight new tests fails with the old behaviour put back)
 and asserted by `BatchItemCardDeviceTest`, which also renders the rolled-back row. They change
-words about what already happened, not what a replacement does. They have not been seen on the
-phone: v1.6.324 predates them. The end-of-batch message has no device test: the harness makes a
-replacement fail below the batch, in the replacement IO, and the app has no hook to make one fail
-inside a batch.
+words about what already happened, not what a replacement does. v1.6.324 predates them; the
+row's lines were seen on the phone on v1.6.325 (below). The end-of-batch message has no device
+test: the harness makes a replacement fail below the batch, in the replacement IO, and the app
+has no hook to make one fail inside a batch.
+
+### The row's new lines, on v1.6.325 (November 14, 15:09 UTC)
+
+The owner installed the matched v1.6.325 APKs from `8a6d6a8` over v1.6.324 and reran the same
+case in the same run. It passed, 10 of 10, with the row test now asserting the outcome line on
+the copy-ready, not-replaced, rolled-back and at-risk rows. The three originals and their
+baselines were checked before and after it: 144 checks in the run now, all unchanged.
+
+Of the eight images, five are unchanged byte for byte across all three runs, and the open
+suggestion is the v1.6.322 run's. The row of a replacement that left the original incomplete
+reads "Original at risk", the warning that an intact copy is held inside the app, and "Outcome:
+Compressed, but replacing the original failed", drawn as a warning. The new image, a replacement
+written, failed and rolled back with its copy saved, reads "Copy saved", "Original restored
+intact after a failed replacement; copy saved to the gallery" and "Outcome: Compressed".
+
+Not covered on the phone: the end-of-batch warning and finish line, which are tested on the JVM
+only, as above.
