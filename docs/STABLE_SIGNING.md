@@ -30,8 +30,7 @@ check.
 
     keytool -exportcert -keystore ci-debug.keystore -alias compressor-debug | sha256sum
 
-For **release** signing — a separate key, separate secrets, and a workflow that never runs on
-pull requests — see [RELEASE_SIGNING.md](RELEASE_SIGNING.md).
+Release builds use a separate certificate. Use an Android CI app APK to update an existing stable-debug installation in place. [Release signing](RELEASE_SIGNING.md)
 
 ## Generate a stable debug keystore later
 
@@ -43,18 +42,7 @@ Encode it for GitHub Secrets:
 
     base64 -w 0 ci-debug.keystore
 
-Put that output into:
-
-    COMPRESSOR_DEBUG_KEYSTORE_BASE64
-
-Use the same password for:
-
-    COMPRESSOR_DEBUG_KEYSTORE_PASSWORD
-    COMPRESSOR_DEBUG_KEY_PASSWORD
-
-Use this alias unless changed:
-
-    compressor-debug
+Use the encoded keystore for `KEYSTORE_BASE64`, the selected alias for `KEY_ALIAS`, and the matching passwords for `KEYSTORE_PASSWORD` and `KEY_PASSWORD`. Set `EXPECTED_SIGNER_SHA256` to the certificate fingerprint shown above.
 
 ## Safety
 

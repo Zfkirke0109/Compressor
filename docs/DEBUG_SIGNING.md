@@ -29,15 +29,8 @@ The Gradle file automatically uses that key when the file exists. If the file is
 
 Do not commit the keystore. Store it in repository secrets instead.
 
-Suggested secrets:
-
-- `COMPRESSOR_DEBUG_KEYSTORE_B64`: base64 text of `ci-debug.keystore`
-- `COMPRESSOR_DEBUG_KEYSTORE_PASSWORD`: keystore password
-- `COMPRESSOR_DEBUG_KEY_ALIAS`: key alias
-- `COMPRESSOR_DEBUG_KEY_PASSWORD`: key password
-
-Then restore the secret to `ci-debug.keystore` in the APK build workflow before running Gradle. The app module is already prepared to use that file when it exists.
+The workflow reads `KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_ALIAS`, `KEY_PASSWORD` and `EXPECTED_SIGNER_SHA256`. Its Gradle environment variables are documented with the setup steps. [Stable CI signing](STABLE_SIGNING.md)
 
 ## Important install note
 
-If the phone currently has an APK signed with a different debug certificate, Android will require one uninstall. After installing an APK signed by the stable key, future APKs signed by that same key should update in place.
+Android requires a matching certificate for an in-place update. To retain settings and learned profiles on a stable-debug install, continue with the app APK from Android CI. Use the release-signed APK for fresh installs and existing release-signed installations. [GitHub Releases](https://github.com/Zfkirke0109/Compressor/releases/latest)

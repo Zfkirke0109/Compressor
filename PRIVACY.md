@@ -1,22 +1,17 @@
-# Privacy Policy for Compressor
+# Privacy and local data in Galaxy Compressor
 
-**Last updated:** January 26, 2026
+Updated November 14, 2026.
 
-**Compressor** ("the App") is designed with privacy as its core principle.
+Galaxy Compressor processes selected videos on your device using Android media APIs. You choose which inputs to open or share to the app and whether to keep copies, export a file or replace an original.
 
-## 1. Data Collection
-The App **does not** collect, store, transmit, or share any personal information, usage data, or metadata. 
+## What is stored
 
-## 2. Permissions
-The App operates with **zero** invasive permissions:
-*   **No Internet Access:** The App does not request the `INTERNET` permission. It is technically impossible for the App to send data to a remote server.
-*   **No Storage Scanning:** The App uses the Android System Photo Picker. It only has access to the specific video files you explicitly select for compression. It cannot read your other files.
+- The app stores settings, device-specific encoder learning and local records of compression runs. Diagnostics can include device and codec details, file fingerprints, hashes, timestamps, sampled quality scores and results. Optional capture settings can retain traces and encoded candidates.
+- When replacement is enabled, recovery data can include an intact copy of the original. If a result says an original is at risk, follow the recovery message and keep the app’s private storage intact until you have recovered the file.
+- Android’s backup and transfer rules exclude diagnostics, rollback copies, device-test files, and learned encoder profiles and their journal. Other app settings can follow the device’s backup settings. [Backup rules](app/src/main/res/xml/data_extraction_rules.xml)
 
-## 3. Third-Party Services
-The App contains **no** third-party tracking, analytics, or advertising SDKs (such as Google Analytics, Firebase, or AdMob).
+## What you can share
 
-## 4. Local Processing
-All video compression is performed locally on your device using the Android hardware acceleration capabilities. Your videos never leave your device.
+You can export outputs to the gallery, save a diagnostics ZIP in Downloads, or share an export through an app you choose. A log-only export can still identify a file by its hash. Check an export’s contents before sharing it publicly. Files you export to shared storage are subject to the settings of the gallery or backup apps you use.
 
-## 5. Contact
-If you have questions about this policy, please open an issue on the [GitHub Repository](https://github.com/JoshAtticus/Compressor) or send an email to compressor@joshattic.us.
+The fork and its release documentation are maintained here. [Galaxy Compressor on GitHub](https://github.com/Zfkirke0109/Compressor)

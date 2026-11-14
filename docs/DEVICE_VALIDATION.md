@@ -1,8 +1,6 @@
-# Device validation (b169 and b177 review rounds)
+# Device validation on the Galaxy S26 Ultra and S23 Ultra
 
-What JVM tests and the observational replay cannot establish, and how to establish it on the
-S23 Ultra. Nothing here uploads a source video: files are matched locally by name hash, pushed
-to the phone over ADB, and deleted from `/data/local/tmp` after use.
+Sections 1–5 describe the earlier S23 Ultra validation plan. Sections 6–12 document the retry and timeline investigations, S26 Ultra measurements, and the safe-copy harness. Section 12 includes the physical S26 runs through v1.6.325. Physical S23 testing for PR #44 remains pending.
 
 ## 1. What is already verified off-device
 

@@ -14,8 +14,8 @@ APKs install as updates. It must **not** be reused for release:
 - A Play Store upload key cannot be swapped freely once you have published under it — recovery
   requires Google's key-reset process.
 
-Release signing is therefore a distinct key, distinct secrets, and a distinct workflow that
-never runs on pull requests.
+Release signing is therefore a distinct key and a distinct workflow for version tags, manual runs and
+eligible same-repository pull requests. See the fork and collaborator note below.
 
 ## One-time setup
 
@@ -59,14 +59,14 @@ Settings → Secrets and variables → Actions → New repository secret:
 
 ## Building
 
-- **On every pull request:** a signed release APK is built and uploaded as an artifact, so you
+- **On a same-repository pull request:** a signed release APK is built and uploaded as an artifact, so you
   can install the actual release-signed build straight from the PR. The `.aab` is skipped here
   — it is only needed for Play upload and would just add build time.
 - **Manually:** Actions → *Android Release (signed)* → Run workflow. The `build_aab` input
   controls whether a Play-ready `.aab` is produced alongside the APK.
 - **On a version tag:** pushing a `v*` tag builds both automatically.
 
-Artifacts: `compressor-release-apk` and `compressor-release-aab`.
+The workflow uploads `compressor-release-apk-b<run>` and, when requested, `compressor-release-aab-b<run>` to Actions. To publish a version, set the clean version in `app/build.gradle.kts`, tag the tested commit as `v<version>`, and download the signed APK from that tag’s successful workflow. Check the APK version and signature, then attach the APK and its SHA-256 to the release for the same tag. [Published releases](https://github.com/Zfkirke0109/Compressor/releases)
 
 Combined with the debug signing in `android-ci.yml` and `android.yml`, every APK this repo
 produces from Actions is signed — debug builds with the stable debug key, release builds with
@@ -74,7 +74,7 @@ the release key.
 
 ### Before the secrets exist
 
-Until the five `RELEASE_*` secrets are configured, pull-request runs **skip** the signed
+Until the required `RELEASE_*` secrets are configured, pull-request runs **skip** the signed
 release build and log a notice naming the missing secrets. They do not fail — configuring
 release signing should not be a prerequisite for CI being green.
 

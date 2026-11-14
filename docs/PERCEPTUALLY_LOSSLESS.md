@@ -4,6 +4,8 @@ This document says what the app means when it labels an output "Perceptually Los
 evidence it requires before it says so, and how that claim is to be validated with people rather
 than with one number.
 
+The viewing reference below was established on the S23 Ultra. The S26 Ultra and S23 Ultra now have separate encoder profiles. Sections 8–12 of the [device validation notes](DEVICE_VALIDATION.md) cover the S26 measurements, including retries, audio repair and safe-copy recovery.
+
 ## 1. The definition
 
 An output is *perceptually lossless* for a viewing condition **V** when a normal-sighted viewer,

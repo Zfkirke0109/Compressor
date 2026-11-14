@@ -65,7 +65,7 @@ val buildTag: String = if (buildNumber > 0) "$buildLabel-b$buildNumber" else bui
 // The version itself climbs with every CI build, so Android — not just a label — sees each new
 // APK as newer, and "which build is this?" is readable straight off Settings > Apps.
 //
-//   versionName  1.6.<run>  e.g. 1.6.155 for run 155; a local build stays 1.6.1-local, and a
+//   versionName  1.6.<run>  e.g. 1.6.155 for run 155; a local build uses the base version plus -local, and a
 //                tagged release keeps its clean base version.
 //   versionCode  minutes since 2026-01-01 UTC, offset by 100 000. It must be monotonic across
 //                EVERY workflow that produces an installable APK, and run numbers are not: the
@@ -74,7 +74,7 @@ val buildTag: String = if (buildNumber > 0) "$buildLabel-b$buildNumber" else bui
 //                Android refuses a downgrade. Build time only ever increases. Local builds keep
 //                the historical 26 so a developer install never outranks a CI one.
 val baseVersion = "1.6"
-val basePatch = 1
+val basePatch = 334
 val isTaggedRelease: Boolean = buildTag == "release"
 val versionNameComputed: String = when {
     isTaggedRelease -> "$baseVersion.$basePatch"

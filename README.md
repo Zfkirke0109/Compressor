@@ -1,51 +1,46 @@
 <div align="center">
-  <img width="96" alt="ic_launcher-playstore" src="https://github.com/user-attachments/assets/9a2e0de5-1b6e-4110-81f1-b4616a31da6b" />
+  <img width="96" alt="Galaxy Compressor icon" src="app/src/main/ic_launcher-playstore.png" />
 
-# Compressor
+# Galaxy Compressor
 
-Lightning fast, ad free, super lightweight native video compressor for Android (inspired by the AMAZING Kompresso app for iOS).
+On-device Android batch video compression with sampled quality checks, original-file recovery and separate profiles for the Galaxy S26 Ultra and S23 Ultra.
 
-<a href="https://apt.izzysoft.de/packages/compress.joshattic.us"><img src="https://gitlab.com/IzzyOnDroid/repo/-/raw/master/assets/IzzyOnDroidButtonGreyBorder_nofont.png" height="40" align="middle" alt="Get it at IzzyOnDroid"></a>
-<a href="https://play.google.com/store/apps/details?id=compress.joshattic.us"><img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" height="60" align="middle" alt="Get it on Google Play"></a>
+[Download the latest signed APK](https://github.com/Zfkirke0109/Compressor/releases/latest) · [Changelog](CHANGELOG.md) · [Android CI](https://github.com/Zfkirke0109/Compressor/actions/workflows/android-ci.yml?query=branch%3Amain)
 
-<br>
+![Kotlin](https://img.shields.io/badge/Kotlin-7F52FF?logo=kotlin&logoColor=white)
+![Android](https://img.shields.io/badge/Android-3DDC84?logo=android&logoColor=white)
+[![License](https://img.shields.io/github/license/Zfkirke0109/Compressor)](LICENSE)
 
-![Kotlin](https://img.shields.io/badge/kotlin-%237F52FF.svg?style=for-the-badge&logo=kotlin&logoColor=white) 
-![Android](https://img.shields.io/badge/Android-3DDC84?style=for-the-badge&logo=android&logoColor=white) 
-![License](https://img.shields.io/github/license/JoshAtticus/Compressor?style=for-the-badge)
-
-<br>
-
-<img src="assets/select.jpg" alt="Screenshot 3" width="24%"/> <img src="assets/settings.jpg" alt="Screenshot 1" width="24%"/> <img src="assets/compressing.jpg" alt="Screenshot 2" width="24%"> <img src="assets/done.jpg" alt="Screenshot 4" width="24%"/>
+<img src="assets/select.jpg" alt="Select videos" width="24%" /> <img src="assets/settings.jpg" alt="Compression settings" width="24%" /> <img src="assets/compressing.jpg" alt="Compression in progress" width="24%" /> <img src="assets/done.jpg" alt="Finished compression" width="24%" />
+<p><em>Original Compressor screenshots</em></p>
 </div>
 
----
+## Install
 
-## About This Fork
+The fork installs as `io.github.zfkirke0109.galaxycompressor` on 64-bit ARM devices running Android 7.0 or later. For a new installation or an update to a release-signed copy, install the APK from GitHub Releases. If you already use a PR or Android CI debug build, use the `debug/app-debug.apk` from a successful `main` CI run to update in place and retain your settings and learned profile. Android requires the same signing certificate for an in-place update.
 
-This fork is based on [JoshAtticus/Compressor](https://github.com/JoshAtticus/Compressor). Huge thanks to JoshAtticus for creating the original fast, lightweight, native Android video compressor that this work builds on.
+## Compressing a batch
 
-This fork keeps the original Kotlin and Android media foundation, then focuses on Samsung Galaxy S23 Ultra batch workflows, stronger metadata preservation, safer replace-original behavior, and clearer trust/reporting around what happened to each video.
+1. Select videos in the app, or share them to Galaxy Compressor from the gallery. Use copy mode to keep the originals while evaluating the results.
+2. Choose **Perceptually Lossless** to search for a smaller encode. The app checks the final video against the source timeline, audio and color information, then measures aligned decoded frames in sampled windows. It keeps the original when a candidate is too large, misses a quality check or cannot be verified. **Remux only** copies compatible tracks without re-encoding.
+3. Read each result to see whether the original was kept, a copy was saved, or a replacement was verified or needs recovery. Batch-wide suggestions explain their effect before you apply them. A log-only export is available in Downloads.
 
-## What Is Different From JoshAtticus/Compressor?
+You can adjust codec, frame rate and thermal pacing, and choose whether to preserve recording dates and location. Optional Shizuku support provides another route for authorized file operations.
 
-- Batch-first compression for selecting and processing multiple videos.
-- S23 Ultra-oriented controls for quality, codec, frame rate, thermal pacing, and presets.
-- `Original` mode for perceptually lossless re-encoding that keeps resolution, source FPS where possible, source audio bitrate where possible, and HDR mode.
-- `Remux only` / no re-encode mode for compatible files, copying video and audio tracks unchanged with `MediaExtractor` and `MediaMuxer`.
-- Metadata preservation for source date/time, MP4/retriever date tags, location, rotation, and relative gallery path where Android exposes or allows it.
-- Preservation diagnostics that show whether date/location came from MediaStore, MP4 metadata, retriever metadata, or other supported sources.
-- Output verification reports that reread the finished file for resolution, FPS, codec, audio, HDR/color data, date, location, rotation, size, and playability.
-- Safer replace-original flow with verification before replacement, backup support, Android writable-document handling, optional Shizuku fallback, and safe-copy fallback.
-- Smart compression recommendations, performance metrics, and battery/thermal reporting for longer batch sessions.
-- Metadata privacy controls for preserving or intentionally removing date/location while keeping technical video metadata separate.
-- Stable debug signing workflow for PR APKs so future test builds can install as updates.
+## What changed in v1.6.334
 
----
+The S26 Ultra and S23 Ultra use separate encoder profiles. Exhaustive mode can try a lower measured bitrate, use a bounded hardware AVC search on eligible inputs and retry a safer measured bitrate when needed. Device-specific learning, native frame preparation and targeted MP4/AAC repairs support that search. Gallery saves now require a successful publish and a byte-for-byte read-back before Compressor reports success. [Release notes](CHANGELOG.md) · [Quality criteria](docs/PERCEPTUALLY_LOSSLESS.md) · [Device validation](docs/DEVICE_VALIDATION.md)
+
+## About this fork
+
+Galaxy Compressor builds on JoshAtticus’s Compressor and its Kotlin and Android Media3 implementation. This fork adds batch workflows, hardware encoder controls, metadata preservation, recovery for interrupted replacements, and per-video verification. The store listings and historical benchmarks below belong to the original project. [Upstream repository](https://github.com/JoshAtticus/Compressor) · [Privacy and local data](PRIVACY.md)
 
 ## Original App Stats & Downloads
 
-These badges link to the upstream app package, releases, and store listings from [JoshAtticus/Compressor](https://github.com/JoshAtticus/Compressor). This fork may provide its own test builds through pull request artifacts or fork releases.
+These downloads and statistics are for JoshAtticus’s upstream package, `compress.joshattic.us`.
+
+<a href="https://apt.izzysoft.de/packages/compress.joshattic.us"><img src="https://gitlab.com/IzzyOnDroid/repo/-/raw/master/assets/IzzyOnDroidButtonGreyBorder_nofont.png" height="40" align="middle" alt="Get it at IzzyOnDroid"></a>
+<a href="https://play.google.com/store/apps/details?id=compress.joshattic.us"><img src="https://play.google.com/intl/en_us/badges/static/images/badges/en_badge_web_generic.png" height="60" align="middle" alt="Get it on Google Play"></a>
 
 [![RB Status](https://shields.rbtlog.dev/simple/compress.joshattic.us?style=for-the-badge)](https://shields.rbtlog.dev/compress.joshattic.us) ![IzzyOnDroid Version](https://img.shields.io/endpoint?url=https://apt.izzysoft.de/fdroid/api/v1/shield/compress.joshattic.us&label=IzzyOnDroid%20Version&style=for-the-badge) ![Stars](https://img.shields.io/github/stars/JoshAtticus/Compressor?style=for-the-badge) ![Forks](https://img.shields.io/github/forks/JoshAtticus/Compressor?style=for-the-badge)
 
@@ -63,24 +58,9 @@ You can also donate with crypto:
 
 ---
 
-## Features
-- Faster than every single compression app on the Play Store. Period.
-- Uses native Media3 library, not another slow, bulky FFMpeg wrapper
-- H.265 and AV1 support for compatible devices
-- Share Sheet Support
-- No third party libraries
-- No invasive permissions (no storage, no internet etc)
-- Ad free
-- Super lightweight (< 10MB)
-- Completely native Kotlin (no React Native slop here)
-- Simple, clean UI
-- Works on Android 7.0 and up
-- Reproducible Builds
+## Historical upstream benchmarks
 
----
-
-## Performance
-Below are four benchmarks of Compressor running on various devices. The baseline videos are available underneath all the benchmarks. All devices are running the latest version of Compressor from the Google Play Store at the time (1.5.2).
+JoshAtticus recorded these benchmarks with the upstream Google Play release, version 1.5.2. The baseline videos and original measurements are reproduced below. Galaxy Compressor’s S26 measurements are in the [device validation notes](docs/DEVICE_VALIDATION.md).
 
 <details>
 <summary><b>Testing Devices</b></summary>
@@ -221,7 +201,8 @@ You can download them [here](https://l.joshattic.us/mDAc6J)
 
 ---
 
-## Credits
+## Upstream credits
+
 Compressor wouldn't be possible without these amazing people
 
 [@rA9stuff](https://github.com/rA9stuff) - Inspiration to create Compressor & donated
@@ -236,6 +217,6 @@ I would like to acknowledge that Compressor has used AI language models to assis
 
 ---
 
-## Star History
+## Upstream star history
 
 [![Star History Chart](https://api.star-history.com/svg?repos=JoshAtticus/Compressor&type=Date)](https://star-history.com/#JoshAtticus/Compressor&Date)
