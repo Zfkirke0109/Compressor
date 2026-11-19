@@ -290,6 +290,73 @@ object VideoMetadataPreserver {
         }.getOrNull()
     }
 
+    /** Checks the cache file itself. A read failure is distinct from finding no location. */
+    internal fun containsEmbeddedLocation(input: FileInputStream): Boolean {
+        if (outputHasLocationAtom(input.channel)) return true
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(input.fd)
+            return !retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_LOCATION).isNullOrBlank()
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
+    /** Strict scan of MP4 output. The source metadata reader separately recovers usable coordinates. */
+    internal fun outputHasLocationAtom(channel: java.nio.channels.FileChannel): Boolean {
+        val header = ByteBuffer.allocate(8)
+        var movieFound = false
+        var boxesRead = 0
+
+        fun readWord(position: Long, length: Int): ByteBuffer {
+            header.clear()
+            header.limit(length)
+            while (header.hasRemaining()) {
+                check(channel.read(header, position + header.position()) > 0) { "incomplete MP4 header" }
+            }
+            header.flip()
+            return header
+        }
+
+        fun inspect(start: Long, end: Long, depth: Int): Boolean {
+            require(depth <= MAX_MP4_SCAN_DEPTH) { "MP4 nesting limit" }
+            var offset = start
+            while (offset < end) {
+                require(++boxesRead <= 100_000 && end - offset >= 8L) { "incomplete or oversized MP4 box table" }
+                val word = readWord(offset, 8)
+                val size32 = word.int.toLong() and 0xffff_ffffL
+                val type = String(word.array(), 4, 4, StandardCharsets.ISO_8859_1)
+                val headerSize = if (size32 == 1L) 16L else 8L
+                require(end - offset >= headerSize) { "incomplete MP4 box header" }
+                val size = when (size32) {
+                    0L -> end - offset
+                    1L -> readWord(offset + 8L, 8).long
+                    else -> size32
+                }
+                require(size in headerSize..(end - offset)) { "invalid MP4 box size" }
+                if (isLocationBox(type)) return true
+                val boxEnd = offset + size
+                if (type in mp4ContainerTypes) {
+                    if (depth == 0 && type == "moov") movieFound = true
+                    var children = offset + headerSize
+                    if (type == "meta") {
+                        require(boxEnd - children >= 4L) { "incomplete MP4 meta box" }
+                        // ISO FullBox starts with version/flags = 0. QuickTime meta starts with
+                        // the first child header. Both layouts must parse to their declared end.
+                        if (readWord(children, 4).int == 0) children += 4L
+                    }
+                    if (inspect(children, boxEnd, depth + 1)) return true
+                }
+                offset = boxEnd
+            }
+            return false
+        }
+
+        if (inspect(0L, channel.size(), 0)) return true
+        require(movieFound) { "MP4 movie box unavailable" }
+        return false
+    }
+
     private fun readMp4LocationAtom(context: Context, uri: Uri): String? {
         return runCatching {
             context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->

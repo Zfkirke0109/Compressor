@@ -300,21 +300,20 @@ private fun HighQualityRetryCard(count: Int, onRetry: () -> Unit) {
     ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text(
-                "Want the rest smaller?",
+                "Try High Quality copies?",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSecondaryContainer
             )
             Text(
-                "$count ${if (many) "videos were" else "video was"} kept at original quality — " +
-                    "Perceptually Lossless couldn't shrink ${if (many) "them" else "it"} without visible change. " +
-                    "High Quality can re-encode ${if (many) "them" else "it"} smaller at the same resolution and " +
-                    "frame rate, for a small quality trade.",
+                "Perceptually Lossless kept $count ${if (many) "originals" else "original"}. " +
+                    "The bitrate estimate suggests High Quality could make ${if (many) "smaller copies" else "a smaller copy"}. " +
+                    "The originals stay in place. Copies use the source resolution and frame rate. Quality may visibly change.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSecondaryContainer
             )
             Button(onClick = onRetry, modifier = Modifier.fillMaxWidth()) {
-                Text("Shrink $count with High Quality")
+                Text("Try High Quality on $count ${if (many) "videos" else "video"}")
             }
         }
     }
@@ -845,7 +844,7 @@ private fun BatchSettingsCard(
                 if (remuxOnly) {
                     "No re-encode: video/audio copied unchanged. This keeps quality exact but may not shrink much."
                 } else {
-                    "Perceptually Lossless only shrinks a file when it can with no visible change — otherwise it keeps the original unchanged (many phone videos are already efficient, so this is common and honest). High Quality re-encodes at a lower bitrate (same resolution and FPS) for a small quality trade — the usual way to shrink files PL leaves unchanged (already low-bitrate videos may not shrink). Storage Saver goes smaller still and may show visible loss."
+                    "Perceptually Lossless checks samples of a smaller encode before accepting it. High Quality is lossy and targets the source resolution. It keeps the source frame rate unless you select a cap. Storage Saver prioritizes size and can also lower resolution."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1087,7 +1086,7 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
             Text("Real compressions: ${state.realCompressionCount} • Remuxed/kept/no size win: ${state.nonCompressionCount}")
             Text("Failed: ${state.failedCount} • Skipped: ${state.skippedCount} • Cancelled: ${state.cancelledCount}")
             Text("Original: ${state.formattedTotalOriginal}")
-            Text("Mode: ${state.qualityPreset} • Codec: ${state.codecOption} • FPS: ${state.frameRateOption}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Selected settings • ${state.qualityPreset} • ${state.codecOption} • ${state.frameRateOption}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Metadata: ${MetadataPrivacyMode.fromLabel(state.metadataPrivacyMode).summary}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Thermal: ${state.thermalMode} • Cooldown: ${state.cooldownSeconds}s", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (state.isCompressing) {
@@ -1119,7 +1118,7 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
 private fun BatchMetricsCard(metrics: BatchMetricsSummary) {
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Batch metrics", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("Latest run metrics", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             metrics.summaryLines.forEach { line ->
                 Text(line, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }

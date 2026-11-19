@@ -114,14 +114,16 @@ object QualityProbePolicy {
 
     private fun clears(w: WindowScore, bar: QualityBar) = validScore(w) && w.mean >= bar.meanMin && w.p5 >= bar.p5Min && w.min >= bar.minMin
 
-    /** How a measured rung stands: clears bar and margin, clears only the bar, or fails the bar. */
-    fun rungVerdict(scores: List<WindowScore>?): RungVerdict = when {
+    /** A measured failure can end a rung early. A pass requires every planned window. */
+    fun rungVerdict(scores: List<WindowScore>?, plannedWindows: Int? = null): RungVerdict = when {
         scores.isNullOrEmpty() -> RungVerdict.UNMEASURED
+        plannedWindows != null && scores.size > plannedWindows -> RungVerdict.UNMEASURED
         // A window with enough frames below the bar is a measurement, whatever the others hold.
         scores.any { validScore(it) && it.comparedFrames >= MIN_COMPARED_FRAMES_PER_WINDOW && !clears(it, PERCEPTUAL_LOSSLESS) } ->
             RungVerdict.FAILED
         scores.any { !validScore(it) } -> RungVerdict.UNMEASURED
         scores.any { it.comparedFrames < MIN_COMPARED_FRAMES_PER_WINDOW } -> RungVerdict.INSUFFICIENT
+        plannedWindows != null && scores.size < plannedWindows -> RungVerdict.UNMEASURED
         windowsPass(scores, PROBE_SELECTION) -> RungVerdict.PASSED
         windowsPass(scores) -> RungVerdict.MARGINAL
         else -> RungVerdict.FAILED

@@ -99,7 +99,15 @@ def plane_hashes(data,width,height):
     return {k:hashlib.sha256(v).hexdigest() for k,v in dict(i420=data,y=data[:y],u=data[y:y+y//4],v=data[y+y//4:]).items()}
 
 
-def select_filter(indices): return 'select='+'+'.join(f'eq(n\\,{i})' for i in indices)
+def select_filter(indices):
+    # FFmpeg limits expression depth. A left-to-right sum fails on ordinary 120-frame windows.
+    terms = [f'eq(n\\,{index})' for index in indices]
+    while len(terms) > 1:
+        combined = [f'({left}+{right})' for left, right in zip(terms[::2], terms[1::2])]
+        if len(terms) % 2:
+            combined.append(terms[-1])
+        terms = combined
+    return 'select=' + (terms[0] if terms else '0')
 
 
 def inspect_video(path):

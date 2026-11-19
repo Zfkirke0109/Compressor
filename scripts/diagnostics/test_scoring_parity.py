@@ -3,6 +3,8 @@ import copy
 import hashlib
 import io
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -41,7 +43,20 @@ class ParityTest(unittest.TestCase):
         a=plane_hashes(bytes([1,2,3,4,5,6]),2,2)
         b=plane_hashes(bytes([1,2,3,4,5,7]),2,2)
         self.assertEqual(a['y'],b['y']); self.assertNotEqual(a['v'],b['v'])
-        self.assertEqual(select_filter([0,2]),r'select=eq(n\,0)+eq(n\,2)')
+    @unittest.skipUnless(shutil.which('ffmpeg'), 'requires FFmpeg')
+    def test_long_sparse_selection_returns_exact_manifest_frames(self):
+        # Every two-pixel raw frame encodes its index, including indices above 255.
+        frames = [i.to_bytes(2, 'little') for i in range(400)]
+        indices = [i for i in range(len(frames)) if i % 3 != 1]
+        for chosen in (indices, [17], []):
+            with self.subTest(count=len(chosen)):
+                decoded = subprocess.run(
+                    ['ffmpeg', '-nostdin', '-v', 'error', '-f', 'rawvideo', '-pixel_format', 'gray',
+                     '-video_size', '2x1', '-i', 'pipe:0', '-vf', select_filter(chosen), '-vsync', '0',
+                     '-threads', '1', '-f', 'rawvideo', 'pipe:1'],
+                    input=b''.join(frames), stdout=subprocess.PIPE, check=True, timeout=30
+                ).stdout
+                self.assertEqual(decoded, b''.join(frames[i] for i in chosen))
     def test_manifest_tampering_is_rejected(self):
         with tempfile.TemporaryDirectory() as d:
             path=Path(d)/'capture.zip'

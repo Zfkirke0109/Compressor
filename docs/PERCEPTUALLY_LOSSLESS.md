@@ -120,6 +120,13 @@ keeps the original, the message says the quality was measured and the size was p
 longer falls back to the inference plan, whose target ratio may be a rung the probes had just
 measured as failing.
 
+In Exhaustive mode, when the preferred rung predicts an output at least as large as the source,
+the planner checks the other rungs it already measured on the same windows and encoder. It first
+looks for the smallest predicted output among candidates that cleared the selection margin. If
+only marginal passes fit, it tries the highest of those ratios. The chosen rung supplies its own
+scores and bitrate observations. Only the verified size and certification of the finished file
+can count as savings.
+
 Each window holds at least 12 compared frames. At 30 fps the calibrated 1.2 s holds 36; below about
 11.7 fps the window now grows to hold 14 (`QualityProbePolicy.windowDurationUs`). A rung whose only
 problem is a window with too few frames is *undecided*, never a measured rejection: b168's 10 fps

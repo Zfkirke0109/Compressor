@@ -453,15 +453,10 @@ class CompressorViewModel(application: Application) : AndroidViewModel(applicati
                 bitrate = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toIntOrNull() ?: 0
                 duration = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
 
-                // FPS extraction is flaky, sometimes in CAPTURE_FRAMERATE or needs calculation
-                val fpsStr = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)
-                fps = fpsStr?.toFloatOrNull() ?: 0f
-                if (fps <= 0f && videoInfo != null && videoInfo.frameRate > 0f) {
-                    fps = videoInfo.frameRate
-                }
-                if (fps <= 0f) {
-                    fps = 30f
-                }
+                fps = playbackFrameRate(
+                    videoInfo?.frameRate,
+                    retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull()
+                ) ?: 30f
 
                 val cursor = context.contentResolver.query(uri, null, null, null, null)
                 if (cursor != null && cursor.moveToFirst()) {

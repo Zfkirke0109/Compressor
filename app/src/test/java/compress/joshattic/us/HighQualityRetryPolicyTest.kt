@@ -40,8 +40,7 @@ class HighQualityRetryPolicyTest {
         assertEquals(7_200_000, HighQualityRetryPolicy.highQualityTargetVideoBitrate(10_000_000, 1080))
         // 4K 15 Mbps: 0.72x = 10.8 Mbps, lifted to the 12 Mbps 4K floor (still below source).
         assertEquals(12_000_000, HighQualityRetryPolicy.highQualityTargetVideoBitrate(15_000_000, 2160))
-        // Low 1080p 3 Mbps: floor (5M) exceeds source. The production coerceIn(floor, source)
-        // would THROW here; the guarded helper returns the source bitrate (i.e. no shrink).
+        // Low 1080p 3 Mbps: the shared encoder floor clamps back to source.
         assertEquals(3_000_000, HighQualityRetryPolicy.highQualityTargetVideoBitrate(3_000_000, 1080))
         // Unknown source bitrate -> 0.
         assertEquals(0, HighQualityRetryPolicy.highQualityTargetVideoBitrate(0, 1080))
@@ -49,6 +48,55 @@ class HighQualityRetryPolicyTest {
 
     private val bigFile = 500L * 1024 * 1024
     private val smallFile = 20L * 1024 * 1024
+
+    private val portrait = VideoSourceInfo(
+        width = 1080, height = 1920, frameRate = 60f, durationMs = 60_000L,
+        totalBitrate = 7_000_000, audioPresent = false
+    )
+
+    private fun offered(source: VideoSourceInfo, bytes: Long): Boolean = HighQualityRetryPolicy.isEligible(
+        true, BatchTerminalResult.ALREADY_HIGHLY_OPTIMIZED, source, bytes
+    )
+
+    @Test
+    fun theOfferUsesTheActualOrientationIndependentTargetAndTheWholeFile() {
+        val size = 52_500_000L
+        assertEquals(0.28, HighQualityRetryPolicy.predictedSavingFraction(portrait, size), 1e-9)
+        assertTrue(offered(portrait, size))
+        assertTrue(offered(portrait.copy(width = 1920, height = 1080), size))
+
+        // A 6 Mbps video at the 5 Mbps floor saves 16.7% of video but only 14.77% of this
+        // clip with its copied 768 kbps audio. The saving is too small for the large-file path.
+        val surround = portrait.copy(totalBitrate = 6_768_000, audioPresent = true,
+            audioMime = "audio/mp4a-latm", audioBitrate = 768_000)
+        assertEquals(1_000_000.0 / 6_768_000, HighQualityRetryPolicy.predictedSavingFraction(surround, 50_760_000), 1e-9)
+        assertFalse(offered(surround, 50_760_000))
+    }
+
+    @Test
+    fun theOfferIncludesTheAudioEncoderRequestEvenWhenVideoIsAtItsFloor() {
+        val pcm = portrait.copy(totalBitrate = 4_536_000, audioPresent = true,
+            audioMime = "audio/raw", audioBitrate = 1_536_000)
+        val bytes = 34_020_000L
+        assertEquals(9_120_000.0 / bytes, HighQualityRetryPolicy.predictedSavingFraction(pcm, bytes), 1e-9)
+        assertTrue(offered(pcm, bytes))
+        assertFalse(offered(pcm.copy(audioMime = "audio/mp4a-latm"), bytes))
+    }
+
+    @Test
+    fun inconsistentTagsUnexplainedContainerBytesAndUnknownsCannotCreateOffers() {
+        val source = portrait.copy(totalBitrate = 10_000_000)
+        // The planned video alone exceeds the file's observed 5 Mbps average.
+        assertFalse(offered(source, 37_500_000))
+        // Only the 2.8 Mbps video cut is credited. The other 75 MB in this file is unexplained.
+        assertEquals(0.14, HighQualityRetryPolicy.predictedSavingFraction(source, 150_000_000), 1e-9)
+        assertFalse(offered(source, 150_000_000))
+        assertFalse(offered(source, 0L))
+        assertFalse(offered(source.copy(width = 0), 75_000_000))
+        assertFalse(offered(source.copy(durationMs = 0L), 75_000_000))
+        assertFalse(offered(source.copy(audioPresent = true, audioMime = "audio/mp4a-latm"), 75_000_000))
+        assertFalse(HighQualityRetryPolicy.highQualityWouldShrink(10_000_000, 1080, 0L))
+    }
 
     @Test
     fun highQualityWouldShrinkOnlyWhenTheFloorLeavesRealHeadroom() {

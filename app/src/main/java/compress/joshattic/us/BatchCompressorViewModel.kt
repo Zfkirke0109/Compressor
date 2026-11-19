@@ -58,6 +58,7 @@ import compress.joshattic.us.quality.EncodeConfigIdentity
 import compress.joshattic.us.quality.RungEvidence
 import compress.joshattic.us.quality.ShadowCalibration
 import compress.joshattic.us.quality.SizeGateEvidence
+import compress.joshattic.us.quality.withSizeViableAlternative
 import compress.joshattic.us.quality.scoredWindows
 import compress.joshattic.us.quality.PairScoreOutcome
 import compress.joshattic.us.quality.SaferRungRetry
@@ -216,8 +217,18 @@ data class BatchCompressorUiState(
     // post-batch "shrink these with High Quality?" offer. Empty except right after a PL batch.
     val highQualityRetryCandidates: List<Uri> = emptyList(),
     val statusMessage: String? = null,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val isSavingCopies: Boolean = false,
+    val pendingVideoUris: List<Uri> = emptyList()
 ) {
+    val selectionBusy: Boolean get() = isLoading || isCompressing || isSavingCopies
+    val hasUnsavedCopies: Boolean get() = items.any {
+        it.outputPath != null && !it.galleryCopySaved && it.copySaved != true && it.status != BatchItemStatus.Replaced
+    }
+
+    internal fun shouldDeferSelection(fromShare: Boolean, batchStarting: Boolean): Boolean =
+        selectionBusy || batchStarting || (fromShare && hasUnsavedCopies)
+
     val highQualityRetryCount: Int get() = highQualityRetryCandidates.size
     val doneCount: Int get() = items.count { it.status == BatchItemStatus.Done || it.status == BatchItemStatus.Replaced || it.status == BatchItemStatus.SavedCopy }
     val failedCount: Int get() = items.count { it.status == BatchItemStatus.Failed }
@@ -252,6 +263,49 @@ data class BatchCompressorUiState(
     val formattedTotalCurrentOutput: String get() = formatFileSize(totalCurrentOutputBytes)
     val formattedTotalTargetOutput: String get() = formatFileSize(totalTargetOutputBytes)
     val formattedTotalSaved: String get() = formatFileSize(totalSavedBytes)
+
+    internal fun highQualityRetrySelection(): BatchCompressorUiState? {
+        if (selectionBusy) return null
+        val offered = highQualityRetryCandidates.toSet()
+        val subset = items.filter { !it.isAlreadyCompressed && it.sourceUri in offered }
+        if (subset.isEmpty()) return null
+        return copy(
+            items = subset.map { it.copy(replacementOutcome = null, copySaved = null, galleryCopySaved = false) },
+            qualityPreset = BatchQualityPreset.HIGH.label,
+            frameRateOption = BatchFrameRateOption.ORIGINAL.label,
+            replaceOriginals = false,
+            selectedPreset = null,
+            highQualityRetryCandidates = emptyList(),
+            batchMetrics = null,
+            errorMessage = null
+        )
+    }
+
+    /** Retain the other PL results and restore the user's settings after the one-off copy run. */
+    internal fun withHighQualityRetryResults(retry: BatchCompressorUiState): BatchCompressorUiState {
+        val retried = retry.items.associateBy { it.sourceUri }
+        val merged = items.map { previous ->
+            val result = retried[previous.sourceUri]
+            when {
+                result == null -> previous
+                previous.outputPath != null && (result.outputPath == null || result.terminalResult?.countsAsRealCompression != true) ->
+                    previous.copy(message = listOfNotNull(previous.message,
+                        "High Quality retry: ${result.terminalResult?.label ?: "no completed output"}. Previous copy available."
+                    ).joinToString(" "))
+                else -> result
+            }
+        }
+        return retry.copy(
+            items = merged,
+            qualityPreset = qualityPreset,
+            frameRateOption = frameRateOption,
+            replaceOriginals = replaceOriginals,
+            selectedPreset = selectedPreset,
+            statusMessage = retry.statusMessage?.let { "High Quality retry • $it" },
+            errorMessage = listOfNotNull(retry.errorMessage, BatchEndNotice.warning(merged)).distinct()
+                .joinToString(" ").ifEmpty { null }
+        )
+    }
 }
 
 @OptIn(UnstableApi::class)
@@ -280,6 +334,7 @@ class BatchCompressorViewModel internal constructor(
 
     private var compressionJob: Job? = null
     private var selfCheckJob: Job? = null
+    private var handledActivityShare = false
 
     /**
      * Keeps a failed batch from killing the process.
@@ -672,6 +727,7 @@ class BatchCompressorViewModel internal constructor(
     }
 
     fun clear() {
+        if (_uiState.value.isSavingCopies || _uiState.value.isLoading) return
         val runningJob = compressionJob?.takeIf { !it.isCompleted }
         if (runningJob != null) {
             cancelCompression()
@@ -695,17 +751,38 @@ class BatchCompressorViewModel internal constructor(
                 errorMessage = null,
                 isLoading = false,
                 isCompressing = false,
+                highQualityRetryCandidates = emptyList(),
                 batchMetrics = null
             )
         }
     }
 
-    fun loadUris(context: Context, uris: List<Uri>) {
+    /** A recreated Activity and its retained ViewModel must consume the launch share only once. */
+    fun receiveSharedVideos(context: Context, uris: List<Uri>, fromActivityCreation: Boolean) {
+        if (fromActivityCreation && handledActivityShare) return
+        handledActivityShare = true
+        loadUris(context, uris, fromShare = true)
+    }
+
+    fun openPendingVideos(context: Context) {
+        val state = _uiState.value
+        if (state.selectionBusy || compressionJob?.isCompleted == false || state.pendingVideoUris.isEmpty()) return
+        _uiState.update { it.copy(pendingVideoUris = emptyList()) }
+        loadUris(context, state.pendingVideoUris)
+    }
+
+    fun loadUris(context: Context, uris: List<Uri>) = loadUris(context, uris, fromShare = false)
+
+    private fun loadUris(context: Context, uris: List<Uri>, fromShare: Boolean) {
         val distinct = uris.distinct()
         if (distinct.isEmpty()) return
-
+        if (_uiState.value.shouldDeferSelection(fromShare, batchStarting = compressionJob?.isCompleted == false)) {
+            _uiState.update { it.copy(pendingVideoUris = (it.pendingVideoUris + distinct).distinct()) }
+            return
+        }
+        // Claim the row list synchronously so a start or a second share cannot race the IO load.
+        _uiState.update { it.copy(isLoading = true, errorMessage = null, statusMessage = "Reading ${distinct.size} video${if (distinct.size == 1) "" else "s"}…") }
         viewModelScope.launch(Dispatchers.IO) {
-            _uiState.update { it.copy(isLoading = true, errorMessage = null, statusMessage = "Reading ${distinct.size} video${if (distinct.size == 1) "" else "s"}…") }
             val quality = qualityFromLabel(_uiState.value.qualityPreset)
             val codec = codecFromLabel(_uiState.value.codecOption)
             val frameRate = frameRateFromLabel(_uiState.value.frameRateOption)
@@ -808,39 +885,26 @@ class BatchCompressorViewModel internal constructor(
             HighQualityRetryPolicy.isEligible(
                 batchWasPerceptualLossless = true,
                 terminal = item.terminalResult,
-                sourceVideoBitrate = item.toSourceInfo().videoBitrate,
-                sourceHeight = item.originalHeight,
+                source = item.toSourceInfo(),
                 sourceSizeBytes = item.originalSize
             )
         }.map { it.sourceUri }
     }
 
-    /**
-     * Re-run only the kept-original videos from the last Perceptually Lossless batch in High
-     * Quality — the honest lossy lever that trades a little quality for a real size reduction.
-     * Reuses the existing pipeline: it narrows the batch to the offered sources, switches the mode
-     * to High Quality, and starts a fresh run (which resets and processes them). Originals are never
-     * touched here; only new output files are produced. A no-op while a batch is running.
-     */
+    /** Start the offered one-off run after acquiring the same exclusive lease as a normal batch. */
     fun retryUnshrunkAsHighQuality(context: Context) {
-        val current = _uiState.value
-        if (current.isCompressing || compressionJob?.isCompleted == false) return
-        val candidateUris = current.highQualityRetryCandidates.toSet()
-        if (candidateUris.isEmpty()) return
-        val subset = current.items.filter { it.sourceUri in candidateUris }
-        if (subset.isEmpty()) return
-        _uiState.update {
-            it.copy(
-                items = subset,
-                qualityPreset = BatchQualityPreset.HIGH.label,
-                selectedPreset = null,
-                highQualityRetryCandidates = emptyList(),
-                batchMetrics = null,
-                errorMessage = null,
-                statusMessage = "Re-running ${subset.size} video${if (subset.size == 1) "" else "s"} in High Quality…"
-            )
+        startCompression(context, highQualityRetry = true)
+    }
+
+    private suspend fun runHighQualityRetry(context: Context) {
+        val previous = _uiState.value
+        val selection = previous.highQualityRetrySelection() ?: return
+        _uiState.value = selection
+        try {
+            runBatch(context, highQualityRetryFrom = previous)
+        } finally {
+            _uiState.update { previous.withHighQualityRetryResults(it) }
         }
-        startCompression(context)
     }
 
     /**
@@ -886,7 +950,9 @@ class BatchCompressorViewModel internal constructor(
         }
     }
 
-    fun startCompression(callerContext: Context) {
+    fun startCompression(callerContext: Context) = startCompression(callerContext, highQualityRetry = false)
+
+    private fun startCompression(callerContext: Context, highQualityRetry: Boolean) {
         // The batch outlives the screen that started it: it keeps running through rotation, a
         // theme change, or the activity being recreated in the background. Holding the caller's
         // Activity for the whole run would pin that dead Activity and its view tree in memory for
@@ -897,8 +963,9 @@ class BatchCompressorViewModel internal constructor(
             _uiState.update { it.copy(statusMessage = "Finishing the learned-profile reset. Start again when it completes.") }
             return
         }
-        if (current.items.isEmpty() || current.isCompressing || compressionJob?.isCompleted == false) return
-        if (current.compressibleCount == 0) {
+        if (current.items.isEmpty() || current.selectionBusy || compressionJob?.isCompleted == false) return
+        if (highQualityRetry && current.highQualityRetryCandidates.isEmpty()) return
+        if (!highQualityRetry && current.compressibleCount == 0) {
             _uiState.update { it.copy(statusMessage = "All selected videos already look compressed by Compressor, so nothing was recompressed.") }
             return
         }
@@ -907,7 +974,9 @@ class BatchCompressorViewModel internal constructor(
             // A running self-check would share the encoder, the scorer and the decision log with
             // the batch. The batch wins: the self-check stops first, at its next suspension point.
             selfCheckJob?.takeIf { it.isActive }?.cancelAndJoin()
-            val started = ExportDebugTracing.tryRunExclusive(consumeTraceArm = true) { runBatch(context) }
+            val started = ExportDebugTracing.tryRunExclusive(consumeTraceArm = true) {
+                if (highQualityRetry) runHighQualityRetry(context) else runBatch(context)
+            }
             if (!started) _uiState.update { it.copy(statusMessage = "Wait for the current batch, scorer self-check, or profile reset to finish.") }
         }
     }
@@ -966,6 +1035,7 @@ class BatchCompressorViewModel internal constructor(
         val codec: BatchCodecOption,
         val privacyMode: MetadataPrivacyMode,
         val exhaustivePerceptualLossless: Boolean,
+        val copiesOnly: Boolean,
         // Opt-in pilot check: hash every source in full before and after its job (FullSourceHash).
         val fullSourceHash: Boolean = false
     ) {
@@ -1110,7 +1180,7 @@ class BatchCompressorViewModel internal constructor(
         }
     }
 
-    private suspend fun runBatch(context: Context) {
+    private suspend fun runBatch(context: Context, highQualityRetryFrom: BatchCompressorUiState? = null) {
         val batchStartedAt = System.currentTimeMillis()
         _uiState.update {
             it.copy(
@@ -1130,7 +1200,8 @@ class BatchCompressorViewModel internal constructor(
         // Reclaim orphaned cache files, but keep anything the CURRENT results still reference:
         // re-running while previous results are still on screen must not delete files that
         // share/save are still offering. Those entries are replaced by this run's own outputs.
-        clearBatchCache(preservePaths = _uiState.value.items.mapNotNull { it.outputPath }.toSet())
+        val previousRows = highQualityRetryFrom?.items ?: _uiState.value.items
+        clearBatchCache(preservePaths = previousRows.mapNotNull { it.outputPath }.toSet())
         // Normalised copies a previous process died holding (Media3InputNormalizer.CACHE_SUBDIR).
         runCatching { Media3InputNormalizer.clearLeftovers(context.cacheDir) }
             .getOrNull()?.takeIf { it > 0L }
@@ -1171,6 +1242,7 @@ class BatchCompressorViewModel internal constructor(
             codec = codec,
             privacyMode = privacyMode,
             exhaustivePerceptualLossless = exhaustivePerceptualLossless,
+            copiesOnly = highQualityRetryFrom != null,
             fullSourceHash = EncoderExperiments.isFullSourceHashEnabled(context)
         )
         // The output settings this batch STARTS with. The switches are read again when an item
@@ -1428,7 +1500,11 @@ class BatchCompressorViewModel internal constructor(
         if (run.fullSourceHash) hashSourceForPilot(run, item, "before")
         // Before anything reads the source for the encode: the bytes a replacement of this
         // original would have to still find there (ReplacementRequest.boundSourceDigest).
-        if (_uiState.value.replaceOriginals) bindSourceForReplacement(run, item) else replacementSourceDigests.remove(item.sourceUri)
+        if (!run.copiesOnly && _uiState.value.replaceOriginals) {
+            bindSourceForReplacement(run, item)
+        } else {
+            replacementSourceDigests.remove(item.sourceUri)
+        }
         val s = ItemRun(
             run = run,
             index = index,
@@ -3394,7 +3470,7 @@ class BatchCompressorViewModel internal constructor(
                 )
             )
         }
-        if (terminal.allowsOriginalReplacement && _uiState.value.replaceOriginals) {
+        if (terminal.allowsOriginalReplacement && !run.copiesOnly && _uiState.value.replaceOriginals) {
             // Once destructive replacement starts, finish it and publish its disposition
             // atomically before honoring cancellation. This prevents an original from changing
             // while the UI remains stuck at a pre-replacement Done state.
@@ -3555,39 +3631,48 @@ class BatchCompressorViewModel internal constructor(
     }
 
     fun saveAllCopiesToGallery(context: Context) {
-        val outputs = _uiState.value.items.mapNotNull { item ->
+        val settings = _uiState.value
+        if (settings.selectionBusy || compressionJob?.isCompleted == false) return
+        val privacyMode = MetadataPrivacyMode.fromLabel(settings.metadataPrivacyMode)
+        val outputs = settings.items.mapNotNull { item ->
             val path = item.outputPath ?: return@mapNotNull null
             item to File(path)
         }
         if (outputs.isEmpty()) return
-
+        _uiState.update { it.copy(isSavingCopies = true) }
         viewModelScope.launch(Dispatchers.IO) {
-            val privacyMode = MetadataPrivacyMode.fromLabel(_uiState.value.metadataPrivacyMode)
+            try {
             var saved = 0
             var unconfirmed = 0
-            val proven = mutableSetOf<Uri>()
+            var locationBlocked = 0
+            val proven = mutableMapOf<Uri, BatchVideoItem>()
             outputs.forEach { (item, file) ->
-                if (file.exists()) {
-                    val result = saveFileToGallery(
-                        context = context,
-                        file = file,
-                        targetName = item.outputName(qualityFromLabel(item.outputMode ?: _uiState.value.qualityPreset)),
-                        metadata = item.metadataSnapshot,
-                        privacyMode = privacyMode
-                    )
-                    if (result is GalleryPublication.Result.Published) {
+                val result = GalleryPublication.saveOutputCopy(file, privacyMode.removeLocation, VideoMetadataPreserver::containsEmbeddedLocation) { openSource ->
+                    saveToGallery(context, openSource, item.outputName(qualityFromLabel(item.outputMode ?: settings.qualityPreset)),
+                        item.metadataSnapshot, privacyMode, expectedSha256 = null)
+                }
+                when (result) {
+                    is GalleryPublication.Result.Published -> {
                         saved++
-                        proven += item.sourceUri
-                    } else {
-                        unconfirmed++
+                        proven[item.sourceUri] = item
                     }
+                    is GalleryPublication.Result.Failed -> if (result.stage == GalleryPublication.Stage.LOCATION_PRIVACY) locationBlocked++ else unconfirmed++
                 }
             }
             _uiState.update { state ->
                 state.copy(
-                    items = state.items.map { if (it.sourceUri in proven) it.copy(galleryCopySaved = true) else it },
-                    statusMessage = GallerySaveSummary.message(saved, unconfirmed, privacyMode.summary)
+                    items = state.items.map { item ->
+                        val savedItem = proven[item.sourceUri]
+                        if (savedItem != null && savedItem.attempt == item.attempt &&
+                            savedItem.outputPath == item.outputPath && savedItem.outputSize == item.outputSize) {
+                            item.copy(galleryCopySaved = true)
+                        } else item
+                    },
+                    statusMessage = GallerySaveSummary.message(saved, unconfirmed, privacyMode.summary, locationBlocked)
                 )
+            }
+            } finally {
+                _uiState.update { it.copy(isSavingCopies = false) }
             }
         }
     }
@@ -3892,10 +3977,10 @@ class BatchCompressorViewModel internal constructor(
                         "(container exposed no overall bitrate)"
                 )
             }
-            fps = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull()
-                ?: trackProbe.videoFrameRate
-            if (fps <= 0f && trackProbe.videoFrameRate > 0f) fps = trackProbe.videoFrameRate
-            if (fps <= 0f) fps = 30f
+            fps = playbackFrameRate(
+                trackProbe.videoFrameRate,
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull()
+            ) ?: 30f
         } finally {
             try { retriever.release() } catch (_: Exception) {}
         }
@@ -4233,7 +4318,7 @@ class BatchCompressorViewModel internal constructor(
                 "CompressorProbe",
                 "short ladder; job=${diagnosticJobId(item)}; ${item.originalWidth}x${item.originalHeight} is above " +
                     "the full-ladder geometry; exhaustive mode probes ${candidates.joinToString { "%.2f".format(java.util.Locale.US, it) }} " +
-                    "with no bisection"
+                    "with a budgeted midpoint after an early pass"
             )
         }
         // Decaying probe-skip latch: after repeated MEASURED safest-rung rejections for this
@@ -4267,7 +4352,7 @@ class BatchCompressorViewModel internal constructor(
             iFrameIntervalSeconds = s.iFrameIntervalSeconds,
             maxBFrames = EncoderExperiments.maxBFrames(getApplication())
         )
-        val decision = qualityProber.runLadder(
+        val ladder = qualityProber.runLadder(
             sourceUri = item.sourceUri,
             durationMs = item.durationMs,
             outputMime = outputMime,
@@ -4282,7 +4367,8 @@ class BatchCompressorViewModel internal constructor(
                 )
             },
             audioBitrate = calculateAudioBitrate(item, BatchQualityPreset.ORIGINAL),
-            allowDownwardRefinement = !plan.shortProbeLadder && !alternateCodecSearch,
+            allowDownwardRefinement = !alternateCodecSearch,
+            shortLadder = plan.shortProbeLadder,
             shape = shape,
             budgetMs = if (alternateCodecSearch) PerceptualCodecFallbackPolicy.PROBE_BUDGET_MS
                 else ExhaustivePerceptualLosslessPolicy.probeBudgetMs(plan.shortProbeLadder),
@@ -4306,6 +4392,11 @@ class BatchCompressorViewModel internal constructor(
                 }
             } else null
         )
+        val decision = if (exhaustive) {
+            ladder.withSizeViableAlternative(item.originalSize) { ratio, factors ->
+                predictBytes(ratio, MeasuredOvershoot.forPrediction(plan.expectedOvershootFactor, factors))
+            }
+        } else ladder
         DiagLog.i(
             "CompressorProbe",
             "probe result; job=${diagnosticJobId(item)}; probed=${decision.probedRatios}; " +
@@ -4387,10 +4478,8 @@ class BatchCompressorViewModel internal constructor(
                 "verdict=${if (worth) "encode" else "keep original"}"
         )
         if (!worth) {
-            // The ladder returns the lowest rung it may use and every rung above it is larger, so
-            // no usable ratio is both proven and smaller: keep the original. Falling back to the
-            // inference plan instead would encode at its target ratio, which may be a rung the
-            // probes just measured as failing.
+            // No selected measured plan clears this mode's size gate. The initial inference
+            // plan may request a bitrate the probes rejected.
             return probeTrace.copy(
                 preferRemux = true,
                 remuxReason = KeepOriginalMessages.SIZE_GATE_REASON,
@@ -5402,12 +5491,10 @@ class BatchCompressorViewModel internal constructor(
         // injected on a device (ENOSPC mid-write, a provider that will not report a size, a rollback
         // that itself fails). This object supplies only the raw IO.
         val recoveryCopy = runCatching {
-            ReplacementContentProof.newRecoveryFile(recoveryDir, diagnosticJobId(item))
+            ReplacementJournal.newActiveCopy(recoveryDir, diagnosticJobId(item))
         }.getOrNull() ?: return@withContext ReplacementResult(false,
             "Replacement skipped: a recovery file could not be allocated. Original left untouched.",
             ReplacementOutcome.REFUSED_RECOVERY_UNAVAILABLE, evidence())
-        // This replacement owns the copy until it returns: a scan for leftovers skips it.
-        ReplacementJournal.markActive(recoveryCopy)
         try {
         // What the write is confirmed against, and what a later start compares the file with.
         outputDigest = runCatching { outputFile.inputStream().use { ReplacementContentProof.sha256(it) } }.getOrNull()
@@ -5699,7 +5786,12 @@ class BatchCompressorViewModel internal constructor(
     ): File {
         val outputDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
         val base = originalName.substringBeforeLast(".").ifBlank { "Video" }
-        val suffix = if (quality == BatchQualityPreset.REMUX_ONLY) "Remuxed" else "Compressed"
+        // A failed HQ retry must not overwrite an earlier verified PL transcode of this source.
+        val suffix = when (quality) {
+            BatchQualityPreset.REMUX_ONLY -> "Remuxed"
+            BatchQualityPreset.HIGH -> "HighQuality_Compressed"
+            else -> "Compressed"
+        }
         val sourceToken = DiagnosticsRecorder.redactedJobId(sourceUri.toString()).removePrefix("job_")
         return File(outputDir, "${base}_${sourceToken}_$suffix.mp4")
     }

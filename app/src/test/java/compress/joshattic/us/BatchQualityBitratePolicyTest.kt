@@ -2,12 +2,28 @@ package compress.joshattic.us
 
 import android.media.MediaFormat
 import androidx.media3.common.MimeTypes
+import compress.joshattic.us.quality.QualityProbePolicy
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class BatchQualityBitratePolicyTest {
+
+    @Test
+    fun highSpeedCaptureTagDoesNotSuppressThePlaybackRatesProbeLadder() {
+        val source = VideoSourceInfo(width = 1920, height = 1080, totalBitrate = 10_000_000, audioPresent = false)
+        fun probeRungs(fps: Float) = QualityProbePolicy.candidateRatiosForSource(
+            0.90, BatchQualityBitratePolicy.sourceBitsPerPixelPerFrame(source.copy(frameRate = fps))
+        )
+        assertTrue(probeRungs(240f).isEmpty())
+        assertEquals(30f, playbackFrameRate(30f, 240f)!!, 0f)
+        assertTrue(probeRungs(playbackFrameRate(30f, 240f)!!).isNotEmpty())
+        assertEquals(29.97f, playbackFrameRate(29.97f, null)!!, 0f)
+        assertEquals(60f, playbackFrameRate(Float.NaN, 60f)!!, 0f)
+        assertNull(playbackFrameRate(0f, Float.POSITIVE_INFINITY))
+    }
 
     // A 1080p source already below the lossy resolution floors: 3 Mbps video is under both the
     // High Quality 1080p floor (5 Mbps) and the Storage Saver 1080p floor (3.5 Mbps). Before the
@@ -142,26 +158,47 @@ class BatchQualityBitratePolicyTest {
         )
     }
 
-    // Adversarial-review regression: the lossy floor tables key off raw source.height, which
-    // mis-tiers PORTRAIT clips (1080x1920 is 1080p-class, but height 1920 selects the 1440p tier
-    // and its higher 8 Mbps floor). A 1080x1920 clip at 7 Mbps really has High Quality headroom
-    // (0.72 x 7 = 5.04 Mbps), so the orientation-normalized re-check must refuse to skip it.
     @Test
-    fun portraitClipsAreNotSkippedByAnOrientationMisTieredFloor() {
-        val portrait = lowBitrate1080pSource().copy(width = 1080, height = 1920, totalBitrate = 7_000_000)
-        assertEquals(7_000_000, portrait.videoBitrate)
-        assertFalse(
-            "a portrait 1080p-class clip with real headroom must never be skipped",
-            BatchQualityBitratePolicy.lossyTargetHasNoHeadroom(
-                portrait, BatchQualityMode.HIGH_QUALITY, MimeTypes.VIDEO_H265
-            )
+    fun portraitAndLandscapeUseTheSameEncoderRequestAndResolutionFloor() {
+        fun check(width: Int, height: Int, bitrate: Int, expected: Int) {
+            val source = lowBitrate1080pSource().copy(width = width, height = height, totalBitrate = bitrate)
+            for (clip in listOf(source, source.copy(width = height, height = width))) {
+                val plan = ResolvedEncodePlan.resolve(
+                    clip, BatchQualityMode.HIGH_QUALITY, MimeTypes.VIDEO_H265, null, clip.height, null, null
+                )
+                assertEquals(expected, plan.requestedVideoBitrate)
+                assertEquals(
+                    plan.estimatedBytes,
+                    BatchQualityBitratePolicy.estimateOutputSize(
+                        clip, BatchQualityMode.HIGH_QUALITY, MimeTypes.VIDEO_H265, BatchFrameRateChoice.SOURCE
+                    )
+                )
+                assertEquals(expected >= bitrate, BatchQualityBitratePolicy.lossyTargetHasNoHeadroom(
+                    clip, BatchQualityMode.HIGH_QUALITY, MimeTypes.VIDEO_H265
+                ))
+            }
+        }
+        check(1280, 720, 4_000_000, 2_880_000)
+        check(1920, 1080, 7_000_000, 5_040_000)
+        check(2560, 1440, 10_000_000, 8_000_000)
+        check(3840, 2160, 15_000_000, 12_000_000)
+        check(1920, 1080, 3_000_000, 3_000_000)
+    }
+
+    @Test
+    fun highQualityBelowTheVideoFloorStillRunsWhenEncodingAudioCanSaveBytes() {
+        val pcm = lowBitrate1080pSource().copy(totalBitrate = 4_536_000, audioPresent = true,
+            audioMime = "audio/raw", audioBitrate = 1_536_000)
+        fun skipped(source: VideoSourceInfo) = BatchQualityBitratePolicy.lossyTargetHasNoHeadroom(
+            source, BatchQualityMode.HIGH_QUALITY, MimeTypes.VIDEO_H265
         )
-        // Landscape 1080p at the same bitrate is genuinely above its floor too -> also not skipped.
-        assertFalse(
-            BatchQualityBitratePolicy.lossyTargetHasNoHeadroom(
-                portrait.copy(width = 1920, height = 1080), BatchQualityMode.HIGH_QUALITY, MimeTypes.VIDEO_H265
-            )
-        )
+        assertEquals(3_000_000, BatchQualityBitratePolicy.calculateVideoBitrate(
+            pcm, BatchQualityMode.HIGH_QUALITY, MimeTypes.VIDEO_H265
+        ))
+        assertFalse(skipped(pcm))
+        assertFalse(skipped(pcm.copy(totalBitrate = 3_000_000, audioBitrate = 0)))
+        assertTrue(skipped(pcm.copy(audioMime = "audio/mp4a-latm")))
+        assertTrue(skipped(pcm.copy(totalBitrate = 3_128_000, audioBitrate = 128_000)))
     }
 
     @Test

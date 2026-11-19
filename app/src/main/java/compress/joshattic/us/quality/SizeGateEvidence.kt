@@ -1,14 +1,59 @@
 package compress.joshattic.us.quality
 
 /**
+ * In Exhaustive mode a size veto applies to one encoder request. Other rungs from the same
+ * ladder can have different measured rate factors. Try an existing complete pass before
+ * abandoning the file. The final encode still has to certify and actually save bytes.
+ */
+internal fun ProbeDecision.withSizeViableAlternative(
+    sourceBytes: Long,
+    predictBytes: (ratio: Double, rateFactors: List<Double>) -> Long
+): ProbeDecision {
+    val selectedRatio = provenRatio ?: return this
+    if (sourceBytes <= 0L || sourceParseFailure != null) return this
+    val originalBytes = predictBytes(selectedRatio, provenRateFactors)
+    if (originalBytes < sourceBytes) return this
+    val selected = RungEvidence.measuredAt(rungs, selectedRatio) ?: return this
+    if (selected.encodeShapeId.isNullOrBlank() || selected.encoderNames.singleOrNull().isNullOrBlank() ||
+        selected.windows.isEmpty() || selected.scores.size != selected.windows.size) return this
+
+    val viable = rungs.filter { rung ->
+        val verdict = rung.measuredVerdict
+        rung.ratio != selectedRatio &&
+            rung.ratio in QualityProbePolicy.HARD_RATIO_FLOOR..QualityProbePolicy.SAFEST_RATIO_CEILING &&
+            rung.requestedVideoBitrate > 0 &&
+            rung.windows == selected.windows &&
+            rung.encodeShapeId == selected.encodeShapeId && rung.encoderNames == selected.encoderNames &&
+            (verdict == QualityProbePolicy.RungVerdict.PASSED || verdict == QualityProbePolicy.RungVerdict.MARGINAL) &&
+            rung.verdict == verdict.name.lowercase() &&
+            predictBytes(rung.ratio, rung.rateFactors) in 1 until sourceBytes
+    }
+    // Prefer a clean selection-margin pass. When only marginal passes fit, retain the
+    // ladder's existing preference for the highest marginal ratio.
+    val clean = viable.filter { it.verdict == SizeGateEvidence.PASSED }
+        .minByOrNull { predictBytes(it.ratio, it.rateFactors) }
+    val alternative = clean ?: viable.maxByOrNull { it.ratio } ?: return this
+    return copy(
+        provenRatio = alternative.ratio,
+        windowScores = alternative.scores,
+        marginal = clean == null,
+        detail = "Size prediction at $selectedRatio was $originalBytes bytes. Trying measured " +
+            "${alternative.ratio} (${alternative.verdict}) from the same ladder for final certification.",
+        provenRateFactors = alternative.rateFactors,
+        saferPassingRatio = null,
+        saferPassingRateFactors = emptyList()
+    )
+}
+
+/**
  * What the size gate assessed and what it decided, as values the record, the row text and the
  * audit all read.
  *
  * Three things meet at this gate and must not be folded into one word:
  *  - the QUALITY evidence is one probe rung: sampled windows measured against the Perceptually
  *    Lossless bar. A rung that clears the bar and the selection margin is "passed"; one that clears
- *    only the bar is "marginal" (QualityProbePolicy.RungVerdict). The ladder hands the gate a
- *    marginal rung only when no rung cleared the margin;
+ *    only the bar is "marginal" (QualityProbePolicy.RungVerdict). Exhaustive planning can also
+ *    try a measured marginal rung when the clean pass is predicted to exceed the source size;
  *  - the SIZE is a prediction from the requested bitrate and an overshoot factor, never a
  *    measurement of an output;
  *  - nothing here is a full-file result. No encode has run, so there is no candidate, no
