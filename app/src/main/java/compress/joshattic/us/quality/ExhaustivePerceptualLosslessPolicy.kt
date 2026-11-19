@@ -24,9 +24,8 @@ package compress.joshattic.us.quality
  * 4K HEVC SDR clip from the S23 was therefore kept as-is on an inference, the same-codec rule,
  * without a single measurement. Camera footage can carry far more bits per pixel than the 0.092 bpp
  * source whose same-codec re-encode failed calibration. The 4K60 HEVC file in batch_1790259773632
- * ran at ~120 Mbps, about 0.24 bpp. That file was HDR, so it stays excluded, and no capture has yet
- * measured an SDR 4K camera clip. Whether such clips compress transparently is an empirical
- * question, and the short ladder is how it gets asked.
+ * ran at ~120 Mbps, about 0.24 bpp. That file was HDR and stays excluded. On eligible SDR
+ * recordings the short ladder measures the individual clip before choosing its bitrate.
  *
  * Every re-encode candidate needs complete, passing measured windows on its final output.
  * This applies to plans selected by the ladder and plans at the codec default.
@@ -105,9 +104,9 @@ object ExhaustivePerceptualLosslessPolicy {
             !QualityProbePolicy.isProbeLadderGeometry(width, height)
 
     /**
-     * The short ladder: at most three rungs, namely the most aggressive rung, the codec default
-     * and the retreat rung. The in-between rung is dropped, and the caller also skips the downward
-     * bisection after a pass.
+     * Schedule up to three initial rungs: the most aggressive rung, the codec default and the
+     * retreat rung. A complete selection-margin pass on the first of three rungs can
+     * spend one unused slot on a midpoint below it, subject to [shortLadderRefinementCandidate].
      *
      * Why those three. A failing rung is cheap, because the prober stops at the first window below
      * the bar, while a passing rung scores every window. So the aggressive rung costs little to try
@@ -119,6 +118,20 @@ object ExhaustivePerceptualLosslessPolicy {
      */
     fun trimToShortLadder(rungs: List<Double>): List<Double> =
         if (rungs.size <= 3) rungs else (listOf(rungs.first()) + rungs.takeLast(2)).distinct().sorted()
+
+    /** The first rung on several certified S26 4K clips was 0.75. Before trying a lower ratio,
+     * reserve at least the measured cost of that complete rung in the existing short-ladder budget.
+     * A later pass keeps its ratio. Starved sources keep their shorter, safest-biased ladders.
+     */
+    internal fun shortLadderRefinementCandidate(
+        candidates: List<Double>, rungs: List<RungEvidence>, remainingMs: Long
+    ): Double? {
+        val first = rungs.singleOrNull() ?: return null
+        if (candidates.size != 3 || first.ratio != candidates.first() ||
+            first.elapsedMs !in 1L..remainingMs || first.measuredVerdict != QualityProbePolicy.RungVerdict.PASSED
+        ) return null
+        return QualityProbePolicy.refinementCandidate(first.ratio, null)
+    }
 
     /** The class-level probe-skip ratchet never pre-empts a measurement in exhaustive mode. */
     fun honourProbeSkip(exhaustive: Boolean): Boolean = !exhaustive

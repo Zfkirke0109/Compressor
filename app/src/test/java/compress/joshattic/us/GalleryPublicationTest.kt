@@ -6,6 +6,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.FilterInputStream
 import java.io.IOException
 import java.io.InputStream
@@ -71,6 +72,51 @@ class GalleryPublicationTest {
     }
 
     @Test
+    fun saveCopiesRefusesAnEarlierLocatedFileWhenLocationRemovalIsNowSelected() {
+        val file = File.createTempFile("cached-output", ".mp4")
+        try {
+            file.writeBytes(bytes)
+            val gallery = FakeGallery()
+            val blocked = GalleryPublication.saveOutputCopy(file, removeLocation = true, containsLocation = { true }) { source ->
+                save(gallery, source = source)
+            }
+            assertFailed(blocked, GalleryPublication.Stage.LOCATION_PRIVACY)
+            val unreadable = GalleryPublication.saveOutputCopy(file, removeLocation = true, containsLocation = { throw IOException() }) { source ->
+                save(gallery, source = source)
+            }
+            assertFailed(unreadable, GalleryPublication.Stage.LOCATION_PRIVACY)
+            assertTrue(gallery.calls.isEmpty())
+            assertTrue(GallerySaveSummary.message(0, 0, "source location omitted", 1).contains("No output copies were saved"))
+
+            val ordinary = GalleryPublication.saveOutputCopy(file, removeLocation = false, containsLocation = { error("unrequested check") }) { source ->
+                save(gallery, source = source)
+            }
+            assertTrue(ordinary is GalleryPublication.Result.Published)
+        } finally {
+            file.delete()
+        }
+    }
+
+    @Test
+    fun saveCopiesRewindsAndPublishesTheFileWhoseLocationWasChecked() {
+        val file = File.createTempFile("cached-output", ".mp4")
+        try {
+            file.writeBytes(bytes)
+            val gallery = FakeGallery()
+            val saved = GalleryPublication.saveOutputCopy(file, removeLocation = true, containsLocation = { input ->
+                assertEquals(bytes[0].toInt(), input.read())
+                // A subsequent encode can replace this cache path while the copy is open.
+                if (file.delete()) file.writeBytes(byteArrayOf(99))
+                false
+            }) { source -> save(gallery, source = source) }
+            assertTrue(saved is GalleryPublication.Result.Published)
+            assertTrue(bytes.contentEquals(gallery.stored.toByteArray()))
+        } finally {
+            file.delete()
+        }
+    }
+
+    @Test
     fun aSaveIsPublishedOnlyAfterTheWholeCopyReadsBack() {
         val gallery = FakeGallery()
         val result = save(gallery, expected = sha(bytes))
@@ -83,6 +129,17 @@ class GalleryPublicationTest {
     @Test
     fun theExpectedDigestIsComparedWithoutRegardToCase() {
         assertTrue(save(FakeGallery(), expected = sha(bytes).uppercase()) is GalleryPublication.Result.Published)
+    }
+
+    @Test
+    fun anEmptyVideoIsRemovedBeforePublicationEvenWhenItsDigestMatches() {
+        val empty = byteArrayOf()
+        for (expected in listOf(null, sha(empty))) {
+            val gallery = FakeGallery()
+            assertFailed(save(gallery, expected) { empty.inputStream() }, GalleryPublication.Stage.WRITE)
+            assertEquals(listOf("insert", "write", "delete"), gallery.calls)
+            assertTrue(gallery.closedWriter)
+        }
     }
 
     @Test

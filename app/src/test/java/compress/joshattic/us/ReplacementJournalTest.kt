@@ -6,6 +6,9 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * A rollback copy that outlives its process must say what it belongs to, and may be deleted only
@@ -71,14 +74,14 @@ class ReplacementJournalTest {
         val legacy = ReplacementContentProof.newRecoveryFile(dir, "job_legacy").apply { writeBytes(byteArrayOf(2)) }
         // An entry whose copy is gone describes nothing.
         File(dir, "replace_recovery_job_gone_123.mp4" + ReplacementJournal.SUFFIX).writeText(entry().encode())
-        File(dir, "unrelated.txt").writeText("x")
+        val unrelated = File(dir, "unrelated.journal").apply { writeText("x") }
 
         val found = ReplacementJournal.leftovers(dir)
         assertEquals(setOf(known, legacy), found.map { it.recoveryCopy }.toSet())
         assertEquals(entry(), found.first { it.recoveryCopy == known }.journal)
         assertNull(found.first { it.recoveryCopy == legacy }.journal)
         assertFalse(File(dir, "replace_recovery_job_gone_123.mp4" + ReplacementJournal.SUFFIX).exists())
-        assertTrue(File(dir, "unrelated.txt").exists())
+        assertTrue(unrelated.exists())
         assertEquals(emptyList<ReplacementLeftover>(), ReplacementJournal.leftovers(File(dir, "missing")))
     }
 
@@ -117,10 +120,9 @@ class ReplacementJournalTest {
         // The scan runs when a screen opens. A replacement finishing under an earlier screen may
         // still hold its rollback copy mid-write; taking that for a dead process's remains and
         // disposing of it would remove the only way back.
-        val inFlight = ReplacementContentProof.newRecoveryFile(dir, "job_inflight").apply { writeBytes(byteArrayOf(1)) }
+        val inFlight = ReplacementJournal.newActiveCopy(dir, "job_inflight").apply { writeBytes(byteArrayOf(1)) }
         ReplacementJournal.write(inFlight, entry())
         val dead = ReplacementContentProof.newRecoveryFile(dir, "job_dead").apply { writeBytes(byteArrayOf(2)) }
-        ReplacementJournal.markActive(inFlight)
         try {
             assertEquals(listOf(dead), ReplacementJournal.leftovers(dir).map { it.recoveryCopy })
             assertTrue("its journal is not swept as stale either", ReplacementJournal.fileFor(inFlight).exists())
@@ -128,6 +130,27 @@ class ReplacementJournalTest {
             ReplacementJournal.release(inFlight)
         }
         assertEquals(setOf(inFlight, dead), ReplacementJournal.leftovers(dir).map { it.recoveryCopy }.toSet())
+    }
+
+    @Test
+    fun activeJournalFilesSurviveAScanEvenWhileTheirCopyIsAbsent() = inTempDir { dir ->
+        val copy = ReplacementJournal.newActiveCopy(dir, "job_staging")
+        val journal = ReplacementJournal.fileFor(copy)
+        val temp = File(dir, journal.name + ".tmp")
+        try {
+            assertTrue("the new placeholder already belongs to the replacement", ReplacementJournal.leftovers(dir).isEmpty())
+            assertTrue(copy.delete())
+            assertTrue(ReplacementJournal.write(copy, entry(ReplacementJournalEntry.STAGING)))
+            temp.writeText(entry().encode())
+            assertTrue(ReplacementJournal.leftovers(dir).isEmpty())
+            assertEquals(ReplacementJournalEntry.STAGING, ReplacementJournal.read(copy)?.state)
+            assertTrue("the pending rename can still complete", temp.exists())
+        } finally {
+            ReplacementJournal.release(copy)
+        }
+        assertTrue(ReplacementJournal.leftovers(dir).isEmpty())
+        assertFalse(journal.exists())
+        assertFalse(temp.exists())
     }
 
     @Test
@@ -170,6 +193,60 @@ class ReplacementJournalTest {
             preserve = { leftover, expected -> GalleryPublication.save({ leftover.recoveryCopy.inputStream() }, gallery, expected) },
             log = { logs += it }
         )
+
+    @Test
+    fun overlappingStartsPublishOnlyOneCopyWithoutBlockingOtherScans() = inTempDir { dir ->
+        val original = byteArrayOf(4, 5, 6)
+        val copy = ReplacementContentProof.newRecoveryFile(dir, "job_overlap").apply { writeBytes(original) }
+        assertTrue(ReplacementJournal.write(copy, entry().copy(stagedSha256 = sha(original))))
+        val gallery = Gallery()
+        val sourceOpen = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val worker = Executors.newSingleThreadExecutor()
+        val first = worker.submit<ReplacementRecovery.StartupResult> {
+            ReplacementRecovery.recoverLeftovers(dir, targetSha256 = { null }, preserve = { leftover, expected ->
+                leftover.recoveryCopy.inputStream().use { input ->
+                    sourceOpen.countDown()
+                    check(resume.await(10, TimeUnit.SECONDS))
+                    GalleryPublication.save({ input }, gallery, expected)
+                }
+            })
+        }
+        try {
+            assertTrue(sourceOpen.await(10, TimeUnit.SECONDS))
+            val secondGallery = Gallery()
+            assertEquals(ReplacementRecovery.StartupResult(0, 0), startUp(dir, secondGallery, null))
+            assertTrue(secondGallery.published.isEmpty())
+            assertTrue(copy.exists())
+            resume.countDown()
+            assertEquals(ReplacementRecovery.StartupResult(1, 0), first.get(10, TimeUnit.SECONDS))
+            assertTrue(gallery.published.single().contentEquals(original))
+            assertFalse(copy.exists())
+        } finally {
+            resume.countDown()
+            worker.shutdownNow()
+        }
+    }
+
+    @Test
+    fun anInterruptedEmptyAllocationIsNotARecoveredOriginal() = inTempDir { dir ->
+        val placeholder = ReplacementContentProof.newRecoveryFile(dir, "job_before_staging")
+        val gallery = Gallery()
+        assertEquals(ReplacementRecovery.StartupResult(0, 0), startUp(dir, gallery, null))
+        assertTrue(gallery.published.isEmpty())
+        assertFalse(placeholder.exists())
+
+        val damaged = ReplacementContentProof.newRecoveryFile(dir, "job_damaged")
+        assertTrue(ReplacementJournal.write(damaged, entry()))
+        val unknown = ReplacementContentProof.newRecoveryFile(dir, "job_unreadable_entry")
+        ReplacementJournal.fileFor(unknown).writeText("interrupted journal")
+        assertEquals(ReplacementRecovery.StartupResult(0, 2), startUp(dir, gallery, null))
+        assertTrue(gallery.published.isEmpty())
+        for (copy in listOf(damaged, unknown)) {
+            assertTrue(copy.exists())
+            assertTrue(ReplacementJournal.fileFor(copy).exists())
+        }
+    }
 
     @Test
     fun aCopyIsKeptUntilItsGalleryCopyIsProvenThenDeletedOnce() = inTempDir { dir ->

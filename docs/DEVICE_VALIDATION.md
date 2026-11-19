@@ -153,9 +153,10 @@ What to know before running it:
   a marginal trial on that device with its current learned state. Otherwise they are skipped and
   the script exits 2 (incomplete), never 0. The run log prints the rungs and verdicts it saw
   (`b287-fallback …`), skipped or not.
-- **Only the full probe ladder can select one,** so the clip must be at most 1920 × 1088 pixels.
-  A larger source gets the short ladder, which does not bisect after a pass: when its first rung
-  passes there is no marginal rung below a passing one to try.
+- **The marginal-refinement retry requires the full probe ladder.** Use a clip of at most
+  1920 × 1088 pixels. The short ladder can try a midpoint after an early pass. A midpoint must
+  clear the selection margin to become its preferred rung. If that preferred rung predicts no
+  saving, the separate Exhaustive size check can try an already measured marginal pass.
 - It budgets two full encodes of the clip per batch. Use a disposable copy; replace-original must
   be off and is asserted off; the copy's SHA-256 is compared before and after every batch.
 - It turns the opt-in safer-rung retry switch on (off for the control) and restores it afterwards.

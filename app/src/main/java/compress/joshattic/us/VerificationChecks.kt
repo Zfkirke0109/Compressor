@@ -25,6 +25,8 @@ package compress.joshattic.us
  */
 data class VerificationChecks(
     val playable: Boolean,
+    val contentTracksMatch: Boolean,
+    val locationRemovalPass: Boolean,
     val criticalFieldsComplete: Boolean,
     val durationMatches: Boolean,
     val frameCountMatches: Boolean,
@@ -53,7 +55,7 @@ data class VerificationChecks(
          */
         PERCEPTUAL_LOSSLESS_EXCEPT_VIDEO_BITRATE(
             listOf(
-                "playable", "criticalFieldsComplete", "durationMatches", "frameCountMatches",
+                "playable", "contentTracksMatch", "locationRemovalPass", "criticalFieldsComplete", "durationMatches", "frameCountMatches",
                 "videoMatches", "fpsMatches", "hdrMatches", "standardMatches", "rangeMatches",
                 "audioCodecMatches", "audioShapeMatches", "audioBitratePass", "rotationMatches",
                 "locationMatches", "mediaStoreDateMatches", "mp4DateMatches"
@@ -73,18 +75,18 @@ data class VerificationChecks(
         ),
 
         /**
-         * A lossy mode (High Quality, Storage Saver) promises a playable re-encode and makes no
-         * claim that anything matches the source: the codec changes by design, and Media3 codes a
-         * portrait source as landscape with a rotation hint. Those are differences, not failures.
-         * Naming the scope lets a lossy verdict report the predicates it was actually judged on
-         * instead of none at all, which sent its record down a text scan that listed
-         * `videoCodec` and `rotation` as failed checks on a verified output (b287 HQ job_31e5faeaf665).
+         * Lossy encoding can change codecs, frame rate and raster. It still needs a playable
+         * output of the same duration that retains the source's audio, video and subtitle tracks.
          */
-        LOSSY(listOf("playable"));
+        LOSSY(listOf("playable", "contentTracksMatch", "locationRemovalPass", "durationMatches")),
+        /** An encoder format fallback may change the coded orientation, but HQ keeps the display resolution. */
+        HIGH_QUALITY(LOSSY.names + "videoMatches");
     }
 
     private fun valueOf(name: String): Boolean = when (name) {
         "playable" -> playable
+        "contentTracksMatch" -> contentTracksMatch
+        "locationRemovalPass" -> locationRemovalPass
         "criticalFieldsComplete" -> criticalFieldsComplete
         "durationMatches" -> durationMatches
         "frameCountMatches" -> frameCountMatches

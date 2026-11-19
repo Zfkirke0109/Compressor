@@ -13,7 +13,7 @@ import kotlin.random.Random
 class VerificationChecksTest {
 
     private fun allPassing() = VerificationChecks(
-        playable = true, criticalFieldsComplete = true, durationMatches = true,
+        playable = true, contentTracksMatch = true, locationRemovalPass = true, criticalFieldsComplete = true, durationMatches = true,
         frameCountMatches = true, videoMatches = true, fpsMatches = true,
         videoCodecMatches = true, audioCodecMatches = true, audioShapeMatches = true,
         audioBitratePass = true, hdrMatches = true, standardMatches = true,
@@ -38,7 +38,7 @@ class VerificationChecksTest {
         repeat(2000) {
             fun b() = rng.nextInt(10) != 0 // mostly-true, so failures are sparse and realistic
             val c = VerificationChecks(
-                playable = b(), criticalFieldsComplete = b(), durationMatches = b(),
+                playable = b(), contentTracksMatch = b(), locationRemovalPass = b(), criticalFieldsComplete = b(), durationMatches = b(),
                 frameCountMatches = b(), videoMatches = b(), fpsMatches = b(),
                 videoCodecMatches = b(), audioCodecMatches = b(), audioShapeMatches = b(),
                 audioBitratePass = b(), hdrMatches = b(), standardMatches = b(),
@@ -56,7 +56,7 @@ class VerificationChecksTest {
     }
 
     @Test
-    fun aLossyVerdictIsJudgedOnPlayabilityAndEverythingElseIsADifference() {
+    fun lossyRequiresCompletenessAndAllowsCodecAndOrientationChanges() {
         // H.264 to HEVC, and a portrait source coded as landscape: what High Quality changes by design.
         val c = allPassing().copy(videoCodecMatches = false, rotationMatches = false)
         assertTrue(c.passes(VerificationChecks.Scope.LOSSY))
@@ -70,6 +70,8 @@ class VerificationChecksTest {
         assertTrue(pl.passes(VerificationChecks.Scope.PERCEPTUAL_LOSSLESS))
         assertEquals(listOf("videoCodecMatches"), pl.differencesOutside(VerificationChecks.Scope.PERCEPTUAL_LOSSLESS))
         assertEquals(listOf("playable"), allPassing().copy(playable = false).failures(VerificationChecks.Scope.LOSSY))
+        val incomplete = c.copy(contentTracksMatch = false, durationMatches = false)
+        assertEquals(listOf("contentTracksMatch", "durationMatches"), incomplete.failures(VerificationChecks.Scope.LOSSY))
     }
 
     @Test
@@ -78,7 +80,7 @@ class VerificationChecksTest {
         repeat(500) {
             fun b() = rng.nextInt(4) != 0
             val c = VerificationChecks(
-                playable = b(), criticalFieldsComplete = b(), durationMatches = b(),
+                playable = b(), contentTracksMatch = b(), locationRemovalPass = b(), criticalFieldsComplete = b(), durationMatches = b(),
                 frameCountMatches = b(), videoMatches = b(), fpsMatches = b(),
                 videoCodecMatches = b(), audioCodecMatches = b(), audioShapeMatches = b(),
                 audioBitratePass = b(), hdrMatches = b(), standardMatches = b(),

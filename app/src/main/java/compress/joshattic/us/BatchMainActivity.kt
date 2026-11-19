@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -51,11 +52,11 @@ class BatchMainActivity : ComponentActivity() {
             CompressorTheme {
                 BatchCompressorScreen(
                     viewModel = viewModel,
-                    onShareOutputs = { shareCompressedOutputs(this, viewModel.uiState.value) }
+                    onShareOutputs = { shareCompressedOutputs(this, viewModel) }
                 )
             }
         }
-        window.decorView.post { consumeIncomingVideos(startupIntent) }
+        consumeIncomingVideos(startupIntent, fromActivityCreation = true)
         // Diagnostics-only: logs real encoder capabilities once per process in debug builds.
         EncoderCapabilityDiagnostics.dumpOnceInBackground(this)
     }
@@ -63,12 +64,11 @@ class BatchMainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        consumeIncomingVideos(intent)
+        consumeIncomingVideos(intent, fromActivityCreation = false)
     }
 
-    private fun consumeIncomingVideos(intent: Intent?) {
-        val uris = extractIncomingVideoUris(intent)
-        if (uris.isNotEmpty()) viewModel.loadUris(this, uris)
+    private fun consumeIncomingVideos(intent: Intent?, fromActivityCreation: Boolean) {
+        viewModel.receiveSharedVideos(this, extractIncomingVideoUris(intent), fromActivityCreation)
     }
 
     @Suppress("DEPRECATION")
@@ -99,10 +99,12 @@ class BatchMainActivity : ComponentActivity() {
 @Composable
 private fun BatchCompressorScreen(
     viewModel: BatchCompressorViewModel,
-    onShareOutputs: () -> Unit
+    onShareOutputs: suspend () -> Unit
 ) {
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
+    val shareScope = rememberCoroutineScope()
+    var preparingShare by remember { mutableStateOf(false) }
     var pickAfterMetadataGrant by remember { mutableStateOf(false) }
     val pickVideos = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments(),
@@ -175,9 +177,22 @@ private fun BatchCompressorScreen(
                                 }
                             },
                             modifier = Modifier.fillMaxWidth(),
-                            enabled = !state.isCompressing && !state.isLoading
+                            enabled = !state.selectionBusy
                         ) {
                             Text(if (state.items.isEmpty()) "Select videos with write access" else "Select different videos")
+                        }
+                        if (state.pendingVideoUris.isNotEmpty()) {
+                            val count = state.pendingVideoUris.size
+                            Text(
+                                if (state.hasUnsavedCopies) "Save any copies you want before opening the next selection."
+                                else "Another video selection is waiting.",
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                            OutlinedButton(
+                                onClick = { viewModel.openPendingVideos(context) },
+                                enabled = !state.selectionBusy,
+                                modifier = Modifier.fillMaxWidth()
+                            ) { Text("Open next selection ($count)") }
                         }
                     }
                 }
@@ -200,7 +215,7 @@ private fun BatchCompressorScreen(
                 state.batchMetrics?.let { metrics ->
                     item { BatchMetricsCard(metrics) }
                 }
-                if (!state.isCompressing && state.highQualityRetryCount > 0) {
+                if (!state.selectionBusy && state.highQualityRetryCount > 0) {
                     item {
                         HighQualityRetryCard(
                             count = state.highQualityRetryCount,
@@ -223,7 +238,7 @@ private fun BatchCompressorScreen(
                         Button(
                             onClick = { viewModel.startCompression(context) },
                             modifier = Modifier.weight(1f),
-                            enabled = !state.isCompressing && !state.isLoading
+                            enabled = !state.selectionBusy
                         ) { Text("Compress ${state.items.size}") }
                         OutlinedButton(
                             onClick = { viewModel.cancelCompression() },
@@ -239,13 +254,24 @@ private fun BatchCompressorScreen(
                             OutlinedButton(
                                 onClick = { viewModel.saveAllCopiesToGallery(context) },
                                 modifier = Modifier.weight(1f),
-                                enabled = !state.isCompressing
-                            ) { Text("Save copies") }
+                                enabled = !state.selectionBusy
+                            ) { Text(if (state.isSavingCopies) "Saving copies…" else "Save copies") }
                             OutlinedButton(
-                                onClick = onShareOutputs,
+                                onClick = {
+                                    if (!preparingShare) {
+                                        preparingShare = true
+                                        shareScope.launch {
+                                            try {
+                                                onShareOutputs()
+                                            } finally {
+                                                preparingShare = false
+                                            }
+                                        }
+                                    }
+                                },
                                 modifier = Modifier.weight(1f),
-                                enabled = !state.isCompressing
-                            ) { Text("Share") }
+                                enabled = !state.selectionBusy && !preparingShare
+                            ) { Text(if (preparingShare) "Preparing…" else "Share") }
                         }
                     }
                 }
@@ -254,7 +280,7 @@ private fun BatchCompressorScreen(
                     Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
                         TextButton(
                             onClick = { viewModel.clear() },
-                            enabled = !state.isCompressing
+                            enabled = !state.selectionBusy
                         ) { Text("Clear batch") }
                     }
                 }
@@ -300,21 +326,20 @@ private fun HighQualityRetryCard(count: Int, onRetry: () -> Unit) {
     ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text(
-                "Want the rest smaller?",
+                "Try High Quality copies?",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold,
                 color = MaterialTheme.colorScheme.onSecondaryContainer
             )
             Text(
-                "$count ${if (many) "videos were" else "video was"} kept at original quality — " +
-                    "Perceptually Lossless couldn't shrink ${if (many) "them" else "it"} without visible change. " +
-                    "High Quality can re-encode ${if (many) "them" else "it"} smaller at the same resolution and " +
-                    "frame rate, for a small quality trade.",
+                "Perceptually Lossless kept $count ${if (many) "originals" else "original"}. " +
+                    "The bitrate estimate suggests High Quality could make ${if (many) "smaller copies" else "a smaller copy"}. " +
+                    "The originals stay in place. The encoder requests the source resolution and frame rate. Quality may visibly change.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSecondaryContainer
             )
             Button(onClick = onRetry, modifier = Modifier.fillMaxWidth()) {
-                Text("Shrink $count with High Quality")
+                Text("Try High Quality on $count ${if (many) "videos" else "video"}")
             }
         }
     }
@@ -845,7 +870,7 @@ private fun BatchSettingsCard(
                 if (remuxOnly) {
                     "No re-encode: video/audio copied unchanged. This keeps quality exact but may not shrink much."
                 } else {
-                    "Perceptually Lossless only shrinks a file when it can with no visible change — otherwise it keeps the original unchanged (many phone videos are already efficient, so this is common and honest). High Quality re-encodes at a lower bitrate (same resolution and FPS) for a small quality trade — the usual way to shrink files PL leaves unchanged (already low-bitrate videos may not shrink). Storage Saver goes smaller still and may show visible loss."
+                    "Perceptually Lossless checks samples of a smaller encode before accepting it. High Quality is lossy and requests the source resolution and frame rate unless you select an FPS cap. Storage Saver prioritizes size and can also lower resolution."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -906,7 +931,7 @@ private fun BatchSettingsCard(
                 when {
                     remuxOnly -> "Disabled in Remux Only because source timestamps and FPS are copied unchanged."
                     perceptuallyLossless -> "Disabled in Perceptually Lossless because source FPS/motion (including 120fps) is always preserved. Choose High Quality or Storage Saver to cap FPS."
-                    else -> "Original/source FPS is preserved by default, including 120fps. 120/60/30/24 caps are applied only when you explicitly choose them."
+                    else -> "The encoder requests the source frame rate by default. Select a cap to request 120, 60, 30, or 24 fps on faster footage."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1087,7 +1112,7 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
             Text("Real compressions: ${state.realCompressionCount} • Remuxed/kept/no size win: ${state.nonCompressionCount}")
             Text("Failed: ${state.failedCount} • Skipped: ${state.skippedCount} • Cancelled: ${state.cancelledCount}")
             Text("Original: ${state.formattedTotalOriginal}")
-            Text("Mode: ${state.qualityPreset} • Codec: ${state.codecOption} • FPS: ${state.frameRateOption}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("Selected settings • ${state.qualityPreset} • ${state.codecOption} • ${state.frameRateOption}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Metadata: ${MetadataPrivacyMode.fromLabel(state.metadataPrivacyMode).summary}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Text("Thermal: ${state.thermalMode} • Cooldown: ${state.cooldownSeconds}s", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (state.isCompressing) {
@@ -1119,7 +1144,7 @@ private fun BatchSummaryCard(state: BatchCompressorUiState) {
 private fun BatchMetricsCard(metrics: BatchMetricsSummary) {
     OutlinedCard(modifier = Modifier.fillMaxWidth()) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("Batch metrics", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text("Latest run metrics", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             metrics.summaryLines.forEach { line ->
                 Text(line, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
@@ -1577,14 +1602,33 @@ private fun needsOriginalMediaLocationPermission(context: Context): Boolean {
         ) != PackageManager.PERMISSION_GRANTED
 }
 
-private fun shareCompressedOutputs(context: Context, state: BatchCompressorUiState) {
-    val outputUris = state.items.mapNotNull { item ->
-        val path = item.outputPath ?: return@mapNotNull null
-        val file = File(path)
-        if (!file.exists()) return@mapNotNull null
-        FileProvider.getUriForFile(context, context.packageName + ".provider", file)
+private suspend fun shareCompressedOutputs(context: Context, viewModel: BatchCompressorViewModel) {
+    val state = viewModel.uiState.value
+    if (state.selectionBusy) return
+    val outputs = state.items.mapNotNull { item ->
+        item.outputPath?.let { OutputSharing.Output(File(it), item.outputSize, item.outputName()) }
     }
-    if (outputUris.isEmpty()) return
+    val removeLocation = MetadataPrivacyMode.fromLabel(state.metadataPrivacyMode).removeLocation
+    val result = withContext(Dispatchers.IO) {
+        var checked: OutputSharing.Result = OutputSharing.Result.Blocked("Another operation is active. Try sharing when it finishes.")
+        ExportDebugTracing.tryRunExclusive {
+            checked = OutputSharing.prepare(outputs, removeLocation, VideoMetadataPreserver::containsEmbeddedLocation)
+        }
+        checked
+    }
+    if (result is OutputSharing.Result.Blocked) {
+        Toast.makeText(context, result.message, Toast.LENGTH_LONG).show()
+        return
+    }
+    val current = viewModel.uiState.value
+    if (current.metadataPrivacyMode != state.metadataPrivacyMode ||
+        current.items.mapNotNull { it.outputPath } != state.items.mapNotNull { it.outputPath }) {
+        Toast.makeText(context, "The selection or privacy setting changed. Tap Share again.", Toast.LENGTH_LONG).show()
+        return
+    }
+    val outputUris = (result as OutputSharing.Result.Ready).outputs.map { output ->
+        FileProvider.getUriForFile(context, context.packageName + ".provider", output.file, output.displayName)
+    }
 
     val intent = if (outputUris.size == 1) {
         Intent(Intent.ACTION_SEND).apply {

@@ -83,6 +83,9 @@ data class RungEvidence(
 
     val measured: Boolean get() = outcome == MEASURED
 
+    internal val measuredVerdict: QualityProbePolicy.RungVerdict
+        get() = QualityProbePolicy.rungVerdict(scores.takeIf { measured }, windows.size)
+
     /** The ids of the windows that were actually scored, aligned with [scores]. */
     val scoredWindowIds: List<String> get() = windows.take(scores.size).map { it.id }
 
@@ -107,5 +110,13 @@ data class RungEvidence(
         /** The last measured rung at exactly [ratio], or null when none was measured there. */
         fun measuredAt(rungs: List<RungEvidence>, ratio: Double): RungEvidence? =
             rungs.lastOrNull { it.measured && kotlin.math.abs(it.ratio - ratio) < 1e-9 }
+
+        /** A safety decision needs evidence at the highest scheduled ratio, or at a higher
+         * ceiling that was subsequently tried. A timed-out ceiling keeps its own verdict.
+         */
+        internal fun safestAttempted(rungs: List<RungEvidence>, highestScheduled: Double?): RungEvidence? {
+            val highest = rungs.asReversed().maxByOrNull { it.ratio } ?: return null
+            return highest.takeIf { highestScheduled != null && it.ratio >= highestScheduled }
+        }
     }
 }

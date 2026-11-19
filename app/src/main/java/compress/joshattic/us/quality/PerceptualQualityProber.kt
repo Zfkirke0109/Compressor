@@ -47,10 +47,8 @@ data class ProbeDecision(
     // justified the decision either way. Null only when nothing could be measured.
     val windowScores: List<WindowScore>?,
     val detail: String,
-    // True when the HIGHEST candidate ratio (the codec default) was measured — not merely
-    // unmeasurable — and its windows fell below the acceptance thresholds. This is positive
-    // pixel evidence that no allowed ratio can encode the clip transparently, which justifies
-    // skipping the item entirely instead of writing a useless stream copy.
+    // A sufficiently sampled window failed at the safest scheduled rung, or at the higher
+    // ceiling if tried. This evidence lets the batch skip the item and record a rejection.
     val highestCandidateMeasuredRejected: Boolean = false,
     // How many ladder rungs actually produced window scores, and why the rest did not.
     //
@@ -112,12 +110,11 @@ data class ProbeEncodeShape(
  * Probe-based per-clip Perceptually Lossless targeting: encodes short clipped windows of the
  * source at candidate bitrate ratios with the SAME hardware pipeline as real encodes (Media3
  * Transformer, VBR, same output codec), scores each probe against the source windows with
- * on-device VMAF (phone model), and returns the lowest ratio whose windows all pass
+ * on-device VMAF (v0.6.1, phone transform off), and returns a ratio whose windows all pass
  * [QualityProbePolicy] thresholds.
  *
- * SDR-only by contract (VMAF is not calibrated for PQ/HLG) and only for strictly more
- * efficient output codecs — the callers enforce both. Every failure path returns "no
- * evidence" and leaves the conservative gate decision unchanged.
+ * Callers enforce the SDR, codec, and geometry eligibility rules. The full encode is scored
+ * separately before the batch can keep it as Perceptually Lossless.
  */
 // Every Media3 Transformer entry point this class uses is marked @UnstableApi. The rest of the
 // app already opts in per class (BatchCompressorViewModel, CompressorViewModel); this file was
@@ -149,8 +146,7 @@ class PerceptualQualityProber(private val context: Context) {
         candidateRatios: List<Double>,
         targetBitrateForRatio: (Double) -> Int,
         audioBitrate: Int,
-        // False for the short above-1080p ladder (ExhaustivePerceptualLosslessPolicy): a passing
-        // rung is returned as-is instead of spending one more 4K probe encode on a bisection.
+        // The alternate codec search uses only its fixed candidates.
         allowDownwardRefinement: Boolean = true,
         // The request shape the REAL encode will use. A probe is evidence about that encode only
         // if it is encoded the same way. Debug builds ran the full encode in CBR (the experimental
@@ -168,7 +164,8 @@ class PerceptualQualityProber(private val context: Context) {
         traceRequest: FrameTraceRequest? = null,
         allowFloorRefinement: Boolean = false,
         // Set only on the primary full Exhaustive ladder when the safer-rung retry is enabled.
-        preferMarginalRefinement: ((lower: RungEvidence, safer: RungEvidence) -> Boolean)? = null
+        preferMarginalRefinement: ((lower: RungEvidence, safer: RungEvidence) -> Boolean)? = null,
+        shortLadder: Boolean = false
     ): ProbeDecision {
         if (!VmafNative.isAvailable) return ProbeDecision(null, emptyList(), null, "vmaf unavailable")
         // Long enough to hold the minimum frame count at this frame rate (QualityProbePolicy).
@@ -185,12 +182,12 @@ class PerceptualQualityProber(private val context: Context) {
             )
         }
 
-        val startedAt = System.currentTimeMillis()
-        fun overBudget() = System.currentTimeMillis() - startedAt > budgetMs
+        val startedAt = SystemClock.elapsedRealtime()
+        fun elapsedMs() = SystemClock.elapsedRealtime() - startedAt
+        fun remainingMs() = budgetMs - elapsedMs()
+        fun overBudget() = remainingMs() < 0L
         val probed = mutableListOf<Double>()
         val highestCandidate = candidateRatios.maxOrNull()
-        var highestMeasuredRejected = false
-        var highestMarginal = false
         var highestFailedBelow: Double? = null
         var lastMeasuredScores: List<WindowScore>? = null
         // The highest rung that cleared the bar but not the selection margin. Attempted only when
@@ -212,9 +209,18 @@ class PerceptualQualityProber(private val context: Context) {
         // Every rung the ladder tried, frozen as it finished (RungEvidence, b177 F2).
         val rungEvidence = mutableListOf<RungEvidence>()
         val windowRefs = windows.map { WindowRef(it.startUs, it.endUs) }
-        var rungMark = System.nanoTime()
-        fun countRung(ratio: Double, r: RungResult) {
+        fun verdict(scores: List<WindowScore>?) = QualityProbePolicy.rungVerdict(scores, windows.size)
+        suspend fun probe(ratio: Double, timeoutMs: Long? = null): RungResult {
+            probed += ratio
+            val rungStart = SystemClock.elapsedRealtime()
             val bitrate = targetBitrateForRatio(ratio)
+            suspend fun measure() = probeOneRatio(
+                sourceUri, transformerInputUri, outputMime, ratio, bitrate, audioBitrate, windows, shape, sourceFps, traceRequest
+            )
+            val r = if (timeoutMs == null) measure() else {
+                withTimeoutOrNull(timeoutMs) { measure() }
+                    ?: RungResult.Unavailable("short ladder refinement exhausted its remaining probe budget")
+            }
             rungEvidence += RungEvidence(
                 ratio = ratio,
                 outcome = when (r) {
@@ -222,14 +228,14 @@ class PerceptualQualityProber(private val context: Context) {
                     is RungResult.Misaligned -> RungEvidence.MISALIGNED
                     is RungResult.Unavailable -> RungEvidence.UNAVAILABLE
                 },
-                verdict = (r as? RungResult.Measured)?.let { QualityProbePolicy.rungVerdict(it.scores).name.lowercase() },
+                verdict = (r as? RungResult.Measured)?.let { verdict(it.scores).name.lowercase() },
                 requestedVideoBitrate = bitrate,
                 configId = EncodeConfigIdentity.of(outputMime, shape, bitrate),
                 windows = windowRefs,
                 scores = (r as? RungResult.Measured)?.scores.orEmpty(),
                 rateFactors = (r as? RungResult.Measured)?.rateFactors.orEmpty(),
                 rateDiag = (r as? RungResult.Measured)?.rateDiag,
-                elapsedMs = (System.nanoTime() - rungMark) / 1_000_000L,
+                elapsedMs = SystemClock.elapsedRealtime() - rungStart,
                 encoderNames = (r as? RungResult.Measured)?.encoderNames.orEmpty(),
                 reason = when (r) {
                     is RungResult.Misaligned -> r.reason
@@ -252,6 +258,7 @@ class PerceptualQualityProber(private val context: Context) {
                     unavailableReasons[r.reason] = (unavailableReasons[r.reason] ?: 0) + 1
                 }
             }
+            return r
         }
         fun rateDiag() = rateDiags.takeIf { it.isNotEmpty() }?.joinToString(";")
         fun scoresOf(r: RungResult) = (r as? RungResult.Measured)?.scores
@@ -267,9 +274,25 @@ class PerceptualQualityProber(private val context: Context) {
                 "; $insufficient rung(s) undecided: a window held fewer than " +
                     "${QualityProbePolicy.MIN_COMPARED_FRAMES_PER_WINDOW} frames, which is not a quality measurement"
             } else "",
-            highestMeasuredRejected,
+            RungEvidence.safestAttempted(rungEvidence, highestCandidate)?.measuredVerdict == QualityProbePolicy.RungVerdict.FAILED,
             measured, misaligned, unavailable, rateDiag = rateDiag(), rungs = rungEvidence.toList()
         )
+        suspend fun parseFailureDecision(rung: RungResult): ProbeDecision? {
+            val reason = (rung as? RungResult.Unavailable)?.reason ?: return null
+            if (!reason.startsWith(SourceParseFailure.REASON_PREFIX)) return null
+            val failure = lastExportInput?.parseFailure ?: SourceParseFailure(
+                extractor = "unknown", errorClass = "ParseError",
+                message = reason.removePrefix(SourceParseFailure.REASON_PREFIX).trim(), inputPosition = -1L
+            )
+            if (failure.inputPosition >= 0L) {
+                withContext(Dispatchers.IO) { SourceBytes.hexAround(context, transformerInputUri, failure.inputPosition) }
+                    ?.let { DiagLog.w(TAG, "source parse failure; ${failure.describe()}; $it") }
+            }
+            return exhausted(
+                QualityProbePolicy.ladderExhaustedDetail(measured, misaligned, unavailable, unavailableReasons, misalignedReasons) +
+                    "; remaining rungs skipped: Media3 cannot parse this input"
+            ).copy(sourceParseFailure = failure)
+        }
         // A rung that cleared the bar by less than the selection margin is not thrown away: if no
         // safer rung clears the margin, the highest such rung is attempted and the full-output
         // certification decides. The label says so, so a capture can count how these fare.
@@ -295,7 +318,7 @@ class PerceptualQualityProber(private val context: Context) {
         }
         for (ratio in candidateRatios) {
             if (overBudget()) {
-                val elapsed = System.currentTimeMillis() - startedAt
+                val elapsed = elapsedMs()
                 when (ExhaustivePerceptualLosslessPolicy.overBudgetAction(ratio, highestCandidate, elapsed, budgetMs)) {
                     ExhaustivePerceptualLosslessPolicy.OverBudget.SKIP_TO_SAFEST -> {
                         DiagLog.i(TAG, "probe budget spent after ${elapsed / 1000}s; skipping %.2f to measure the safest rung".format(ratio))
@@ -307,30 +330,8 @@ class PerceptualQualityProber(private val context: Context) {
                         return marginalFallback() ?: exhausted("probe budget exhausted")
                 }
             }
-            probed += ratio
-            rungMark = System.nanoTime()
-            val rung = probeOneRatio(
-                sourceUri, transformerInputUri, outputMime, ratio, targetBitrateForRatio(ratio), audioBitrate, windows, shape, sourceFps, traceRequest
-            )
-            countRung(ratio, rung)
-            if (rung is RungResult.Unavailable && rung.reason.startsWith(SourceParseFailure.REASON_PREFIX)) {
-                // Media3 cannot read this input: every rung cuts the same windows from it, and the
-                // full encode reads all of it. Stop here and say so; the caller decides what next.
-                val failure = lastExportInput?.parseFailure ?: SourceParseFailure(
-                    extractor = "unknown",
-                    errorClass = "ParseError",
-                    message = rung.reason.removePrefix(SourceParseFailure.REASON_PREFIX).trim(),
-                    inputPosition = -1L
-                )
-                if (failure.inputPosition >= 0L) {
-                    withContext(Dispatchers.IO) { SourceBytes.hexAround(context, transformerInputUri, failure.inputPosition) }
-                        ?.let { DiagLog.w(TAG, "source parse failure; ${failure.describe()}; $it") }
-                }
-                return exhausted(
-                    QualityProbePolicy.ladderExhaustedDetail(measured, misaligned, unavailable, unavailableReasons, misalignedReasons) +
-                        "; remaining rungs skipped: Media3 cannot parse this input"
-                ).copy(sourceParseFailure = failure)
-            }
+            val rung = probe(ratio)
+            parseFailureDecision(rung)?.let { return it }
             if (rung is RungResult.Unavailable && rung.reason.startsWith(EXPORT_TIMEOUT_PREFIX)) {
                 describeKeyframes(sourceUri)?.let { DiagLog.w(TAG, "probe export timed out; source $it") }
                 // Every rung exports the same windows, and a clip that took over a minute to cut
@@ -344,7 +345,7 @@ class PerceptualQualityProber(private val context: Context) {
             }
             val scores = scoresOf(rung)
             if (!scores.isNullOrEmpty()) lastMeasuredScores = scores
-            when (QualityProbePolicy.rungVerdict(scores)) {
+            when (verdict(scores)) {
                 QualityProbePolicy.RungVerdict.PASSED -> {
                     DiagLog.i(
                         TAG,
@@ -355,36 +356,24 @@ class PerceptualQualityProber(private val context: Context) {
                     // an extra probe encode may reclaim up to half the rung gap in real savings.
                     // A failed or unmeasurable refinement keeps this result. A marginal
                     // refinement can be tried when the caller can use this result as a fallback.
-                    val refined = if (allowDownwardRefinement) {
-                        QualityProbePolicy.refinementCandidate(ratio, highestFailedBelow)
-                    } else {
-                        null
+                    val refined = when {
+                        !allowDownwardRefinement -> null
+                        shortLadder -> ExhaustivePerceptualLosslessPolicy.shortLadderRefinementCandidate(candidateRatios, rungEvidence, remainingMs())
+                        else -> QualityProbePolicy.refinementCandidate(ratio, highestFailedBelow)
                     }
                     if (refined != null && !overBudget()) {
                         val saferEvidence = rungEvidence.last()
-                        probed += refined
-                        rungMark = System.nanoTime()
-                        val refinedRung = probeOneRatio(
-                            sourceUri, transformerInputUri, outputMime, refined, targetBitrateForRatio(refined), audioBitrate,
-                            windows, shape, sourceFps, traceRequest
-                        )
-                        countRung(refined, refinedRung)
+                        val refinedRung = probe(refined, timeoutMs = if (shortLadder) remainingMs() else null)
                         val refinedScores = scoresOf(refinedRung)
-                        when (QualityProbePolicy.rungVerdict(refinedScores)) {
+                        when (verdict(refinedScores)) {
                             QualityProbePolicy.RungVerdict.PASSED -> {
                                 DiagLog.i(TAG, "refinement %.2f pixel-proven (bisection below %.2f)".format(refined, ratio))
-                                val floor = if (allowFloorRefinement && !overBudget()) {
+                                val floor = if (!shortLadder && allowFloorRefinement && !overBudget()) {
                                     QualityProbePolicy.floorRefinementCandidate(refined, highestFailedBelow, refinedScores)
                                 } else null
                                 if (floor != null) {
-                                    probed += floor
-                                    rungMark = System.nanoTime()
-                                    val floorRung = probeOneRatio(
-                                        sourceUri, transformerInputUri, outputMime, floor, targetBitrateForRatio(floor),
-                                        audioBitrate, windows, shape, sourceFps, traceRequest
-                                    )
-                                    countRung(floor, floorRung)
-                                    if (QualityProbePolicy.rungVerdict(scoresOf(floorRung)) == QualityProbePolicy.RungVerdict.PASSED) {
+                                    val floorRung = probe(floor)
+                                    if (verdict(scoresOf(floorRung)) == QualityProbePolicy.RungVerdict.PASSED) {
                                         DiagLog.i(TAG, "floor refinement %.2f pixel-proven; keeping %.2f as the measured fallback".format(floor, refined))
                                         return proven(floor, floorRung, " (measured floor)")
                                             .copy(saferPassingRatio = refined, saferPassingRateFactors = factorsOf(refinedRung))
@@ -396,7 +385,7 @@ class PerceptualQualityProber(private val context: Context) {
                                     .copy(saferPassingRatio = ratio, saferPassingRateFactors = factorsOf(rung))
                             }
                             QualityProbePolicy.RungVerdict.MARGINAL -> {
-                                if (preferMarginalRefinement?.invoke(rungEvidence.last(), saferEvidence) == true) {
+                                if (!shortLadder && preferMarginalRefinement?.invoke(rungEvidence.last(), saferEvidence) == true) {
                                     DiagLog.i(
                                         TAG, "trying marginal refinement %.2f with measured fallback %.2f; certification decides"
                                             .format(refined, ratio)
@@ -420,7 +409,6 @@ class PerceptualQualityProber(private val context: Context) {
                     marginalScores = scores
                     marginalFactors = factorsOf(rung)
                     highestFailedBelow = ratio
-                    if (ratio == highestCandidate) highestMarginal = true
                     DiagLog.i(
                         TAG,
                         "ratio %.2f cleared the bar by only %.2f, below the selection margin; trying the next rung"
@@ -429,10 +417,6 @@ class PerceptualQualityProber(private val context: Context) {
                 }
                 QualityProbePolicy.RungVerdict.FAILED -> {
                     highestFailedBelow = ratio
-                    if (ratio == highestCandidate) {
-                        // Measured (not merely unmeasurable) rejection at the safest candidate.
-                        highestMeasuredRejected = true
-                    }
                     DiagLog.i(TAG, "ratio %.2f rejected by probe windows (measured=true)".format(ratio))
                 }
                 QualityProbePolicy.RungVerdict.INSUFFICIENT -> {
@@ -454,24 +438,21 @@ class PerceptualQualityProber(private val context: Context) {
         // clip that failed by a lot never pays for a doomed extra encode.
         // Also spent when the safest rung was only marginal: the ceiling is the best chance of a
         // pass that clears the selection margin as well as the bar.
-        if ((highestMeasuredRejected || highestMarginal) && highestCandidate != null && !overBudget()) {
-            val upward = if (highestMeasuredRejected) {
-                QualityProbePolicy.upwardRefinementCandidate(highestCandidate, lastMeasuredScores)
-            } else {
-                QualityProbePolicy.upwardMarginCandidate(highestCandidate)
+        val safest = RungEvidence.safestAttempted(rungEvidence, highestCandidate)
+        if (safest != null && !overBudget()) {
+            val upward = when (safest.measuredVerdict) {
+                QualityProbePolicy.RungVerdict.FAILED -> QualityProbePolicy.upwardRefinementCandidate(safest.ratio, safest.scores)
+                QualityProbePolicy.RungVerdict.MARGINAL -> QualityProbePolicy.upwardMarginCandidate(safest.ratio)
+                else -> null
             }
             if (upward != null && upward !in probed) {
-                probed += upward
-                rungMark = System.nanoTime()
-                val upRung = probeOneRatio(
-                    sourceUri, transformerInputUri, outputMime, upward, targetBitrateForRatio(upward), audioBitrate,
-                    windows, shape, sourceFps, traceRequest
-                )
-                countRung(upward, upRung)
+                val upRung = probe(upward)
+                parseFailureDecision(upRung)?.let { return it }
                 val upScores = scoresOf(upRung)
-                when (QualityProbePolicy.rungVerdict(upScores)) {
+                if (!upScores.isNullOrEmpty()) lastMeasuredScores = upScores
+                when (verdict(upScores)) {
                     QualityProbePolicy.RungVerdict.PASSED -> {
-                        DiagLog.i(TAG, "upward near-miss refinement %.2f pixel-proven (safest rung %.2f just missed)".format(upward, highestCandidate))
+                        DiagLog.i(TAG, "upward near-miss refinement %.2f pixel-proven (safest rung %.2f just missed)".format(upward, safest.ratio))
                         return proven(upward, upRung, " (upward near-miss refinement)")
                     }
                     QualityProbePolicy.RungVerdict.MARGINAL -> {
@@ -484,10 +465,14 @@ class PerceptualQualityProber(private val context: Context) {
                                 .format(upward, QualityProbePolicy.barMargin(upScores!!))
                         )
                     }
-                    else -> {
-                        DiagLog.i(TAG, "upward near-miss refinement %.2f rejected; source cannot be transparently re-encoded".format(upward))
-                        if (!upScores.isNullOrEmpty()) lastMeasuredScores = upScores
+                    QualityProbePolicy.RungVerdict.FAILED ->
+                        DiagLog.i(TAG, "upward near-miss refinement %.2f fell below the PL bar".format(upward))
+                    QualityProbePolicy.RungVerdict.INSUFFICIENT -> {
+                        insufficient++
+                        DiagLog.i(TAG, "upward near-miss refinement %.2f had too few compared frames".format(upward))
                     }
+                    QualityProbePolicy.RungVerdict.UNMEASURED ->
+                        DiagLog.i(TAG, "upward near-miss refinement %.2f could not be measured".format(upward))
                 }
             }
         }
@@ -766,8 +751,12 @@ class PerceptualQualityProber(private val context: Context) {
                 })
                 .build()
             continuation.invokeOnCancellation {
-                transformer.cancel()
-                runCatching { outputFile.delete() }
+                // A ladder deadline can fire on a worker thread. Media3 requires its owner looper.
+                val cancel = Runnable {
+                    transformer.cancel()
+                    runCatching { outputFile.delete() }
+                }
+                if (Looper.myLooper() == mainHandler.looper) cancel.run() else mainHandler.post(cancel)
             }
             // Media3 stops loading on a parse error it will never retry, and the export then sits
             // idle until the 60 s timeout (SourceParseFailure). End it once it stops moving instead;

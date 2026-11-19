@@ -21,6 +21,22 @@ object OutputVerifier {
         val frameCount: Int = 0
     )
 
+    /** A/V codecs may change on encode. Keep subtitle MIME types distinct in the track count. */
+    internal data class ContentTrack(val kind: String, val durationMs: Long? = null) {
+        companion object {
+            fun from(mime: String?, durationMs: Long? = null): ContentTrack? {
+                val kind = when {
+                    mime == null -> return null
+                    mime.startsWith("video/") -> "video"
+                    mime.startsWith("audio/") -> "audio"
+                    MimeTypes.isText(mime) -> mime
+                    else -> return null
+                }
+                return ContentTrack(kind, durationMs)
+            }
+        }
+    }
+
     internal data class TrackProbe(
         val videoCodec: String?,
         val audioCodec: String?,
@@ -34,8 +50,12 @@ object OutputVerifier {
         val videoFrameRate: Float = 0f,
         val hdrStaticInfoDigest: String? = null,
         val hdr10PlusInfoDigest: String? = null,
-        val videoProfile: Int? = null
+        val videoProfile: Int? = null,
+        val extractedContentTracks: List<ContentTrack>? = null
     ) {
+        val contentTracks: List<ContentTrack>
+            get() = extractedContentTracks ?: listOfNotNull(ContentTrack.from(videoCodec), ContentTrack.from(audioCodec))
+
         val hdrMetadataPresent: Boolean
             get() = hdrStaticInfoDigest != null || hdr10PlusInfoDigest != null
 
@@ -77,7 +97,9 @@ object OutputVerifier {
         // True when the packet comparison or its decoder-configuration or timing proof differs.
         val audioPacketsDiffer: Boolean = false,
         val videoTimeline: MediaTimelineEvidence.Result? = null,
-        val audioEvidence: AudioTrackIdentity.Outcome? = null
+        val audioEvidence: AudioTrackIdentity.Outcome? = null,
+        /** Checked on the file when location removal was requested; null if the check did not finish. */
+        val embeddedLocationDetected: Boolean? = null
     )
 
     fun verify(
@@ -105,16 +127,13 @@ object OutputVerifier {
         val rawOutputProbe = readFileProbe(outputFile)
         val sourceTracks = probeTracks(context, source.sourceUri)
         val outputTracks = readTrackProbe(outputFile.absolutePath)
-        // The retriever's CAPTURE_FRAMERATE is often absent on freshly encoded/remuxed files, so
-        // fall back to the extractor's track frame rate before treating FPS as "not exposed".
-        val outputProbe = if (rawOutputProbe.fps <= 0f && outputTracks.videoFrameRate > 0f) {
-            rawOutputProbe.copy(fps = outputTracks.videoFrameRate)
-        } else {
-            rawOutputProbe
-        }
+        val outputProbe = rawOutputProbe.copy(fps = playbackFrameRate(outputTracks.videoFrameRate, rawOutputProbe.fps) ?: 0f)
         val outputMetadata = runCatching {
             VideoMetadataPreserver.capture(context, Uri.fromFile(outputFile))
         }.getOrDefault(VideoMetadataSnapshot())
+        val embeddedLocationDetected = if (privacyMode.removeLocation) runCatching {
+            outputFile.inputStream().use(VideoMetadataPreserver::containsEmbeddedLocation)
+        }.getOrNull() else null
         // Compared in every re-encoding mode, not only Perceptually Lossless: a lossy mode that
         // requested an audio copy is otherwise described by its mode name instead of by what its
         // output holds (b177 F5). A measurement only; it adds proof and removes no check.
@@ -166,7 +185,8 @@ object OutputVerifier {
             audioPacketsIdentical = audioIdentity?.result == AudioTrackIdentity.Result.IDENTICAL,
             audioPacketsCompared = audioIdentity?.packets ?: 0,
             audioPacketsDiffer = audioIdentity?.result == AudioTrackIdentity.Result.DIFFERENT,
-            videoTimeline = timeline, audioEvidence = audioIdentity
+            videoTimeline = timeline, audioEvidence = audioIdentity,
+            embeddedLocationDetected = embeddedLocationDetected
         )
     }
 
@@ -174,6 +194,14 @@ object OutputVerifier {
         val playable = input.outputSize > 0L &&
             input.outputFileProbe.durationMs > 0L &&
             input.outputTrackProbe.videoCodec != null
+        val lossy = input.mode == BatchQualityMode.HIGH_QUALITY || input.mode == BatchQualityMode.STORAGE_SAVER
+        val sourceTracks = input.sourceTrackProbe.contentTracks
+        val outputTracks = input.outputTrackProbe.contentTracks
+        val sourceTrackCounts = sourceTracks.groupingBy { it.kind }.eachCount()
+        val outputTrackCounts = outputTracks.groupingBy { it.kind }.eachCount()
+        // A failed source probe cannot establish that a source was silent. A matching census
+        // establishes presence only; PL audio packet and video timeline proof still run separately.
+        val contentTracksMatch = "video" in sourceTrackCounts && sourceTrackCounts == outputTrackCounts
 
         val videoMatches = sameDimensions(
             input.source.width,
@@ -218,10 +246,18 @@ object OutputVerifier {
         // source must never pass Perceptually Lossless or Remux verification, no matter how good
         // its per-field metadata looks (a truncated file is also "strictly smaller", so without
         // this check it could even qualify for replacement).
-        val durationMatches = input.source.durationMs <= 0L ||
-            input.outputFileProbe.durationMs <= 0L ||
-            abs(input.outputFileProbe.durationMs - input.source.durationMs) <=
-            maxOf(500L, (input.source.durationMs * 0.02).toLong())
+        val durationsKnown = input.source.durationMs > 0L && input.outputFileProbe.durationMs > 0L
+        // A long audio track can mask a truncated video track in the container duration, or vice
+        // versa. Compare separately exposed single tracks to their own source durations. Extractors
+        // can omit track durations, and the tracks of a valid source need not end together.
+        val mismatchedTrackDuration = if (lossy) listOf("video", "audio").firstOrNull { kind ->
+            val sourceMs = sourceTracks.singleOrNull { it.kind == kind }?.durationMs
+            val outputMs = outputTracks.singleOrNull { it.kind == kind }?.durationMs
+            sourceMs != null && outputMs != null && !durationsMatch(sourceMs, outputMs)
+        } else null
+        val durationMatches = if (durationsKnown) {
+            durationsMatch(input.source.durationMs, input.outputFileProbe.durationMs) && mismatchedTrackDuration == null
+        } else !lossy
 
         // Frame-count parity (when the platform exposes it on both files) catches dropped or
         // duplicated frames that metadata-level FPS tolerance cannot see.
@@ -241,6 +277,8 @@ object OutputVerifier {
             sourceRotationDegrees = input.sourceMetadata.rotationDegrees,
             outputRotationDegrees = input.outputFileProbe.rotationDegrees
         )
+        val locationDetected = input.embeddedLocationDetected == true || input.outputMetadata.hasLocation || input.outputMetadata.hasRawLocation
+        val locationRemovalPass = !input.privacyMode.removeLocation || (input.embeddedLocationDetected == false && !locationDetected)
         val locationMatches = when {
             input.privacyMode.removeLocation -> true
             !input.sourceMetadata.hasLocation -> true
@@ -390,6 +428,8 @@ object OutputVerifier {
         // VerificationChecks makes that divergence unrepresentable.
         val checks = VerificationChecks(
             playable = playable,
+            contentTracksMatch = contentTracksMatch,
+            locationRemovalPass = locationRemovalPass,
             criticalFieldsComplete = criticalFieldsComplete,
             durationMatches = durationMatches,
             frameCountMatches = frameCountMatches,
@@ -418,16 +458,16 @@ object OutputVerifier {
         val remuxVerified = checks.passes(VerificationChecks.Scope.REMUX)
 
         // The failing predicates for the mode actually being judged, straight from the same
-        // structure that produced the verdict above. A lossy mode is judged on LOSSY: what it
-        // changes by design (codec, a portrait source's coded orientation) is a difference
-        // outside its scope, reported apart, and never a failed check.
+        // structure that produced the verdict above. A lossy transcode can change the codec or
+        // a portrait source's coded orientation. HQ still verifies the display dimensions.
         val scope = when (input.mode) {
             BatchQualityMode.REMUX_ONLY -> VerificationChecks.Scope.REMUX
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> VerificationChecks.Scope.PERCEPTUAL_LOSSLESS
-            else -> VerificationChecks.Scope.LOSSY
+            BatchQualityMode.HIGH_QUALITY -> VerificationChecks.Scope.HIGH_QUALITY
+            BatchQualityMode.STORAGE_SAVER -> VerificationChecks.Scope.LOSSY
         }
         val failedChecks: List<String> = checks.failures(scope)
-        val lossyVerified = checks.passes(VerificationChecks.Scope.LOSSY)
+        val lossyVerified = lossy && failedChecks.isEmpty()
 
         val outputWithinTolerance = input.sourceSize <= 0L ||
             input.outputSize <= (input.sourceSize * (1.0 + BatchQualityBitratePolicy.PERCEPTUAL_LOSSLESS_SIZE_TOLERANCE)).toLong()
@@ -441,18 +481,19 @@ object OutputVerifier {
         val replacementSafe = when (input.mode) {
             BatchQualityMode.REMUX_ONLY -> remuxVerified
             BatchQualityMode.PERCEPTUAL_LOSSLESS -> perceptuallyLosslessVerified && outputWithinTolerance && strictlySmaller
-            // A lossy mode promises nothing about sameness, but the output must still be the WHOLE
-            // video before it may overwrite its source. One that plays and stops early is also
-            // much smaller, so it read as a real compression and as replaceable; the block reason
-            // below already named the duration while this flag stayed true. The lossy verdict
-            // itself is unchanged: this decides only what may replace an original.
-            else -> lossyVerified && durationMatches
+            else -> lossyVerified
         }
 
         val blockReason = when {
             !playable -> "output did not pass playability verification"
+            !locationRemovalPass -> if (locationDetected) "output still contains embedded location"
+                else "output could not be checked for embedded location"
+            !durationsKnown && lossy -> "source duration could not be verified"
+            mismatchedTrackDuration != null -> "output $mismatchedTrackDuration track duration differs from the source (possible truncation)"
             !durationMatches -> "output duration differs from the source (possible truncation)"
-            !frameCountMatches -> "complete video timeline not verified: ${input.videoTimeline?.reason ?: "frame count or timeline evidence unavailable"}"
+            !contentTracksMatch -> "audio, video or subtitle track count could not be preserved or verified (source=$sourceTrackCounts, output=$outputTrackCounts)"
+            input.mode == BatchQualityMode.HIGH_QUALITY && !videoMatches -> "High Quality output could not be verified at the source display resolution"
+            !lossy && !frameCountMatches -> "complete video timeline not verified: ${input.videoTimeline?.reason ?: "frame count or timeline evidence unavailable"}"
             input.mode == BatchQualityMode.REMUX_ONLY && !criticalFieldsComplete -> "stream-copy verification was incomplete"
             input.mode == BatchQualityMode.REMUX_ONLY && !videoMatches -> "remux output changed resolution"
             input.mode == BatchQualityMode.REMUX_ONLY && !rotationMatches -> "remux output changed display orientation"
@@ -484,8 +525,8 @@ object OutputVerifier {
                 !criticalFieldsComplete -> "Perceptually Lossless Unverified"
                 else -> "Perceptually Lossless Verification Failed"
             }
-            BatchQualityMode.HIGH_QUALITY -> "High Quality (lossy mode)"
-            BatchQualityMode.STORAGE_SAVER -> "Storage Saver (lossy mode)"
+            BatchQualityMode.HIGH_QUALITY, BatchQualityMode.STORAGE_SAVER ->
+                if (lossyVerified) "${input.mode.label} (lossy mode)" else "${input.mode.label} Verification Failed"
         }
 
         return OutputVerificationReport(
@@ -536,7 +577,12 @@ object OutputVerifier {
                 input.sourceMetadata.rawDateTag != null,
                 input.outputMetadata.rawDateTag != null
             ),
-            location = locationVerificationLabel(input.privacyMode.removeLocation, input.sourceMetadata.hasLocation, input.outputMetadata.hasLocation),
+            location = when {
+                !input.privacyMode.removeLocation -> locationVerificationLabel(input.sourceMetadata.hasLocation, input.outputMetadata.hasLocation)
+                locationRemovalPass -> "no embedded location detected"
+                locationDetected -> "embedded location still present"
+                else -> "unverified"
+            },
             rotation = "${rotationLabel(input.sourceMetadata.rotationDegrees)} -> ${rotationLabel(input.outputFileProbe.rotationDegrees)} ${statusSuffix(rotationMatches)}",
             fileSize = "${formatFileSize(input.sourceSize)} -> ${formatFileSize(input.outputSize)}",
             replacementSafe = replacementSafe,
@@ -544,7 +590,9 @@ object OutputVerifier {
             criticalFieldsComplete = criticalFieldsComplete,
             failedChecks = failedChecks,
             unjudgedDifferences = checks.differencesOutside(scope),
-            structuralEvidence = mapOf("videoTimeline" to input.videoTimeline?.let { t -> mapOf(
+            structuralEvidence = mapOf("sourceContentTrackCounts" to sourceTrackCounts,
+                "outputContentTrackCounts" to outputTrackCounts, "mismatchedTrackDuration" to mismatchedTrackDuration,
+                "videoTimeline" to input.videoTimeline?.let { t -> mapOf(
                 "matches" to t.matches, "sourceFrames" to t.sourceFrames, "outputFrames" to t.outputFrames,
                 "sourceOriginUs" to t.sourceOriginUs, "outputOriginUs" to t.outputOriginUs,
                 "maxSkewUs" to t.maxSkewUs, "firstMismatch" to t.firstMismatch, "reason" to t.reason) },
@@ -579,6 +627,9 @@ object OutputVerifier {
                 }
         )
     }
+
+    private fun durationsMatch(sourceMs: Long, outputMs: Long): Boolean =
+        abs(outputMs - sourceMs) <= maxOf(500L, (sourceMs * 0.02).toLong())
 
     private fun readFileProbe(file: File): FileProbe {
         val retriever = MediaMetadataRetriever()
@@ -668,10 +719,15 @@ object OutputVerifier {
         var hdrStaticInfoDigest: String? = null
         var hdr10PlusInfoDigest: String? = null
         var videoProfile: Int? = null
+        val contentTracks = mutableListOf<ContentTrack>()
 
         for (i in 0 until extractor.trackCount) {
             val format = extractor.getTrackFormat(i)
             val mime = format.getString(MediaFormat.KEY_MIME)
+            val durationMs = if (format.containsKey(MediaFormat.KEY_DURATION)) {
+                runCatching { format.getLong(MediaFormat.KEY_DURATION) / 1000L }.getOrNull()?.takeIf { it > 0 }
+            } else null
+            ContentTrack.from(mime, durationMs)?.let(contentTracks::add)
             when {
                 mime?.startsWith("video/") == true -> {
                     if (videoCodec == null) videoCodec = mime
@@ -708,7 +764,8 @@ object OutputVerifier {
             videoFrameRate = videoFrameRate,
             hdrStaticInfoDigest = hdrStaticInfoDigest,
             hdr10PlusInfoDigest = hdr10PlusInfoDigest,
-            videoProfile = videoProfile
+            videoProfile = videoProfile,
+            extractedContentTracks = contentTracks
         )
     }
 
@@ -978,9 +1035,8 @@ object OutputVerifier {
         }
     }
 
-    private fun locationVerificationLabel(removedByPrivacy: Boolean, sourcePresent: Boolean, outputPresent: Boolean): String {
+    private fun locationVerificationLabel(sourcePresent: Boolean, outputPresent: Boolean): String {
         return when {
-            removedByPrivacy -> "omitted by privacy setting"
             !sourcePresent -> "not required"
             outputPresent -> "verified"
             else -> "unverified"

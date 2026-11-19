@@ -55,6 +55,7 @@
         <activity
             android:name=".BatchMainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:label="@string/app_name"
             android:theme="@style/Theme.Compressor">
             <intent-filter>

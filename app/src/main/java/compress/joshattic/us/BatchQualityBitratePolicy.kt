@@ -50,6 +50,10 @@ enum class BatchCodecChoice(val label: String, val mimeType: String?) {
     }
 }
 
+/** Slow-motion recordings can carry a camera capture rate several times their playback rate. */
+internal fun playbackFrameRate(trackRate: Float?, captureRate: Float?): Float? =
+    trackRate?.takeIf { it.isFinite() && it > 0f } ?: captureRate?.takeIf { it.isFinite() && it > 0f }
+
 data class VideoSourceInfo(
     val width: Int = 0,
     val height: Int = 0,
@@ -93,6 +97,7 @@ data class BatchModeProfile(
 
 object BatchQualityBitratePolicy {
     const val PERCEPTUAL_LOSSLESS_SIZE_TOLERANCE = 0.03
+    const val HIGH_QUALITY_RATIO = 0.72
 
     // Minimum SOURCE video bit density (bits per pixel per frame) for a Perceptually Lossless
     // re-encode to be plausibly transparent. Calibrated from the 2026-07-14 VMAF suite
@@ -158,9 +163,9 @@ object BatchQualityBitratePolicy {
             )
             BatchQualityMode.HIGH_QUALITY -> BatchModeProfile(
                 label = mode.label,
-                honestSummary = "Re-encodes at a lower bitrate, same resolution and frame rate, for a small quality trade — the usual way to shrink files Perceptually Lossless leaves unchanged.",
+                honestSummary = "Lossy re-encode. Requests the source resolution and frame rate unless you select an FPS cap. Output size and visible quality depend on the clip.",
                 allowsResolutionReduction = false,
-                allowsFrameRateReduction = false
+                allowsFrameRateReduction = true
             )
             BatchQualityMode.STORAGE_SAVER -> BatchModeProfile(
                 label = mode.label,
@@ -363,11 +368,9 @@ object BatchQualityBitratePolicy {
      *    the user asked for in its own right (a Storage Saver 4K->1080p/30fps output is the point,
      *    not merely a smaller number of bytes). Whenever [outputFps] caps the source or
      *    [outputHeight] differs from the source height, this returns false and the encode runs.
-     *  - ORIENTATION-CONSERVATIVE. The lossy floor tables key off raw `source.height`, which
-     *    mis-tiers portrait clips (a 1080x1920 clip is 1080p-class, but height 1920 selects the
-     *    1440p tier). The verdict is therefore re-checked against an orientation-normalized source
-     *    (short edge as height); a mis-tier can then only make this guard fire LESS often. Note
-     *    this deliberately does NOT change any floor — it only refuses to skip on a doubtful tier.
+     *  - High Quality uses the same orientation-independent floor as its encoder. A non-AAC
+     *    audio track can still shrink at the requested AAC bitrate even if video hits its floor.
+     *    Storage Saver retains its conservative orientation recheck.
      */
     fun lossyTargetHasNoHeadroom(
         source: VideoSourceInfo,
@@ -391,6 +394,12 @@ object BatchQualityBitratePolicy {
             outputHeight = outputHeight
         )
         if (target < sourceVideoBitrate) return false
+        if (mode == BatchQualityMode.HIGH_QUALITY) {
+            if (source.width <= 0) return false
+            val audio = ResolvedEncodePlan.audioPlan(source, mode)
+            return audio !is ResolvedEncodePlan.AudioPlan.Reencode ||
+                (source.audioBitrate > 0 && audio.requestedBitrate >= source.audioBitrate)
+        }
 
         // Re-check on the orientation-normalized source: if the clip's short edge puts it in a
         // lower floor tier, the encode may still have real headroom and must not be skipped.
@@ -406,6 +415,26 @@ object BatchQualityBitratePolicy {
             outputHeight = normalized.height
         )
         return conservativeTarget >= sourceVideoBitrate
+    }
+
+    /** The encoder and the source-FPS retry offer share this resolution tier and target. */
+    internal fun highQualityTargetVideoBitrate(
+        source: VideoSourceInfo,
+        sourceVideoBitrate: Int = source.videoBitrate,
+        fpsScale: Float = 1f,
+        heightScale: Float = 1f
+    ): Int {
+        if (sourceVideoBitrate <= 0) return 0
+        val resolution = if (source.width > 0 && source.height > 0) shortEdge(source) else longEdge(source)
+        val floor = when {
+            resolution >= 2160 -> 12_000_000
+            resolution >= 1440 -> 8_000_000
+            resolution >= 1080 -> 5_000_000
+            resolution >= 720 -> 2_500_000
+            else -> 1_000_000
+        }
+        val ratio = HIGH_QUALITY_RATIO.toFloat() * fpsScale * heightScale
+        return (sourceVideoBitrate * ratio).toInt().coerceIn(minOf(floor, sourceVideoBitrate), sourceVideoBitrate)
     }
 
     fun calculateVideoBitrate(
@@ -455,21 +484,8 @@ object BatchQualityBitratePolicy {
                 val target = (originalVideoBitrate * targetRatio).toInt()
                 target.coerceIn(floor.coerceAtMost(originalVideoBitrate), originalVideoBitrate)
             }
-            BatchQualityMode.HIGH_QUALITY -> {
-                val ratio = 0.72f * fpsScale * heightScale
-                val floor = when {
-                    source.height >= 2160 -> 12_000_000
-                    source.height >= 1440 -> 8_000_000
-                    source.height >= 1080 -> 5_000_000
-                    source.height >= 720 -> 2_500_000
-                    else -> 1_000_000
-                }
-                // Clamp the floor to at most the source bitrate before coerceIn: an already-
-                // below-floor source (e.g. a 1080p clip at 3 Mbps, floor 5 Mbps) would otherwise
-                // make min > max and throw. This resolves to "no shrink" (target = source).
-                (originalVideoBitrate * ratio).toInt()
-                    .coerceIn(floor.coerceAtMost(originalVideoBitrate), originalVideoBitrate)
-            }
+            BatchQualityMode.HIGH_QUALITY ->
+                highQualityTargetVideoBitrate(source, originalVideoBitrate, fpsScale, heightScale)
             BatchQualityMode.STORAGE_SAVER -> {
                 val ratio = 0.42f * fpsScale * heightScale
                 val floor = when {
@@ -672,8 +688,12 @@ object BatchQualityBitratePolicy {
         val outputFps = plannedOutputFps(source.frameRate, mode, frameRateChoice)
         val outputHeight = targetHeightFor(source.height, mode)
         val videoBitrate = calculateVideoBitrate(source, mode, outputMimeType, outputFps, outputHeight)
-        val audioBitrate = calculateAudioBitrate(source, mode)
-        val estimatedBits = (videoBitrate + audioBitrate).toDouble() * durationSec
+        val audioBitrate = if (mode == BatchQualityMode.HIGH_QUALITY) {
+            ResolvedEncodePlan.audioPlan(source, mode).estimateBitrate
+        } else {
+            calculateAudioBitrate(source, mode)
+        }
+        val estimatedBits = (videoBitrate.toDouble() + audioBitrate) * durationSec
         val containerOverhead = estimatedBits * 0.04
         return ((estimatedBits + containerOverhead) / 8.0).toLong().coerceAtLeast(1L)
     }

@@ -5,6 +5,8 @@ import android.content.ContentValues
 import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
+import java.io.File
+import java.io.FileInputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.security.MessageDigest
@@ -31,9 +33,11 @@ internal object GalleryPublication {
     data class Content(val bytes: Long, val sha256: String)
 
     enum class Stage {
+        /** The requested output-copy location check found a tag or could not read the cache file. */
+        LOCATION_PRIVACY,
         /** The provider gave no row. Nothing was written. */
         INSERT,
-        /** The row could not be opened, or the copy into it, or its close, failed. */
+        /** The row could not be opened, the video source was empty, or copying or closing failed. */
         WRITE,
         /** The source read now is not the bytes the caller expected: what would be saved is not what it means to save. */
         SOURCE_CHANGED,
@@ -70,6 +74,28 @@ internal object GalleryPublication {
         fun delete(uri: String)
     }
 
+    /** Save Copies can run after a change of privacy settings. Inspect and copy the same open file. */
+    fun saveOutputCopy(
+        file: File,
+        removeLocation: Boolean,
+        containsLocation: (FileInputStream) -> Boolean,
+        publish: (() -> InputStream) -> Result
+    ): Result {
+        if (!removeLocation) return publish(file::inputStream)
+        return try {
+            file.inputStream().use { input ->
+                if (containsLocation(input)) {
+                    Result.Failed(Stage.LOCATION_PRIVACY, "embedded location is still present", cleanupFailed = false)
+                } else {
+                    input.channel.position(0L)
+                    publish { input }
+                }
+            }
+        } catch (e: Exception) {
+            Result.Failed(Stage.LOCATION_PRIVACY, "location check failed (${describe(e)})", cleanupFailed = false)
+        }
+    }
+
     /**
      * Saves the bytes [openSource] yields as a new gallery item.
      *
@@ -92,6 +118,7 @@ internal object GalleryPublication {
         } catch (e: Exception) {
             return failed(Stage.WRITE, describe(e))
         }
+        if (written.bytes == 0L) return failed(Stage.WRITE, "the video source was empty")
         if (expectedSha256 != null && !written.sha256.equals(expectedSha256, ignoreCase = true)) {
             return failed(Stage.SOURCE_CHANGED, "the source read as ${written.bytes} bytes with a digest other than the one expected")
         }
@@ -180,11 +207,15 @@ internal class MediaStoreGallery(
 
 /** What the user is told after saving output copies: only a copy proven in the gallery counts as saved. */
 internal object GallerySaveSummary {
-    fun message(saved: Int, unconfirmed: Int, privacySummary: String): String {
+    fun message(saved: Int, unconfirmed: Int, privacySummary: String, locationBlocked: Int = 0): String {
         fun copies(n: Int) = if (n == 1) "1 output copy" else "$n output copies"
-        val head = "Saved ${copies(saved)} to Movies/Compressor with $privacySummary."
-        if (unconfirmed <= 0) return head
+        val head = if (saved == 0 && locationBlocked > 0) "No output copies were saved."
+            else "Saved ${copies(saved)} to Movies/Compressor with $privacySummary."
+        val privacy = if (locationBlocked > 0) {
+            " Location removal could not be confirmed for ${copies(locationBlocked)}. Run compression again with location removal selected."
+        } else ""
+        if (unconfirmed <= 0) return head + privacy
         val verb = if (unconfirmed == 1) "was" else "were"
-        return "$head ${copies(unconfirmed).replaceFirstChar { it.uppercase() }} could not be confirmed in the gallery and $verb not counted; try saving again."
+        return "$head ${copies(unconfirmed).replaceFirstChar { it.uppercase() }} could not be confirmed in the gallery and $verb not counted; try saving again.$privacy"
     }
 }

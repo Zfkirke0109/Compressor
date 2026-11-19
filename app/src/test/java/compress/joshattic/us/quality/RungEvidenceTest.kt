@@ -42,6 +42,22 @@ class RungEvidenceTest {
     }
 
     @Test
+    fun aNearMissCannotRejectTheHigherCeilingWhenTheCeilingWasUndecided() {
+        val nearMiss = rung(0.95, 95.4)
+        assertEquals(0.97, QualityProbePolicy.upwardRefinementCandidate(0.95, nearMiss.scores)!!, 0.0)
+        fun safestWith(ceiling: RungEvidence) = RungEvidence.safestAttempted(listOf(nearMiss, ceiling), 0.95)!!.measuredVerdict
+        val ceiling = rung(0.97, 97.0, 97.0, 97.0)
+        assertEquals(QualityProbePolicy.RungVerdict.INSUFFICIENT,
+            safestWith(ceiling.copy(scores = listOf(w(94.0).copy(comparedFrames = 11)))))
+        assertEquals(QualityProbePolicy.RungVerdict.UNMEASURED, safestWith(ceiling.copy(outcome = RungEvidence.MISALIGNED)))
+        assertEquals(QualityProbePolicy.RungVerdict.UNMEASURED, safestWith(ceiling.copy(outcome = RungEvidence.UNAVAILABLE)))
+        assertEquals(QualityProbePolicy.RungVerdict.UNMEASURED, safestWith(rung(0.97, 97.0)))
+        assertEquals(QualityProbePolicy.RungVerdict.FAILED, safestWith(rung(0.97, 95.4)))
+        assertEquals(QualityProbePolicy.RungVerdict.PASSED, safestWith(ceiling))
+        assertNull(RungEvidence.safestAttempted(listOf(nearMiss), highestScheduled = 0.97))
+    }
+
+    @Test
     fun completeLowerMarginalRefinementCanTryForMoreSavings() {
         val safer = rung(0.80, 96.590, 98.119, 96.484)
         val lower = rung(0.75, 96.446, 97.493, 95.963).copy(verdict = "marginal")

@@ -54,8 +54,7 @@ class SafeCopyProcessDeathDeviceTest {
         val bytes = InstrumentationRegistry.getInstrumentation().context.assets.open("edit_whole_168.mp4").use { it.readBytes() }
         val output = File(copies.runDir, "output-death.mp4").apply { writeBytes(bytes) }
         val outputSha = HarnessCopies.sha256(bytes)
-        val recovery = ReplacementContentProof.newRecoveryFile(copies.recoveryDir, "job_pllab_death")
-        ReplacementJournal.markActive(recovery)
+        val recovery = ReplacementJournal.newActiveCopy(copies.recoveryDir, "job_pllab_death")
         val real = ContentResolverReplacementIo(context.contentResolver, c, output, recovery, outputSha)
         val dying = object : OriginalReplacementIo by real {
             override fun writeOutputOverOriginal() {

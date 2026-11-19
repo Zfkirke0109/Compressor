@@ -81,12 +81,15 @@ data class ReplacementLeftover(val recoveryCopy: File, val journal: ReplacementJ
 object ReplacementJournal {
     const val SUFFIX = ".journal"
 
-    // Rollback copies a replacement in THIS process is using right now. A scan for leftovers must
-    // not take one of them for the remains of a dead process and dispose of it mid-write.
-    private val active = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    // Includes copies being staged by a replacement and copies claimed by a startup scan.
+    // Allocation, discovery and registration share one lock. Provider I/O happens outside it.
+    private val active = mutableSetOf<String>()
 
-    fun markActive(recoveryCopy: File) { active += recoveryCopy.absolutePath }
+    @Synchronized
+    fun newActiveCopy(directory: File, jobId: String): File =
+        ReplacementContentProof.newRecoveryFile(directory, jobId).also { active += it.absolutePath }
 
+    @Synchronized
     fun release(recoveryCopy: File) { active -= recoveryCopy.absolutePath }
 
     fun fileFor(recoveryCopy: File): File = File(recoveryCopy.parentFile, recoveryCopy.name + SUFFIX)
@@ -136,14 +139,26 @@ object ReplacementJournal {
      * first, with entries whose copy is gone removed. A copy with no readable entry is still
      * returned: it may be all that is left of an original.
      */
+    @Synchronized
     fun leftovers(directory: File): List<ReplacementLeftover> {
-        val files = directory.listFiles()?.toList().orEmpty()
-        val copies = files.filter { it.isFile && it.name.startsWith(BatchCacheRetention.RECOVERY_FILE_PREFIX) && !isJournalFile(it) }
+        val files = directory.listFiles().orEmpty().filter { it.isFile && it.name.startsWith(BatchCacheRetention.RECOVERY_FILE_PREFIX) }
         files.filter { isJournalFile(it) }.forEach { entry ->
-            val copyName = entry.name.removeSuffix(".tmp").removeSuffix(SUFFIX)
-            if (copies.none { it.name == copyName }) runCatching { entry.delete() }
+            val copy = File(directory, entry.name.removeSuffix(".tmp").removeSuffix(SUFFIX))
+            if (copy.absolutePath !in active && !copy.exists()) runCatching { entry.delete() }
         }
-        return copies.filter { it.absolutePath !in active }.sortedBy { it.lastModified() }.map { ReplacementLeftover(it, read(it)) }
+        return files.filter { !isJournalFile(it) && it.absolutePath !in active }
+            .sortedBy { it.lastModified() }.map { ReplacementLeftover(it, read(it)) }
+    }
+
+    internal fun <T> withClaimedLeftovers(directory: File, recover: (List<ReplacementLeftover>) -> T): T {
+        val claimed = synchronized(this) {
+            leftovers(directory).onEach { active += it.recoveryCopy.absolutePath }
+        }
+        try {
+            return recover(claimed)
+        } finally {
+            claimed.forEach { release(it.recoveryCopy) }
+        }
     }
 
     private fun isJournalFile(file: File) = file.name.endsWith(SUFFIX) || file.name.endsWith("$SUFFIX.tmp")
@@ -191,7 +206,8 @@ object ReplacementRecovery {
     /**
      * Settles every rollback copy in [directory] that no replacement in this process is using.
      *
-     * A copy is deleted when the user's file is proven whole ([classify]), or once a gallery copy
+     * An empty allocation left before the first journal write contains nothing to recover.
+     * A staged copy is deleted when the user's file is proven whole ([classify]), or once a gallery copy
      * of it is proven: published, and read back as the bytes the copy was staged with (as the
      * copy's own bytes when no entry says what those were). A save that is not proven leaves the
      * copy and its entry where they are, so the next start tries again. A copy is never deleted on
@@ -206,16 +222,25 @@ object ReplacementRecovery {
         targetSha256: (ReplacementJournalEntry) -> String?,
         preserve: (ReplacementLeftover, expectedSha256: String?) -> GalleryPublication.Result,
         log: (String) -> Unit = {}
-    ): StartupResult {
+    ): StartupResult = ReplacementJournal.withClaimedLeftovers(directory) { leftovers ->
         var preserved = 0
         var held = 0
-        for (leftover in ReplacementJournal.leftovers(directory)) {
+        for (leftover in leftovers) {
             val journal = leftover.journal
+            // A kill between allocation and the first journal write leaves only an empty file.
+            // Confirm EOF before removing it. An unreadable file or journal may still be needed.
+            val copy = leftover.recoveryCopy
+            if (journal == null && copy.length() == 0L && !ReplacementJournal.fileFor(copy).exists() &&
+                runCatching { copy.inputStream().use { it.read() == -1 } }.getOrDefault(false)
+            ) {
+                ReplacementJournal.discard(copy)
+                continue
+            }
             val target = journal?.takeIf { it.state == ReplacementJournalEntry.STAGED }?.let { runCatching { targetSha256(it) }.getOrNull() }
             val verdict = classify(journal, target)
-            log("replacement recovery; job=${journal?.jobId ?: "unknown"}; verdict=${verdict.name}; copyBytes=${leftover.recoveryCopy.length()}")
+            log("replacement recovery; job=${journal?.jobId ?: "unknown"}; verdict=${verdict.name}; copyBytes=${copy.length()}")
             if (!verdict.preserveCopy) {
-                ReplacementJournal.discard(leftover.recoveryCopy)
+                ReplacementJournal.discard(copy)
                 continue
             }
             val saved = runCatching { preserve(leftover, journal?.stagedSha256) }.getOrElse {
@@ -223,7 +248,7 @@ object ReplacementRecovery {
             }
             when (saved) {
                 is GalleryPublication.Result.Published -> {
-                    ReplacementJournal.discard(leftover.recoveryCopy)
+                    ReplacementJournal.discard(copy)
                     preserved++
                 }
                 is GalleryPublication.Result.Failed -> {
@@ -235,7 +260,7 @@ object ReplacementRecovery {
                 }
             }
         }
-        return StartupResult(preserved, held)
+        StartupResult(preserved, held)
     }
 
     /**

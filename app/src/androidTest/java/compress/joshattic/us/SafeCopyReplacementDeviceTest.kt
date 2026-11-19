@@ -60,8 +60,7 @@ class SafeCopyReplacementDeviceTest {
     /** One replacement of [target] through the app's own IO, with [wrap] around it for a fault. */
     private fun replace(case: String, target: Uri, wrap: (ContentResolverReplacementIo) -> OriginalReplacementIo = { it }): Pair<ReplacementTransaction, File> {
         copies.requireDisposable(target, null)
-        val recovery = ReplacementContentProof.newRecoveryFile(copies.recoveryDir, "job_pllab_$case")
-        ReplacementJournal.markActive(recovery)
+        val recovery = ReplacementJournal.newActiveCopy(copies.recoveryDir, "job_pllab_$case")
         val io = ContentResolverReplacementIo(context.contentResolver, target, output, recovery, outputSha)
         val entry = ReplacementJournalEntry(
             jobId = "job_pllab_$case", state = ReplacementJournalEntry.STAGING, targetUri = target.toString(),

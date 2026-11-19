@@ -165,9 +165,9 @@ class OutputDispositionTest {
         assertFalse(skipped.candidateRejected)
     }
 
-    private fun highQualityPortrait(outputDurationMs: Long = 64_834L) = OutputVerifier.verify(
+    private fun portraitInput(outputDurationMs: Long = 64_834L, mode: BatchQualityMode = BatchQualityMode.HIGH_QUALITY) =
         OutputVerifier.VerificationInput(
-            mode = BatchQualityMode.HIGH_QUALITY,
+            mode = mode,
             source = VideoSourceInfo(width = 2160, height = 3840, frameRate = 30f, durationMs = 64_834, totalBitrate = 15_273_860, audioBitrate = 128_039),
             // Media3 codes a portrait source as landscape with a quarter-turn hint: the display size
             // is the source's, the rotation tag is not.
@@ -180,13 +180,12 @@ class OutputDispositionTest {
             outputSize = 122_130_776L,
             privacyMode = MetadataPrivacyMode.PRESERVE_ALL
         )
-    )
 
     @Test
     fun aVerifiedLossyOutputNamesItsDifferencesWithoutCallingThemFailures() {
         // The same HQ job: H.264 to HEVC, portrait coded as landscape. Its record carried
         // verified=true beside failedChecks=[videoCodec, rotation].
-        val report = highQualityPortrait()
+        val report = OutputVerifier.verify(portraitInput())
         assertEquals("High Quality (lossy mode)", report.verdict)
         assertTrue(report.verified)
         assertEquals(emptyList<String>(), report.failingChecks())
@@ -195,32 +194,138 @@ class OutputDispositionTest {
     }
 
     @Test
-    fun aLossyOutputThatStopsEarlyMayNeverReplaceItsSource() {
-        // Five seconds of a 64.8 s source: playable, and far smaller for the wrong reason. The
-        // lossy verdict is unchanged, but it is not the whole video and must not overwrite it.
-        val truncated = highQualityPortrait(outputDurationMs = 5_000L)
-        assertTrue(truncated.verified)
-        assertFalse(truncated.replacementSafe)
-        assertEquals("output duration differs from the source (possible truncation)", truncated.replacementBlockReason)
-        assertEquals(emptyList<String>(), truncated.failingChecks())
-        assertTrue(truncated.unjudgedDifferences!!.contains("durationMatches"))
-        val acceptance = FinalAcceptance.of(BatchTerminalResult.LOSSY_SMALLER, truncated, 9_000_000L, 9_000_000L)
-        assertFalse(acceptance.replacementSafe)
-        assertFalse(OutputDisposition.of(BatchTerminalResult.LOSSY_SMALLER, acceptance, originalRetained = false, pixelCertified = false).replacementEligible)
-        // Inside the tolerance (the larger of 500 ms and 2 %) it is the whole video.
-        for (ms in listOf(64_834L, 64_400L, 65_900L)) {
-            val whole = highQualityPortrait(outputDurationMs = ms)
-            assertTrue("$ms", whole.replacementSafe)
-            assertEquals("$ms", null, whole.replacementBlockReason)
-        }
-        assertFalse(highQualityPortrait(outputDurationMs = 63_000L).replacementSafe)
+    fun aHardwareDownscaleCannotCountAsHighQualitySavings() {
+        val input = portraitInput()
+        val downscaled = input.copy(outputFileProbe = input.outputFileProbe.copy(width = 1080, height = 1920))
+        assertRejected(downscaled, "videoMatches")
+        assertTrue(OutputVerifier.verify(downscaled.copy(mode = BatchQualityMode.STORAGE_SAVER)).verified)
     }
 
     @Test
-    fun anUnplayableLossyOutputStillFailsOnAPredicateItIsJudgedOn() {
-        val report = highQualityPortrait(outputDurationMs = 0L)
+    fun aTruncatedLossyOutputDoesNotCountAsSavingsOrProduceACopy() {
+        for (mode in listOf(BatchQualityMode.HIGH_QUALITY, BatchQualityMode.STORAGE_SAVER)) {
+            val input = portraitInput(outputDurationMs = 5_000L, mode = mode).copy(outputSize = 9_000_000L)
+            assertRejected(input, "durationMatches")
+            assertRejected(input.copy(source = input.source.copy(durationMs = 0)), "durationMatches")
+        }
+        // Preserve the existing duration tolerance at either boundary.
+        for (ms in listOf(64_834L, 64_400L, 65_900L)) {
+            val whole = OutputVerifier.verify(portraitInput(outputDurationMs = ms))
+            assertTrue("$ms", whole.replacementSafe)
+            assertEquals("$ms", null, whole.replacementBlockReason)
+        }
+        assertRejected(portraitInput(outputDurationMs = 63_000L), "durationMatches")
+    }
+
+    @Test
+    fun missingAudioOrAnUnreadableSourceInventoryCannotPassOnFileDuration() {
+        for (mode in listOf(BatchQualityMode.HIGH_QUALITY, BatchQualityMode.STORAGE_SAVER)) {
+            val input = portraitInput(mode = mode)
+            val silentOutput = input.outputTrackProbe.copy(audioCodec = null, audioBitrate = 0, audioChannelCount = null, audioSampleRate = null)
+            assertRejected(input.copy(outputTrackProbe = silentOutput), "contentTracksMatch")
+            val silentSource = input.sourceTrackProbe.copy(audioCodec = null, audioBitrate = 0, audioChannelCount = null, audioSampleRate = null)
+            assertTrue(OutputVerifier.verify(input.copy(sourceTrackProbe = silentSource, outputTrackProbe = silentOutput)).verified)
+            assertRejected(input.copy(sourceTrackProbe = silentSource.copy(videoCodec = null), outputTrackProbe = silentOutput), "contentTracksMatch")
+            val twoSoundtracks = input.sourceTrackProbe.contentTracks + OutputVerifier.ContentTrack("audio")
+            assertRejected(input.copy(sourceTrackProbe = input.sourceTrackProbe.copy(extractedContentTracks = twoSoundtracks)), "contentTracksMatch")
+        }
+    }
+
+    @Test
+    fun differentSourceTrackDurationsAreValidButOneTruncatedTrackCannotHideBehindTheOther() {
+        val input = portraitInput()
+        val source = listOf(OutputVerifier.ContentTrack("video", 64_834L), OutputVerifier.ContentTrack("audio", 55_000L))
+        val checked = input.copy(sourceTrackProbe = input.sourceTrackProbe.copy(extractedContentTracks = source))
+        assertTrue(OutputVerifier.verify(checked.copy(outputTrackProbe = input.outputTrackProbe.copy(extractedContentTracks = source))).verified)
+        for (kind in listOf("video", "audio")) {
+            val truncated = source.map { if (it.kind == kind) it.copy(durationMs = 5_000L) else it }
+            assertRejected(checked.copy(outputTrackProbe = input.outputTrackProbe.copy(extractedContentTracks = truncated)), "durationMatches")
+        }
+    }
+
+    @Test
+    fun completeLossyOutputCanChangeFrameRateAudioCodecAndStorageSaverResolution() {
+        for (mode in listOf(BatchQualityMode.HIGH_QUALITY, BatchQualityMode.STORAGE_SAVER)) {
+            val input = portraitInput(mode = mode)
+            val output = input.outputFileProbe.copy(fps = 24f, frameCount = 1556)
+            val report = OutputVerifier.verify(input.copy(
+                outputFileProbe = if (mode == BatchQualityMode.STORAGE_SAVER) output.copy(width = 608, height = 1080) else output,
+                sourceFrameCount = 1945,
+                sourceTrackProbe = input.sourceTrackProbe.copy(audioCodec = "audio/mpeg")
+            ))
+            assertTrue(report.verified)
+            assertTrue(report.replacementSafe)
+            assertEquals(emptyList<String>(), report.failingChecks())
+            assertNull(report.replacementBlockReason)
+            assertFalse(report.pixelCertified)
+        }
+    }
+
+    @Test
+    fun droppingAnEmbeddedSubtitleTrackIsNotAValidOutputInAnyMode() {
+        val input = portraitInput()
+        val captions = requireNotNull(OutputVerifier.ContentTrack.from("application/x-quicktime-tx3g"))
+        assertNull(OutputVerifier.ContentTrack.from("application/id3"))
+        val withCaptions = input.sourceTrackProbe.copy(extractedContentTracks = input.sourceTrackProbe.contentTracks + captions)
+        for (mode in BatchQualityMode.entries) {
+            val sameStreams = input.copy(
+                mode = mode,
+                outputFileProbe = input.outputFileProbe.copy(rotationDegrees = 0),
+                sourceTrackProbe = withCaptions,
+                outputTrackProbe = withCaptions,
+                videoTimeline = MediaTimelineEvidence.Result(true, 1945, 1945, 0, 0),
+                audioPacketsIdentical = true
+            )
+            assertTrue(mode.name, OutputVerifier.verify(sameStreams).verified)
+            assertRejected(sameStreams.copy(outputTrackProbe = input.sourceTrackProbe), "contentTracksMatch")
+        }
+    }
+
+    @Test
+    fun locationRemovalChecksTheActualOutputInEveryMode() {
+        val input = portraitInput()
+        val gps = VideoMetadataSnapshot(latitude = 42.25, longitude = -71.0, rotationDegrees = 0)
+        val complete = input.copy(
+            outputFileProbe = input.outputFileProbe.copy(rotationDegrees = 0),
+            outputTrackProbe = input.sourceTrackProbe,
+            sourceMetadata = gps, outputMetadata = gps,
+            videoTimeline = MediaTimelineEvidence.Result(true, 1945, 1945, 0, 0),
+            audioPacketsIdentical = true
+        )
+        for (mode in BatchQualityMode.entries) {
+            val preserved = complete.copy(mode = mode)
+            assertTrue(mode.name, OutputVerifier.verify(preserved).verified)
+            val removing = preserved.copy(privacyMode = MetadataPrivacyMode.REMOVE_LOCATION)
+            assertRejected(removing.copy(embeddedLocationDetected = true), "locationRemovalPass")
+            val stripped = removing.copy(outputMetadata = VideoMetadataSnapshot(), embeddedLocationDetected = false)
+            assertTrue(mode.name, OutputVerifier.verify(stripped).verified)
+            assertEquals("no embedded location detected", OutputVerifier.verify(stripped).location)
+            assertRejected(stripped.copy(embeddedLocationDetected = null), "locationRemovalPass")
+            assertRejected(stripped.copy(outputMetadata = VideoMetadataSnapshot(rawLocationTag = "tag")), "locationRemovalPass")
+        }
+    }
+
+    @Test
+    fun anUnplayableLossyOutputReportsBothFailedIntegrityChecks() {
+        val report = OutputVerifier.verify(portraitInput(outputDurationMs = 0L))
+        assertEquals(listOf("playable", "durationMatches"), report.failingChecks())
+    }
+
+    private fun assertRejected(input: OutputVerifier.VerificationInput, failedCheck: String) {
+        val report = OutputVerifier.verify(input)
         assertFalse(report.verified)
         assertFalse(report.replacementSafe)
-        assertEquals(listOf("playable"), report.failingChecks())
+        assertEquals(listOf(failedCheck), report.failingChecks())
+        val terminal = BatchTerminalClassifier.classify(BatchTerminalInput(
+            requestedMode = input.mode, effectiveMode = input.mode, wasStreamCopy = input.mode == BatchQualityMode.REMUX_ONLY,
+            verified = report.verified, replacementSafe = report.replacementSafe, sourceSize = input.sourceSize, outputSize = input.outputSize
+        ))
+        assertEquals(BatchTerminalResult.OUTPUT_VALIDATION_FAILED, terminal)
+        assertEquals(0L, BatchTerminalAccounting.savedBytes(BatchTerminalAccountingEntry(terminal, input.sourceSize, input.outputSize)))
+        val d = disposition(terminal, report, kept = input.outputSize, candidate = input.outputSize)
+        assertEquals(OutputDisposition.OUTPUT_NONE, d.output)
+        assertTrue(d.candidateRejected)
+        assertFalse(d.qualifyingSavings)
+        assertFalse(d.replacementEligible)
     }
 }

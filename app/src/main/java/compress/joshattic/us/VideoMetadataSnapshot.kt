@@ -290,6 +290,102 @@ object VideoMetadataPreserver {
         }.getOrNull()
     }
 
+    /** Checks the cache file itself. A read failure is distinct from finding no location. */
+    internal fun containsEmbeddedLocation(input: FileInputStream): Boolean {
+        if (outputHasLocationAtom(input.channel)) return true
+        val retriever = MediaMetadataRetriever()
+        try {
+            retriever.setDataSource(input.fd)
+            return !retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_LOCATION).isNullOrBlank()
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
+    /** Strict scan of MP4 output. The source metadata reader separately recovers usable coordinates. */
+    internal fun outputHasLocationAtom(channel: java.nio.channels.FileChannel): Boolean {
+        val header = ByteBuffer.allocate(8)
+        val isoLocationKey = "com.apple.quicktime.location.ISO6709".toByteArray(StandardCharsets.UTF_8)
+        var movieFound = false
+        var boxesRead = 0
+
+        fun readInto(position: Long, buffer: ByteBuffer): ByteBuffer {
+            while (buffer.hasRemaining()) {
+                check(channel.read(buffer, position + buffer.position()) > 0) { "incomplete MP4 metadata" }
+            }
+            buffer.flip()
+            return buffer
+        }
+
+        fun readWord(position: Long, length: Int): ByteBuffer {
+            header.clear()
+            header.limit(length)
+            return readInto(position, header)
+        }
+
+        fun hasQuickTimeLocationKey(start: Long, end: Long): Boolean {
+            require(end - start >= 8) { "incomplete MP4 metadata keys" }
+            val keys = readWord(start, 8)
+            require(keys.int == 0) { "unsupported MP4 metadata keys" }
+            val count = keys.int
+            require(count in 0..100_000) { "invalid MP4 metadata key count" }
+            var offset = start + 8
+            repeat(count) {
+                require(end - offset >= 8) { "incomplete MP4 metadata key" }
+                val entry = readWord(offset, 8)
+                val size = entry.int.toLong() and 0xffff_ffffL
+                val mdtaNamespace = entry.int == 0x6d647461 // "mdta"
+                require(size in 8..(end - offset)) { "invalid MP4 metadata key size" }
+                if (mdtaNamespace && size == 8L + isoLocationKey.size) {
+                    val key = readInto(offset + 8, ByteBuffer.allocate(isoLocationKey.size)).array()
+                    if (key.contentEquals(isoLocationKey)) return true
+                }
+                offset += size
+            }
+            require(offset == end) { "incomplete MP4 metadata key table" }
+            return false
+        }
+
+        fun inspect(start: Long, end: Long, depth: Int, parent: String? = null): Boolean {
+            require(depth <= MAX_MP4_SCAN_DEPTH) { "MP4 nesting limit" }
+            var offset = start
+            while (offset < end) {
+                require(++boxesRead <= 100_000 && end - offset >= 8L) { "incomplete or oversized MP4 box table" }
+                val word = readWord(offset, 8)
+                val size32 = word.int.toLong() and 0xffff_ffffL
+                val type = String(word.array(), 4, 4, StandardCharsets.ISO_8859_1)
+                val headerSize = if (size32 == 1L) 16L else 8L
+                require(end - offset >= headerSize) { "incomplete MP4 box header" }
+                val size = when (size32) {
+                    0L -> end - offset
+                    1L -> readWord(offset + 8L, 8).long
+                    else -> size32
+                }
+                require(size in headerSize..(end - offset)) { "invalid MP4 box size" }
+                if (isLocationBox(type) || type == "loci") return true
+                val boxEnd = offset + size
+                if (parent == "meta" && type == "keys" && hasQuickTimeLocationKey(offset + headerSize, boxEnd)) return true
+                if (type in mp4ContainerTypes) {
+                    if (depth == 0 && type == "moov") movieFound = true
+                    var children = offset + headerSize
+                    if (type == "meta") {
+                        require(boxEnd - children >= 4L) { "incomplete MP4 meta box" }
+                        // ISO FullBox starts with version/flags = 0. QuickTime meta starts with
+                        // the first child header. Both layouts must parse to their declared end.
+                        if (readWord(children, 4).int == 0) children += 4L
+                    }
+                    if (inspect(children, boxEnd, depth + 1, type)) return true
+                }
+                offset = boxEnd
+            }
+            return false
+        }
+
+        if (inspect(0L, channel.size(), 0)) return true
+        require(movieFound) { "MP4 movie box unavailable" }
+        return false
+    }
+
     private fun readMp4LocationAtom(context: Context, uri: Uri): String? {
         return runCatching {
             context.contentResolver.openFileDescriptor(uri, "r")?.use { descriptor ->
