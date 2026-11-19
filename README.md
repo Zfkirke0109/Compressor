@@ -27,6 +27,8 @@ Galaxy Compressor runs on 64-bit ARM devices with Android 7.0 or later. The curr
 
 You can adjust codec, frame rate and thermal pacing, and choose whether to preserve recording dates and location. Optional Shizuku support provides another route for authorized file operations.
 
+With Remove Location selected, Compressor checks the finished MP4 for Android's embedded location tag, QuickTime location atoms and ISO 6709 metadata keys, and the 3GPP location box. Save Copies and Share check the closed cache files again using the selected privacy setting. A detected location or an incomplete check blocks the affected save or the entire share. Private vendor fields and coordinates visible in the video itself remain outside these checks.
+
 ## What changed in v1.6.335
 
 The S26 Ultra and S23 Ultra use separate encoder profiles. Exhaustive mode can try a lower measured bitrate, use a bounded hardware AVC search on eligible inputs and retry a safer measured bitrate when needed. Device-specific learning, native frame preparation and targeted MP4/AAC repairs support that search. Gallery saves now require a successful publish and a byte-for-byte read-back before Compressor reports success. [Release notes](CHANGELOG.md) · [Quality criteria](docs/PERCEPTUALLY_LOSSLESS.md) · [Device validation](docs/DEVICE_VALIDATION.md)

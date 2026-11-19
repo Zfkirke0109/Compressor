@@ -305,20 +305,48 @@ object VideoMetadataPreserver {
     /** Strict scan of MP4 output. The source metadata reader separately recovers usable coordinates. */
     internal fun outputHasLocationAtom(channel: java.nio.channels.FileChannel): Boolean {
         val header = ByteBuffer.allocate(8)
+        val isoLocationKey = "com.apple.quicktime.location.ISO6709".toByteArray(StandardCharsets.UTF_8)
         var movieFound = false
         var boxesRead = 0
+
+        fun readInto(position: Long, buffer: ByteBuffer): ByteBuffer {
+            while (buffer.hasRemaining()) {
+                check(channel.read(buffer, position + buffer.position()) > 0) { "incomplete MP4 metadata" }
+            }
+            buffer.flip()
+            return buffer
+        }
 
         fun readWord(position: Long, length: Int): ByteBuffer {
             header.clear()
             header.limit(length)
-            while (header.hasRemaining()) {
-                check(channel.read(header, position + header.position()) > 0) { "incomplete MP4 header" }
-            }
-            header.flip()
-            return header
+            return readInto(position, header)
         }
 
-        fun inspect(start: Long, end: Long, depth: Int): Boolean {
+        fun hasQuickTimeLocationKey(start: Long, end: Long): Boolean {
+            require(end - start >= 8) { "incomplete MP4 metadata keys" }
+            val keys = readWord(start, 8)
+            require(keys.int == 0) { "unsupported MP4 metadata keys" }
+            val count = keys.int
+            require(count in 0..100_000) { "invalid MP4 metadata key count" }
+            var offset = start + 8
+            repeat(count) {
+                require(end - offset >= 8) { "incomplete MP4 metadata key" }
+                val entry = readWord(offset, 8)
+                val size = entry.int.toLong() and 0xffff_ffffL
+                val mdtaNamespace = entry.int == 0x6d647461 // "mdta"
+                require(size in 8..(end - offset)) { "invalid MP4 metadata key size" }
+                if (mdtaNamespace && size == 8L + isoLocationKey.size) {
+                    val key = readInto(offset + 8, ByteBuffer.allocate(isoLocationKey.size)).array()
+                    if (key.contentEquals(isoLocationKey)) return true
+                }
+                offset += size
+            }
+            require(offset == end) { "incomplete MP4 metadata key table" }
+            return false
+        }
+
+        fun inspect(start: Long, end: Long, depth: Int, parent: String? = null): Boolean {
             require(depth <= MAX_MP4_SCAN_DEPTH) { "MP4 nesting limit" }
             var offset = start
             while (offset < end) {
@@ -334,8 +362,9 @@ object VideoMetadataPreserver {
                     else -> size32
                 }
                 require(size in headerSize..(end - offset)) { "invalid MP4 box size" }
-                if (isLocationBox(type)) return true
+                if (isLocationBox(type) || type == "loci") return true
                 val boxEnd = offset + size
+                if (parent == "meta" && type == "keys" && hasQuickTimeLocationKey(offset + headerSize, boxEnd)) return true
                 if (type in mp4ContainerTypes) {
                     if (depth == 0 && type == "moov") movieFound = true
                     var children = offset + headerSize
@@ -345,7 +374,7 @@ object VideoMetadataPreserver {
                         // the first child header. Both layouts must parse to their declared end.
                         if (readWord(children, 4).int == 0) children += 4L
                     }
-                    if (inspect(children, boxEnd, depth + 1)) return true
+                    if (inspect(children, boxEnd, depth + 1, type)) return true
                 }
                 offset = boxEnd
             }

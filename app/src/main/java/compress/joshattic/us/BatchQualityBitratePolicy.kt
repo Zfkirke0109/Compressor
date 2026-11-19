@@ -163,7 +163,7 @@ object BatchQualityBitratePolicy {
             )
             BatchQualityMode.HIGH_QUALITY -> BatchModeProfile(
                 label = mode.label,
-                honestSummary = "Lossy re-encode at source resolution. Keeps the source frame rate unless you select a cap. Output size and visible quality depend on the clip.",
+                honestSummary = "Lossy re-encode. Requests the source resolution and frame rate unless you select an FPS cap. Output size and visible quality depend on the clip.",
                 allowsResolutionReduction = false,
                 allowsFrameRateReduction = true
             )

@@ -88,7 +88,7 @@ private const val PIXEL_PROVEN_UNDERSHOOT_TOLERANCE = 0.15
 internal enum class BatchQualityPreset(val label: String, val targetRatio: Float) {
     REMUX_ONLY("Remux Only", 1.0f),
     ORIGINAL("Perceptually Lossless", 0.85f),
-    HIGH("High Quality", 0.70f),
+    HIGH("High Quality", BatchQualityBitratePolicy.HIGH_QUALITY_RATIO.toFloat()),
     MEDIUM("Storage Saver", 0.40f),
     LOW("Low", 0.22f)
 }
@@ -185,6 +185,18 @@ data class BatchVideoItem(
     val currentOutputDisplaySize: String get() = formatFileSize(currentOutputSize)
     val targetOutputDisplaySize: String get() = formatFileSize(targetOutputSize)
     val progressPercent: Int get() = (progress.coerceIn(0f, 1f) * 100f).toInt()
+
+    internal fun outputName(quality: BatchQualityPreset? = null): String {
+        val base = originalName.substringBeforeLast(".").ifBlank { "Video_${System.currentTimeMillis()}" }
+        val remux = (quality?.label ?: outputMode) == BatchQualityPreset.REMUX_ONLY.label
+        return "${base}_${if (remux) "Remuxed" else "Compressed"}.mp4"
+    }
+
+    internal fun withGalleryReceipt(saved: BatchVideoItem?): BatchVideoItem {
+        if (saved == null || outputPath == null || saved.sourceUri != sourceUri || saved.attempt != attempt ||
+            saved.outputPath != outputPath || saved.outputSize != outputSize || saved.outputMode != outputMode) return this
+        return copy(galleryCopySaved = true)
+    }
 }
 
 data class BatchCompressorUiState(
@@ -290,7 +302,7 @@ data class BatchCompressorUiState(
                 result == null -> previous
                 previous.outputPath != null && (result.outputPath == null || result.terminalResult?.countsAsRealCompression != true) ->
                     previous.copy(message = listOfNotNull(previous.message,
-                        "High Quality retry: ${result.terminalResult?.label ?: "no completed output"}. Previous copy available."
+                        "High Quality retry • ${result.terminalResult?.label ?: "no completed output"}. Previous copy available."
                     ).joinToString(" "))
                 else -> result
             }
@@ -743,22 +755,26 @@ class BatchCompressorViewModel internal constructor(
     }
 
     private fun clearBatchState() {
-        clearBatchCache()
-        _uiState.update {
-            it.copy(
-                items = emptyList(),
-                statusMessage = null,
-                errorMessage = null,
-                isLoading = false,
-                isCompressing = false,
-                highQualityRetryCandidates = emptyList(),
-                batchMetrics = null
-            )
+        val cleared = ExportDebugTracing.tryChangeSettings {
+            clearBatchCache()
+            _uiState.update {
+                it.copy(
+                    items = emptyList(),
+                    statusMessage = null,
+                    errorMessage = null,
+                    isLoading = false,
+                    isCompressing = false,
+                    highQualityRetryCandidates = emptyList(),
+                    batchMetrics = null
+                )
+            }
         }
+        if (!cleared) _uiState.update { it.copy(statusMessage = "Another operation is using these files. Try clearing them when it finishes.") }
     }
 
     /** A recreated Activity and its retained ViewModel must consume the launch share only once. */
     fun receiveSharedVideos(context: Context, uris: List<Uri>, fromActivityCreation: Boolean) {
+        if (uris.isEmpty()) return
         if (fromActivityCreation && handledActivityShare) return
         handledActivityShare = true
         loadUris(context, uris, fromShare = true)
@@ -819,9 +835,14 @@ class BatchCompressorViewModel internal constructor(
                 ""
             }
             _uiState.update {
+                if (items.isEmpty() && it.items.isNotEmpty()) return@update it.copy(
+                    isLoading = false,
+                    statusMessage = "No readable videos in the new selection. Previous results kept.$unreadableNote"
+                )
                 it.copy(
                     items = items,
                     isLoading = false,
+                    batchMetrics = null,
                     highQualityRetryCandidates = emptyList(),
                     deviceProfile = DeviceCapabilityProfiles.current().name,
                     hasHardwareAv1Encoder = hasEncoder(MimeTypes.VIDEO_AV1),
@@ -1383,6 +1404,9 @@ class BatchCompressorViewModel internal constructor(
                             phaseSteps = null,
                             candidateOutputSize = 0L,
                             estimateIsProvisional = true,
+                            replacementOutcome = null,
+                            copySaved = null,
+                            galleryCopySaved = false,
                             currentOutputSize = 0L,
                             targetOutputSize = estimateOutputSize(item, quality, codec, frameRate),
                             outputUri = null,
@@ -2134,13 +2158,11 @@ class BatchCompressorViewModel internal constructor(
         val item = s.item
         val context = run.context
         val remuxResult = if (s.effectiveQuality == BatchQualityPreset.REMUX_ONLY) {
-            s.candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
-            remuxOnlyOne(context, item, s.phases, run.privacyMode)
+            remuxOnlyOne(s)
         } else {
             val safeResolvedMime = s.resolvedMime
                 ?: throw IllegalStateException("Encoder selection failed before export planning. Use Remux Only or choose a different codec.")
             try {
-                s.candidateFiles += item.cacheOutputFile(context, run.quality)
                 val attempt = encodeReadingSource(s, safeResolvedMime)
                 s.encodeAttempt = attempt
                 s.phases.detail("Finalizing: writing the source's metadata into the output…")
@@ -2254,6 +2276,7 @@ class BatchCompressorViewModel internal constructor(
         val run = s.run
         val plan = s.perceptualPlan
         val encodePlan = s.resolvedPlan ?: resolveEncodePlan(s, mime).also { s.resolvedPlan = it }
+        val outputFile = s.newCacheOutput(run.quality)
         suspend fun encode() = compressOne(
             run.context,
             s.item,
@@ -2261,6 +2284,7 @@ class BatchCompressorViewModel internal constructor(
             run.quality,
             run.frameRate,
             mime,
+            outputFile = outputFile,
             plan = encodePlan,
             phases = s.phases,
             useCbrCeiling = plan?.useCbrCeiling == true,
@@ -2479,8 +2503,7 @@ class BatchCompressorViewModel internal constructor(
         s.effectiveQuality = BatchQualityPreset.REMUX_ONLY
         s.diagnosticEffectiveQuality = s.effectiveQuality
         s.preEncodeRemuxNote = "Remux Fallback Kept: the encoder rejected the perceptually lossless attempt ($reason)"
-        s.candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
-        return remuxOnlyOne(context, item, s.phases, run.privacyMode)
+        return remuxOnlyOne(s)
     }
 
     /**
@@ -2699,7 +2722,7 @@ class BatchCompressorViewModel internal constructor(
         val context = run.context
         val item = s.item
         val directory = candidate.parentFile ?: context.cacheDir
-        val repairedFile = File(directory, "pl-timing-${System.nanoTime()}.mp4")
+        val repairedFile = OutputSharing.newCacheFile(directory, ".mp4", prefix = "pl-timing-")
         s.candidateFiles += repairedFile
         val repaired = withContext(Dispatchers.IO) {
             val ioContext = currentCoroutineContext()
@@ -3292,8 +3315,7 @@ class BatchCompressorViewModel internal constructor(
             s.cooldownForNextItemMs = applyPostItemCooldown(context, s.index, ranFullEncode = s.encodeAttempt != null)
             return false
         }
-        s.candidateFiles += item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
-        val remuxResult = remuxOnlyOne(context, item, s.phases, run.privacyMode)
+        val remuxResult = remuxOnlyOne(s)
         s.remuxResult = remuxResult
         s.outputFile = remuxResult.outputFile
         s.outputUri = Uri.fromFile(remuxResult.outputFile)
@@ -3642,38 +3664,46 @@ class BatchCompressorViewModel internal constructor(
         _uiState.update { it.copy(isSavingCopies = true) }
         viewModelScope.launch(Dispatchers.IO) {
             try {
-            var saved = 0
-            var unconfirmed = 0
-            var locationBlocked = 0
-            val proven = mutableMapOf<Uri, BatchVideoItem>()
-            outputs.forEach { (item, file) ->
-                val result = GalleryPublication.saveOutputCopy(file, privacyMode.removeLocation, VideoMetadataPreserver::containsEmbeddedLocation) { openSource ->
-                    saveToGallery(context, openSource, item.outputName(qualityFromLabel(item.outputMode ?: settings.qualityPreset)),
-                        item.metadataSnapshot, privacyMode, expectedSha256 = null)
+                val started = ExportDebugTracing.tryRunExclusive {
+                    publishBatchCopies(context.applicationContext, outputs, settings.qualityPreset, privacyMode)
                 }
-                when (result) {
-                    is GalleryPublication.Result.Published -> {
-                        saved++
-                        proven[item.sourceUri] = item
-                    }
-                    is GalleryPublication.Result.Failed -> if (result.stage == GalleryPublication.Stage.LOCATION_PRIVACY) locationBlocked++ else unconfirmed++
-                }
-            }
-            _uiState.update { state ->
-                state.copy(
-                    items = state.items.map { item ->
-                        val savedItem = proven[item.sourceUri]
-                        if (savedItem != null && savedItem.attempt == item.attempt &&
-                            savedItem.outputPath == item.outputPath && savedItem.outputSize == item.outputSize) {
-                            item.copy(galleryCopySaved = true)
-                        } else item
-                    },
-                    statusMessage = GallerySaveSummary.message(saved, unconfirmed, privacyMode.summary, locationBlocked)
-                )
-            }
+                if (!started) _uiState.update { it.copy(statusMessage = "Another operation is active. Try saving again when it finishes.") }
             } finally {
                 _uiState.update { it.copy(isSavingCopies = false) }
             }
+        }
+    }
+
+    private fun publishBatchCopies(
+        context: Context,
+        outputs: List<Pair<BatchVideoItem, File>>,
+        qualityPreset: String,
+        privacyMode: MetadataPrivacyMode
+    ) {
+        var unconfirmed = 0
+        var locationBlocked = 0
+        val proven = mutableMapOf<Uri, BatchVideoItem>()
+        outputs.forEach { (item, file) ->
+            val result = GalleryPublication.saveOutputCopy(
+                file, privacyMode.removeLocation, VideoMetadataPreserver::containsEmbeddedLocation
+            ) { openSource ->
+                saveToGallery(
+                    context, openSource, item.outputName(qualityFromLabel(item.outputMode ?: qualityPreset)),
+                    item.metadataSnapshot, privacyMode, expectedSha256 = null
+                )
+            }
+            when (result) {
+                is GalleryPublication.Result.Published -> proven[item.sourceUri] = item
+                is GalleryPublication.Result.Failed -> {
+                    if (result.stage == GalleryPublication.Stage.LOCATION_PRIVACY) locationBlocked++ else unconfirmed++
+                }
+            }
+        }
+        _uiState.update { state ->
+            state.copy(
+                items = state.items.map { it.withGalleryReceipt(proven[it.sourceUri]) },
+                statusMessage = GallerySaveSummary.message(proven.size, unconfirmed, privacyMode.summary, locationBlocked)
+            )
         }
     }
 
@@ -4604,6 +4634,7 @@ class BatchCompressorViewModel internal constructor(
         quality: BatchQualityPreset,
         frameRate: BatchFrameRateOption,
         videoMimeType: String,
+        outputFile: File,
         // The resolved encode (ResolvedEncodePlan): the bitrate requested here, the audio
         // copy/re-encode decision and the row's estimate all come from it.
         plan: ResolvedEncodePlan,
@@ -4615,7 +4646,6 @@ class BatchCompressorViewModel internal constructor(
         transformerInputUri: Uri = item.sourceUri
     ): EncodeAttemptResult = withContext(Dispatchers.Main) {
         suspendCancellableCoroutine { continuation ->
-            val outputFile = item.cacheOutputFile(context, quality)
             if (outputFile.exists()) outputFile.delete()
 
             val targetBitrate = plan.requestedVideoBitrate
@@ -4857,16 +4887,14 @@ class BatchCompressorViewModel internal constructor(
         }
     }
 
-    private suspend fun remuxOnlyOne(
-        context: Context,
-        item: BatchVideoItem,
-        phases: PhaseReporter,
-        privacyMode: MetadataPrivacyMode
-    ): Mp4MetadataRemuxResult = withContext(Dispatchers.IO) {
+    private suspend fun remuxOnlyOne(s: ItemRun): Mp4MetadataRemuxResult = withContext(Dispatchers.IO) {
+        val context = s.run.context
+        val item = s.item
+        val phases = s.phases
         val remuxContext = currentCoroutineContext()
         phases.enter(ItemPhase.REMUXING)
         phases.detail("Copying the video and audio unchanged into a new file; no re-encode")
-        val outputFile = item.cacheOutputFile(context, BatchQualityPreset.REMUX_ONLY)
+        val outputFile = s.newCacheOutput(BatchQualityPreset.REMUX_ONLY)
         val estimatedOutputSize = estimateOutputSize(
             item = item,
             quality = BatchQualityPreset.REMUX_ONLY,
@@ -4877,7 +4905,7 @@ class BatchCompressorViewModel internal constructor(
             context = context,
             sourceUri = item.sourceUri,
             outputFile = outputFile,
-            snapshot = item.metadataSnapshot.filteredForPrivacy(privacyMode),
+            snapshot = item.metadataSnapshot.filteredForPrivacy(s.run.privacyMode),
             onProgress = { copiedBytes, outputBytes ->
                 remuxContext.ensureActive()
                 // Source bytes copied over source size: a real fraction of the work, unlike output bytes.
@@ -5774,26 +5802,14 @@ class BatchCompressorViewModel internal constructor(
             base.endsWith("-remuxed")
     }
 
-    private fun BatchVideoItem.outputName(quality: BatchQualityPreset): String {
-        val base = originalName.substringBeforeLast(".").ifBlank { "Video_${System.currentTimeMillis()}" }
-        val suffix = if (quality == BatchQualityPreset.REMUX_ONLY) "Remuxed" else "Compressed"
-        return "${base}_$suffix.mp4"
-    }
-
-    private fun BatchVideoItem.cacheOutputFile(
-        context: Context,
-        quality: BatchQualityPreset
-    ): File {
-        val outputDir = File(context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
-        val base = originalName.substringBeforeLast(".").ifBlank { "Video" }
-        // A failed HQ retry must not overwrite an earlier verified PL transcode of this source.
+    private fun ItemRun.newCacheOutput(quality: BatchQualityPreset): File {
+        val outputDir = File(run.context.cacheDir, "batch_compressed_videos").apply { mkdirs() }
         val suffix = when (quality) {
             BatchQualityPreset.REMUX_ONLY -> "Remuxed"
             BatchQualityPreset.HIGH -> "HighQuality_Compressed"
             else -> "Compressed"
         }
-        val sourceToken = DiagnosticsRecorder.redactedJobId(sourceUri.toString()).removePrefix("job_")
-        return File(outputDir, "${base}_${sourceToken}_$suffix.mp4")
+        return OutputSharing.newCacheFile(outputDir, "_$suffix.mp4").also { candidateFiles += it }
     }
 
     /**
